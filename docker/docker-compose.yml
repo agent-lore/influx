@@ -1,0 +1,16 @@
+# Influx Docker Compose configuration
+services:
+  influx:
+    image: ${INFLUX_IMAGE:-influx:dev}
+    pull_policy: never
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ${INFLUX_CONTAINER_NAME:-influx}
+    user: "${INFLUX_UID:-1000}:${INFLUX_GID:-1000}"
+    volumes:
+      - ${INFLUX_DATA_PATH:-./data}:/data
+    environment:
+      - INFLUX_CONFIG=/data/influx.toml
+      - INFLUX_DATA_DIR=/data
+      - INFLUX_ENVIRONMENT=${INFLUX_ENVIRONMENT:-dev}

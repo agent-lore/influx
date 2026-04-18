@@ -1,0 +1,13 @@
+# Influx configuration.
+# Copy to influx.toml (cwd), ~/.influx/influx.toml, or /etc/influx/influx.toml
+# and adjust to taste. Alternatively point INFLUX_CONFIG at this file.
+
+[influx]
+environment = "dev"
+greeting = "Hello"
+
+[influx.storage]
+data_dir = "~/.influx/data"
+
+[influx.logging]
+level = "info"   # one of: debug, info, warning, error
