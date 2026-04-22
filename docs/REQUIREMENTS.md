@@ -1,7 +1,7 @@
 ---
 title: Influx — Requirements Document
-version: 0.3.0
-date: 2026-04-19
+version: 0.4.0
+date: 2026-04-22
 status: draft
 tags: [influx, requirements, design, architecture]
 ---
@@ -9,7 +9,7 @@ tags: [influx, requirements, design, architecture]
 # Influx — Requirements Document
 
 > [!abstract] Project Summary
-> **Influx** is a knowledge ingestion pipeline that monitors arXiv and web sources (blogs, Medium, RSS feeds) for new content matching one or more configurable interest profiles, filters it for relevance using an LLM, and feeds the results into a Lithos knowledge base as structured markdown notes. For each relevant item, Influx extracts clean text from the source (preferring arXiv HTML over PDF where available, using `trafilatura` for web articles), generates a structured summary with key contributions and relevance reasoning, downloads and archives the original source to a local file store, and writes a rich Lithos note linking back to both the canonical source URL and the local file. A companion project **lithos-lens** provides a local web UI with feed view and interactive graph visualisation of the knowledge base. A feedback mechanism allows the user to mark items as irrelevant, improving future filtering over time via negative few-shot examples.
+> **Influx** is a knowledge ingestion pipeline that monitors arXiv and web sources (blogs, Medium, RSS feeds) for new content matching one or more configurable interest profiles, filters it for relevance using an LLM, and feeds the results into a Lithos knowledge base as structured markdown notes. For each relevant item, Influx extracts clean text from the source (preferring arXiv HTML over PDF where available, using `trafilatura` for web articles), generates a structured summary with key contributions and relevance reasoning, downloads and archives the original source to a local file store, and writes a rich Lithos note linking back to both the canonical source URL and the local file. A feedback mechanism allows the user to mark items as irrelevant, improving future filtering over time via negative few-shot examples. Influx has no UI of its own — a companion project **Lithos Lens** provides a local web UI with feed view and interactive graph visualisation of the knowledge base.
 
 ---
 
@@ -53,12 +53,12 @@ tags: [influx, requirements, design, architecture]
 
 ### Non-Goals
 
-- Full-text search UI — that is Lithos's job
+- Full-text search UI — that is Lithos's job (surfaced by Lithos Lens)
 - Relationship discovery and concept formation — that is LCMA's job
-- Email delivery — v1 scope; may be added later
+- Email delivery — out of v1 scope; may be added later
 - Social media monitoring — out of scope for v1
 - Citation graph construction — out of scope for v1
-- The lithos-lens UI is not Influx-specific; it is a general Lithos knowledge browser
+- Any UI — all browsing lives in Lithos Lens
 
 ---
 
@@ -78,11 +78,11 @@ tags: [influx, requirements, design, architecture]
 │  │  MCP API     │     │  batch job   │     │  HTTP server    │   │
 │  └──────────────┘     └──────────────┘     └────────┬────────┘   │
 │          ▲                                           │            │
-│          └───────────────────────────────────────────┘           │
-│                       Lithos HTTP API only                        │
+│          └───────────────────────────────────────────┘            │
+│                       Lithos MCP API only                         │
 └──────────────────────────────────────────────────────────────────┘
          │                                     │
-         │ HTTP API                            │ :7843 exposed to host
+         │ MCP API                             │ :7843 exposed to host
          ▼                                     ▼
   ┌─────────────┐                      ┌──────────────┐
   │ AGENT ZERO  │                      │   BROWSER    │
@@ -91,8 +91,8 @@ tags: [influx, requirements, design, architecture]
   └─────────────┘
 ```
 
-> [!important] UI Independence
-> **lithos-lens has zero runtime dependency on the Influx ingestion container.** It is a pure Lithos client. All data — paper notes, run history, feedback, graph edges — comes from Lithos. The UI and ingestion pipeline can be restarted, updated, or fail independently.
+> [!important] Influx has no UI
+> Influx is a headless scheduled pipeline. All human-facing browsing, graph rendering, and feedback UI live in Lithos Lens. Influx exposes only a health endpoint and receives feedback indirectly via notes tagged `influx:rejected` in Lithos.
 
 ### Repository Structure
 
@@ -101,23 +101,21 @@ Two separate repositories:
 | Repo | Purpose |
 |------|---------|
 | `influx` | Ingestion pipeline — arXiv/RSS monitoring, LLM filtering, Lithos ingestion |
-| `lithos-lens` | Web UI — feed view, graph view, feedback; pure Lithos client |
+| `lithos-lens` | Web UI — documented separately (see `LITHOS-LENS-REQUIREMENTS-0.4.md`) |
 
 ### Key Design Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Deployment | Three separate Docker containers | Independent restartability; clean separation of concerns |
+| Deployment | Separate Docker container | Independent restartability; clean separation of concerns |
 | Scheduling | APScheduler (Python, in Influx container) | Configurable, handles missed runs, stays in-process |
 | LLM access | LiteLLM | Provider-agnostic; supports OpenRouter, local models, Ollama |
 | Deduplication | Lithos `lithos_cache_lookup` by `source_url` | Lithos is the source of truth; no separate state DB |
 | Archive storage | Local filesystem shared volume | Simple, human-accessible, easy to back up |
-| Lithos communication | HTTP MCP API | Clean decoupling; Lithos is the authority |
+| Lithos communication | MCP API (SSE transport) | Clean decoupling; Lithos is the authority |
 | Notification | Webhook to Agent Zero | Real-time; no polling needed |
 | Text extraction | arXiv HTML → PDF fallback → abstract-only | Quality-first with graceful degradation |
 | Feedback storage | Lithos notes tagged `influx:rejected` | Lithos is source of truth; LCMA can reason over rejections |
-| UI graph rendering | Cytoscape.js | Best for knowledge graphs; handles typed LCMA edges; scales to ~10K nodes |
-| UI frontend | FastAPI + HTMX + Cytoscape.js | No build step; minimal stack |
 | Config format | TOML (Python 3.12 built-in `tomllib`) | Consistent with Cardinal and other recent projects |
 | Interest profiles | Multiple named profiles | Keeps unrelated domains (AI/robotics vs HEMA) cleanly separated |
 | OTEL | Opt-in, additive, optional packages | Consistent with Lithos conventions |
@@ -127,22 +125,22 @@ Two separate repositories:
 
 ## 3. Infrastructure & Deployment
 
-### Containers
+### Container
 
 | Container | Base image | Purpose |
 |-----------|-----------|--------|
-| `lithos` | lithos image | Knowledge store and MCP API |
 | `influx` | `python:3.12-slim` | Ingestion pipeline, scheduler, archive downloader |
-| `lithos-lens` | `python:3.12-slim` | Web UI, feed view, graph view, feedback API |
+
+Lithos runs in its own container (`lithos`) and is a dependency, not a sub-component of Influx.
 
 ### Shared Volume: Archive Store
 
-The archive volume is named **`influx-archive`** (generic — holds PDFs, saved web pages, and any other downloaded source material, not just papers).
+The archive volume is named **`influx-archive`** (generic — holds PDFs, saved web pages, and any other downloaded source material, not just papers). It is owned by Influx but mounted read-only by Lithos Lens.
 
-| Volume | Influx mount | lithos-lens mount | Purpose |
-|--------|-------------|------------------|--------|
-| `influx-archive` | `/archive` (rw) | `/archive` (ro) | Downloaded source files |
-| `influx-config` | `/etc/influx` (rw) | `/etc/influx` (ro) | Shared config (TOML) |
+| Volume | Influx mount | Purpose |
+|--------|-------------|--------|
+| `influx-archive` | `/archive` (rw) | Downloaded source files |
+| `influx-config` | `/etc/influx` (rw) | Shared config (TOML) — mounted read-only by Lens |
 
 ### Environment Files & run.sh
 
@@ -153,7 +151,7 @@ Follows the Lithos convention exactly:
 - The `environment:` section in compose passes specific vars into the container using `${VAR:-default}` syntax
 - API keys and secrets are **not** in the env files — they are injected separately (e.g. via `.a0proj/secrets.env` or a secrets manager)
 
-**Influx `.env.dev`:**
+**`.env.dev`:**
 ```env
 INFLUX_ENVIRONMENT=dev
 INFLUX_ARCHIVE_PATH=./archive
@@ -163,7 +161,7 @@ INFLUX_OTEL_ENABLED=false
 OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318
 ```
 
-**Influx `.env.prod`:**
+**`.env.prod`:**
 ```env
 INFLUX_ENVIRONMENT=production
 INFLUX_ARCHIVE_PATH=/home/user/projects/influx/archive
@@ -173,25 +171,7 @@ INFLUX_OTEL_ENABLED=true
 OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
 ```
 
-**lithos-lens `.env.dev`:**
-```env
-LENS_ENVIRONMENT=dev
-LENS_HOST_PORT=7843
-LENS_CONTAINER_NAME=lithos-lens
-LENS_OTEL_ENABLED=false
-OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318
-```
-
-**lithos-lens `.env.prod`:**
-```env
-LENS_ENVIRONMENT=production
-LENS_HOST_PORT=7843
-LENS_CONTAINER_NAME=lithos-lens
-LENS_OTEL_ENABLED=true
-OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
-```
-
-### Influx `docker-compose.yml`
+### `docker-compose.yml`
 
 ```yaml
 # Influx — ingestion pipeline
@@ -234,44 +214,9 @@ volumes:
   influx-archive:
 ```
 
-### lithos-lens `docker-compose.yml` (separate repo)
+### `run.sh`
 
-```yaml
-# lithos-lens — knowledge browser UI
-services:
-  lithos-lens:
-    image: ${LENS_IMAGE:-lithos-lens:local}
-    pull_policy: never
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: ${LENS_CONTAINER_NAME:-lithos-lens}
-    user: "${LENS_UID:-1000}:${LENS_GID:-1000}"
-    restart: unless-stopped
-    ports:
-      - "${LENS_HOST_PORT:-7843}:8000"
-    volumes:
-      - ${INFLUX_ARCHIVE_PATH:-./archive}:/archive:ro
-      - ./config:/etc/influx:ro
-    environment:
-      - LENS_ENVIRONMENT=${LENS_ENVIRONMENT:-dev}
-      - LITHOS_URL=${LITHOS_URL:-http://host.docker.internal:8765}
-      - LENS_OTEL_ENABLED=${LENS_OTEL_ENABLED:-false}
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://host.docker.internal:4318}
-      - LENS_LOG_LEVEL=${LENS_LOG_LEVEL:-INFO}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-```
-
-### `run.sh` (both repos)
-
-Both `influx` and `lithos-lens` ship the same `run.sh` pattern as Lithos, adapted for their service name:
+Ships the same `run.sh` pattern as Lithos, adapted for `influx`:
 
 ```bash
 #!/usr/bin/env bash
@@ -286,11 +231,6 @@ Both `influx` and `lithos-lens` ship the same `run.sh` pattern as Lithos, adapte
 #           logs    Tail container logs (Ctrl-C to detach)
 #           status  Show running containers for this project
 #           restart Shortcut for down + up
-#
-# Examples:
-#   ./run.sh prod            # build & start production
-#   ./run.sh dev logs        # follow dev logs
-#   ./run.sh prod restart    # rebuild and restart production
 
 set -euo pipefail
 
@@ -317,22 +257,11 @@ compose_args=(-p "${project_name}" --env-file "${env_file}")
 cd "${SCRIPT_DIR}"
 
 case "${action}" in
-    up)
-        docker compose "${compose_args[@]}" up -d --build
-        ;;
-    down)
-        docker compose "${compose_args[@]}" down
-        ;;
-    restart)
-        docker compose "${compose_args[@]}" down
-        docker compose "${compose_args[@]}" up -d --build
-        ;;
-    logs)
-        docker compose "${compose_args[@]}" logs -f 2>&1 | grep -v 'GET /health'
-        ;;
-    status)
-        docker compose "${compose_args[@]}" ps
-        ;;
+    up)      docker compose "${compose_args[@]}" up -d --build ;;
+    down)    docker compose "${compose_args[@]}" down ;;
+    restart) docker compose "${compose_args[@]}" down && docker compose "${compose_args[@]}" up -d --build ;;
+    logs)    docker compose "${compose_args[@]}" logs -f 2>&1 | grep -v 'GET /health' ;;
+    status)  docker compose "${compose_args[@]}" ps ;;
     *)
         echo "Error: unknown action '${action}'" >&2
         echo "Valid actions: up, down, restart, logs, status" >&2
@@ -341,15 +270,11 @@ case "${action}" in
 esac
 ```
 
-> [!note] lithos-lens `run.sh`
-> Identical to the above with `influx` replaced by `lithos-lens` in the project name and usage text.
-
-
 ---
 
 ## 4. Configuration
 
-Configuration uses **TOML** format (Python 3.12 built-in `tomllib` for reading; `tomli-w` for writing if needed). The config file lives at `/etc/influx/config.toml` and is shared read-only with lithos-lens.
+Configuration uses **TOML** format (Python 3.12 built-in `tomllib` for reading; `tomli-w` for writing if needed). The config file lives at `/etc/influx/config.toml` and is shared read-only with Lithos Lens (for settings views).
 
 ```toml
 # Influx Configuration
@@ -413,35 +338,17 @@ url = "https://karpathy.github.io/feed.xml"
 name = "Lilian Weng"
 url = "https://lilianweng.github.io/index.xml"
 
-# Example second profile — kept entirely separate in Lithos
-# [[profiles]]
-# name = "hema"
-# description = """
-#   HIGH INTEREST: Historical European Martial Arts, longsword, rapier,
-#   wrestling, historical fencing manuals, biomechanics of swordsmanship.
-#   ...
-#   """
-# [profiles.thresholds]
-# relevance = 7
-# ...
-# [profiles.sources.arxiv]
-# enabled = false
-# [[profiles.sources.rss]]
-# name = "HEMA Alliance"
-# url = "https://hemaalliance.com/feed"
-
 # ---------------------------------------------------------------------------
 # Models
 # All model references use LiteLLM format: "provider/model-name"
 # ---------------------------------------------------------------------------
 
 [models]
-filter   = "openai/gpt-4.1-mini"     # cheap scoring of title+abstract
-enrich   = "openai/gpt-4.1-mini"     # tier-1 summarisation
+filter   = "openai/gpt-4.1-mini"          # cheap scoring of title+abstract
+enrich   = "openai/gpt-4.1-mini"          # tier-1 summarisation
 extract  = "anthropic/claude-sonnet-4.6"  # tier-3 deep extraction
 
 [models.litellm]
-# Optional LiteLLM-specific settings
 request_timeout = 30
 max_retries = 2
 
@@ -778,22 +685,31 @@ ingested_by: influx
 
 ### 9.1 Deduplication
 
-Before processing any item:
+Before processing any item, use `lithos_cache_lookup` with both `query` (required) and `source_url` (fast path):
+
 ```python
-result = lithos_cache_lookup(source_url=url, max_age_hours=None)
-# hit   → skip
-# stale → update existing note
-# miss  → proceed
+# query is REQUIRED — use a short descriptor; source_url is the fast-path dedup key
+result = lithos_cache_lookup(
+    query=f"{title} {abstract_first_sentence}",
+    source_url=url,
+    max_age_hours=None,
+)
+# result["hit"] is True   → skip (already have fresh copy)
+# result["stale_exists"]  → update existing note (result["stale_id"])
+# otherwise               → proceed with fresh ingest
 ```
 
 ### 9.2 Writing Notes
 
-`lithos_write` parameters:
+`lithos_write` requires `title`, `content`, and `agent` on every call (even updates — omitted optional fields preserve existing values, but the required trio is never optional at the MCP boundary). For Influx:
+
 - `agent`: `"influx"`
 - `path`: `"papers/{profile}/{YYYY}/{MM}"`
-- `source_url`: canonical URL
+- `source_url`: canonical URL (acts as dedup key after normalisation)
 - `tags`: filter tags + `profile:{name}` tag
 - `confidence`: `relevance_score / 10.0`
+- `note_type`: `"summary"` for Tier 1 notes, `"observation"` for full-text notes
+- `derived_from_ids`: for Tier 2 notes, the UUID of the Tier 1 summary note
 
 ### 9.3 Agent Registration
 
@@ -802,13 +718,15 @@ On startup:
 lithos_agent_register(id="influx", name="Influx Pipeline", type="ingestion-pipeline")
 ```
 
+Registration is optional (agents auto-register on first use), but doing so explicitly sets a human-readable name and type.
+
 ---
 
 ## 10. LCMA Integration
 
-Lithos LCMA MVP1 and MVP2 tools are available and should be used by both Influx and lithos-lens.
+Lithos LCMA MVP1 and MVP2 tools are available and should be used by Influx to seed the knowledge graph at ingest time.
 
-### 10.1 Influx — Post-Ingestion Retrieval
+### 10.1 Post-Ingestion Retrieval
 
 After writing each summary note, use `lithos_retrieve` (LCMA MVP1) instead of basic semantic search. This runs seven parallel scouts with reranking and produces an audit receipt:
 
@@ -824,7 +742,7 @@ related = lithos_retrieve(
 
 Top results are included in the notification digest as "Related in your knowledge base".
 
-### 10.2 Influx — Explicit Edge Creation
+### 10.2 Explicit Edge Creation
 
 For Tier 3 papers (score ≥ deep_extract), after extracting "Builds On" prior works, create typed edges:
 
@@ -855,7 +773,7 @@ lithos_edge_upsert(
 )
 ```
 
-### 10.3 Influx — Run Task Coordination
+### 10.3 Run Task Coordination
 
 Each pipeline run creates a Lithos task for LCMA coordination and audit:
 
@@ -874,69 +792,8 @@ lithos_task_complete(
 )
 ```
 
-### 10.4 lithos-lens — Graph View
-
-The graph view uses LCMA edge tools directly:
-
-```python
-# Get all edges for graph rendering
-edges = lithos_edge_list(namespace="influx")
-
-# Get edges for a specific node (node detail panel)
-related = lithos_related(
-    id=note_id,
-    include=["edges", "links", "provenance"],
-    depth=2,
-)
-```
-
-Edge types rendered in Cytoscape with distinct colours:
-
-| Edge type | Colour | Source |
-|-----------|--------|--------|
-| `related_to` | 🔵 Blue | Semantic similarity (Influx) |
-| `builds_on` | 🟢 Green | LLM extraction (Influx Tier 3) |
-| `contradicts` | 🔴 Red | LCMA contradiction detection |
-| `uses_method` | 🟡 Yellow | LCMA concept formation |
-| `analogous_to` | 🟣 Purple | LCMA analogy scout |
-
-### 10.5 lithos-lens — Node Stats
-
-The node detail panel shows LCMA salience and retrieval stats:
-
-```python
-stats = lithos_node_stats(node_id=note_id)
-# → salience, retrieval_count, cited_count, misleading_count
-```
-
-This surfaces which papers are most frequently retrieved and cited by agents.
-
-### 10.6 lithos-lens — Conflict Resolution UI
-
-When `contradicts` edges exist, the UI shows a resolution panel:
-
-```python
-# Resolve a contradiction
-lithos_conflict_resolve(
-    edge_id=edge_id,
-    resolution="superseded",  # accepted_dual | superseded | refuted | merged
-    resolver="user",
-    winner_id=winning_note_id,
-)
-```
-
-### 10.7 lithos-lens — Cognitive Retrieval Search
-
-The search bar in lithos-lens uses `lithos_retrieve` for best-quality results:
-
-```python
-results = lithos_retrieve(
-    query=search_query,
-    limit=20,
-    agent_id="lithos-lens",
-    tags=[f"profile:{active_profile}"] if active_profile else None,
-)
-```
+> [!note] `lithos_task_complete` extended parameters
+> The implementation accepts `outcome`, `cited_nodes`, `misleading_nodes`, and `receipt_id` even though the public SPECIFICATION.md only lists `task_id` and `agent`. These extended parameters are the canonical surface — the spec text lags behind the code.
 
 ---
 
@@ -991,39 +848,24 @@ POSTs to Agent Zero webhook after each profile run:
 
 ### 12.1 Overview
 
-Users mark items as "not relevant" via lithos-lens. Feedback is stored in Lithos and injected as negative few-shot examples into the filter prompt on subsequent runs.
+Feedback is authored in Lithos Lens. From Influx's perspective, feedback is data it reads from Lithos at the start of each run.
 
-### 12.2 Storing Feedback
+### 12.2 How Feedback Arrives
 
-When an item is rejected, the existing summary note is updated:
-```python
-lithos_write(
-    id=existing_note_uuid,
-    tags=[*existing_tags, "influx:rejected"],
-    confidence=0.0,
-    agent="lithos-lens",
-)
-```
+Lithos Lens updates the rejected note's tags via `lithos_write` (see Lens requirements §8). The resulting note carries the tag `influx:rejected`. Influx does not write feedback itself.
 
 ### 12.3 Injecting Negative Examples
 
-At the start of each filter run, per profile:
+At the start of each filter run, per profile — use `lithos_list` (tag-only filtering), **not** `lithos_search` (which requires a free-text `query` argument):
+
 ```python
-rejected = lithos_search(
+rejected = lithos_list(
     tags=["influx:rejected", f"profile:{profile_name}"],
     limit=config.feedback.negative_examples_per_profile,
 )
 ```
 
-Formatted and injected into the `NEGATIVE EXAMPLES` block of the filter prompt.
-
-### 12.4 Feedback Entry Points
-
-| Entry point | Mechanism |
-|-------------|----------|
-| lithos-lens feed view | 👍 / 👎 buttons on each paper card |
-| lithos-lens graph view | 👎 button in node detail panel |
-| Notification link | `[not relevant]` link → `POST /api/feedback` |
+Each returned item is read via `lithos_read(id=...)` to get title+abstract, then formatted and injected into the `NEGATIVE EXAMPLES` block of the filter prompt.
 
 ---
 
@@ -1039,8 +881,9 @@ Formatted and injected into the `NEGATIVE EXAMPLES` block of the filter prompt.
 | Duplicate detected | Skip silently |
 | Malformed LLM JSON | Log warning; attempt regex extraction; fall back to no-tags |
 | arXiv rate limit (429) | Back off 10 seconds; retry |
-| Feedback write fails | Log error; show error in UI; do not silently drop |
 | LCMA edge upsert fails | Log warning; continue — edges are enrichment, not critical path |
+| `lithos_write` returns `status=version_conflict` | Re-read note, merge changes, retry once |
+| `lithos_write` returns `status=slug_collision` | Log error; append short hash to slug; retry |
 
 ### Retry Policy
 
@@ -1098,14 +941,9 @@ Follows the Lithos pattern — **stdout only, no log files**:
 - **Durable run history** is stored as Lithos notes at `path: "influx/runs"` — queryable, persistent, human-readable
 - OTEL (when enabled) provides structured spans and metrics for deeper observability
 
-> [!note] No log volume needed
-> The `influx-logs` volume is not required. `docker logs` handles ephemeral operational logs; Lithos handles the durable record.
-
-
 ### Health Endpoint
 
-- Influx: `GET http://localhost:8080/health` → `{"status": "ok", "last_run": "...", "next_run": "..."}`
-- lithos-lens: `GET /health` → `{"status": "ok", "lithos": "ok"}`
+- `GET http://localhost:8080/health` → `{"status": "ok", "last_run": "...", "next_run": "..."}`
 
 ---
 
@@ -1159,30 +997,17 @@ python -m influx backfill --all-profiles --days 7
 
 ### 16.3 Lithos MCP API — Influx Usage
 
-| Tool | Purpose |
-|------|---------|
-| `lithos_cache_lookup(source_url)` | Deduplication before processing |
-| `lithos_write(...)` | Write summary, full-text, feedback notes |
-| `lithos_retrieve(query, agent_id, task_id)` | LCMA post-ingestion connection query |
-| `lithos_search(tags, limit)` | Load negative examples for filter prompt |
-| `lithos_edge_upsert(from_id, to_id, type, weight, namespace)` | Create typed edges between notes |
-| `lithos_task_create(title, agent, tags)` | Create run coordination task |
-| `lithos_task_complete(task_id, agent, outcome, cited_nodes)` | Complete run task with feedback |
-| `lithos_agent_register(id, name, type)` | Register on startup |
-
-### 16.4 Lithos MCP API — lithos-lens Usage
-
-| Tool | Purpose |
-|------|---------|
-| `lithos_list(path_prefix, tags, since)` | Feed view paper listing |
-| `lithos_read(id)` | Paper detail view |
-| `lithos_retrieve(query, agent_id)` | Cognitive search bar |
-| `lithos_edge_list(namespace)` | Graph edge data for Cytoscape |
-| `lithos_related(id, include, depth)` | Node detail panel — related papers |
-| `lithos_node_stats(node_id)` | Node salience and retrieval stats |
-| `lithos_conflict_resolve(edge_id, resolution, resolver)` | Contradiction resolution UI |
-| `lithos_write(id, tags, confidence)` | Write feedback (reject/accept) |
-| `lithos_tags(prefix)` | Tag cloud / filter panel |
+| Tool | Required args | Purpose |
+|------|---------------|---------|
+| `lithos_cache_lookup(query, source_url?, max_age_hours?, tags?)` | `query` | Deduplication before processing. `query` is REQUIRED even when a `source_url` fast-path hit is expected. |
+| `lithos_write(title, content, agent, ...)` | `title`, `content`, `agent` | Write summary, full-text notes. Always pass all three required fields — even on updates. |
+| `lithos_read(id)` | `id` | Load rejected-note title/content when building negative examples |
+| `lithos_retrieve(query, limit, agent_id, task_id, tags)` | `query` | LCMA post-ingestion connection query |
+| `lithos_list(path_prefix?, tags?, since?, limit?)` | none | Load negative examples for filter prompt (tag-only; not `lithos_search`) |
+| `lithos_edge_upsert(from_id, to_id, type, weight, namespace, ...)` | as named | Create typed edges between notes |
+| `lithos_task_create(title, agent, tags?)` | `title`, `agent` | Create run coordination task |
+| `lithos_task_complete(task_id, agent, outcome?, cited_nodes?)` | `task_id`, `agent` | Complete run task with outcome summary |
+| `lithos_agent_register(id, name?, type?)` | `id` | Register on startup (optional — auto-registers otherwise) |
 
 ---
 
@@ -1196,7 +1021,7 @@ python -m influx backfill --all-profiles --days 7
 - [ ] arXiv fetcher module (`influx/sources/arxiv.py`)
 - [ ] LiteLLM filter module (`influx/filter.py`) with batching
 - [ ] Lithos client wrapper (`influx/lithos_client.py`)
-- [ ] Deduplication via `lithos_cache_lookup`
+- [ ] Deduplication via `lithos_cache_lookup` (passing both `query` and `source_url`)
 - [ ] Tier 1 note writer with profile-based paths
 - [ ] Archive downloader (`influx/storage.py`)
 - [ ] APScheduler setup (`influx/scheduler.py`)
@@ -1228,45 +1053,18 @@ python -m influx backfill --all-profiles --days 7
 - [ ] Config-driven feed list per profile
 - [ ] Backfill CLI (`influx backfill --profile ... --days N`)
 
-### Milestone 4 — lithos-lens: Feed View + Feedback (v0.4)
-*Goal: human-readable feed with feedback mechanism (separate repo)*
-
-- [ ] `lithos-lens` repo scaffold (FastAPI + HTMX + Tailwind)
-- [ ] Feed view: paper list from Lithos, filterable by profile/date/tag/score
-- [ ] Expandable abstract inline (HTMX)
-- [ ] Archive file link (opens local file)
-- [ ] 👍 / 👎 feedback buttons → `lithos_write` update
-- [ ] Negative examples loaded from Lithos and injected into Influx filter prompt
-- [ ] Settings view (read-only)
-- [ ] Health endpoint
-- [ ] `docker-compose.yml` with shared `influx-archive` volume
-
-### Milestone 5 — lithos-lens: Graph View (v0.5)
-*Goal: visual knowledge graph with LCMA edges*
-
-- [ ] Graph view with Cytoscape.js
-- [ ] Nodes: papers sized by score, coloured by profile/tag cluster
-- [ ] Edges from `lithos_edge_list` — typed and colour-coded
-- [ ] Click node → side panel with detail, `lithos_related`, `lithos_node_stats`
-- [ ] Filter panel (profile, date, tag, score, edge type)
-- [ ] Contradiction resolution UI (`lithos_conflict_resolve`)
-- [ ] Cognitive search bar using `lithos_retrieve`
-
-### Milestone 6 — Observability (v0.6)
+### Milestone 4 — Observability (v0.4)
 *Goal: production-ready telemetry*
 
 - [ ] `influx/telemetry.py` — mirrors Lithos OTEL pattern
 - [ ] `@traced` decorator on key pipeline stages
 - [ ] OTEL metrics: items fetched, filtered, ingested, errors (per profile)
-- [ ] `lithos-lens/telemetry.py` — same pattern
 - [ ] Run history notes in Lithos
 - [ ] Tag rejection rate reporting
 
 ---
 
 ## Appendix A — Directory Structure
-
-### `influx` repo
 
 ```
 influx/
@@ -1276,6 +1074,7 @@ influx/
 ├── .env.prod
 ├── pyproject.toml
 ├── README.md
+├── run.sh
 ├── config/
 │   └── config.toml
 ├── influx/
@@ -1299,41 +1098,9 @@ influx/
 └── tests/
 ```
 
-### `lithos-lens` repo
-
-```
-lithos-lens/
-├── Dockerfile
-├── docker-compose.yml
-├── .env.dev
-├── .env.prod
-├── pyproject.toml
-├── README.md
-├── app/
-│   ├── __init__.py
-│   ├── main.py
-│   ├── config.py
-│   ├── lithos_client.py
-│   ├── telemetry.py
-│   ├── routers/
-│   │   ├── feed.py
-│   │   ├── graph.py
-│   │   ├── feedback.py
-│   │   └── settings.py
-│   └── templates/
-│       ├── base.html
-│       ├── feed.html
-│       ├── graph.html
-│       └── settings.html
-└── static/
-    └── cytoscape.min.js
-```
-
 ---
 
 ## Appendix B — Key Dependencies
-
-### `influx`
 
 | Package | Purpose |
 |---------|---------|
@@ -1348,18 +1115,3 @@ lithos-lens/
 | `python-json-logger` | Structured JSON logging |
 | `tomli-w` | TOML writing (if config needs updating at runtime) |
 | `opentelemetry-*` | OTEL (optional extra: `uv sync --extra otel`) |
-
-### `lithos-lens`
-
-| Package | Purpose |
-|---------|---------|
-| `fastapi` | Web framework |
-| `uvicorn` | ASGI server |
-| `httpx` | Lithos API client |
-| `jinja2` | HTML templating |
-| `pydantic` | Request/response validation |
-| `python-json-logger` | Structured JSON logging |
-| `opentelemetry-*` | OTEL (optional extra) |
-| Cytoscape.js (CDN) | Graph visualisation |
-| HTMX (CDN) | Dynamic HTML without JS framework |
-| Tailwind CSS (CDN) | Styling |
