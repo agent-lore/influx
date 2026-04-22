@@ -1532,48 +1532,7 @@ Influx fails fast on startup if any configured model's required API key env var 
 
 ---
 
-## Appendix A — Directory Structure
-
-```
-influx/
-├── Dockerfile
-├── docker-compose.yml
-├── .env.dev
-├── .env.prod
-├── pyproject.toml
-├── README.md
-├── run.sh
-├── config/
-│   └── config.toml
-├── influx/
-│   ├── __init__.py
-│   ├── main.py
-│   ├── config.py            # TOML loader + Pydantic models + profile-name validation
-│   ├── http_client.py       # Guarded HTTP client (SSRF, size, timeout)
-│   ├── scheduler.py
-│   ├── pipeline.py
-│   ├── filter.py            # LiteLLM + JSON mode + Pydantic schemas
-│   ├── enrichment.py
-│   ├── lithos_client.py     # mcp SDK + SSE
-│   ├── notifier.py
-│   ├── storage.py           # Archive downloader + path-safety
-│   ├── telemetry.py         # mirrors lithos/telemetry.py
-│   ├── sources/
-│   │   ├── arxiv.py
-│   │   └── rss.py
-│   └── extraction/
-│       ├── html.py
-│       └── pdf.py
-└── tests/
-    ├── unit/
-    ├── contract/
-    ├── integration/
-    └── fixtures/
-```
-
----
-
-## Appendix B — Key Dependencies
+## Appendix A — Key Dependencies
 
 | Package | Purpose |
 |---------|---------|
