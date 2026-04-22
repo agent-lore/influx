@@ -1,26 +1,25 @@
 ---
 title: Influx — Requirements Document
-version: 0.5.0
+version: 0.6.0
 date: 2026-04-22
 status: draft
 tags: [influx, requirements, design, architecture]
-supersedes: INFLUX-REQUIREMENTS-0.4.md
+supersedes: INFLUX-REQUIREMENTS-0.5.md
 ---
 
 # Influx — Requirements Document
 
 > [!abstract] Project Summary
-> **Influx** is a knowledge ingestion pipeline that monitors arXiv and web sources (blogs, Medium, RSS feeds) for new content matching one or more configurable interest profiles, filters it for relevance using an LLM, and feeds the results into a Lithos knowledge base as structured markdown notes. For each relevant item, Influx extracts clean text from the source (preferring arXiv HTML over PDF where available, using `trafilatura` for web articles), generates a structured summary with key contributions and relevance reasoning, downloads and archives the original source to a local file store, and writes a rich Lithos note linking back to both the canonical source URL and the local file. A feedback mechanism allows the user to mark items as irrelevant, improving future filtering over time via negative few-shot examples. Influx has no UI of its own — a companion project **Lithos Lens** provides a local web UI with feed view and interactive graph visualisation of the knowledge base.
+> **Influx** is a knowledge ingestion pipeline that monitors arXiv and web sources (blogs, Medium, RSS feeds) for new content matching one or more configurable interest profiles, filters it for relevance using an LLM, and feeds the results into a Lithos knowledge base as structured markdown notes. For each relevant item, Influx extracts clean text from the source (preferring arXiv HTML over PDF where available, using `trafilatura` for web articles), generates a structured summary with key contributions and relevance reasoning, downloads and archives the original source to a local file store, and writes exactly one canonical Lithos note per source. Profile membership is represented by tags on that canonical note rather than by duplicate notes. A feedback mechanism allows the user to mark items as irrelevant per profile, improving future filtering over time via negative few-shot examples. Influx has no UI of its own — a companion project **Lithos Lens** provides a local web UI with feed view and interactive graph visualisation of the knowledge base.
 
-> [!info] Changes since 0.4
-> - Logging corrected to stderr (matches Lithos).
-> - MCP client/transport pinned (official `mcp` SDK + Streamable HTTP).
-> - Frontmatter mapping table added (§9.2) — Lithos-allowed fields only; extensions go in `tags`.
-> - Stale-cache update semantics (§9.4) fully specified.
-> - LLM JSON-mode + Pydantic schema enforcement pinned (§6, §7).
-> - SSRF guard, download size, and timeout caps added (§13).
-> - LCMA availability probe, profile-name validation, archive-path sanitisation, webhook/backfill/concurrency/health-endpoint rules all specified.
-> - New sections: §18 Testing Strategy, §19 Environment Variables, §20 Reserved Tags, §21 Retention & Secrets. Milestones gained acceptance criteria.
+> [!info] Changes Since 0.5
+> - Canonical note model pinned: exactly one Lithos note per source; profile membership is expressed by tags, not duplicate notes.
+> - Lithos transport aligned to current canonical behavior: official `mcp` SDK over SSE.
+> - Generic stale-update semantics replaced with explicit repair/upgrade semantics aligned to current `lithos_write`.
+> - Full-text and deep-extraction content now extend the canonical note instead of creating tier-specific sibling notes.
+> - LCMA is now a required dependency for Influx v0.6; startup fails fast if required LCMA tools are absent.
+> - arXiv exact lookup is pinned to canonical `source_url` plus `arxiv-id:<id>` tags rather than filename assumptions.
+> - Feedback tags are now profile-scoped (`influx:rejected:<profile>`) so one canonical note can be rejected for one profile without poisoning another.
 
 ---
 
@@ -60,8 +59,8 @@ supersedes: INFLUX-REQUIREMENTS-0.4.md
 - Improve filtering over time via user feedback (negative few-shot examples)
 - Extract clean text from sources (HTML preferred, PDF fallback)
 - Archive original PDFs and web articles to local filesystem
-- Ingest structured notes into Lithos knowledge base, organised by profile and date
-- Use LCMA retrieval and edge tools to surface connections at ingest time (when LCMA is available)
+- Ingest structured notes into Lithos knowledge base, organised by source and date
+- Use LCMA retrieval and edge tools to surface connections at ingest time via an LCMA-enabled Lithos deployment
 - Notify the user of new relevant content immediately
 - Support backfill of historical content
 - Run independently of Agent Zero (separate container, restartable independently)
@@ -109,7 +108,7 @@ supersedes: INFLUX-REQUIREMENTS-0.4.md
 Influx is an **MCP client** of Lithos. All dependencies flow Influx → Lithos.
 
 > [!important] Influx has no UI
-> Influx is a headless scheduled pipeline. All human-facing browsing, graph rendering, and feedback UI live in Lithos Lens. Influx exposes only a health endpoint and receives feedback indirectly via notes tagged `influx:rejected` in Lithos.
+> Influx is a headless scheduled pipeline. All human-facing browsing, graph rendering, and feedback UI live in Lithos Lens. Influx exposes only a health endpoint and receives feedback indirectly via notes tagged `influx:rejected:<profile>` in Lithos.
 
 ### Repository Structure
 
@@ -127,14 +126,16 @@ Two separate repositories:
 | Deployment | Separate Docker container | Independent restartability; clean separation of concerns |
 | Scheduling | APScheduler (Python, in Influx container) | Configurable, handles missed runs, stays in-process |
 | LLM access | LiteLLM, JSON mode + Pydantic schema | Provider-agnostic; enforces structured output |
+| Canonical note model | One Lithos note per source | Avoids duplicate notes across profiles; simplifies repair and upgrades |
 | Deduplication | Lithos `lithos_cache_lookup` by `source_url` | Lithos is the source of truth; no separate state DB |
 | Archive storage | Local filesystem shared volume | Simple, human-accessible, easy to back up |
-| Lithos communication | Official `mcp` Python SDK, **Streamable HTTP** transport | Canonical; SSE is on a deprecation path |
+| Lithos communication | Official `mcp` Python SDK, **SSE** transport | Matches current Lithos transport surface and deployment target |
 | Notification | Webhook to Agent Zero, fire-and-forget | Real-time; no polling; no local queue |
 | Text extraction | arXiv HTML → PDF fallback → abstract-only | Quality-first with graceful degradation |
-| Feedback storage | Lithos notes tagged `influx:rejected` | Lithos is source of truth; LCMA can reason over rejections |
+| Feedback storage | Lithos notes tagged `influx:rejected:<profile>` | Supports profile-specific rejection on a shared canonical note |
 | Config format | TOML (Python 3.12 built-in `tomllib`) | Consistent with Cardinal and other recent projects |
 | Interest profiles | Multiple named profiles | Keeps unrelated domains (AI/robotics vs HEMA) cleanly separated |
+| Multi-profile merge | Union profile tags; use max score for note-wide confidence | Preserves one note per source while keeping per-profile relevance |
 | OTEL | Opt-in, additive, optional packages | Consistent with Lithos conventions |
 | Environments | `.env.dev` / `.env.prod` per service | Consistent with Lithos conventions |
 | Logging | JSON to **stderr** (not stdout) | Matches Lithos; captured by `docker logs` |
@@ -195,8 +196,8 @@ services:
       - INFLUX_ENVIRONMENT=${INFLUX_ENVIRONMENT:-dev}
       - INFLUX_ARCHIVE_DIR=/archive
       - INFLUX_CONFIG=/etc/influx/config.toml
-      - LITHOS_URL=${LITHOS_URL:-http://host.docker.internal:8765}
-      - LITHOS_MCP_TRANSPORT=${LITHOS_MCP_TRANSPORT:-streamable-http}
+      - LITHOS_URL=${LITHOS_URL:-http://host.docker.internal:8765/sse}
+      - LITHOS_MCP_TRANSPORT=${LITHOS_MCP_TRANSPORT:-sse}
       - INFLUX_AGENT_ID=${INFLUX_AGENT_ID:-influx}
       - AGENT_ZERO_WEBHOOK_URL=${AGENT_ZERO_WEBHOOK_URL:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
@@ -322,7 +323,8 @@ allow_private_ips = false
 # ---------------------------------------------------------------------------
 # Interest Profiles
 # Multiple profiles are supported. Each profile has its own interest
-# description, source list, thresholds, and Lithos path prefix.
+# description, source list, and thresholds. Notes remain source-scoped;
+# profile membership is represented by `profile:<name>` tags, not paths.
 # Profile names MUST match regex: ^[a-z][a-z0-9-]{0,31}$
 # ---------------------------------------------------------------------------
 
@@ -351,7 +353,7 @@ relevance = 7                # minimum score to ingest
 full_text = 8                # minimum score to fetch and store full text
 deep_extract = 9             # minimum score for deep structured extraction
 notify_immediate = 8         # minimum score for immediate notification
-lcma_edge_similarity = 0.75  # minimum lithos_retrieve score to create related_to edge
+lcma_edge_score = 0.75       # minimum lithos_retrieve composite score to create related_to edge
 
 [profiles.sources.arxiv]
 enabled = true
@@ -548,14 +550,14 @@ Titles longer than 200 chars are truncated. Limit: `feedback.negative_examples_p
 | Score | Action |
 |-------|--------|
 | < relevance threshold (default 7) | Discard |
-| ≥ 7 | Ingest Tier 1 summary note |
-| ≥ 8 | Ingest Tier 1 + Tier 2 full text note |
-| ≥ 9 | Ingest Tier 1 + Tier 2 + Tier 3 deep extraction |
+| ≥ 7 | Ingest or update the canonical note with Tier 1 sections |
+| ≥ 8 | Canonical note includes Tier 2 full-text sections |
+| ≥ 9 | Canonical note includes Tier 3 deep-extraction sections |
 | ≥ notify_immediate (default 8) | Include in immediate notification |
 
 ### 6.6 Multi-Profile Runs
 
-Each run processes all enabled profiles sequentially. A paper may match multiple profiles — it is ingested once per matching profile with separate notes under each profile's path, tagged with the profile name.
+Each run processes all enabled profiles sequentially. A source may match multiple profiles. Influx writes one canonical note per source, unions the matching `profile:<name>` tags onto that note, stores the note under a source/date path, and records per-profile relevance inside the managed body. The note-wide `confidence` field is set to the maximum matched profile score divided by 10. Full-text and deep-extraction upgrades are triggered if any matched profile crosses the corresponding threshold.
 
 ---
 
@@ -617,7 +619,7 @@ class Tier3Extraction(BaseModel):
 
 ### 7.4 LLM Enrichment Failure Policy
 
-If any enrichment call fails after retries, the note is still written **without** the failed section. Missing sections are omitted from the body; no placeholder text is inserted. The failure is logged with the note ID and retried on the next scheduled run that re-encounters the paper (rare, since dedup will typically skip).
+If any enrichment call fails after retries, the note is still written **without** the failed section. Missing sections are omitted from the body; no placeholder text is inserted. The note is tagged `influx:repair-needed`, and later dedup hits on that note enter the repair/upgrade path instead of being skipped.
 
 ---
 
@@ -627,14 +629,14 @@ If any enrichment call fails after retries, the note is still written **without*
 
 **Volume:** `influx-archive` mounted at `/archive`
 
-**Layout:** `/{source}/{profile}/{YYYY}/{MM}/{id}.{ext}`
+**Layout:** `/{source}/{YYYY}/{MM}/{id}.{ext}`
 
 **Examples:**
 ```
-/archive/arxiv/ai-robotics/2026/03/2603.12939.pdf
-/archive/arxiv/hema/2026/03/2603.99999.pdf
-/archive/blog/ai-robotics/2026/03/karpathy-2026-03-15.html
-/archive/blog/ai-robotics/2026/03/lilianweng-2026-03-10.html
+/archive/arxiv/2026/03/2603.12939.pdf
+/archive/arxiv/2026/03/2603.99999.pdf
+/archive/blog/2026/03/karpathy-2026-03-15.html
+/archive/blog/2026/03/lilianweng-2026-03-10.html
 ```
 
 **Naming convention:**
@@ -644,31 +646,39 @@ If any enrichment call fails after retries, the note is still written **without*
 
 **Path safety:** feed names are slugified (`^[a-z0-9]+(-[a-z0-9]+)*$`, max 40 chars). After constructing the full archive path, Influx must verify `path.resolve().is_relative_to(archive_root)` and reject otherwise. Empty slugs (e.g. feed name of all-whitespace) are rejected at config load.
 
-**On download failure:** Log error, set `local_file: null` on the Lithos note, retry next run.
+**On download failure:** Log error, leave the canonical note without a local-file path, tag it `influx:repair-needed`, and retry on a later run.
 
 ### 8.2 Lithos Note Paths
 
-Notes are organised by profile, source type, year, and month to avoid directory bloat as the knowledge base grows:
+Notes are organised by source type, year, and month to avoid directory bloat as the knowledge base grows:
 
 ```
-papers/{profile}/{YYYY}/{MM}/{id}
+papers/arxiv/{YYYY}/{MM}
+articles/rss/{YYYY}/{MM}
+articles/blog/{YYYY}/{MM}
 ```
 
 **Examples:**
 ```
-papers/ai-robotics/2026/03/2603.12939
-papers/ai-robotics/2026/03/karpathy-2026-03-15
-papers/hema/2026/03/some-hema-article
+papers/arxiv/2026/03
+articles/rss/2026/03
+articles/blog/2026/03
 ```
 
 > [!note] Directory Scale Planning
-> At 10-20 ingested papers/day, a flat `papers/` directory would accumulate ~5,000 files/year. The `{profile}/{YYYY}/{MM}/` hierarchy caps any single directory at ~200-400 files (one month's intake for one profile), which Linux handles comfortably. At higher ingestion rates, adding `/{DD}/` is a simple config change.
+> At 10-20 ingested papers/day, a flat `papers/` directory would accumulate ~5,000 files/year. The `{source}/{YYYY}/{MM}/` hierarchy keeps any single directory comfortably sized without encoding profile membership in the path.
+
+> [!important] Lithos Filename Behavior
+> Influx controls only the directory path passed to `lithos_write`. Current Lithos derives the filename from the note title slug. Influx MUST NOT assume caller-controlled basenames in v0.6.
+
+> [!note] arXiv Exact Lookup
+> Current Lithos does not let Influx choose a separate slug or filename for arXiv IDs. Influx therefore keeps the human paper title in `title` and relies on exact `source_url = https://arxiv.org/abs/<id>` plus `arxiv-id:<id>` tags for deterministic machine lookup. A future Lithos enhancement may add caller-specified filenames; that is out of scope for Influx v0.6.
 
 ### 8.3 Lithos Note Structure
 
-Frontmatter below uses **only Lithos-allowed fields** (see Lithos SPEC §3.2 and §9.2 of this document). Influx-specific metadata (arxiv ID, categories, text quality, relevance score) is carried via `tags` and reserved keys.
+Influx writes exactly **one canonical note per source**. Frontmatter below uses **only Lithos-allowed fields** (see Lithos SPEC §3.2 and §9.2 of this document). Influx-specific metadata (arXiv ID, categories, text quality, repair state, and stage-completion state) is carried via `tags`. The note-wide `confidence` field is the maximum matched profile score divided by `10.0`; per-profile reasoning is stored in the managed body.
 
-#### Tier 1 — Summary Note (all ingested items)
+#### Canonical Note (all ingested items)
 
 ```markdown
 ---
@@ -676,6 +686,7 @@ title: "{Paper Title}"
 source_url: https://arxiv.org/abs/2603.12939
 tags:
   - profile:ai-robotics
+  - profile:agents
   - source:arxiv
   - arxiv-id:2603.12939
   - cat:cs.RO
@@ -686,17 +697,19 @@ tags:
   - robot-memory
   - spatio-temporal-reasoning
   - embodied-ai
-confidence: 0.9              # relevance_score / 10.0
+confidence: 0.9              # max(profile_scores) / 10.0
 note_type: summary
 namespace: influx
 ---
 
 # {Paper Title}
 
+<!-- INFLUX-MANAGED-START -->
+**arXiv ID:** 2603.12939
 **Authors:** Author A, Author B
 **Published:** 2026-03-16
 **Ingested:** 2026-03-16T06:12:34Z
-**Local file:** `/archive/arxiv/ai-robotics/2026/03/2603.12939.pdf`
+**Local file:** `/archive/arxiv/2026/03/2603.12939.pdf`
 
 ## Abstract
 {original abstract text}
@@ -712,62 +725,55 @@ namespace: influx
 ## Results
 {1-2 sentence summary of findings}
 
-## Relevance
-{why this was flagged — from filter reason + enrichment}
+## Profile Relevance
+- `ai-robotics` (score 9): {why this was flagged for ai-robotics}
+- `agents` (score 7): {why this was flagged for agents}
 
 ## Links
 - [arXiv page](https://arxiv.org/abs/2603.12939)
 - [PDF](https://arxiv.org/pdf/2603.12939)
+<!-- INFLUX-MANAGED-END -->
+
+## User Notes
 ```
 
 The `agent="influx"` parameter is passed on every `lithos_write` call (see §9.3) — it appears in Lithos's `author`/`contributors` fields automatically and does not need to be in the note body.
 
-#### Tier 2 — Full Text Note (score ≥ full_text threshold)
+Body ownership rules:
+
+- Influx fully owns the content between `<!-- INFLUX-MANAGED-START -->` and `<!-- INFLUX-MANAGED-END -->`.
+- Content outside the managed markers is preserved byte-for-byte on repair and upgrade writes.
+- If an Influx-authored note is missing the managed markers, Influx skips automatic repair rather than risking user-content loss.
+
+#### Tier 2 — Full Text Additions To The Canonical Note (score ≥ full_text threshold)
 
 ```markdown
----
-title: "{Paper Title} — Full Text"
-source_url: https://arxiv.org/abs/2603.12939
-tags:
-  - profile:ai-robotics
-  - source:arxiv
-  - arxiv-id:2603.12939
-  - full-text
-  - ingested-by:influx
-  - schema:1
-note_type: observation
-namespace: influx
-# derived_from_ids is set by Influx at write time (list containing the Tier 1
-# summary UUID). Lithos auto-projects derived_from_ids into edges.db as
-# `derived_from` edges — do NOT manually upsert those edges (see §10.2).
----
+## Full Text
 
-# {Paper Title} — Full Text
-
-> Summary note: [[{Paper Title}]]
-
-## Introduction
+### Introduction
 {extracted text}
 
-## Related Work
+### Related Work
 {extracted text}
 
-## Methods
+### Methods
 {extracted text}
 
-## Experiments / Results
+### Experiments / Results
 {extracted text}
 
-## Discussion
+### Discussion
 {extracted text}
 
-## Conclusion
+### Conclusion
 {extracted text}
 ```
 
-#### Tier 3 — Deep Extraction additions to summary note (score ≥ deep_extract threshold)
+When these sections are present, the canonical note also carries the `full-text` tag.
 
-Appended sections to the Tier 1 note:
+#### Tier 3 — Deep Extraction Additions To The Canonical Note (score ≥ deep_extract threshold)
+
+Appended sections inside the managed block:
 
 ```markdown
 ## Claims
@@ -783,18 +789,21 @@ Appended sections to the Tier 1 note:
 - {question 1}
 ```
 
+When these sections are present, the canonical note also carries the `influx:deep-extracted` tag. If any Influx-owned stage is incomplete or needs a later retry, the note carries `influx:repair-needed`.
+
 ---
 
 ## 9. Lithos Integration
 
 ### 9.1 MCP Client & Transport
 
-Influx uses the **official `mcp` Python SDK** connecting to Lithos via **Streamable HTTP** (`LITHOS_MCP_TRANSPORT=streamable-http`, default). SSE is supported as a fallback for older Lithos deployments but is considered legacy.
+Influx uses the **official `mcp` Python SDK** connecting to Lithos via **SSE** (`LITHOS_MCP_TRANSPORT=sse`, default). Influx follows current Lithos code behavior as canonical when it differs from older published documentation.
 
 - Client wrapper lives at `influx/lithos_client.py`
 - Connection is established lazily on first use and kept alive for the duration of a run
-- Transport is configurable via env (`LITHOS_MCP_TRANSPORT`) to allow graceful migration
-- On startup, the client calls `tools/list` to probe available tools and logs the tool set (see §10.3 for LCMA availability handling)
+- `LITHOS_URL` points to the Lithos SSE endpoint (for example `http://host.docker.internal:8765/sse`)
+- Transport is fixed to `sse` for v0.6
+- On startup, the client calls `tools/list` to probe available tools and logs the tool set (see §10.1 for LCMA availability handling)
 
 ### 9.2 Frontmatter Mapping (Lithos schema ↔ Influx concepts)
 
@@ -803,15 +812,17 @@ Lithos enforces a defined frontmatter schema (SPEC §3.2). Anything outside it i
 | Influx concept | Lithos field or tag | Notes |
 |---|---|---|
 | Canonical URL | `source_url` | Dedup key after normalisation |
-| Relevance score (0–10) | `confidence` (0.0–1.0) | `confidence = score / 10` |
-| Profile name | `tag: profile:<name>` | Reserved prefix (see §20) |
+| Note-wide max relevance score (0–10) | `confidence` (0.0–1.0) | `confidence = max(profile_scores) / 10` |
+| Profile name | `tag: profile:<name>` | One or more per note; reserved prefix (see §20) |
 | Source type | `tag: source:arxiv`, `source:rss`, `source:blog` | |
-| arXiv ID | `tag: arxiv-id:<id>` | |
+| arXiv exact identifier | `tag: arxiv-id:<id>` | Deterministic exact lookup key; preserve the dotted arXiv ID verbatim |
 | Category | `tag: cat:<category>` (one per category) | |
 | Text quality | `tag: text:html` \| `text:pdf` \| `text:abstract-only` | |
 | Note authored by Influx | `tag: ingested-by:influx`, `namespace: influx`, and `agent="influx"` on write | |
 | Note schema version | `tag: schema:<N>` | Sourced from `influx.note_schema_version` |
-| Tier 2 → Tier 1 link | `derived_from_ids: [<tier1-uuid>]` | Lithos auto-projects to `derived_from` edge |
+| Full-text sections present | `tag: full-text` | Present on the canonical note when Tier 2 sections exist |
+| Deep extraction present | `tag: influx:deep-extracted` | Present on the canonical note when Tier 3 sections exist |
+| Repair pending | `tag: influx:repair-needed` | Set when any Influx-owned stage is incomplete or needs a retry |
 | Keyword tags from filter | Bare tags | Not prefixed |
 
 All tags with a colon use the `prefix:value` convention. The reserved prefixes are listed in §20.
@@ -826,9 +837,10 @@ result = lithos_cache_lookup(
     source_url=normalize_url(url),
     max_age_hours=None,
 )
-# result["hit"] is True        → skip (already have a fresh copy)
-# result["stale_exists"]       → update existing note (result["stale_id"]); see §9.4
-# otherwise                    → proceed with a fresh ingest
+# result["hit"] is True and no repair/upgrade is needed  → skip
+# result["hit"] is True and repair/upgrade is needed     → read/merge/update existing note; see §9.5
+# result["stale_exists"]                                 → secondary repair signal; see §9.5
+# otherwise                                              → proceed with a fresh ingest
 ```
 
 **URL normalisation (Influx side, before calling Lithos):**
@@ -840,54 +852,76 @@ result = lithos_cache_lookup(
 
 Lithos further normalises on write; Influx pre-normalises so the fast-path hit rate is high even for duplicates reached via different feeds.
 
+**Exact arXiv lookup:**
+- Influx MUST set `source_url=https://arxiv.org/abs/{id}` on every arXiv note.
+- Influx MUST tag every arXiv note with `arxiv-id:{id}`.
+- Machine clients resolving an arXiv paper SHOULD use exact `source_url` lookup first and MAY use `lithos_list(tags=[f"arxiv-id:{id}"], limit=1)` as a deterministic secondary lookup or migration helper.
+- Influx does **not** distort the human title solely to influence the current Lithos title-derived filename.
+
 ### 9.4 Write Path — Create
 
 ```python
 result = lithos_write(
     title=title,
-    content=tier1_body,
+    content=canonical_body,
     agent="influx",                      # required on every call, creates and updates
-    path=f"papers/{profile}/{yyyy}/{mm}",
+    path=build_note_path(item),          # e.g. papers/arxiv/2026/03
     source_url=normalize_url(url),
-    tags=build_tags(...),                # see §9.2
-    confidence=score / 10.0,
+    tags=build_tags(...),                # union of matched profiles + stage-state tags
+    confidence=max_score / 10.0,
     note_type="summary",
     namespace="influx",
+    expires_at=next_retry_at if repair_needed else None,
 )
 # result["status"] ∈ {"created", "updated", "duplicate", "error"}
 ```
 
-### 9.5 Write Path — Stale Update
+### 9.5 Write Path — Repair & Upgrade
 
-When `lithos_cache_lookup` returns `stale_exists: true` with a `stale_id`, Influx replaces the existing note content in a single write:
+When a cache hit requires repair or upgrade, Influx re-reads the current note, preserves user-owned content, and rewrites the canonical note using optimistic locking:
 
 ```python
 # 1. Read the current version to capture expected_version for optimistic lock
-existing = lithos_read(id=stale_id)
+existing = lithos_read(id=doc_id)
 expected_version = existing["metadata"]["version"]
 
-# 2. Replace content + frontmatter-mapped fields; do NOT touch user-edited
-#    fields. `agent` is still required.
-write = lithos_write(
-    id=stale_id,
-    title=title,                     # may have been corrected upstream; replace
-    content=tier1_body,              # full replacement of the body
-    agent="influx",
-    source_url=normalize_url(url),   # pass again (normalised may have changed)
-    tags=build_tags(...),            # full replacement of Influx-managed tags
-    confidence=score / 10.0,
-    expected_version=expected_version,
+# 2. Merge Influx-owned tags + replace only the managed body block.
+merged_tags = merge_note_tags(
+    existing_tags=existing["metadata"]["tags"],
+    managed_tags=build_managed_tags(...),
+)
+merged_content = replace_managed_block(
+    existing_content=existing["content"],
+    managed_block=render_managed_block(...),
 )
 
-# 3. On version_conflict: re-read once, re-apply, retry once. On second
+# 3. Write back the merged document. `agent` is still required.
+write = lithos_write(
+    id=doc_id,
+    title=title,                     # may have been corrected upstream; replace
+    content=merged_content,
+    agent="influx",
+    source_url=normalize_url(url),
+    tags=merged_tags,
+    confidence=merged_confidence,
+    expected_version=expected_version,
+    expires_at=next_retry_at if repair_needed else "",
+)
+
+# 4. On version_conflict: re-read once, re-apply, retry once. On second
 #    conflict, log and skip (the next run will retry).
 ```
 
 Rules:
-- Tier 2 and Tier 3 content is regenerated from scratch on stale update (no merge).
-- `ingested_at` (in the body, not frontmatter) is updated to the current run's timestamp.
-- Any user-added tags that do not use reserved prefixes (`profile:`, `source:`, `arxiv-id:`, `cat:`, `text:`, `ingested-by:`, `schema:`, `influx:`) are **preserved** — Influx only replaces tags it knows it manages.
-- If a Tier 1 note is stale-updated from score X → score Y where Y drops below `full_text` threshold, the Tier 2 note is **not** deleted. Users may choose to delete it in Lens.
+- Repair/upgrade is triggered when a cache hit carries `influx:repair-needed`, when one or more currently matched `profile:*` tags are not yet present on the note, when the note is missing `full-text` and the current max score reaches `full_text`, when the note is missing `influx:deep-extracted` and the current max score reaches `deep_extract`, or when `lithos_cache_lookup` returns `stale_exists=true`.
+- Influx replaces only the body block between `<!-- INFLUX-MANAGED-START -->` and `<!-- INFLUX-MANAGED-END -->`.
+- If those markers are missing, Influx logs a warning and skips automatic repair to avoid clobbering user edits.
+- `profile:*` tags and `## Profile Relevance` entries are merged by profile name: newly matched profiles are added, currently processed profiles are refreshed, and unrelated existing profiles are preserved.
+- Influx replaces the rest of the note tags it owns: `source:*`, `arxiv-id:*`, `cat:*`, `text:*`, `ingested-by:*`, `schema:*`, `full-text`, `influx:repair-needed`, and `influx:deep-extracted`.
+- All other note tags are preserved, including `influx:rejected:<profile>`.
+- `merged_confidence` is `max(existing_confidence, current_max_score / 10.0)` so a repair pass for one profile does not erase a higher historical match from another profile.
+- `expires_at` is unset for complete notes. Incomplete notes may set `expires_at` to the next scheduled retry boundary, but Influx does not rely on `stale_exists` as its only repair trigger.
+- If a note already contains richer sections than current thresholds require, Influx leaves them in place. It does not delete full-text or deep-extraction content automatically.
 
 ### 9.6 Write Path — Error Envelopes
 
@@ -898,8 +932,8 @@ Rules:
 | `created` / `updated` | Proceed |
 | `duplicate` | Treat as hit; log info |
 | `error: invalid_input` | Log error with payload; skip item |
-| `error: content_too_large` | Truncate body at Lithos limit (see `max_content_size_bytes`); retry once |
-| `error: slug_collision` | Append short hash to slug; retry once |
+| `error: content_too_large` | Trim full-text sections first, then retry once |
+| `error: slug_collision` | Retry once with a disambiguated title suffix (arXiv: ` [arXiv <id>]`; web: ` [<host>]`) |
 | `error: version_conflict` | Re-read, re-apply, retry once |
 
 All other Lithos tool errors are logged and the item is skipped — they do not abort the run (see §13).
@@ -918,11 +952,19 @@ Registration is optional (agents auto-register on first use), but doing so expli
 
 ## 10. LCMA Integration
 
-Lithos LCMA MVP1 and MVP2 tools are used by Influx to seed the knowledge graph at ingest time **when available**. Influx detects LCMA availability on startup and gracefully disables LCMA behaviour when the tools are not present.
+Influx v0.6 requires a Lithos deployment with LCMA tools enabled. Startup fails fast if the required LCMA surface is absent. Where the older published Lithos spec lags, the current Lithos implementation is treated as canonical for Influx.
 
 ### 10.1 Availability Probe
 
-On startup, Influx calls `tools/list` on the Lithos MCP server and stores the set of available tools. If any of `lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete` is missing, LCMA integration is disabled for the run and logged as a warning. The pipeline still functions — it just skips §10.2–§10.4.
+On startup, Influx calls `tools/list` on the Lithos MCP server and stores the set of available tools. The following tools are required:
+
+- `lithos_retrieve`
+- `lithos_edge_upsert`
+- `lithos_edge_list`
+- `lithos_task_create`
+- `lithos_task_complete`
+
+If any are missing, `validate-config` and service startup fail fast with a clear error. After a successful probe, Influx calls `lithos_edge_list()` once to force lazy creation of `edges.db` before later edge writes.
 
 ### 10.2 Post-Ingestion Retrieval
 
@@ -942,12 +984,10 @@ Top results are included in the notification digest as "Related in your knowledg
 
 ### 10.3 Explicit Edge Creation
 
-**Do NOT** manually upsert `derived_from` edges — Lithos's `provenance_projection` reconcile scope projects `derived_from_ids` frontmatter into `edges.db` as `derived_from` edges automatically. Double-writing causes drift.
-
-**Do** manually upsert:
+Influx manually upserts only the semantic edges it authors at ingest time:
 
 - `builds_on` edges from Tier 3 extraction. For each named prior work, resolve deterministically via `lithos_cache_lookup(source_url=arxiv_abs_url, query=prior_title)` after attempting to extract an arXiv ID from the body. Create an edge only on an exact `source_url` match. Fuzzy title matching is deferred.
-- `related_to` edges when `lithos_retrieve` returns a result with `score >= profiles.thresholds.lcma_edge_similarity` (default 0.75).
+- `related_to` edges when `lithos_retrieve` returns a result with `score >= profiles.thresholds.lcma_edge_score` (default 0.75).
 
 ```python
 lithos_edge_upsert(
@@ -957,17 +997,19 @@ lithos_edge_upsert(
     weight=0.8,
     namespace="influx",
     provenance_actor="influx",
-    provenance_type="llm_extraction",
+    provenance_type="agent",
+    evidence={"kind": "tier3_builds_on_extraction"},
 )
 
 lithos_edge_upsert(
     from_id=new_note_id,
     to_id=related_id,
     type="related_to",
-    weight=similarity_score,
+    weight=related_score,
     namespace="influx",
     provenance_actor="influx",
-    provenance_type="semantic_similarity",
+    provenance_type="agent",
+    evidence={"kind": "lithos_retrieve", "score": related_score, "receipt_id": receipt_id},
 )
 ```
 
@@ -986,11 +1028,10 @@ lithos_task_complete(
     task_id=task["task_id"],
     agent="influx",
     outcome=f"Ingested {count} items from {profile_name}",
-    cited_nodes=ingested_note_ids,
 )
 ```
 
-`lithos_task_complete` extended parameters (`outcome`, `cited_nodes`, `misleading_nodes`, `receipt_id`) are the canonical surface — verified in the Lithos implementation.
+`lithos_task_complete` currently supports the extended parameters (`outcome`, `cited_nodes`, `misleading_nodes`, `receipt_id`) in Lithos code. Influx v0.6 uses `outcome`, but it does **not** automatically send `cited_nodes` or `misleading_nodes`: in current Lithos behavior those fields are interpreted as feedback about nodes returned by a retrieval receipt, not about newly ingested note IDs.
 
 Backfill runs use `influx:backfill` in place of `influx:run`.
 
@@ -1020,11 +1061,11 @@ POSTs to Agent Zero webhook after each profile run. **Fire-and-forget**: 5-secon
       "tags": ["robot-memory", "embodied-ai"],
       "reason": "...",
       "url": "https://arxiv.org/abs/2603.12939",
-      "related_in_lithos": [
-        {"title": "...", "similarity": 0.89}
-      ]
-    }
-  ],
+	      "related_in_lithos": [
+	        {"title": "...", "score": 0.89}
+	      ]
+	    }
+	  ],
   "all_ingested": [...]
 }
 ```
@@ -1055,7 +1096,7 @@ Feedback is authored in Lithos Lens. From Influx's perspective, feedback is data
 
 ### 12.2 How Feedback Arrives
 
-Lithos Lens updates the rejected note's tags via `lithos_write` (see `LITHOS-LENS-REQUIREMENTS-0.4.md` §8 for the write-side contract). The resulting note carries the tag `influx:rejected`. Influx does not write feedback itself.
+Lithos Lens updates the rejected note's tags via `lithos_write` (see `LITHOS-LENS-REQUIREMENTS-0.4.md` §8 for the write-side contract). The resulting note carries the profile-scoped tag `influx:rejected:<profile>`. Influx does not write feedback itself.
 
 ### 12.3 Injecting Negative Examples
 
@@ -1063,7 +1104,7 @@ At the start of each filter run, per profile — use `lithos_list` (tag-only fil
 
 ```python
 rejected = lithos_list(
-    tags=["influx:rejected", f"profile:{profile_name}"],
+    tags=[f"influx:rejected:{profile_name}"],
     limit=config.feedback.negative_examples_per_profile,
 )
 ```
@@ -1082,17 +1123,17 @@ Each returned item is read via `lithos_read(id=...)` to get the title, which is 
 | arXiv rate limit (429) | Back off 10 seconds; retry up to 3× |
 | HTML fetch fails | Fall back to PDF extraction |
 | HTML extraction <1000 chars | Treat as failure; fall back to PDF |
-| PDF download fails | Store abstract-only note; set `local_file: null`; retry next run |
+| PDF download fails | Store canonical note with `text:abstract-only`, add `influx:repair-needed`, retry next run |
 | Download exceeds `max_download_bytes` | Abort download; log; proceed with abstract-only |
 | Download exceeds `download_timeout_seconds` | Same as above |
-| LLM call fails | Retry 2×; store note without enrichment fields (see §7.4) |
+| LLM call fails | Retry 2×; store note without the failed sections, add `influx:repair-needed` (see §7.4) |
 | LLM returns non-JSON despite JSON mode | Log raw response; attempt regex fallback; if that fails, skip item |
 | Lithos unreachable on first call | Retry 3×; abort run; log error; exit non-zero |
-| Lithos MCP tool missing at runtime | Log error; skip that item; continue run |
-| LCMA tools missing at startup | Disable §10; log warning; continue |
-| Duplicate detected | Skip silently |
+| Lithos MCP tool missing at runtime | Abort the current run; log error; exit non-zero |
+| LCMA tools missing at startup | Fail startup / `validate-config`; exit non-zero |
+| Duplicate detected | Treat as hit; if repair/upgrade is needed, enter the merge path |
 | `lithos_write` returns `version_conflict` | Re-read, re-apply, retry once; skip on second conflict |
-| `lithos_write` returns `slug_collision` | Append short hash to slug; retry once |
+| `lithos_write` returns `slug_collision` | Retry once with a disambiguated title suffix |
 | `lithos_write` returns `content_too_large` | Truncate body; retry once |
 | `lithos_edge_upsert` fails | Log warning; continue — edges are enrichment, not critical path |
 | Webhook POST fails | Log warning; no retry (see §11.1) |
@@ -1192,7 +1233,7 @@ Follows the Lithos pattern — **stderr only, no log files**:
 - All log output goes to stderr → captured by `docker logs influx`
 - `INFLUX_LOG_LEVEL` controls verbosity (`DEBUG` in dev, `INFO` in prod)
 - Structured JSON format via `python-json-logger`
-- **Durable run history** is stored as Lithos notes at `path: "influx/runs"` — queryable, persistent, human-readable
+- **Durable run history** is stored as Lithos notes under the `influx/runs` path prefix. Each run note is tagged with `profile:<name>` plus `influx:run` or `influx:backfill`, and contains a machine-readable JSON block inside the Influx-managed body with `profile`, `run_type`, `started_at`, `completed_at`, `status`, `sources_checked`, `ingested`, and `high_relevance`.
 - OTEL (when enabled) provides structured spans and metrics for deeper observability
 
 ### 14.4 Health Endpoint
@@ -1219,7 +1260,7 @@ Semantics:
 - `status` is the worst per-profile status: `ok` if all profiles succeeded on their last run, `degraded` if any last run failed, `starting` if no run has completed yet since container start.
 - `last_run_at` is the wall-clock start of the most recent run attempt (success or failure).
 - `next_run_at` comes from APScheduler `next_fire_time`.
-- On startup, Influx reads `lithos_list(path_prefix="influx/runs", limit=1)` per profile to pre-populate `last_run_*` so `/health` is correct immediately and not just after the first run.
+- On startup, Influx performs a best-effort bootstrap by calling `lithos_list(path_prefix="influx/runs", tags=[f"profile:{profile_name}"], limit=50)`, selecting the newest item by `updated`, then reading that run note and parsing the managed JSON block. If bootstrap fails, the profile remains `starting` until the next completed run.
 
 ---
 
@@ -1235,7 +1276,7 @@ python -m influx backfill --all-profiles --days 7
 - Respects arXiv rate limits (3s between requests; plan for ~30s per day of backfill per profile)
 - Skips already-ingested papers via `lithos_cache_lookup`
 - **Does not send notifications** during backfill
-- Writes `influx/runs` notes and creates `lithos_task_create`/`complete` tasks tagged `influx:backfill` (not `influx:run`) so dashboards can filter them out
+- Writes `influx/runs/{YYYY}/{MM}` notes and creates `lithos_task_create`/`complete` tasks tagged `influx:backfill` (not `influx:run`) so dashboards can filter them out
 - Logs progress to stderr
 - Prints an estimated LLM cost at start; requires `--confirm` when expected item count > 1000
 - Respects the same concurrency locks as scheduled runs (see §13.3)
@@ -1280,14 +1321,15 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 
 | Tool | Required args | Purpose |
 |------|---------------|---------|
-| `lithos_cache_lookup(query, source_url?, max_age_hours?, tags?)` | `query` | Deduplication before processing. `query` is REQUIRED even when a `source_url` fast-path hit is expected. |
-| `lithos_write(title, content, agent, ...)` | `title`, `content`, `agent` | Write summary, full-text notes. Always pass all three required fields — even on updates. |
-| `lithos_read(id)` | `id` | Load rejected-note titles for negative examples; load existing version before stale update. |
+| `lithos_cache_lookup(query, source_url?, max_age_hours?, tags?)` | `query` | Deduplication and repair/upgrade decisioning before processing. `query` is REQUIRED even when a `source_url` fast-path hit is expected. |
+| `lithos_write(title, content, agent, ...)` | `title`, `content`, `agent` | Write the single canonical note for a source. Always pass all three required fields — even on updates. |
+| `lithos_read(id)` | `id` | Load rejected-note titles for negative examples; load the existing document before repair/upgrade writes. |
 | `lithos_retrieve(query, limit, agent_id, task_id, tags)` | `query` | LCMA post-ingestion connection query |
-| `lithos_list(path_prefix?, tags?, since?, limit?)` | none | Load negative examples for filter prompt (tag-only; not `lithos_search`) |
-| `lithos_edge_upsert(from_id, to_id, type, weight, namespace, ...)` | as named | Create typed edges between notes — NOT `derived_from` (auto-projected) |
+| `lithos_list(path_prefix?, tags?, since?, limit?)` | none | Load negative examples, exact arXiv tag hits, and run-history note candidates |
+| `lithos_edge_list(from_id?, to_id?, type?, namespace?)` | none | Bootstrap `edges.db` on startup and inspect LCMA state |
+| `lithos_edge_upsert(from_id, to_id, type, weight, namespace, ...)` | as named | Create typed semantic edges between notes |
 | `lithos_task_create(title, agent, tags?)` | `title`, `agent` | Create run coordination task |
-| `lithos_task_complete(task_id, agent, outcome?, cited_nodes?)` | `task_id`, `agent` | Complete run task with outcome summary |
+| `lithos_task_complete(task_id, agent, outcome?)` | `task_id`, `agent` | Complete run task with outcome summary; Influx v0.6 does not send automated retrieval-feedback fields |
 | `lithos_agent_register(id, name?, type?)` | `id` | Register on startup (optional — auto-registers otherwise) |
 
 ### 16.4 Influx CLI
@@ -1299,7 +1341,7 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 | `python -m influx run --profile X` | Trigger a single run for one profile now |
 | `python -m influx backfill ...` | See §15 |
 | `python -m influx validate-config` | Parse config, dry-connect to Lithos, probe tools, print effective config, exit non-zero if anything is wrong |
-| `python -m influx migrate-notes` | Apply schema_version upgrades to existing Influx-authored notes (placeholder in v0.1) |
+| `python -m influx migrate-notes` | Apply future schema upgrades to existing Influx-authored notes, including 0.5-style note-shape migrations if needed |
 
 ---
 
@@ -1314,11 +1356,11 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 - [ ] Guarded HTTP client with SSRF + size + timeout caps (§13.4)
 - [ ] arXiv fetcher module (`influx/sources/arxiv.py`)
 - [ ] LiteLLM filter module (`influx/filter.py`) with batching + JSON mode + Pydantic schema
-- [ ] MCP client wrapper (`influx/lithos_client.py`) using `mcp` SDK + Streamable HTTP
-- [ ] Startup probe: `tools/list`, API-key preflight, LCMA availability
+- [ ] MCP client wrapper (`influx/lithos_client.py`) using `mcp` SDK + SSE
+- [ ] Startup probe: `tools/list`, API-key preflight, required LCMA tools, and `lithos_edge_list()` bootstrap
 - [ ] Deduplication via `lithos_cache_lookup` (passing both `query` and `source_url`)
-- [ ] Tier 1 note writer with profile-based paths + frontmatter mapping (§9.2)
-- [ ] Stale-update path (§9.5) with `expected_version` + one retry
+- [ ] Canonical note writer with source/date paths + frontmatter mapping (§9.2)
+- [ ] Managed-body repair/upgrade path (§9.5) with `expected_version` + one retry
 - [ ] Archive downloader (`influx/storage.py`) with path-safety check
 - [ ] APScheduler setup (`influx/scheduler.py`) with `max_instances=1`, `coalesce=True`
 - [ ] Webhook notification to Agent Zero (fire-and-forget, 5s timeout)
@@ -1327,7 +1369,7 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 - [ ] `docker-compose.yml` with `.env.dev` / `.env.prod`
 - [ ] CLI: `validate-config` and `run --profile X`
 
-**M1 acceptance:** `./run.sh dev up` → scheduled run fires at configured cron → a new arXiv paper that matches `ai-robotics` appears in Lithos with `agent=influx`, correct `source_url`, `profile:ai-robotics` tag, and is absent on the following run (dedup works). Agent Zero webhook receives the digest. `/health` shows `last_run_at` and `next_run_at`.
+**M1 acceptance:** `./run.sh dev up` → scheduled run fires at configured cron → a new arXiv paper that matches `ai-robotics` appears in Lithos with `agent=influx`, correct `source_url`, `arxiv-id:...` tag, source/date path, and is absent on the following run (dedup works). Agent Zero webhook receives the digest. `/health` shows `last_run_at` and `next_run_at`.
 
 ### Milestone 2 — Full Text, Enrichment & LCMA Edges (v0.2)
 *Goal: richer notes + LCMA graph seeding*
@@ -1335,29 +1377,29 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 - [ ] arXiv HTML fetcher with trafilatura extraction + quality gate (≥1000 chars)
 - [ ] PDF text extraction with pymupdf4llm (fallback)
 - [ ] HTML sanitisation (strip `<script>` etc. per §13.5)
-- [ ] Tier 2 full text note writer (linked via `derived_from_ids`)
+- [ ] Tier 2 full-text section writer on the canonical note
 - [ ] Tier 1 LLM enrichment with JSON mode + Pydantic schema
 - [ ] Tier 3 deep extraction for score ≥ `deep_extract` threshold
-- [ ] LCMA availability gate wrapping §10
+- [ ] LCMA-required startup validation wrapping §10
 - [ ] `lithos_retrieve` post-ingestion connection query
-- [ ] `lithos_edge_upsert` for `builds_on` (deterministic arXiv-ID resolution) and `related_to` (similarity ≥ threshold)
-- [ ] `lithos_task_create` / `lithos_task_complete` per run with `outcome` + `cited_nodes`
+- [ ] `lithos_edge_upsert` for `builds_on` (deterministic arXiv-ID resolution) and `related_to` (score ≥ threshold)
+- [ ] `lithos_task_create` / `lithos_task_complete` per run with `outcome`
 - [ ] "Related in your knowledge base" in notifications
 
-**M2 acceptance:** For a paper scoring ≥ 9, a Tier 1 note, Tier 2 full-text note, and Tier 3 sections all appear in Lithos. `lithos_related` on the Tier 1 note shows the Tier 2 note as a `derived_from` edge (auto-projected), plus `builds_on` / `related_to` edges where applicable. Running against a pre-LCMA Lithos produces a clear startup warning and skips §10 cleanly.
+**M2 acceptance:** For a paper scoring ≥ 9, one canonical note exists in Lithos and includes Tier 1, Tier 2, and Tier 3 sections in the managed body. `lithos_related` on that note shows `builds_on` / `related_to` edges where applicable. If required LCMA tools are absent, startup fails fast.
 
 ### Milestone 3 — Multiple Profiles & RSS (v0.3)
 *Goal: multi-profile support + blog/RSS monitoring*
 
 - [ ] Multi-profile pipeline orchestration (sequential, with per-profile locks)
-- [ ] Profile-scoped paths, tags, and negative examples
+- [ ] Profile-union note tagging, profile-scoped rejection tags, and per-profile negative examples
 - [ ] RSS feed fetcher with `feedparser`
 - [ ] Web article extraction with `trafilatura`
 - [ ] Config-driven feed list per profile
 - [ ] Backfill CLI (`influx backfill --profile ... --days N` / `--from` / `--to` / `--all-profiles`) with cost-estimate + `--confirm`
 - [ ] Feed-name slug validation + archive path-safety enforcement
 
-**M3 acceptance:** Two profiles (e.g. `ai-robotics`, `hema`) both run in one scheduled fire, produce separate notes under their own paths and tags, and RSS items from configured feeds appear alongside arXiv items. Backfill over 7 days completes and never overlaps with a scheduled run.
+**M3 acceptance:** Two profiles (e.g. `ai-robotics`, `hema`) both run in one scheduled fire. If the same source matches both profiles, Lithos contains one canonical note carrying both profile tags; if different sources match, each is written once under the source/date path. RSS items from configured feeds appear alongside arXiv items. Backfill over 7 days completes and never overlaps with a scheduled run.
 
 ### Milestone 4 — Observability (v0.4)
 *Goal: production-ready telemetry*
@@ -1365,10 +1407,10 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 - [ ] `influx/telemetry.py` — mirrors Lithos OTEL pattern
 - [ ] `@traced` decorator on key pipeline stages with standard attributes (§14.2)
 - [ ] OTEL metrics: items fetched, filtered, ingested, errors (per profile)
-- [ ] Run history notes in Lithos (`influx/runs` path)
+- [ ] Run history notes in Lithos (`influx/runs/{YYYY}/{MM}` path prefix)
 - [ ] Tag rejection rate reporting (per §4 `feedback.recalibrate_after_runs`)
 
-**M4 acceptance:** With `INFLUX_OTEL_ENABLED=true` and a local collector, spans appear in the collector with correct attributes and run-level metrics. With OTEL disabled, nothing changes from M3 behaviour. `influx/runs` notes are queryable in Lens.
+**M4 acceptance:** With `INFLUX_OTEL_ENABLED=true` and a local collector, spans appear in the collector with correct attributes and run-level metrics. With OTEL disabled, nothing changes from M3 behaviour. `influx/runs` notes are queryable in Lens and can bootstrap `/health` after restart.
 
 ---
 
@@ -1378,7 +1420,7 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 
 | Layer | Scope | Tooling |
 |---|---|---|
-| Unit | Config loader, URL normaliser, path-safety, Pydantic schemas, prompt formatters, slugifier | `pytest`, no network |
+| Unit | Config loader, URL normaliser, path-safety, managed-body merge logic, Pydantic schemas, prompt formatters, slugifier | `pytest`, no network |
 | Contract | MCP client wrapper against a fake Lithos server | `pytest` + `mcp` SDK test harness |
 | Integration | End-to-end against a real Lithos dev container, recorded arXiv responses, and mocked LiteLLM | `pytest` + `docker compose` + VCR.py for arXiv + LiteLLM response fixtures |
 | E2E (manual) | One scheduled run against a staging Lithos with real APIs | Checklist in `docs/e2e.md` |
@@ -1387,7 +1429,7 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 
 - Unit: 80%+ for pure modules (config, URL, path, schemas, prompts)
 - Contract: every Lithos tool called by Influx has a happy-path + error-envelope test
-- Integration: at least one end-to-end arXiv → Lithos flow, one RSS → Lithos flow, one stale-update flow
+- Integration: at least one end-to-end arXiv → Lithos flow, one RSS → Lithos flow, one repair/upgrade merge flow
 
 ### 18.3 Fixtures
 
@@ -1415,8 +1457,8 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 | `INFLUX_OTEL_ENABLED` | container | bool | `false` | `telemetry.enabled` | |
 | `INFLUX_OTEL_CONSOLE_FALLBACK` | container | bool | `false` | `telemetry.console_fallback` | |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | container | url | `http://host.docker.internal:4318` | — | OTLP collector |
-| `LITHOS_URL` | container | url | `http://host.docker.internal:8765` | — | Lithos MCP endpoint |
-| `LITHOS_MCP_TRANSPORT` | container | enum | `streamable-http` | — | `streamable-http` \| `sse` |
+| `LITHOS_URL` | container | url | `http://host.docker.internal:8765/sse` | — | Lithos SSE endpoint |
+| `LITHOS_MCP_TRANSPORT` | container | enum | `sse` | — | Fixed to `sse` in v0.6 |
 | `AGENT_ZERO_WEBHOOK_URL` | container | url | empty | `notifications.webhook_url` | Empty disables webhook |
 | `OPENROUTER_API_KEY` | container | secret | empty | — | Required if any `models.*` uses `openrouter/*` |
 | `OPENAI_API_KEY` | container | secret | empty | — | Required if any `models.*` uses `openai/*` |
@@ -1426,7 +1468,7 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 
 ## 20. Reserved Tags
 
-Tags with the following prefixes are managed by Influx and must not be used by humans in Lens to mean something else:
+Tags with the following prefixes or literals are reserved for the Influx/Lens protocol and must not be repurposed by humans in Lens:
 
 | Prefix | Meaning |
 |---|---|
@@ -1437,8 +1479,10 @@ Tags with the following prefixes are managed by Influx and must not be used by h
 | `text:<quality>` | Extraction quality (`html`, `pdf`, `abstract-only`) |
 | `ingested-by:<agent>` | Always `ingested-by:influx` on Influx-authored notes |
 | `schema:<N>` | Note schema version |
-| `full-text` | Marks a Tier 2 note (bare tag, not a prefix) |
-| `influx:rejected` | User feedback; authored by Lens, consumed by Influx |
+| `full-text` | Canonical note contains Tier 2 full-text sections (bare tag, not a prefix) |
+| `influx:deep-extracted` | Canonical note contains Tier 3 deep-extraction sections |
+| `influx:repair-needed` | Canonical note requires a future repair or upgrade pass |
+| `influx:rejected:<profile>` | User feedback for a specific profile; authored by Lens, consumed by Influx |
 | `influx:run` | Scheduled run task marker |
 | `influx:backfill` | Backfill run task marker |
 
@@ -1487,7 +1531,7 @@ influx/
 │   ├── pipeline.py
 │   ├── filter.py            # LiteLLM + JSON mode + Pydantic schemas
 │   ├── enrichment.py
-│   ├── lithos_client.py     # mcp SDK + Streamable HTTP
+│   ├── lithos_client.py     # mcp SDK + SSE
 │   ├── notifier.py
 │   ├── storage.py           # Archive downloader + path-safety
 │   ├── telemetry.py         # mirrors lithos/telemetry.py
@@ -1510,7 +1554,7 @@ influx/
 
 | Package | Purpose |
 |---------|---------|
-| `mcp` | Official MCP Python SDK (Streamable HTTP client) |
+| `mcp` | Official MCP Python SDK (SSE client) |
 | `litellm` | LLM provider abstraction, JSON mode |
 | `pydantic` | Data validation, settings, and LLM response schemas |
 | `apscheduler` | In-process scheduling |
@@ -1525,4 +1569,4 @@ influx/
 
 ---
 
-**End of Requirements v0.5**
+**End of Requirements v0.6**
