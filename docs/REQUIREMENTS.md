@@ -1,10 +1,14 @@
 ---
 title: Influx — Requirements Document
-version: 0.6.0
+version: 0.7.0
 date: 2026-04-22
 status: draft
-tags: [influx, requirements, design, architecture]
-supersedes: INFLUX-REQUIREMENTS-0.5.md
+tags:
+  - influx
+  - requirements
+  - design
+  - architecture
+supersedes: INFLUX-REQUIREMENTS-0.6.md
 ---
 
 # Influx — Requirements Document
@@ -17,7 +21,7 @@ supersedes: INFLUX-REQUIREMENTS-0.5.md
 > - Lithos transport aligned to current canonical behavior: official `mcp` SDK over SSE.
 > - Generic stale-update semantics replaced with explicit repair/upgrade semantics aligned to current `lithos_write`.
 > - Full-text and deep-extraction content now extend the canonical note instead of creating tier-specific sibling notes.
-> - LCMA is now a required dependency for Influx v0.6; startup fails fast if required LCMA tools are absent.
+> - LCMA is now a required dependency for Influx v0.7; startup fails fast if required LCMA tools are absent.
 > - arXiv exact lookup is pinned to canonical `source_url` plus `arxiv-id:<id>` tags rather than filename assumptions.
 > - Feedback tags are now profile-scoped (`influx:rejected:<profile>`) so one canonical note can be rejected for one profile without poisoning another.
 
@@ -136,6 +140,7 @@ Two separate repositories:
 | Config format | TOML (Python 3.12 built-in `tomllib`) | Consistent with Cardinal and other recent projects |
 | Interest profiles | Multiple named profiles | Keeps unrelated domains (AI/robotics vs HEMA) cleanly separated |
 | Multi-profile merge | Union profile tags; use max score for note-wide confidence | Preserves one note per source while keeping per-profile relevance |
+| Health endpoint | Live readiness checks + current scheduler state | Avoids coupling health to persisted run history |
 | OTEL | Opt-in, additive, optional packages | Consistent with Lithos conventions |
 | Environments | `.env.dev` / `.env.prod` per service | Consistent with Lithos conventions |
 | Logging | JSON to **stderr** (not stdout) | Matches Lithos; captured by `docker logs` |
@@ -428,7 +433,7 @@ def load_config(path: Path) -> Config:
 
 ### 4.4 Profile Name Validation
 
-Profile names are used in tags (`profile:<name>`), archive paths (`/archive/<source>/<name>/...`), and Lithos note paths (`papers/<name>/...`). They must match `^[a-z][a-z0-9-]{0,31}$`. Invalid names cause startup to fail with a clear error — do not silently slugify.
+Profile names are used in tags (`profile:<name>`, `influx:rejected:<profile>`) and task tags. They must match `^[a-z][a-z0-9-]{0,31}$`. Invalid names cause startup to fail with a clear error — do not silently slugify.
 
 ---
 
@@ -669,10 +674,10 @@ articles/blog/2026/03
 > At 10-20 ingested papers/day, a flat `papers/` directory would accumulate ~5,000 files/year. The `{source}/{YYYY}/{MM}/` hierarchy keeps any single directory comfortably sized without encoding profile membership in the path.
 
 > [!important] Lithos Filename Behavior
-> Influx controls only the directory path passed to `lithos_write`. Current Lithos derives the filename from the note title slug. Influx MUST NOT assume caller-controlled basenames in v0.6.
+> Influx controls only the directory path passed to `lithos_write`. Current Lithos derives the filename from the note title slug. Influx MUST NOT assume caller-controlled basenames in v0.7.
 
 > [!note] arXiv Exact Lookup
-> Current Lithos does not let Influx choose a separate slug or filename for arXiv IDs. Influx therefore keeps the human paper title in `title` and relies on exact `source_url = https://arxiv.org/abs/<id>` plus `arxiv-id:<id>` tags for deterministic machine lookup. A future Lithos enhancement may add caller-specified filenames; that is out of scope for Influx v0.6.
+> Current Lithos does not let Influx choose a separate slug or filename for arXiv IDs. Influx therefore keeps the human paper title in `title` and relies on exact `source_url = https://arxiv.org/abs/<id>` plus `arxiv-id:<id>` tags for deterministic machine lookup. A future Lithos enhancement may add caller-specified filenames; that is out of scope for Influx v0.7.
 
 ### 8.3 Lithos Note Structure
 
@@ -802,7 +807,7 @@ Influx uses the **official `mcp` Python SDK** connecting to Lithos via **SSE** (
 - Client wrapper lives at `influx/lithos_client.py`
 - Connection is established lazily on first use and kept alive for the duration of a run
 - `LITHOS_URL` points to the Lithos SSE endpoint (for example `http://host.docker.internal:8765/sse`)
-- Transport is fixed to `sse` for v0.6
+- Transport is fixed to `sse` for v0.7
 - On startup, the client calls `tools/list` to probe available tools and logs the tool set (see §10.1 for LCMA availability handling)
 
 ### 9.2 Frontmatter Mapping (Lithos schema ↔ Influx concepts)
@@ -917,6 +922,7 @@ Rules:
 - Influx replaces only the body block between `<!-- INFLUX-MANAGED-START -->` and `<!-- INFLUX-MANAGED-END -->`.
 - If those markers are missing, Influx logs a warning and skips automatic repair to avoid clobbering user edits.
 - `profile:*` tags and `## Profile Relevance` entries are merged by profile name: newly matched profiles are added, currently processed profiles are refreshed, and unrelated existing profiles are preserved.
+- `influx:rejected:<profile>` is authoritative for that profile while it remains on the note. When that tag is present, Influx MUST NOT re-add `profile:<profile>` if it is absent, and MUST NOT refresh or create the corresponding `## Profile Relevance` entry on subsequent repair/upgrade passes.
 - Influx replaces the rest of the note tags it owns: `source:*`, `arxiv-id:*`, `cat:*`, `text:*`, `ingested-by:*`, `schema:*`, `full-text`, `influx:repair-needed`, and `influx:deep-extracted`.
 - All other note tags are preserved, including `influx:rejected:<profile>`.
 - `merged_confidence` is `max(existing_confidence, current_max_score / 10.0)` so a repair pass for one profile does not erase a higher historical match from another profile.
@@ -952,7 +958,7 @@ Registration is optional (agents auto-register on first use), but doing so expli
 
 ## 10. LCMA Integration
 
-Influx v0.6 requires a Lithos deployment with LCMA tools enabled. Startup fails fast if the required LCMA surface is absent. Where the older published Lithos spec lags, the current Lithos implementation is treated as canonical for Influx.
+Influx v0.7 requires a Lithos deployment with LCMA tools enabled. Startup fails fast if the required LCMA surface is absent. Where the older published Lithos spec lags, the current Lithos implementation is treated as canonical for Influx.
 
 ### 10.1 Availability Probe
 
@@ -1031,7 +1037,7 @@ lithos_task_complete(
 )
 ```
 
-`lithos_task_complete` currently supports the extended parameters (`outcome`, `cited_nodes`, `misleading_nodes`, `receipt_id`) in Lithos code. Influx v0.6 uses `outcome`, but it does **not** automatically send `cited_nodes` or `misleading_nodes`: in current Lithos behavior those fields are interpreted as feedback about nodes returned by a retrieval receipt, not about newly ingested note IDs.
+`lithos_task_complete` currently supports the extended parameters (`outcome`, `cited_nodes`, `misleading_nodes`, `receipt_id`) in Lithos code. Influx v0.7 uses `outcome`, but it does **not** automatically send `cited_nodes` or `misleading_nodes`: in current Lithos behavior those fields are interpreted as feedback about nodes returned by a retrieval receipt, not about newly ingested note IDs.
 
 Backfill runs use `influx:backfill` in place of `influx:run`.
 
@@ -1096,7 +1102,7 @@ Feedback is authored in Lithos Lens. From Influx's perspective, feedback is data
 
 ### 12.2 How Feedback Arrives
 
-Lithos Lens updates the rejected note's tags via `lithos_write` (see `LITHOS-LENS-REQUIREMENTS-0.4.md` §8 for the write-side contract). The resulting note carries the profile-scoped tag `influx:rejected:<profile>`. Influx does not write feedback itself.
+Lithos Lens updates the rejected note's tags via `lithos_write` (see `LITHOS-LENS-REQUIREMENTS-0.4.md` §8 for the write-side contract). The resulting note carries the profile-scoped tag `influx:rejected:<profile>`. Lens SHOULD also remove the matching `profile:<profile>` tag when the user rejects that profile. Influx does not write feedback itself.
 
 ### 12.3 Injecting Negative Examples
 
@@ -1110,6 +1116,12 @@ rejected = lithos_list(
 ```
 
 Each returned item is read via `lithos_read(id=...)` to get the title, which is formatted as a single line (see §6.3) and injected into the `NEGATIVE EXAMPLES` block of the filter prompt. Abstracts are intentionally not injected — negatives are for calibration, not re-filtering.
+
+Semantics:
+
+- `influx:rejected:<profile>` suppresses that profile assignment even on a shared canonical note; it does not affect other profile tags on the same note.
+- Lens profile-scoped views SHOULD exclude notes carrying `influx:rejected:<profile>` for the active profile by default.
+- If the rejection tag is later removed, Influx may add `profile:<profile>` again on a future run if the source still matches.
 
 ---
 
@@ -1233,22 +1245,27 @@ Follows the Lithos pattern — **stderr only, no log files**:
 - All log output goes to stderr → captured by `docker logs influx`
 - `INFLUX_LOG_LEVEL` controls verbosity (`DEBUG` in dev, `INFO` in prod)
 - Structured JSON format via `python-json-logger`
-- **Durable run history** is stored as Lithos notes under the `influx/runs` path prefix. Each run note is tagged with `profile:<name>` plus `influx:run` or `influx:backfill`, and contains a machine-readable JSON block inside the Influx-managed body with `profile`, `run_type`, `started_at`, `completed_at`, `status`, `sources_checked`, `ingested`, and `high_relevance`.
 - OTEL (when enabled) provides structured spans and metrics for deeper observability
+- Influx does **not** persist run logs or run-history notes in Lithos; durable operational telemetry belongs in the OTEL collector and standard container logs.
 
 ### 14.4 Health Endpoint
 
-- `GET http://localhost:8080/health` — returns the persisted run-state view
+- `GET http://localhost:8080/health` — returns live liveness/readiness state plus current scheduler state
 
 ```json
 {
   "status": "ok",
+  "ready": true,
+  "checks": {
+    "config": "ok",
+    "scheduler": "ok",
+    "lithos": "ok",
+    "lithos_tools": "ok",
+    "llm_credentials": "ok"
+  },
   "profiles": {
     "ai-robotics": {
-      "status": "ok",
-      "last_run_at": "2026-03-16T06:12:34Z",
-      "last_run_status": "success",
-      "last_run_ingested": 12,
+      "scheduled": true,
       "next_run_at": "2026-03-17T06:00:00Z"
     }
   }
@@ -1257,10 +1274,17 @@ Follows the Lithos pattern — **stderr only, no log files**:
 
 Semantics:
 
-- `status` is the worst per-profile status: `ok` if all profiles succeeded on their last run, `degraded` if any last run failed, `starting` if no run has completed yet since container start.
-- `last_run_at` is the wall-clock start of the most recent run attempt (success or failure).
-- `next_run_at` comes from APScheduler `next_fire_time`.
-- On startup, Influx performs a best-effort bootstrap by calling `lithos_list(path_prefix="influx/runs", tags=[f"profile:{profile_name}"], limit=50)`, selecting the newest item by `updated`, then reading that run note and parsing the managed JSON block. If bootstrap fails, the profile remains `starting` until the next completed run.
+- `status` is the overall service state: `ok` if all required readiness checks pass, `degraded` if the process is alive but one or more readiness checks fail, `starting` before the first readiness evaluation completes.
+- `ready` is `true` only when Influx can perform a scheduled ingestion cycle immediately.
+- HTTP status is `200 OK` when `ready=true` and `503 Service Unavailable` otherwise. Docker/container health checks MUST treat `/health` as a readiness endpoint.
+- `checks.config` means config loaded and validated successfully.
+- `checks.scheduler` means APScheduler is running and the expected jobs are registered.
+- `checks.lithos` means the Lithos SSE endpoint is reachable.
+- `checks.lithos_tools` means the required Lithos tools are present: `lithos_cache_lookup`, `lithos_write`, `lithos_read`, `lithos_retrieve`, `lithos_edge_upsert`, `lithos_edge_list`, `lithos_task_create`, and `lithos_task_complete`.
+- `checks.llm_credentials` means the configured LLM provider key is present and basic client construction succeeds; it does not require a paid completion call on every health probe.
+- `profiles.<name>.scheduled` indicates whether a scheduler job is currently registered for that profile.
+- `profiles.<name>.next_run_at` comes from APScheduler `next_fire_time`; it is `null` if the profile is disabled or no next fire time is currently known.
+- `/health` is computed live from in-memory state and dependency probes. It does not depend on persisted run history, Lithos notes, or previous run outcomes.
 
 ---
 
@@ -1276,7 +1300,7 @@ python -m influx backfill --all-profiles --days 7
 - Respects arXiv rate limits (3s between requests; plan for ~30s per day of backfill per profile)
 - Skips already-ingested papers via `lithos_cache_lookup`
 - **Does not send notifications** during backfill
-- Writes `influx/runs/{YYYY}/{MM}` notes and creates `lithos_task_create`/`complete` tasks tagged `influx:backfill` (not `influx:run`) so dashboards can filter them out
+- Creates `lithos_task_create`/`complete` tasks tagged `influx:backfill` so dashboards can filter them out
 - Logs progress to stderr
 - Prints an estimated LLM cost at start; requires `--confirm` when expected item count > 1000
 - Respects the same concurrency locks as scheduled runs (see §13.3)
@@ -1325,11 +1349,11 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 | `lithos_write(title, content, agent, ...)` | `title`, `content`, `agent` | Write the single canonical note for a source. Always pass all three required fields — even on updates. |
 | `lithos_read(id)` | `id` | Load rejected-note titles for negative examples; load the existing document before repair/upgrade writes. |
 | `lithos_retrieve(query, limit, agent_id, task_id, tags)` | `query` | LCMA post-ingestion connection query |
-| `lithos_list(path_prefix?, tags?, since?, limit?)` | none | Load negative examples, exact arXiv tag hits, and run-history note candidates |
+| `lithos_list(path_prefix?, tags?, since?, limit?)` | none | Load negative examples and exact arXiv tag hits |
 | `lithos_edge_list(from_id?, to_id?, type?, namespace?)` | none | Bootstrap `edges.db` on startup and inspect LCMA state |
 | `lithos_edge_upsert(from_id, to_id, type, weight, namespace, ...)` | as named | Create typed semantic edges between notes |
-| `lithos_task_create(title, agent, tags?)` | `title`, `agent` | Create run coordination task |
-| `lithos_task_complete(task_id, agent, outcome?)` | `task_id`, `agent` | Complete run task with outcome summary; Influx v0.6 does not send automated retrieval-feedback fields |
+| `lithos_task_create(title, agent, tags?)` | `title`, `agent` | Create scheduled-run or backfill coordination task |
+| `lithos_task_complete(task_id, agent, outcome?)` | `task_id`, `agent` | Complete scheduled-run or backfill task with outcome summary; Influx v0.7 does not send automated retrieval-feedback fields |
 | `lithos_agent_register(id, name?, type?)` | `id` | Register on startup (optional — auto-registers otherwise) |
 
 ### 16.4 Influx CLI
@@ -1364,12 +1388,12 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 - [ ] Archive downloader (`influx/storage.py`) with path-safety check
 - [ ] APScheduler setup (`influx/scheduler.py`) with `max_instances=1`, `coalesce=True`
 - [ ] Webhook notification to Agent Zero (fire-and-forget, 5s timeout)
-- [ ] Health endpoint (`GET /health`) with persisted run-state
+- [ ] Health endpoint (`GET /health`) with live readiness checks and scheduler state
 - [ ] Structured JSON logging to stderr (`python-json-logger`)
 - [ ] `docker-compose.yml` with `.env.dev` / `.env.prod`
 - [ ] CLI: `validate-config` and `run --profile X`
 
-**M1 acceptance:** `./run.sh dev up` → scheduled run fires at configured cron → a new arXiv paper that matches `ai-robotics` appears in Lithos with `agent=influx`, correct `source_url`, `arxiv-id:...` tag, source/date path, and is absent on the following run (dedup works). Agent Zero webhook receives the digest. `/health` shows `last_run_at` and `next_run_at`.
+**M1 acceptance:** `./run.sh dev up` → scheduled run fires at configured cron → a new arXiv paper that matches `ai-robotics` appears in Lithos with `agent=influx`, correct `source_url`, `arxiv-id:...` tag, source/date path, and is absent on the following run (dedup works). Agent Zero webhook receives the digest. `/health` reports `ready=true`, passing dependency checks, and a non-null `next_run_at` for the scheduled profile.
 
 ### Milestone 2 — Full Text, Enrichment & LCMA Edges (v0.2)
 *Goal: richer notes + LCMA graph seeding*
@@ -1407,10 +1431,9 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 - [ ] `influx/telemetry.py` — mirrors Lithos OTEL pattern
 - [ ] `@traced` decorator on key pipeline stages with standard attributes (§14.2)
 - [ ] OTEL metrics: items fetched, filtered, ingested, errors (per profile)
-- [ ] Run history notes in Lithos (`influx/runs/{YYYY}/{MM}` path prefix)
 - [ ] Tag rejection rate reporting (per §4 `feedback.recalibrate_after_runs`)
 
-**M4 acceptance:** With `INFLUX_OTEL_ENABLED=true` and a local collector, spans appear in the collector with correct attributes and run-level metrics. With OTEL disabled, nothing changes from M3 behaviour. `influx/runs` notes are queryable in Lens and can bootstrap `/health` after restart.
+**M4 acceptance:** With `INFLUX_OTEL_ENABLED=true` and a local collector, spans appear in the collector with correct attributes and run-level metrics. With OTEL disabled, nothing changes from M3 behaviour.
 
 ---
 
@@ -1458,7 +1481,7 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 | `INFLUX_OTEL_CONSOLE_FALLBACK` | container | bool | `false` | `telemetry.console_fallback` | |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | container | url | `http://host.docker.internal:4318` | — | OTLP collector |
 | `LITHOS_URL` | container | url | `http://host.docker.internal:8765/sse` | — | Lithos SSE endpoint |
-| `LITHOS_MCP_TRANSPORT` | container | enum | `sse` | — | Fixed to `sse` in v0.6 |
+| `LITHOS_MCP_TRANSPORT` | container | enum | `sse` | — | Fixed to `sse` in v0.7 |
 | `AGENT_ZERO_WEBHOOK_URL` | container | url | empty | `notifications.webhook_url` | Empty disables webhook |
 | `OPENROUTER_API_KEY` | container | secret | empty | — | Required if any `models.*` uses `openrouter/*` |
 | `OPENAI_API_KEY` | container | secret | empty | — | Required if any `models.*` uses `openai/*` |
@@ -1569,4 +1592,4 @@ influx/
 
 ---
 
-**End of Requirements v0.6**
+**End of Requirements v0.7**
