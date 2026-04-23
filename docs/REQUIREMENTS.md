@@ -203,7 +203,7 @@ services:
     environment:
       - INFLUX_ENVIRONMENT=${INFLUX_ENVIRONMENT:-dev}
       - INFLUX_ARCHIVE_DIR=/archive
-      - INFLUX_CONFIG=/etc/influx/config.toml
+      - INFLUX_CONFIG=/etc/influx/influx.toml
       - LITHOS_URL=${LITHOS_URL:-http://host.docker.internal:8765/sse}
       - LITHOS_MCP_TRANSPORT=${LITHOS_MCP_TRANSPORT:-sse}
       - INFLUX_AGENT_ID=${INFLUX_AGENT_ID:-influx}
@@ -292,13 +292,13 @@ Configuration uses **TOML** format (Python 3.12 built-in `tomllib` for reading; 
 
 ### 4.1 Config File Discovery
 
-When `INFLUX_CONFIG` is not set, Influx looks for `config.toml` in this order:
+When `INFLUX_CONFIG` is not set, Influx looks for `influx.toml` in this order:
 
-1. `./config.toml` (current working directory)
-2. `~/.influx/config.toml` (user home)
-3. `/etc/influx/config.toml` (system / container default)
+1. `./influx.toml` (current working directory)
+2. `~/.influx/influx.toml` (user home)
+3. `/etc/influx/influx.toml` (system / container default)
 
-First file found wins. The Docker image sets `INFLUX_CONFIG=/etc/influx/config.toml`.
+First file found wins. The Docker image sets `INFLUX_CONFIG=/etc/influx/influx.toml`.
 
 ### 4.2 Example Config
 
@@ -1471,8 +1471,8 @@ JSON mode (`response_format={"type": "json_object"}`) is controlled per-slot via
 
 | Command | Purpose |
 |---|---|
-| `python -m influx` | Run once, then exit (used by scheduler in container mode after boot) |
-| `python -m influx serve` | Start the scheduler + health endpoint (container default) |
+| `python -m influx` | Print CLI help and exit non-zero; operators MUST pick an explicit subcommand. Influx is a long-running service — use `serve` for the scheduler |
+| `python -m influx serve` | Start the scheduler + health endpoint and block (container default; this is the normal long-running mode) |
 | `python -m influx run --profile X` | Trigger a single run for one profile now |
 | `python -m influx backfill ...` | See §15 |
 | `python -m influx validate-config` | Parse config, dry-connect to Lithos, probe tools, print effective config, exit non-zero if anything is wrong |
@@ -1485,7 +1485,7 @@ JSON mode (`response_format={"type": "json_object"}`) is controlled per-slot via
 ### Milestone 1 — arXiv Pipeline (v0.1)
 *Goal: daily arXiv monitoring → Lithos ingestion → notification*
 
-- [ ] Project scaffold: `pyproject.toml`, `Dockerfile`, `config.toml`
+- [ ] Project scaffold: `pyproject.toml`, `Dockerfile`, `influx.toml`
 - [ ] TOML config loader with env var overrides (§19)
 - [ ] Profile name validator (§4.4)
 - [ ] Guarded HTTP client with SSRF + size + timeout caps (§13.4)
@@ -1578,7 +1578,7 @@ JSON mode (`response_format={"type": "json_object"}`) is controlled per-slot via
 
 | Variable | Scope | Type | Default | Overrides config key | Notes |
 |---|---|---|---|---|---|
-| `INFLUX_CONFIG` | container | path | `/etc/influx/config.toml` | — | Path to the TOML config |
+| `INFLUX_CONFIG` | container | path | `/etc/influx/influx.toml` | — | Path to the TOML config |
 | `INFLUX_ENVIRONMENT` | host+container | string | `dev` | — | Label for logs/telemetry |
 | `INFLUX_ARCHIVE_PATH` | host | path | `./archive` | — | Host bind mount for archive volume |
 | `INFLUX_ARCHIVE_DIR` | container | path | `/archive` | `storage.archive_dir` | |
