@@ -24,6 +24,9 @@ supersedes: INFLUX-REQUIREMENTS-0.6.md
 > - LCMA is now a required dependency for Influx v0.7; startup fails fast if required LCMA tools are absent.
 > - arXiv exact lookup is pinned to canonical `source_url` plus `arxiv-id:<id>` tags rather than filename assumptions.
 > - Feedback tags are now profile-scoped (`influx:rejected:<profile>`) so one canonical note can be rejected for one profile without poisoning another.
+> - LLM provider is now independently configurable from model name (e.g. route Anthropic models via OpenRouter); see §4.2 `[providers.*]`.
+> - All tunable values (thresholds, batch sizes, min-text-length gates, retry/backoff timings, strip-tags list) are explicit config keys, not hardcoded constants.
+> - All LLM prompts (filter, tier-1 enrichment, tier-3 extraction) are configurable via `[prompts.*]` — inline text or file path.
 
 ---
 
@@ -49,7 +52,7 @@ supersedes: INFLUX-REQUIREMENTS-0.6.md
 - [[#18. Testing Strategy]]
 - [[#19. Environment Variables]]
 - [[#20. Reserved Tags]]
-- [[#21. Retention & Secrets]]
+- [[#21. Retention]]
 
 ---
 
@@ -173,7 +176,7 @@ Follows the Lithos convention exactly:
 - Each service has `.env.dev` and `.env.prod` (and optionally `.env.staging`) files
 - **No `env_file:` directive in `docker-compose.yml`** — instead, `run.sh` passes `--env-file .env.<env>` to `docker compose`, making those vars available for interpolation in the compose file
 - The `environment:` section in compose passes specific vars into the container using `${VAR:-default}` syntax
-- API keys and secrets are **not** in the env files — they are injected separately; see §21.2
+- Secrets (provider API keys, webhook URLs) live in the `.env.<env>` files alongside non-secret configuration. The `.env.*` files MUST be gitignored and MUST NOT be committed. Influx fails fast on startup if any configured provider's `api_key_env` variable is empty.
 - Config changes require a container restart (`./run.sh <env> restart`). There is no hot-reload.
 
 See §19 for the canonical environment variable table.
@@ -375,29 +378,121 @@ name = "Lilian Weng"
 url = "https://lilianweng.github.io/index.xml"
 
 # ---------------------------------------------------------------------------
+# Providers
+# Providers are independent of model names. LiteLLM routes by model-string
+# prefix by default; `[providers.*]` entries let you pin a base URL and
+# API-key env var for a provider, or route any model through OpenRouter by
+# binding a model slot to the `openrouter` provider. Every `[models.*]`
+# table MUST name a provider defined here.
+# ---------------------------------------------------------------------------
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+# Optional headers forwarded to OpenRouter (e.g. referer/app-name).
+extra_headers = { "HTTP-Referer" = "https://example.invalid/influx", "X-Title" = "Influx" }
+
+# [providers.ollama]
+# base_url = "http://host.docker.internal:11434"
+# api_key_env = ""                 # Ollama has no API key
+
+# ---------------------------------------------------------------------------
 # Models
-# Each model slot accepts either a bare string (shorthand) or a table with
-# per-model tuning. Shorthand `filter = "openai/gpt-4.1-mini"` is equivalent
-# to `[models.filter]\nmodel = "openai/gpt-4.1-mini"`.
+# Each model slot names a provider defined in `[providers.*]` and a model
+# string. The model string is passed through to LiteLLM unchanged.
+# When provider = "openrouter", the model string MUST be an OpenRouter
+# model identifier (e.g. "openrouter/anthropic/claude-sonnet-4").
 # ---------------------------------------------------------------------------
 
 [models.filter]
+provider = "openai"
 model = "openai/gpt-4.1-mini"
 temperature = 0.0
 max_tokens = 2048
-
-[models.enrich]
-model = "openai/gpt-4.1-mini"
-temperature = 0.2
-
-[models.extract]
-model = "anthropic/claude-sonnet-4.6"
-temperature = 0.2
-
-[models.litellm]
 request_timeout = 30
 max_retries = 2
 json_mode = true              # enforce response_format={"type": "json_object"}
+
+[models.enrich]
+provider = "openai"
+model = "openai/gpt-4.1-mini"
+temperature = 0.2
+request_timeout = 30
+max_retries = 2
+json_mode = true
+
+[models.extract]
+provider = "anthropic"
+model = "anthropic/claude-sonnet-4.6"
+temperature = 0.2
+request_timeout = 60
+max_retries = 2
+json_mode = true
+
+# Example: the same extract slot routed via OpenRouter instead of direct
+# Anthropic — useful for unified billing across mixed providers.
+# [models.extract]
+# provider = "openrouter"
+# model = "openrouter/anthropic/claude-sonnet-4"
+# temperature = 0.2
+
+# ---------------------------------------------------------------------------
+# Prompts
+# Every LLM prompt is configurable. Each entry specifies exactly one of
+# `text` (inline string) or `path` (relative to the config file directory).
+# Prompts are Python `str.format()` templates. Template variables are
+# documented per-entry; an unknown variable raises at startup via
+# `validate-config`. The default prompts ship at `influx/prompts/*.md`.
+# ---------------------------------------------------------------------------
+
+[prompts.filter]
+# Variables: {profile_description}, {negative_examples}, {min_score_in_results}
+path = "./prompts/filter.md"
+
+[prompts.tier1_enrich]
+# Variables: {title}, {abstract}, {profile_summary}
+path = "./prompts/tier1_enrich.md"
+
+[prompts.tier3_extract]
+# Variables: {title}, {full_text}
+path = "./prompts/tier3_extract.md"
+
+# ---------------------------------------------------------------------------
+# Filter tuning
+# ---------------------------------------------------------------------------
+
+[filter]
+batch_size = 25                      # items per filter LLM call
+min_score_in_results = 6             # model returns only items with score >= this
+negative_example_max_title_chars = 200
+
+# ---------------------------------------------------------------------------
+# Extraction tuning
+# ---------------------------------------------------------------------------
+
+[extraction]
+min_html_chars = 1000                # below this, HTML extraction is treated as failure
+min_web_chars = 500                  # below this, web-article extraction is treated as failure
+strip_tags = ["script", "iframe", "object", "embed"]
+
+# ---------------------------------------------------------------------------
+# Resilience tuning
+# ---------------------------------------------------------------------------
+
+[resilience]
+max_retries = 3
+backoff_base_seconds = 1             # exponential: base, base*2, base*4, ...
+arxiv_request_min_interval_seconds = 3
+arxiv_429_backoff_seconds = 10
+lithos_write_conflict_max_retries = 1
 
 # ---------------------------------------------------------------------------
 # Feedback
@@ -476,7 +571,7 @@ ns = {
 
 **Date filtering:** Filter by `<published>` date in Python after fetching. Published timestamps are UTC; `lookback_days` is interpreted in UTC.
 
-**Rate limiting:** Minimum **3 seconds** between successive requests to `export.arxiv.org` (arXiv courtesy guideline). This is separate from 429 backoff handling (see §13).
+**Rate limiting:** Minimum `resilience.arxiv_request_min_interval_seconds` (default 3s) between successive requests to `export.arxiv.org` (arXiv courtesy guideline). This is separate from 429 backoff handling (see §13).
 
 **arXiv HTML availability:** Most papers from 2020 onwards. Check with a HEAD request before full fetch; fall through to PDF on 404.
 
@@ -494,24 +589,30 @@ ns = {
 
 ### 6.1 Filter Prompt
 
-The system prompt below is used with the configured `models.filter` model via LiteLLM **with JSON mode enabled** and responses validated against a Pydantic schema. The `INTEREST PROFILE` block is populated from the active profile's `description`. The `NEGATIVE EXAMPLES` block is populated at runtime from recent rejections stored in Lithos.
+The filter prompt is loaded from config key `prompts.filter` (see §4.2). It is used with the configured `models.filter` model via LiteLLM **with JSON mode enabled** and responses validated against a Pydantic schema. The template has three variables:
+
+- `{profile_description}` — the active profile's `description` field.
+- `{negative_examples}` — recent rejections, formatted per §6.3.
+- `{min_score_in_results}` — value of `filter.min_score_in_results` (default 6); the model returns only items scoring at or above this threshold.
+
+The default prompt shipped at `influx/prompts/filter.md` is:
 
 ```
 You are a research paper relevance filter. Score each paper for relevance
 to the following interest profile.
 
 ## INTEREST PROFILE
-{profile.description}
+{profile_description}
 
 ## NEGATIVE EXAMPLES
 The following were previously marked as NOT interesting by the user.
 Use them to calibrate your scoring (titles only, no abstracts):
 
-{injected_negative_examples}
+{negative_examples}
 
 ## OUTPUT FORMAT
 Return a JSON object with a single key "results" whose value is an array.
-For each paper with score >= 6 include:
+For each paper with score >= {min_score_in_results} include:
 - "id": the arXiv ID or article URL string
 - "score": integer 1-10
 - "tags": list of 2-5 short keyword tags
@@ -541,11 +642,11 @@ Each negative example is rendered as a **single line** — no abstract — to ke
 - "{title}" (rejected)
 ```
 
-Titles longer than 200 chars are truncated. Limit: `feedback.negative_examples_per_profile` (default 20).
+Titles longer than `filter.negative_example_max_title_chars` (default 200) are truncated. Limit: `feedback.negative_examples_per_profile` (default 20).
 
 ### 6.4 Batching
 
-- Papers sent to filter model in batches of 25
+- Papers are sent to the filter model in batches of `filter.batch_size` (default 25)
 - Each batch contains: `ID`, `Title`, `Abstract` (full abstract for the batch items only)
 - JSON mode enforced via `response_format={"type": "json_object"}` with the `FilterResponse` schema
 - On JSON-mode parse failure: log the raw response, attempt a one-shot regex fallback to recover obvious results, and if that also fails the batch is skipped (papers requeue on the next run via `lithos_cache_lookup` miss)
@@ -573,27 +674,34 @@ Each run processes all enabled profiles sequentially. A source may match multipl
 ```
 For arXiv papers:
   1. HEAD https://arxiv.org/html/{id} → if 200, GET and extract with trafilatura
-     - Reject if extracted text < 1000 chars (likely nav/boilerplate); fall through.
+     - Reject if extracted text < extraction.min_html_chars (default 1000, likely nav/boilerplate); fall through.
   2. Fallback: download PDF → extract with pymupdf4llm → markdown
   3. Fallback: use abstract only, tag note `text:abstract-only`
 
 For RSS/web articles:
   1. Fetch article URL (subject to SSRF guard + size/timeout caps)
   2. Extract with trafilatura → markdown
-     - Reject if extracted text < 500 chars; fall through.
+     - Reject if extracted text < extraction.min_web_chars (default 500); fall through.
   3. Fallback: use feed summary only
 ```
 
 ### 7.2 LLM Enrichment (Tier 1 — all papers ≥ relevance threshold)
 
-Uses `models.enrich` with JSON mode. Single LLM call from title + abstract:
+Uses `models.enrich` with JSON mode. Single LLM call from title + abstract. The prompt is loaded from config key `prompts.tier1_enrich` (see §4.2). Template variables: `{title}`, `{abstract}`, `{profile_summary}`.
+
+The default prompt shipped at `influx/prompts/tier1_enrich.md` is:
 
 ```
 Given this paper's title and abstract, extract:
 1. Key contributions (3-5 bullet points, each ≤ 20 words)
 2. Primary method or approach (1-2 sentences)
 3. Main result or finding (1-2 sentences)
-4. Relevance to: {one-line profile summary}
+4. Relevance to: {profile_summary}
+
+Title: {title}
+
+Abstract:
+{abstract}
 
 Return JSON: {"contributions": [...], "method": "...",
               "result": "...", "relevance": "..."}
@@ -611,7 +719,7 @@ class Tier1Enrichment(BaseModel):
 
 ### 7.3 LLM Enrichment (Tier 3 — papers scoring ≥ deep_extract threshold)
 
-Uses `models.extract` with JSON mode on the full text:
+Uses `models.extract` with JSON mode on the full text. The prompt is loaded from config key `prompts.tier3_extract` (see §4.2). Template variables: `{title}`, `{full_text}`. The response is validated against:
 
 ```python
 class Tier3Extraction(BaseModel):
@@ -1131,14 +1239,14 @@ Semantics:
 
 | Failure | Behaviour |
 |---------|----------|
-| arXiv API unreachable | Retry 3× with exponential backoff; skip run if all fail |
-| arXiv rate limit (429) | Back off 10 seconds; retry up to 3× |
+| arXiv API unreachable | Retry `resilience.max_retries` times with exponential backoff; skip run if all fail |
+| arXiv rate limit (429) | Back off `resilience.arxiv_429_backoff_seconds` (default 10s); retry up to `resilience.max_retries` times |
 | HTML fetch fails | Fall back to PDF extraction |
-| HTML extraction <1000 chars | Treat as failure; fall back to PDF |
+| HTML extraction < `extraction.min_html_chars` | Treat as failure; fall back to PDF |
 | PDF download fails | Store canonical note with `text:abstract-only`, add `influx:repair-needed`, retry next run |
-| Download exceeds `max_download_bytes` | Abort download; log; proceed with abstract-only |
-| Download exceeds `download_timeout_seconds` | Same as above |
-| LLM call fails | Retry 2×; store note without the failed sections, add `influx:repair-needed` (see §7.4) |
+| Download exceeds `storage.max_download_bytes` | Abort download; log; proceed with abstract-only |
+| Download exceeds `storage.download_timeout_seconds` | Same as above |
+| LLM call fails | Retry `models.<slot>.max_retries` times; store note without the failed sections, add `influx:repair-needed` (see §7.4) |
 | LLM returns non-JSON despite JSON mode | Log raw response; attempt regex fallback; if that fails, skip item |
 | Lithos unreachable on first call | Retry 3×; abort run; log error; exit non-zero |
 | Lithos MCP tool missing at runtime | Abort the current run; log error; exit non-zero |
@@ -1152,8 +1260,8 @@ Semantics:
 
 ### 13.2 Retry Policy
 
-- Max retries: 3
-- Backoff: exponential (1s, 2s, 4s) unless otherwise specified
+- Max retries: `resilience.max_retries` (default 3)
+- Backoff: exponential from `resilience.backoff_base_seconds` (default 1s → 1s, 2s, 4s, …) unless otherwise specified
 - Per-item failures do not abort the run
 - Run-level failures (Lithos fully unreachable) abort the run and log; exit code 2
 
@@ -1175,7 +1283,7 @@ All outbound HTTP fetches (arXiv API, RSS feeds, article URLs, PDF downloads) go
 
 Extracted HTML (via `trafilatura`) may contain prompt-injection payloads. Influx does not execute extracted content, but downstream LLM consumers reading Influx-authored notes should treat content with the `ingested-by:influx` tag as **untrusted**. Influx additionally:
 
-- Strips `<script>`, `<iframe>`, `<object>`, `<embed>` tags before conversion to markdown
+- Strips tags listed in `extraction.strip_tags` (default `["script", "iframe", "object", "embed"]`) before conversion to markdown
 - Does not preserve HTML fragments in markdown output
 
 ### 13.6 CLI Exit Codes
@@ -1330,16 +1438,19 @@ python -m influx backfill --all-profiles --days 7
 
 ### 16.2 LiteLLM
 
-**Recommended models:**
+**Providers:** Every `[models.*]` slot names a provider defined in `[providers.*]` (see §4.2). The provider entry carries the LiteLLM base URL, the API-key env var to read, and any extra headers to attach. OpenAI, Anthropic, and OpenRouter are documented as first-class providers; any LiteLLM-supported provider may be added by defining a new `[providers.<name>]` block.
 
-| Use case | Config key | Default model | Notes |
-|----------|-----------|--------------|-------|
-| Filtering | `models.filter` | `openai/gpt-4.1-mini` | Fast, cheap, sufficient |
-| Enrichment | `models.enrich` | `openai/gpt-4.1-mini` | Same model fine |
-| Deep extraction | `models.extract` | `anthropic/claude-sonnet-4.6` | Better for nuanced extraction |
-| Local/offline | any | `ollama/llama3.2` | Via LiteLLM Ollama provider |
+**Recommended models (defaults):**
 
-JSON mode (`response_format={"type": "json_object"}`) is required for all filter/enrichment calls. Models must be tested for JSON-mode compatibility at `python -m influx validate-config` time (see §16.4).
+| Use case | Config key | Default provider | Default model | Notes |
+|----------|-----------|-----------------|--------------|-------|
+| Filtering | `models.filter` | `openai` | `openai/gpt-4.1-mini` | Fast, cheap, sufficient |
+| Enrichment | `models.enrich` | `openai` | `openai/gpt-4.1-mini` | Same model fine |
+| Deep extraction | `models.extract` | `anthropic` | `anthropic/claude-sonnet-4.6` | Better for nuanced extraction |
+| Unified billing | any | `openrouter` | e.g. `openrouter/anthropic/claude-sonnet-4` | Route any upstream model through OpenRouter |
+| Local/offline | any | `ollama` | e.g. `ollama/llama3.2` | Define `[providers.ollama]` with your local base URL |
+
+JSON mode (`response_format={"type": "json_object"}`) is controlled per-slot via `models.<slot>.json_mode`. Models must be tested for JSON-mode compatibility at `python -m influx validate-config` time (see §16.4).
 
 ### 16.3 Lithos MCP API — Influx Usage
 
@@ -1483,9 +1594,11 @@ JSON mode (`response_format={"type": "json_object"}`) is required for all filter
 | `LITHOS_URL` | container | url | `http://host.docker.internal:8765/sse` | — | Lithos SSE endpoint |
 | `LITHOS_MCP_TRANSPORT` | container | enum | `sse` | — | Fixed to `sse` in v0.7 |
 | `AGENT_ZERO_WEBHOOK_URL` | container | url | empty | `notifications.webhook_url` | Empty disables webhook |
-| `OPENROUTER_API_KEY` | container | secret | empty | — | Required if any `models.*` uses `openrouter/*` |
-| `OPENAI_API_KEY` | container | secret | empty | — | Required if any `models.*` uses `openai/*` |
-| `ANTHROPIC_API_KEY` | container | secret | empty | — | Required if any `models.*` uses `anthropic/*` |
+| `OPENAI_API_KEY` | container | secret | empty | — | Read when any model uses the `openai` provider (default `providers.openai.api_key_env`) |
+| `ANTHROPIC_API_KEY` | container | secret | empty | — | Read when any model uses the `anthropic` provider (default `providers.anthropic.api_key_env`) |
+| `OPENROUTER_API_KEY` | container | secret | empty | — | Read when any model uses the `openrouter` provider (default `providers.openrouter.api_key_env`) |
+
+Provider API-key env var names are themselves config-driven via `[providers.<name>].api_key_env`. The variables above are defaults. Adding a new provider (e.g. `[providers.together]`) introduces a new env var name without any code change — only the config needs updating. Provider base URLs are likewise config-driven (`[providers.<name>].base_url`) rather than env-driven.
 
 ---
 
@@ -1511,24 +1624,12 @@ Tags with the following prefixes or literals are reserved for the Influx/Lens pr
 
 ---
 
-## 21. Retention & Secrets
-
-### 21.1 Retention
+## 21. Retention
 
 - `storage.retain_days` defaults to `3650` (~10 years) — effectively "keep forever by default".
 - Influx does **not** currently delete archive files or notes; retention is advisory and intended as a hook for a future `python -m influx gc` command.
 - At typical volumes (10–20 papers/day × ~5 MB) the archive grows ~30 GB/year. Users running multiple profiles should size the `influx-archive` volume accordingly.
 - Lens may offer a "prune by tag" view in a later release — out of scope for Influx v1.
-
-### 21.2 Secrets
-
-API keys are **never** written to `.env.dev` / `.env.prod`. They are injected separately — typical options:
-
-- A sibling `.a0proj/secrets.env` file sourced by `run.sh` before invoking `docker compose`
-- An OS secret manager (e.g. `pass`, `1password-cli`)
-- A CI secret store for production deploys
-
-Influx fails fast on startup if any configured model's required API key env var is empty. The error message names the missing variable and the model that needs it. This prevents silent failures deep inside a scheduled run.
 
 ---
 
