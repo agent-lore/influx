@@ -1131,11 +1131,11 @@ lithos_edge_upsert(
 
 ### 10.4 Run Task Coordination
 
-Each pipeline run creates a Lithos task for LCMA coordination and audit:
+Each scheduled, manual, or backfill execution of a **single profile** creates one Lithos task for LCMA coordination and audit:
 
 ```python
 task = lithos_task_create(
-    title=f"Influx run {date}",
+    title=f"Influx run {profile_name} {date}",
     agent="influx",
     tags=["influx:run", f"profile:{profile_name}"],
 )
@@ -1149,7 +1149,7 @@ lithos_task_complete(
 
 `lithos_task_complete` currently supports the extended parameters (`outcome`, `cited_nodes`, `misleading_nodes`, `receipt_id`) in Lithos code. Influx v0.7 uses `outcome`, but it does **not** automatically send `cited_nodes` or `misleading_nodes`: in current Lithos behavior those fields are interpreted as feedback about nodes returned by a retrieval receipt, not about newly ingested note IDs.
 
-Backfill runs use `influx:backfill` in place of `influx:run`.
+Backfill profile-runs use `influx:backfill` in place of `influx:run`.
 
 ---
 
@@ -1494,13 +1494,91 @@ The model/provider table above is illustrative. The stable contract is that prov
 
 ### 16.5 Influx Service HTTP API
 
+In v1, `POST /runs` and `POST /backfills` are **local admin endpoints only**. They are intended for loopback / same-host use by the local CLI and MUST NOT be treated as a general remote-control API. A conforming v1 deployment SHOULD bind them only on localhost by default or otherwise protect them from remote access.
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /live` | Liveness probe for Docker/container health checks |
 | `GET /ready` | Readiness probe from cached dependency state |
 | `GET /status` | Detailed operator-facing service and scheduler status |
-| `POST /runs` | Submit a manual run to the live service. Body includes exactly one of `profile` or `all_profiles`. Returns `202` on acceptance and `409` if conflicting work is already active. |
-| `POST /backfills` | Submit a backfill job to the live service. Body includes profile/range arguments plus `confirm` when required. Returns `202` on acceptance and `409` if conflicting work is already active. |
+| `POST /runs` | Submit a manual run to the live service. Body includes exactly one of `profile` or `all_profiles`. Returns `202` on acceptance and `409` if conflicting work is already active. Local admin endpoint only in v1. |
+| `POST /backfills` | Submit a backfill job to the live service. Body includes profile/range arguments plus `confirm` when required. Returns `202` on acceptance and `409` if conflicting work is already active. Local admin endpoint only in v1. |
+
+Response conventions for `POST /runs` and `POST /backfills`:
+
+- v1 does **not** define a full job-resource API. The response contract is intentionally small: enough for CLI/output correlation, not a general remote queue-management interface.
+- Accepted requests return `202 Accepted` with a compact JSON body containing:
+  - `status: "accepted"`
+  - `request_id`: an opaque identifier for correlating CLI output and service logs
+  - `kind`: `run` or `backfill`
+  - `scope`: the accepted profile/range payload
+  - `submitted_at`: server timestamp in UTC
+- Conflicting requests return `409 Conflict` with a JSON body containing:
+  - `status: "conflict"`
+  - `reason`: stable machine-readable code such as `profile_busy`
+  - `request_id`
+  - `active_run`: compact information about the conflicting active work (`kind`, `profile`, `started_at`)
+- Validation failures return `400 Bad Request` or `422 Unprocessable Entity` with a JSON body containing:
+  - `status: "invalid_request"`
+  - `reason`: stable machine-readable code such as `confirm_required`, `bad_date_range`, or `missing_profile`
+  - `message`: short human-readable explanation
+  - optional structured fields relevant to the error (for example `estimated_items` when `confirm_required`)
+
+Illustrative `202 Accepted` body for `POST /runs`:
+
+```json
+{
+  "status": "accepted",
+  "request_id": "01HXYZ...",
+  "kind": "run",
+  "scope": {
+    "profile": "ai-robotics"
+  },
+  "submitted_at": "2026-04-23T12:34:56Z"
+}
+```
+
+Illustrative `202 Accepted` body for `POST /backfills`:
+
+```json
+{
+  "status": "accepted",
+  "request_id": "01HXYZ...",
+  "kind": "backfill",
+  "scope": {
+    "profile": "ai-robotics",
+    "from": "2026-01-01",
+    "to": "2026-03-15"
+  },
+  "submitted_at": "2026-04-23T12:34:56Z"
+}
+```
+
+Illustrative `409 Conflict` body:
+
+```json
+{
+  "status": "conflict",
+  "reason": "profile_busy",
+  "request_id": "01HXYZ...",
+  "active_run": {
+    "kind": "scheduled",
+    "profile": "ai-robotics",
+    "started_at": "2026-04-23T12:30:00Z"
+  }
+}
+```
+
+Illustrative validation-error body:
+
+```json
+{
+  "status": "invalid_request",
+  "reason": "confirm_required",
+  "message": "Backfill exceeds confirmation threshold.",
+  "estimated_items": 1432
+}
+```
 
 ---
 
