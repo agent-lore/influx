@@ -143,10 +143,10 @@ Two separate repositories:
 | Config format | TOML (Python 3.12 built-in `tomllib`) | Consistent with Cardinal and other recent projects |
 | Interest profiles | Multiple named profiles | Keeps unrelated domains (AI/robotics vs HEMA) cleanly separated |
 | Multi-profile merge | Union profile tags; use max score for note-wide confidence | Preserves one note per source while keeping per-profile relevance |
-| Health endpoint | Live readiness checks + current scheduler state | Avoids coupling health to persisted run history |
+| Health/status endpoints | Separate `/live`, `/ready`, and `/status` | Keeps container probes simple while preserving detailed operator visibility |
 | OTEL | Opt-in, additive, optional packages | Consistent with Lithos conventions |
 | Environments | `.env.dev` / `.env.prod` per service | Consistent with Lithos conventions |
-| Logging | JSON to **stderr** (not stdout) | Matches Lithos; captured by `docker logs` |
+| Logging | JSON to **stdout** | Container-friendly default; captured by `docker logs` |
 
 ---
 
@@ -176,6 +176,7 @@ Follows the Lithos convention exactly:
 - Each service has `.env.dev` and `.env.prod` (and optionally `.env.staging`) files
 - **No `env_file:` directive in `docker-compose.yml`** — instead, `run.sh` passes `--env-file .env.<env>` to `docker compose`, making those vars available for interpolation in the compose file
 - The `environment:` section in compose passes specific vars into the container using `${VAR:-default}` syntax
+- Service endpoints (Lithos, OTEL collector, local model gateways, etc.) are supplied via environment/config values. The requirements do not pin specific hostnames for container-to-container communication.
 - Secrets (provider API keys, webhook URLs) live in the `.env.<env>` files alongside non-secret configuration. The `.env.*` files MUST be gitignored and MUST NOT be committed. Influx fails fast on startup if any configured provider's `api_key_env` variable is empty.
 - Config changes require a container restart (`./run.sh <env> restart`). There is no hot-reload.
 
@@ -204,7 +205,7 @@ services:
       - INFLUX_ENVIRONMENT=${INFLUX_ENVIRONMENT:-dev}
       - INFLUX_ARCHIVE_DIR=/archive
       - INFLUX_CONFIG=/etc/influx/influx.toml
-      - LITHOS_URL=${LITHOS_URL:-http://host.docker.internal:8765/sse}
+      - LITHOS_URL=${LITHOS_URL:-}
       - LITHOS_MCP_TRANSPORT=${LITHOS_MCP_TRANSPORT:-sse}
       - INFLUX_AGENT_ID=${INFLUX_AGENT_ID:-influx}
       - AGENT_ZERO_WEBHOOK_URL=${AGENT_ZERO_WEBHOOK_URL:-}
@@ -212,17 +213,15 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - INFLUX_OTEL_ENABLED=${INFLUX_OTEL_ENABLED:-false}
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://host.docker.internal:4318}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       - INFLUX_LOG_LEVEL=${INFLUX_LOG_LEVEL:-INFO}
       - INFLUX_DRY_RUN=${INFLUX_DRY_RUN:-false}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/live"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 30s
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
 volumes:
   influx-archive:
@@ -274,7 +273,7 @@ case "${action}" in
     up)      docker compose "${compose_args[@]}" up -d --build ;;
     down)    docker compose "${compose_args[@]}" down ;;
     restart) docker compose "${compose_args[@]}" down && docker compose "${compose_args[@]}" up -d --build ;;
-    logs)    docker compose "${compose_args[@]}" logs -f 2>&1 | grep -v 'GET /health' ;;
+    logs)    docker compose "${compose_args[@]}" logs -f 2>&1 | grep -v 'GET /live' ;;
     status)  docker compose "${compose_args[@]}" ps ;;
     *)
         echo "Error: unknown action '${action}'" >&2
@@ -401,7 +400,7 @@ api_key_env = "OPENROUTER_API_KEY"
 extra_headers = { "HTTP-Referer" = "https://example.invalid/influx", "X-Title" = "Influx" }
 
 # [providers.ollama]
-# base_url = "http://host.docker.internal:11434"
+# base_url = "http://<configured-ollama-endpoint>"
 # api_key_env = ""                 # Ollama has no API key
 
 # ---------------------------------------------------------------------------
@@ -914,7 +913,7 @@ Influx uses the **official `mcp` Python SDK** connecting to Lithos via **SSE** (
 
 - Client wrapper lives at `influx/lithos_client.py`
 - Connection is established lazily on first use and kept alive for the duration of a run
-- `LITHOS_URL` points to the Lithos SSE endpoint (for example `http://host.docker.internal:8765/sse`)
+- `LITHOS_URL` points to the Lithos SSE endpoint supplied by environment/config
 - Transport is fixed to `sse` for v0.7
 - On startup, the client calls `tools/list` to probe available tools and logs the tool set (see §10.1 for LCMA availability handling)
 
@@ -1348,33 +1347,53 @@ otel = [
 
 ### 14.3 Logging
 
-Follows the Lithos pattern — **stderr only, no log files**:
+Follows the container logging pattern — **stdout only, no log files**:
 
-- All log output goes to stderr → captured by `docker logs influx`
+- All log output goes to stdout → captured by `docker logs influx`
 - `INFLUX_LOG_LEVEL` controls verbosity (`DEBUG` in dev, `INFO` in prod)
 - Structured JSON format via `python-json-logger`
 - OTEL (when enabled) provides structured spans and metrics for deeper observability
 - Influx does **not** persist run logs or run-history notes in Lithos; durable operational telemetry belongs in the OTEL collector and standard container logs.
 
-### 14.4 Health Endpoint
+### 14.4 Live, Ready, and Status Endpoints
 
-- `GET http://localhost:8080/health` — returns live liveness/readiness state plus current scheduler state
+- `GET http://localhost:8080/live` — liveness probe for Docker/container health checks
+- `GET http://localhost:8080/ready` — readiness probe for operators or orchestrators
+- `GET http://localhost:8080/status` — detailed operator-facing status
+
+Example `GET /status` response:
 
 ```json
 {
   "status": "ok",
   "ready": true,
+  "started_at": "2026-03-16T05:59:58Z",
   "checks": {
     "config": "ok",
-    "scheduler": "ok",
-    "lithos": "ok",
-    "lithos_tools": "ok",
-    "llm_credentials": "ok"
+    "scheduler": "ok"
+  },
+  "dependencies": {
+    "lithos": {
+      "status": "ok",
+      "last_checked_at": "2026-03-16T06:00:05Z"
+    },
+    "lithos_tools": {
+      "status": "ok",
+      "last_checked_at": "2026-03-16T06:00:05Z"
+    },
+    "llm_credentials": {
+      "status": "ok",
+      "last_checked_at": "2026-03-16T06:00:02Z"
+    }
   },
   "profiles": {
     "ai-robotics": {
       "scheduled": true,
-      "next_run_at": "2026-03-17T06:00:00Z"
+      "next_run_at": "2026-03-17T06:00:00Z",
+      "last_run_started_at": "2026-03-16T06:00:00Z",
+      "last_run_finished_at": "2026-03-16T06:03:12Z",
+      "last_run_outcome": "success",
+      "consecutive_failures": 0
     }
   }
 }
@@ -1382,17 +1401,23 @@ Follows the Lithos pattern — **stderr only, no log files**:
 
 Semantics:
 
+- `/live` answers only the liveness question: the process has booted, the HTTP server is running, and the scheduler/event loop is not in a terminal failed state.
+- `/live` returns `200 OK` when alive and `503 Service Unavailable` otherwise. Docker/container health checks MUST use `/live`.
+- `/ready` answers the readiness question: Influx is currently able to perform a scheduled ingestion cycle using the latest cached startup/dependency state.
+- `/ready` returns `200 OK` when ready and `503 Service Unavailable` otherwise. It may return a compact JSON body such as `{"ready": true, "status": "ok"}`.
+- `/status` is the detailed diagnostic endpoint for humans and dashboards. It is not used as the Docker health check.
+- `/status` returns `200 OK` whenever the process can serve the request; callers inspect the JSON body for `status` (`ok`, `degraded`, `starting`) and `ready`.
 - `status` is the overall service state: `ok` if all required readiness checks pass, `degraded` if the process is alive but one or more readiness checks fail, `starting` before the first readiness evaluation completes.
-- `ready` is `true` only when Influx can perform a scheduled ingestion cycle immediately.
-- HTTP status is `200 OK` when `ready=true` and `503 Service Unavailable` otherwise. Docker/container health checks MUST treat `/health` as a readiness endpoint.
 - `checks.config` means config loaded and validated successfully.
 - `checks.scheduler` means APScheduler is running and the expected jobs are registered.
-- `checks.lithos` means the Lithos SSE endpoint is reachable.
-- `checks.lithos_tools` means the required Lithos tools are present: `lithos_cache_lookup`, `lithos_write`, `lithos_read`, `lithos_retrieve`, `lithos_edge_upsert`, `lithos_edge_list`, `lithos_task_create`, and `lithos_task_complete`.
-- `checks.llm_credentials` means the configured LLM provider key is present and basic client construction succeeds; it does not require a paid completion call on every health probe.
+- `dependencies.lithos.status` means the Lithos SSE endpoint is reachable according to the latest background probe result.
+- `dependencies.lithos_tools.status` means the required Lithos tools are present according to the latest background probe result: `lithos_cache_lookup`, `lithos_write`, `lithos_read`, `lithos_retrieve`, `lithos_edge_upsert`, `lithos_edge_list`, `lithos_task_create`, and `lithos_task_complete`.
+- `dependencies.llm_credentials.status` means the configured LLM provider key is present and basic client construction succeeds; it does not require a paid completion call.
 - `profiles.<name>.scheduled` indicates whether a scheduler job is currently registered for that profile.
 - `profiles.<name>.next_run_at` comes from APScheduler `next_fire_time`; it is `null` if the profile is disabled or no next fire time is currently known.
-- `/health` is computed live from in-memory state and dependency probes. It does not depend on persisted run history, Lithos notes, or previous run outcomes.
+- `profiles.<name>.last_run_*` and `consecutive_failures` come from in-memory run bookkeeping maintained by the service and reset on process restart.
+- Dependency probes are performed in the background on a fixed interval and cached in memory with timestamps. `/ready` and `/status` read that cached state; they do **not** perform fresh outbound probes on every request.
+- These endpoints do not depend on persisted run history, Lithos notes, or previous run outcomes stored outside the process.
 
 ---
 
@@ -1409,7 +1434,7 @@ python -m influx backfill --all-profiles --days 7
 - Skips already-ingested papers via `lithos_cache_lookup`
 - **Does not send notifications** during backfill
 - Creates `lithos_task_create`/`complete` tasks tagged `influx:backfill` so dashboards can filter them out
-- Logs progress to stderr
+- Logs progress to stdout
 - Prints an estimated LLM cost at start; requires `--confirm` when expected item count > 1000
 - Respects the same concurrency locks as scheduled runs (see §13.3)
 
@@ -1499,12 +1524,12 @@ JSON mode (`response_format={"type": "json_object"}`) is controlled per-slot via
 - [ ] Archive downloader (`influx/storage.py`) with path-safety check
 - [ ] APScheduler setup (`influx/scheduler.py`) with `max_instances=1`, `coalesce=True`
 - [ ] Webhook notification to Agent Zero (fire-and-forget, 5s timeout)
-- [ ] Health endpoint (`GET /health`) with live readiness checks and scheduler state
-- [ ] Structured JSON logging to stderr (`python-json-logger`)
+- [ ] Endpoints: `GET /live`, `GET /ready`, and `GET /status` with cached dependency status and scheduler state
+- [ ] Structured JSON logging to stdout (`python-json-logger`)
 - [ ] `docker-compose.yml` with `.env.dev` / `.env.prod`
 - [ ] CLI: `validate-config` and `run --profile X`
 
-**M1 acceptance:** `./run.sh dev up` → scheduled run fires at configured cron → a new arXiv paper that matches `ai-robotics` appears in Lithos with `agent=influx`, correct `source_url`, `arxiv-id:...` tag, source/date path, and is absent on the following run (dedup works). Agent Zero webhook receives the digest. `/health` reports `ready=true`, passing dependency checks, and a non-null `next_run_at` for the scheduled profile.
+**M1 acceptance:** `./run.sh dev up` → scheduled run fires at configured cron → a new arXiv paper that matches `ai-robotics` appears in Lithos with `agent=influx`, correct `source_url`, `arxiv-id:...` tag, source/date path, and is absent on the following run (dedup works). Agent Zero webhook receives the digest. `/live` returns `200`, `/ready` returns `200` with `ready=true`, and `/status` reports healthy cached dependency checks plus a non-null `next_run_at` for the scheduled profile.
 
 ### Milestone 2 — Full Text, Enrichment & LCMA Edges (v0.2)
 *Goal: richer notes + LCMA graph seeding*
@@ -1590,8 +1615,8 @@ JSON mode (`response_format={"type": "json_object"}`) is controlled per-slot via
 | `INFLUX_DRY_RUN` | container | bool | `false` | — | When `true`: fetch + filter but do not write to Lithos or webhook |
 | `INFLUX_OTEL_ENABLED` | container | bool | `false` | `telemetry.enabled` | |
 | `INFLUX_OTEL_CONSOLE_FALLBACK` | container | bool | `false` | `telemetry.console_fallback` | |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | container | url | `http://host.docker.internal:4318` | — | OTLP collector |
-| `LITHOS_URL` | container | url | `http://host.docker.internal:8765/sse` | — | Lithos SSE endpoint |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | container | url | empty | — | OTLP collector endpoint; set explicitly for your deployment |
+| `LITHOS_URL` | container | url | empty | — | Lithos SSE endpoint; set explicitly for your deployment |
 | `LITHOS_MCP_TRANSPORT` | container | enum | `sse` | — | Fixed to `sse` in v0.7 |
 | `AGENT_ZERO_WEBHOOK_URL` | container | url | empty | `notifications.webhook_url` | Empty disables webhook |
 | `OPENAI_API_KEY` | container | secret | empty | — | Read when any model uses the `openai` provider (default `providers.openai.api_key_env`) |
@@ -1645,8 +1670,8 @@ Tags with the following prefixes or literals are reserved for the Influx/Lens pr
 | `trafilatura` | Web article text extraction |
 | `pymupdf4llm` | PDF → markdown extraction |
 | `httpx` | Async HTTP client (wrapped with SSRF guard) |
-| `fastapi` + `uvicorn` | Health endpoint |
-| `python-json-logger` | Structured JSON logging to stderr |
+| `fastapi` + `uvicorn` | Live/readiness/status endpoints |
+| `python-json-logger` | Structured JSON logging to stdout |
 | `tomli-w` | TOML writing (if config needs updating at runtime) |
 | `opentelemetry-*` | OTEL (optional extra: `uv sync --extra otel`) |
 
