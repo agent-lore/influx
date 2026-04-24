@@ -381,11 +381,43 @@ def find_config_path() -> Path:
     )
 
 
+def _parse_bool_env(value: str) -> bool:
+    """Parse a boolean environment variable string."""
+    return value.lower() in ("true", "1", "yes")
+
+
+def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
+    """Apply environment variable overrides per REQUIREMENTS §19.
+
+    Env vars listed with an 'Overrides config key' entry in §19
+    take precedence over values set in the TOML file (FR-CFG-3).
+    """
+    overrides: list[tuple[str, str, str, type]] = [
+        ("INFLUX_ARCHIVE_DIR", "storage", "archive_dir", str),
+        ("INFLUX_OTEL_ENABLED", "telemetry", "enabled", bool),
+        ("INFLUX_OTEL_CONSOLE_FALLBACK", "telemetry", "console_fallback", bool),
+        ("AGENT_ZERO_WEBHOOK_URL", "notifications", "webhook_url", str),
+    ]
+
+    for env_var, section, key, value_type in overrides:
+        value = os.environ.get(env_var)
+        if value is None:
+            continue
+        raw.setdefault(section, {})
+        if value_type is bool:
+            raw[section][key] = _parse_bool_env(value)
+        else:
+            raw[section][key] = value
+
+    return raw
+
+
 def load_config(path: Path | None = None) -> AppConfig:
     """Load, validate, and return the v0.7 ``AppConfig``.
 
     Reads TOML via stdlib ``tomllib``, validates the raw dict through
     the pydantic schema, and returns a typed ``AppConfig`` instance.
+    Environment variable overrides (§19) are applied before validation.
     """
     load_dotenv()
     config_path = path if path is not None else find_config_path()
@@ -397,6 +429,8 @@ def load_config(path: Path | None = None) -> AppConfig:
         raise ConfigError(f"Could not read {config_path}: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{config_path}: invalid TOML: {exc}") from exc
+
+    _apply_env_overrides(raw)
 
     try:
         return AppConfig.model_validate(raw)

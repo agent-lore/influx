@@ -1,4 +1,4 @@
-"""Tests for TOML config loading and discovery order (US-005)."""
+"""Tests for TOML config loading, discovery order, and env-var overrides."""
 
 from __future__ import annotations
 
@@ -193,3 +193,174 @@ class TestParsedModel:
 
         with pytest.raises(ConfigError):
             load_config()
+
+
+# ── Environment variable overrides (US-006, FR-CFG-3, AC-01-F) ──────
+
+
+class TestEnvVarOverrides:
+    """Env vars listed in §19 with 'Overrides config key' beat TOML values."""
+
+    def test_influx_archive_dir_overrides_toml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """INFLUX_ARCHIVE_DIR overrides storage.archive_dir (path key)."""
+        toml = dedent("""\
+            [storage]
+            archive_dir = "/archive/original"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.setenv("INFLUX_ARCHIVE_DIR", "/override/archive")
+
+        cfg = load_config()
+
+        assert cfg.storage.archive_dir == "/override/archive"
+
+    def test_influx_otel_enabled_overrides_toml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """INFLUX_OTEL_ENABLED overrides telemetry.enabled (bool key)."""
+        toml = dedent("""\
+            [telemetry]
+            enabled = false
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "true")
+
+        cfg = load_config()
+
+        assert cfg.telemetry.enabled is True
+
+    def test_agent_zero_webhook_url_overrides_toml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AGENT_ZERO_WEBHOOK_URL overrides notifications.webhook_url (str)."""
+        toml = dedent("""\
+            [notifications]
+            webhook_url = "https://original.example.com/hook"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.setenv(
+            "AGENT_ZERO_WEBHOOK_URL", "https://override.example.com/hook"
+        )
+
+        cfg = load_config()
+
+        assert cfg.notifications.webhook_url == "https://override.example.com/hook"
+
+    def test_otel_console_fallback_overrides_toml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """INFLUX_OTEL_CONSOLE_FALLBACK overrides telemetry.console_fallback."""
+        toml = dedent("""\
+            [telemetry]
+            console_fallback = false
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.setenv("INFLUX_OTEL_CONSOLE_FALLBACK", "true")
+
+        cfg = load_config()
+
+        assert cfg.telemetry.console_fallback is True
+
+    def test_unset_env_var_leaves_toml_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unset env vars do not affect TOML values."""
+        toml = dedent("""\
+            [storage]
+            archive_dir = "/archive/original"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.delenv("INFLUX_ARCHIVE_DIR", raising=False)
+
+        cfg = load_config()
+
+        assert cfg.storage.archive_dir == "/archive/original"
+
+    def test_env_overrides_create_section_when_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Env override works even if the target section is missing in TOML."""
+        config_path = _write_config(tmp_path)  # minimal TOML — no [storage]
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.setenv("INFLUX_ARCHIVE_DIR", "/env-only-archive")
+
+        cfg = load_config()
+
+        assert cfg.storage.archive_dir == "/env-only-archive"
+
+    def test_bool_env_false_values(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bool env vars with false-like values are parsed as False."""
+        toml = dedent("""\
+            [telemetry]
+            enabled = true
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "false")
+
+        cfg = load_config()
+
+        assert cfg.telemetry.enabled is False
