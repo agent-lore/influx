@@ -16,6 +16,8 @@
 - FastAPI TestClient (sync) works for most tests; scheduler start requires `async def` test (needs event loop)
 - Ruff UP017: use `datetime.UTC` alias instead of `datetime.timezone.utc`
 - POST /runs uses Pydantic `model_validator(mode="after")` for exactly-one-of validation — FastAPI auto-returns 422 on failure
+- `BackfillRequest` uses Pydantic `Field(alias="from")` for reserved-word JSON keys; needs `populate_by_name=True` in `model_config`
+- `_backfill_estimate_override` module-level var in `http_api.py` is the test hook for forcing estimator values — use `monkeypatch.setattr`
 - Background task via `asyncio.get_event_loop().create_task()` — acquires lock before responding 202, releases in background after `run_profile`
 - To test 409 overlap with sync TestClient, pre-acquire the lock via `asyncio.new_event_loop()` or use `async def` test
 
@@ -114,4 +116,24 @@ Started: Fri Apr 24 14:02:16 UTC 2026
   - `asyncio.get_event_loop().create_task()` works in FastAPI async handlers for fire-and-forget background work
   - To test 409 with sync TestClient, use `asyncio.new_event_loop().run_until_complete(coordinator.try_acquire(...))` or `async def` test
   - All 220 tests pass (9 new POST /runs + 211 existing)
+---
+
+## 2026-04-24 - US-006
+- Implemented `POST /backfills` endpoint with stub estimator and confirm-required flow
+- `BackfillRequest` Pydantic model validates exactly one of `profile`/`all_profiles` + exactly one of `days`/(`from`, `to`)
+- Stub estimator returns 0 by default; `_backfill_estimate_override` module-level var allows test-only forcing
+- When `estimated_items > 1000` and `confirm` is not truthy → 400 + `{reason: "confirm_required", estimated_items: N}`
+- When `confirm=true` or estimate ≤ 1000 → 202 accepted
+- Single-profile path acquires coordinator lock (same as runs, AC-M3-7)
+- `all_profiles` path accepts but defers multi-profile execution to PRD 09
+- `_run_and_release` updated to pass `run_range` to `run_profile` for backfill context
+- Files changed:
+  - src/influx/http_api.py (added BackfillRequest, estimate_backfill_items, POST /backfills, updated _run_and_release)
+  - tests/integration/test_http_api.py (added 14 tests: happy paths, validation, confirm-required, overlap AC-M3-7)
+  - scripts/ralph/prd.json (US-006 passes: true)
+- **Learnings for future iterations:**
+  - Pydantic `Field(alias="from")` handles reserved-word JSON keys; requires `model_config = {"populate_by_name": True}` for both alias and field name access
+  - Pydantic `Field` must be explicitly imported — not included in the `BaseModel, model_validator` import line by default
+  - Module-level `_backfill_estimate_override` + `monkeypatch.setattr` is a clean test hook pattern for stub estimators
+  - All 234 tests pass (14 new POST /backfills + 220 existing)
 ---

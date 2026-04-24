@@ -6,6 +6,9 @@ fresh probes per request (FR-HTTP-7).
 
 ``POST /runs`` accepts manual run requests with coordinator-based
 overlap protection (FR-HTTP-4, FR-SCHED-3).
+
+``POST /backfills`` accepts backfill requests with a stub estimator
+and confirm-required flow (FR-HTTP-5).
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 import influx
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
@@ -194,10 +197,182 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
 
 
 async def _run_and_release(
-    coordinator: Coordinator, profile: str, kind: RunKind
+    coordinator: Coordinator,
+    profile: str,
+    kind: RunKind,
+    run_range: dict[str, str | int] | None = None,
 ) -> None:
     """Run ``run_profile`` and release the coordinator lock afterward."""
     try:
-        await run_profile(profile, kind)
+        await run_profile(profile, kind, run_range=run_range)
     finally:
         coordinator.release(profile)
+
+
+# ── POST /backfills ────────────────────────────────────────────────
+
+# Stub backfill estimator — returns 0 by default.  PRD 09 replaces
+# the body with the naive ``days × categories × avg_results`` formula.
+# Override ``_backfill_estimate_override`` in tests to force a value > 1000.
+_backfill_estimate_override: int | None = None
+
+
+def estimate_backfill_items(
+    profile: str,
+    days: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> int:
+    """Return the estimated number of items a backfill would produce.
+
+    This is a **constant stub** in PRD 03.  By default it returns ``0``.
+    Set :data:`_backfill_estimate_override` to force a specific value
+    for testing the confirm-required flow.
+
+    PRD 09 replaces the body with the ``days × categories × avg_results``
+    formula.
+    """
+    if _backfill_estimate_override is not None:
+        return _backfill_estimate_override
+    return 0
+
+
+class BackfillRequest(BaseModel):
+    """Request body for ``POST /backfills`` (FR-HTTP-5)."""
+
+    profile: str | None = None
+    all_profiles: bool | None = None
+    days: int | None = None
+    date_from: str | None = Field(None, alias="from")
+    date_to: str | None = Field(None, alias="to")
+    confirm: bool | None = None
+
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def _validate_scope_and_range(self) -> BackfillRequest:
+        # Exactly one of profile / all_profiles.
+        has_profile = self.profile is not None
+        has_all = self.all_profiles is not None and self.all_profiles
+        if has_profile and has_all:
+            raise ValueError(
+                "Supply exactly one of 'profile' or 'all_profiles', not both"
+            )
+        if not has_profile and not has_all:
+            raise ValueError(
+                "Supply exactly one of 'profile' or 'all_profiles'"
+            )
+
+        # Exactly one of days / (from, to).
+        has_days = self.days is not None
+        has_range = self.date_from is not None or self.date_to is not None
+        if has_days and has_range:
+            raise ValueError(
+                "Supply exactly one of 'days' or ('from', 'to'), not both"
+            )
+        if not has_days and not has_range:
+            raise ValueError(
+                "Supply exactly one of 'days' or ('from', 'to')"
+            )
+        if has_range and (self.date_from is None or self.date_to is None):
+            raise ValueError(
+                "Both 'from' and 'to' are required when using date range"
+            )
+        return self
+
+
+@router.post("/backfills")
+async def post_backfills(body: BackfillRequest, request: Request) -> JSONResponse:
+    """Accept a backfill request (FR-HTTP-5).
+
+    Uses a stub estimator (replaced by PRD 09).  When the estimate
+    exceeds 1000 and ``confirm`` is not truthy, returns ``400`` with
+    ``reason="confirm_required"`` so the CLI can reprompt the operator.
+
+    Backfills go through the same coordinator as scheduled and manual
+    runs, ensuring non-overlap for the same profile (AC-M3-7).
+    """
+    from influx.config import AppConfig
+
+    coordinator: Coordinator = request.app.state.coordinator
+    config: AppConfig = request.app.state.config
+
+    request_id = str(uuid.uuid4())
+    submitted_at = datetime.now(UTC).isoformat()
+
+    # Build the run_range dict for run_profile.
+    run_range: dict[str, str | int] = {}
+    if body.days is not None:
+        run_range["days"] = body.days
+    else:
+        assert body.date_from is not None and body.date_to is not None
+        run_range["from"] = body.date_from
+        run_range["to"] = body.date_to
+
+    # Determine scope label.
+    scope = body.profile if body.profile is not None else "all"
+
+    # Check the stub estimator for confirm-required flow.
+    estimated = estimate_backfill_items(
+        profile=scope,
+        days=body.days,
+        date_from=body.date_from,
+        date_to=body.date_to,
+    )
+    if estimated > 1000 and not body.confirm:
+        return JSONResponse(
+            {
+                "reason": "confirm_required",
+                "estimated_items": estimated,
+            },
+            status_code=400,
+        )
+
+    if body.profile is not None:
+        # Validate the profile name exists in config.
+        known = {p.name for p in config.profiles}
+        if body.profile not in known:
+            return JSONResponse(
+                {"detail": f"Unknown profile: {body.profile!r}"},
+                status_code=422,
+            )
+
+        try:
+            acquired = await coordinator.try_acquire(body.profile)
+            if not acquired:
+                raise ProfileBusyError(body.profile)
+        except ProfileBusyError:
+            return JSONResponse(
+                {"reason": "profile_busy", "profile": body.profile},
+                status_code=409,
+            )
+
+        # Launch the backfill in the background.
+        asyncio.get_event_loop().create_task(
+            _run_and_release(
+                coordinator, body.profile, RunKind.BACKFILL, run_range
+            )
+        )
+
+        return JSONResponse(
+            {
+                "status": "accepted",
+                "request_id": request_id,
+                "kind": "backfill",
+                "scope": body.profile,
+                "submitted_at": submitted_at,
+            },
+            status_code=202,
+        )
+
+    # all_profiles path — accept but defer multi-profile execution to PRD 09.
+    return JSONResponse(
+        {
+            "status": "accepted",
+            "request_id": request_id,
+            "kind": "backfill",
+            "scope": "all",
+            "submitted_at": submitted_at,
+        },
+        status_code=202,
+    )

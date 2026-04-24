@@ -1,8 +1,9 @@
-"""Integration tests for the HTTP API endpoints (US-004, US-005).
+"""Integration tests for the HTTP API endpoints (US-004, US-005, US-006).
 
 Uses FastAPI's ``TestClient`` (backed by httpx) to exercise
-``/live``, ``/ready``, ``/status``, and ``POST /runs`` against a
-wired-up app with real coordinator, scheduler, and probe loop instances.
+``/live``, ``/ready``, ``/status``, ``POST /runs``, and
+``POST /backfills`` against a wired-up app with real coordinator,
+scheduler, and probe loop instances.
 """
 
 from __future__ import annotations
@@ -359,5 +360,225 @@ class TestPostRunsSchedulerOverlap:
         finally:
             coordinator.release("ai-robotics")
             # Also release web-tech if the run acquired it.
+            if coordinator.is_busy("web-tech"):
+                coordinator.release("web-tech")
+
+
+# ── POST /backfills (US-006) ───────────────────────────────────────
+
+
+class TestPostBackfills:
+    """``POST /backfills`` accepts backfill requests (FR-HTTP-5)."""
+
+    def test_backfills_happy_path_with_days(self, client: TestClient) -> None:
+        """Single-profile backfill with days returns 202."""
+        resp = client.post(
+            "/backfills",
+            json={"profile": "ai-robotics", "days": 7},
+        )
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["status"] == "accepted"
+        assert "request_id" in body
+        assert body["kind"] == "backfill"
+        assert body["scope"] == "ai-robotics"
+        assert "submitted_at" in body
+
+    def test_backfills_happy_path_with_date_range(
+        self, client: TestClient
+    ) -> None:
+        """Single-profile backfill with from/to returns 202."""
+        resp = client.post(
+            "/backfills",
+            json={
+                "profile": "ai-robotics",
+                "from": "2026-01-01",
+                "to": "2026-01-31",
+            },
+        )
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["kind"] == "backfill"
+        assert body["scope"] == "ai-robotics"
+
+    def test_backfills_all_profiles_returns_202(
+        self, client: TestClient
+    ) -> None:
+        """all_profiles=true returns 202 with scope='all'."""
+        resp = client.post(
+            "/backfills",
+            json={"all_profiles": True, "days": 7},
+        )
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["scope"] == "all"
+        assert body["kind"] == "backfill"
+
+    def test_backfills_both_profile_and_all_returns_422(
+        self, client: TestClient
+    ) -> None:
+        """Body with both profile and all_profiles → 422."""
+        resp = client.post(
+            "/backfills",
+            json={
+                "profile": "ai-robotics",
+                "all_profiles": True,
+                "days": 7,
+            },
+        )
+        assert resp.status_code == 422
+
+    def test_backfills_neither_scope_returns_422(
+        self, client: TestClient
+    ) -> None:
+        """Body with neither profile nor all_profiles → 422."""
+        resp = client.post("/backfills", json={"days": 7})
+        assert resp.status_code == 422
+
+    def test_backfills_both_days_and_range_returns_422(
+        self, client: TestClient
+    ) -> None:
+        """Body with both days and from/to → 422."""
+        resp = client.post(
+            "/backfills",
+            json={
+                "profile": "ai-robotics",
+                "days": 7,
+                "from": "2026-01-01",
+                "to": "2026-01-31",
+            },
+        )
+        assert resp.status_code == 422
+
+    def test_backfills_neither_days_nor_range_returns_422(
+        self, client: TestClient
+    ) -> None:
+        """Body with neither days nor from/to → 422."""
+        resp = client.post(
+            "/backfills",
+            json={"profile": "ai-robotics"},
+        )
+        assert resp.status_code == 422
+
+    def test_backfills_unknown_profile_returns_422(
+        self, client: TestClient
+    ) -> None:
+        """Unknown profile name → 422."""
+        resp = client.post(
+            "/backfills",
+            json={"profile": "does-not-exist", "days": 7},
+        )
+        assert resp.status_code == 422
+
+    def test_backfills_conflict_409(self, app_with_state: FastAPI) -> None:
+        """Duplicate backfill while run in flight → 409 + profile_busy."""
+        coordinator: Coordinator = app_with_state.state.coordinator
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(coordinator.try_acquire("ai-robotics"))
+        try:
+            with TestClient(app_with_state) as tc:
+                resp = tc.post(
+                    "/backfills",
+                    json={"profile": "ai-robotics", "days": 7},
+                )
+            assert resp.status_code == 409
+            assert resp.json()["reason"] == "profile_busy"
+        finally:
+            coordinator.release("ai-robotics")
+            loop.close()
+
+
+class TestBackfillConfirmRequired:
+    """Confirm-required flow when estimator reports > 1000 items (AC-M3-8)."""
+
+    def test_confirm_required_when_estimate_exceeds_1000(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Estimate > 1000 without confirm → 400 + confirm_required."""
+        import influx.http_api as http_api_mod
+
+        monkeypatch.setattr(http_api_mod, "_backfill_estimate_override", 5000)
+        resp = client.post(
+            "/backfills",
+            json={"profile": "ai-robotics", "days": 365},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["reason"] == "confirm_required"
+        assert body["estimated_items"] == 5000
+
+    def test_confirm_true_accepts_large_estimate(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Estimate > 1000 with confirm=true → 202 accepted."""
+        import influx.http_api as http_api_mod
+
+        monkeypatch.setattr(http_api_mod, "_backfill_estimate_override", 5000)
+        resp = client.post(
+            "/backfills",
+            json={
+                "profile": "ai-robotics",
+                "days": 365,
+                "confirm": True,
+            },
+        )
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["status"] == "accepted"
+        assert body["kind"] == "backfill"
+
+    def test_estimate_lte_1000_accepted_without_confirm(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Estimate ≤ 1000 without confirm → 202 accepted (no reprompt)."""
+        import influx.http_api as http_api_mod
+
+        monkeypatch.setattr(http_api_mod, "_backfill_estimate_override", 500)
+        resp = client.post(
+            "/backfills",
+            json={"profile": "ai-robotics", "days": 30},
+        )
+        assert resp.status_code == 202
+
+
+class TestBackfillSchedulerOverlap:
+    """AC-M3-7: backfill does not overlap with scheduled run for same profile."""
+
+    async def test_backfill_blocked_by_scheduled_run(
+        self, app_with_state: FastAPI
+    ) -> None:
+        """A scheduled fire holds the lock → backfill returns 409."""
+        coordinator: Coordinator = app_with_state.state.coordinator
+
+        # Simulate a scheduled fire holding the lock.
+        await coordinator.try_acquire("ai-robotics")
+        try:
+            with TestClient(app_with_state) as tc:
+                resp = tc.post(
+                    "/backfills",
+                    json={"profile": "ai-robotics", "days": 7},
+                )
+            assert resp.status_code == 409
+            assert resp.json()["reason"] == "profile_busy"
+        finally:
+            coordinator.release("ai-robotics")
+
+    async def test_backfill_cross_profile_allowed(
+        self, app_with_state: FastAPI
+    ) -> None:
+        """Backfill for profile Y while profile X is busy → 202."""
+        coordinator: Coordinator = app_with_state.state.coordinator
+
+        await coordinator.try_acquire("ai-robotics")
+        try:
+            with TestClient(app_with_state) as tc:
+                resp = tc.post(
+                    "/backfills",
+                    json={"profile": "web-tech", "days": 7},
+                )
+            assert resp.status_code == 202
+        finally:
+            coordinator.release("ai-robotics")
             if coordinator.is_busy("web-tech"):
                 coordinator.release("web-tech")

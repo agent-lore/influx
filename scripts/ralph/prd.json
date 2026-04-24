@@ -95,7 +95,7 @@
         "Tests in tests/integration/test_http_api.py cover: confirm-required path when estimator is forced > 1000 and `--confirm` is not set (AC-M3-8); acceptance path when `confirm=true` is supplied; acceptance path when estimate ≤ 1000 without `confirm`; AC-M3-7 — backfill for profile X does not overlap with a scheduled run for profile X"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
