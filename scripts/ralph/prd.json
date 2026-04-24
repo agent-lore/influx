@@ -64,7 +64,7 @@
         "tests/integration/test_http_api.py (FastAPI TestClient or httpx) covers: `/live` returns 200 under normal conditions; `/ready` returns 200 + `{\"ready\": true}` when probes pass and `503` when they fail; `/status` returns the documented body shape; and AC-03-C — with `INFLUX_TEST_LITHOS_DOWN=1`, within one probe cycle `/ready` returns `503` and `/status.status == \"degraded\"`"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

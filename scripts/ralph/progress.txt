@@ -12,6 +12,9 @@
 - `run_profile(profile, kind, run_range)` is the stub seam — PRDs 04/06/09 replace the body
 - In `_make_config` helpers, use `if x is not None` instead of `x or default` — empty list is falsy in Python
 - APScheduler 3.x `AsyncIOScheduler` needs a running event loop — make registration tests async
+- HTTP API router in `src/influx/http_api.py` — dependencies stored on `app.state` (config, coordinator, scheduler, probe_loop)
+- FastAPI TestClient (sync) works for most tests; scheduler start requires `async def` test (needs event loop)
+- Ruff UP017: use `datetime.UTC` alias instead of `datetime.timezone.utc`
 
 # Ralph Progress Log
 Started: Fri Apr 24 14:02:16 UTC 2026
@@ -68,4 +71,25 @@ Started: Fri Apr 24 14:02:16 UTC 2026
   - APScheduler needs to be installed into the `.venv` site-packages for pyright to resolve imports
   - `_make_config(profiles=[])` fails with `or` fallback — empty list is falsy; use `is not None` check
   - All 198 tests pass (11 new scheduler + 187 existing)
+---
+
+## 2026-04-24 - US-004
+- Implemented `/live`, `/ready`, and `/status` FastAPI endpoints reading cached probe state
+- Created `src/influx/http_api.py` with `router` exposing GET /live, GET /ready, GET /status
+- All endpoints read cached state from `app.state` — never trigger fresh probes per request (FR-HTTP-7)
+- `/live` returns 200 + `{"live": true}` (FR-HTTP-1)
+- `/ready` returns 200 + `{"ready": true}` or 503 + `{"ready": false}` based on probe state (FR-HTTP-2)
+- `/status` returns 200 with full structured body: status, ready, version, dependencies, profiles (FR-HTTP-3)
+- Files changed:
+  - src/influx/http_api.py (new: router with /live, /ready, /status)
+  - tests/integration/__init__.py (new: empty package init)
+  - tests/integration/test_http_api.py (new: 13 tests covering all ACs + AC-03-C degraded state)
+  - scripts/ralph/prd.json (US-004 passes: true)
+- **Learnings for future iterations:**
+  - FastAPI dependencies via `app.state` — set config, coordinator, scheduler, probe_loop before including router
+  - `TestClient` is sync (httpx-backed); scheduler.start() needs async test since AsyncIOScheduler requires running event loop
+  - Ruff UP017 enforces `datetime.UTC` over `datetime.timezone.utc`
+  - Ruff B007 catches unused loop variables — use `_name` prefix
+  - `.venv` symlinks may break if pyenv python is unavailable — recreate with `python -m venv .venv --clear`
+  - All 211 tests pass (13 new HTTP API + 198 existing)
 ---
