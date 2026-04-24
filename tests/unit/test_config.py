@@ -364,3 +364,193 @@ class TestEnvVarOverrides:
         cfg = load_config()
 
         assert cfg.telemetry.enabled is False
+
+
+# ── Profile, RSS, and provider validations (US-007) ─────────────────
+
+
+class TestProfileNameValidation:
+    """Profile names must match ^[a-z][a-z0-9-]{0,31}$ (FR-CFG-4, AC-M1-2)."""
+
+    def test_invalid_profile_name_uppercase_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Uppercase profile name raises ConfigError naming the profile."""
+        toml = dedent("""\
+            [[profiles]]
+            name = "MyProfile"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        with pytest.raises(ConfigError, match="MyProfile"):
+            load_config()
+
+    def test_invalid_profile_name_starts_with_digit_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Profile name starting with a digit raises ConfigError."""
+        toml = dedent("""\
+            [[profiles]]
+            name = "123abc"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        with pytest.raises(ConfigError, match="123abc"):
+            load_config()
+
+    def test_valid_profile_name_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A well-formed profile name passes validation."""
+        toml = dedent("""\
+            [[profiles]]
+            name = "ai-research"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        assert cfg.profiles[0].name == "ai-research"
+
+
+class TestRssSourceTagValidation:
+    """RSS source_tag must be present and exactly 'rss' or 'blog'."""
+
+    def test_missing_source_tag_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing source_tag on RSS entry raises ConfigError (AC-01-C)."""
+        toml = dedent("""\
+            [[profiles]]
+            name = "test-profile"
+
+            [[profiles.sources.rss]]
+            name = "Test Feed"
+            url = "https://example.com/feed.xml"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        with pytest.raises(ConfigError):
+            load_config()
+
+    def test_invalid_source_tag_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """source_tag='web' raises ConfigError (AC-01-D)."""
+        toml = dedent("""\
+            [[profiles]]
+            name = "test-profile"
+
+            [[profiles.sources.rss]]
+            name = "Test Feed"
+            url = "https://example.com/feed.xml"
+            source_tag = "web"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        with pytest.raises(ConfigError):
+            load_config()
+
+
+class TestProviderApiKeyEnvValidation:
+    """Provider api_key_env validation (FR-CFG-8, AC-01-E)."""
+
+    def test_missing_api_key_env_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unset api_key_env env var raises ConfigError (AC-01-E)."""
+        toml = dedent("""\
+            [providers.openai]
+            base_url = "https://api.openai.com/v1"
+            api_key_env = "OPENAI_API_KEY"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
+            load_config()
+
+    def test_keyless_provider_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """api_key_env='' skips the env check (keyless providers like Ollama)."""
+        toml = dedent("""\
+            [providers.ollama]
+            base_url = "http://localhost:11434"
+            api_key_env = ""
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        assert cfg.providers["ollama"].api_key_env == ""

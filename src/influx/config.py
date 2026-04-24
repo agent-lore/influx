@@ -9,6 +9,7 @@ pydantic, and returns a typed ``AppConfig``.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Any, Literal
@@ -174,6 +175,9 @@ class ProfileSources(BaseModel):
     rss: list[RssSourceEntry] = Field(default_factory=list)
 
 
+_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+
+
 class ProfileConfig(BaseModel):
     """``[[profiles]]`` one interest profile."""
 
@@ -181,6 +185,16 @@ class ProfileConfig(BaseModel):
     description: str = ""
     thresholds: ProfileThresholds = Field(default_factory=ProfileThresholds)
     sources: ProfileSources = Field(default_factory=ProfileSources)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_profile_name(cls, v: str) -> str:
+        if not _PROFILE_NAME_RE.match(v):
+            raise ConfigError(
+                f"Profile name {v!r} is invalid; "
+                r"must match ^[a-z][a-z0-9-]{0,31}$"
+            )
+        return v
 
 
 # ── Providers & Models ───────────────────────────────────────────────
@@ -412,6 +426,22 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _validate_provider_api_keys(cfg: AppConfig) -> None:
+    """Validate that provider api_key_env vars are set in the environment.
+
+    For every configured ``[providers.*]`` block, if ``api_key_env`` is
+    non-empty the named env var must be set and non-empty (FR-CFG-8,
+    AC-01-E).  ``api_key_env = ''`` skips the check (keyless providers
+    like Ollama).
+    """
+    for name, provider in cfg.providers.items():
+        if provider.api_key_env and not os.environ.get(provider.api_key_env):
+            raise ConfigError(
+                f"Provider {name!r}: api_key_env={provider.api_key_env!r} "
+                "is not set or empty in the environment"
+            )
+
+
 def load_config(path: Path | None = None) -> AppConfig:
     """Load, validate, and return the v0.7 ``AppConfig``.
 
@@ -433,6 +463,10 @@ def load_config(path: Path | None = None) -> AppConfig:
     _apply_env_overrides(raw)
 
     try:
-        return AppConfig.model_validate(raw)
+        cfg = AppConfig.model_validate(raw)
     except ValidationError as exc:
         raise ConfigError(f"{config_path}: {exc}") from exc
+
+    _validate_provider_api_keys(cfg)
+
+    return cfg
