@@ -35,6 +35,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Load influx.toml, validate, and print the effective config.",
     )
 
+    # FR-CLI-6: migrate-notes
+    sub.add_parser(
+        "migrate-notes",
+        help="Print the current note schema version and exit.",
+    )
+
     # FR-CLI-2: serve takes no flags
     sub.add_parser(
         "serve",
@@ -96,6 +102,12 @@ def _cmd_validate_config() -> None:
     print(config.model_dump_json(indent=2))
 
 
+def _cmd_migrate_notes() -> None:
+    """Print the current note_schema_version from config and exit 0."""
+    config = load_config()
+    print(f"note_schema_version: {config.influx.note_schema_version}")
+
+
 def _cmd_serve_stub() -> None:
     """Stub handler for serve; replaced by PRD 03."""
     print("[stub] serve not wired yet", file=sys.stderr)
@@ -120,6 +132,15 @@ def _cmd_backfill_stub(args: argparse.Namespace) -> None:
     sys.exit(EXIT_USAGE)
 
 
+_KNOWN_COMMANDS = frozenset({
+    "validate-config",
+    "migrate-notes",
+    "serve",
+    "run",
+    "backfill",
+})
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI dispatcher.
 
@@ -129,6 +150,20 @@ def main(argv: list[str] | None = None) -> None:
         Argument list for testing; defaults to ``sys.argv[1:]``.
     """
     parser = _build_parser()
+
+    # Intercept unknown subcommands before argparse (which exits 2).
+    effective_argv = argv if argv is not None else sys.argv[1:]
+    if (
+        effective_argv
+        and not effective_argv[0].startswith("-")
+        and effective_argv[0] not in _KNOWN_COMMANDS
+    ):
+        print(
+            f"influx: unknown command {effective_argv[0]!r}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_USAGE)
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -138,6 +173,8 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if args.command == "validate-config":
             _cmd_validate_config()
+        elif args.command == "migrate-notes":
+            _cmd_migrate_notes()
         elif args.command == "serve":
             _cmd_serve_stub()
         elif args.command == "run":

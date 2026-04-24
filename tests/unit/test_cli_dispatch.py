@@ -1,10 +1,10 @@
-"""Tests for the v1 CLI argparse surface: serve, run, backfill stubs."""
+"""Tests for the v1 CLI argparse surface and exit-code policy."""
 
 from __future__ import annotations
 
 import pytest
 
-from influx.main import EXIT_USAGE, main
+from influx.main import EXIT_SUCCESS, EXIT_USAGE, main
 
 
 class TestServeSubcommand:
@@ -104,3 +104,85 @@ class TestValidateConfigUnchanged:
 
         captured = capsys.readouterr()
         assert captured.out.strip().startswith("{")
+
+
+class TestMigrateNotes:
+    """AC-02-F: migrate-notes prints note_schema_version and exits 0."""
+
+    def test_migrate_notes_prints_version_and_exits_0(
+        self,
+        influx_config_env: object,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        main(["migrate-notes"])
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "note_schema_version: 1"
+
+    def test_migrate_notes_uses_config_value(
+        self,
+        tmp_path: object,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """migrate-notes reads note_schema_version from config."""
+        from pathlib import Path
+        from textwrap import dedent
+
+        config_path = Path(str(tmp_path)) / "influx.toml"
+        config_path.write_text(dedent("""\
+            [influx]
+            note_schema_version = 42
+
+            [prompts.filter]
+            text = "f"
+            [prompts.tier1_enrich]
+            text = "e"
+            [prompts.tier3_extract]
+            text = "x"
+        """))
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        main(["migrate-notes"])
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "note_schema_version: 42"
+
+
+class TestUnknownSubcommand:
+    """AC-02-E: unknown subcommand exits 64."""
+
+    def test_unknown_subcommand_exits_64(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["foobar"])
+
+        assert exc_info.value.code == EXIT_USAGE
+        captured = capsys.readouterr()
+        assert "unknown command" in captured.err.lower()
+
+    def test_another_unknown_exits_64(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["deploy"])
+
+        assert exc_info.value.code == EXIT_USAGE
+
+
+class TestNoSubcommand:
+    """AC-X-5 regression: no subcommand prints help and exits non-zero."""
+
+    def test_no_args_prints_help_and_exits_nonzero(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main([])
+
+        assert exc_info.value.code != EXIT_SUCCESS
+        captured = capsys.readouterr()
+        assert "usage" in captured.err.lower() or "influx" in captured.err.lower()

@@ -17,6 +17,8 @@ Started: Fri Apr 24 11:54:09 UTC 2026
 - CLI exit codes: EXIT_SUCCESS=0, EXIT_PARTIAL=1, EXIT_FAILURE=2, EXIT_USAGE=64 (named constants in main.py)
 - Stub handlers print `[stub] <cmd> not wired yet` to stderr and `sys.exit(EXIT_USAGE)`
 - argparse `dest="from_date"` / `dest="to_date"` used for `--from` / `--to` to avoid Python keyword conflicts
+- Unknown subcommands: intercepted before `parse_args` using `_KNOWN_COMMANDS` frozenset (argparse exits 2, we want 64)
+- migrate-notes handler loads config via `load_config()` and reads `config.influx.note_schema_version`
 
 ---
 
@@ -108,4 +110,18 @@ Started: Fri Apr 24 11:54:09 UTC 2026
   - Use `dest="from_date"` for `--from` flag since `from` is a Python keyword
   - Stub handlers should print to stderr, not stdout, to avoid polluting piped output
   - Full test suite is now 147 tests
+---
+
+## 2026-04-24 - US-007
+- Added migrate-notes subcommand to argparse surface in src/influx/main.py
+- Handler `_cmd_migrate_notes()` loads config, prints `note_schema_version: <N>`, exits 0
+- Unknown subcommand handling: pre-parse check against `_KNOWN_COMMANDS` frozenset exits 64 (argparse's own error would exit 2)
+- No-subcommand (AC-X-5) regression preserved: prints help to stderr, exits 64
+- Added 5 new tests: migrate-notes output/exit-0, config-value test, unknown subcommand x2, no-args regression
+- Files changed: src/influx/main.py, tests/unit/test_cli_dispatch.py, scripts/ralph/prd.json
+- **Learnings for future iterations:**
+  - argparse `add_subparsers(dest="command")` silently sets command to None for unknown subcommands but `parse_args` errors with exit 2 — must intercept before `parse_args`
+  - Use `frozenset` for O(1) command lookup in the pre-parse check
+  - For tests needing a custom config value, create a minimal TOML with just the needed section + required `[prompts]`
+  - Full test suite is now 152 tests
 ---
