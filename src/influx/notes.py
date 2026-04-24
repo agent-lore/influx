@@ -30,7 +30,9 @@ __all__ = [
     "NoteParseError",
     "ParsedNote",
     "ParsedSection",
+    "merge_tags",
     "parse_note",
+    "recompute_confidence",
 ]
 
 # ── Exceptions ───────────────────────────────────────────────────────
@@ -199,3 +201,115 @@ def _split_sections(body: str) -> tuple[list[ParsedSection], str | None]:
         sections.append(ParsedSection(heading=heading, body=section_body))
 
     return sections, user_notes
+
+
+# ── Tag-merging (FR-NOTE-5/6/7/8) ──────────────────────────────────
+
+# Prefixes whose existing tags are fully replaced by new Influx tags.
+_INFLUX_OWNED_PREFIXES: tuple[str, ...] = (
+    "source:",
+    "arxiv-id:",
+    "cat:",
+    "text:",
+    "ingested-by:",
+    "schema:",
+)
+
+# Exact tag values that are fully replaced on rewrite.
+_INFLUX_OWNED_EXACT: frozenset[str] = frozenset(
+    {
+        "full-text",
+        "influx:repair-needed",
+        "influx:archive-missing",
+        "influx:deep-extracted",
+        "influx:text-terminal",
+    }
+)
+
+
+def _is_influx_owned(tag: str) -> bool:
+    """Return True if *tag* is Influx-owned (replaced on rewrite)."""
+    for prefix in _INFLUX_OWNED_PREFIXES:
+        if tag.startswith(prefix):
+            return True
+    return tag in _INFLUX_OWNED_EXACT
+
+
+def merge_tags(
+    *,
+    existing_tags: list[str],
+    new_tags: list[str],
+) -> list[str]:
+    """Compute the final tag set for a note rewrite (FR-NOTE-5/6/7/8).
+
+    Parameters
+    ----------
+    existing_tags:
+        Tags currently on the note (from parsed frontmatter).
+    new_tags:
+        Newly-computed Influx-owned tags for this rewrite cycle.
+
+    Returns
+    -------
+    list[str]
+        The merged tag list: Influx-owned tags fully replaced by
+        *new_tags*, ``profile:*`` tags union-merged (with rejection
+        guard), and external tags preserved verbatim.
+    """
+    # Collect influx:rejected:<profile> guards from both sets
+    rejected_profiles: set[str] = set()
+    for tag in (*existing_tags, *new_tags):
+        if tag.startswith("influx:rejected:"):
+            rejected_profiles.add(tag[len("influx:rejected:") :])
+
+    # 1. External tags: not Influx-owned and not profile:*
+    external = [
+        t
+        for t in existing_tags
+        if not _is_influx_owned(t)
+        and not t.startswith("profile:")
+        and not t.startswith("influx:rejected:")
+    ]
+
+    # 2. Influx-owned tags: fully replaced by new_tags
+    influx_owned = [
+        t for t in new_tags if _is_influx_owned(t)
+    ]
+
+    # 3. profile:* union merge with rejection guard (FR-NOTE-6)
+    existing_profiles = {
+        t for t in existing_tags if t.startswith("profile:")
+    }
+    new_profiles = {
+        t for t in new_tags if t.startswith("profile:")
+    }
+    union_profiles = existing_profiles | new_profiles
+    # Remove profiles that have been rejected
+    guarded_profiles = sorted(
+        t
+        for t in union_profiles
+        if t[len("profile:") :] not in rejected_profiles
+    )
+
+    # 4. Rejection tags: preserve from both sets
+    rejection_tags = sorted(
+        {
+            t
+            for t in (*existing_tags, *new_tags)
+            if t.startswith("influx:rejected:")
+        }
+    )
+
+    return influx_owned + guarded_profiles + rejection_tags + external
+
+
+def recompute_confidence(
+    *,
+    existing_confidence: float,
+    current_max_score: int,
+) -> float:
+    """Compute the rewrite confidence value (FR-NOTE-8).
+
+    Returns ``max(existing_confidence, current_max_score / 10.0)``.
+    """
+    return max(existing_confidence, current_max_score / 10.0)

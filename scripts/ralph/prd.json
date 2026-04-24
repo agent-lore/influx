@@ -1,19 +1,19 @@
 {
-  "project": "Influx v1 — HTTP API, Probe Cache, Scheduler, Execution Coordinator",
-  "branchName": "ralph/03-http-api-scheduler",
-  "description": "Deliver the long-running `python -m influx serve` surface for Influx v1: a FastAPI/Starlette ASGI app exposing `/live`, `/ready`, `/status`, `POST /runs`, and `POST /backfills` (bound to 127.0.0.1 by default); an in-process APScheduler with `max_instances=1`, `coalesce=True`, and `misfire_grace_time=schedule.misfire_grace_seconds`; a per-profile execution coordinator that enforces non-overlap across scheduled, manual, and backfill work and allows cross-profile parallelism; a background probe loop (≥30s cadence) that caches Lithos reachability (stubbed until PRD 05) and LLM-credential presence so `/ready` and `/status` never issue fresh probes per request; a defensive local-admin bind guard that refuses non-loopback bind hosts unless `security.allow_remote_admin = true`; and CLI wiring that makes `serve` start the full service and makes `run`/`backfill` real clients of `/runs` and `/backfills` with the documented exit-code contract. `run_profile()`, the Lithos probe body, the backfill estimator, and the webhook after-run hook remain documented stubs for later PRDs.",
+  "project": "Influx v1 — arXiv Fetcher + Filter Pipeline + Canonical Note Render + Archive",
+  "branchName": "ralph/04-arxiv-filter-notes",
+  "description": "Deliver the arXiv side of the Influx v1 pipeline end-to-end: Atom-feed fetcher against `export.arxiv.org` with client-side date filtering and per-category min-interval pacing; LLM relevance scoring in JSON mode with Pydantic validation and per-profile threshold tagging (relevance / full_text / deep_extract / notify_immediate); canonical Lithos note render+parse with exact-byte `## User Notes` preservation, the `## Archive` section contract, Influx-owned tag replacement, `profile:*` union merging, and preservation of external tags; PDF archive download via the guarded HTTP client from PRD 02 with path-safety verification and the failure path that emits `influx:repair-needed` + `influx:archive-missing` tags; and a real `run_profile` wire-up that calls arXiv → filter → (per accepted item) archive + render note → stubbed `lithos_client.write`. Real MCP calls, the repair sweep, HTML/PDF/article extraction, Tier 2/3 enrichment, webhook notifier, and RSS fetcher are out of scope and remain stubs or seams — `lithos_client.write`, `lithos_client.cache_lookup`, and `enrich.tier1_enrich` are documented stubs replaced by PRDs 05 and 07.",
   "userStories": [
     {
       "id": "US-001",
-      "title": "Add fastapi/uvicorn/apscheduler dependencies and create per-profile execution coordinator",
-      "description": "As a developer, I want fastapi, uvicorn, and apscheduler added to project dependencies and a `src/influx/coordinator.py` module that provides a per-profile in-memory lock manager, so that scheduled fires, `POST /runs`, and `POST /backfills` can all consult a single non-overlap authority that allows cross-profile parallelism while rejecting same-profile overlap.",
+      "title": "Create urls.py with canonical URL normalisation helper",
+      "description": "As a developer, I want a pure URL normalisation helper (in `src/influx/urls.py` or `src/influx/notes.py`, per PRD 04 §5.5) that is reused by both the note renderer and the forthcoming MCP layer (PRD 05), so that arXiv and other sources agree on a single canonical `source_url` shape (FR-MCP-4, FR-MCP-5).",
       "acceptanceCriteria": [
-        "fastapi, uvicorn, and apscheduler are added to project dependencies in pyproject.toml and resolve on install",
-        "src/influx/coordinator.py exposes an execution coordinator that manages per-profile in-memory locks (exact API shape — e.g. acquire/try-acquire/context-manager — left to the implementation)",
-        "Attempting to acquire a lock for a profile that is already held is rejected by the coordinator in a way the HTTP API layer can translate to `409 Conflict` + `reason=\"profile_busy\"` (FR-SCHED-3)",
-        "Two different profiles MAY hold their locks concurrently (cross-profile parallelism is allowed per Q-4 of the master PRD and §5.1 of PRD 03)",
-        "The coordinator is safe to call from both scheduled fires and HTTP request handlers (exact concurrency primitive — asyncio.Lock, threading lock, or equivalent — left to the implementation)",
-        "tests/unit/test_coordinator.py covers: same-profile overlap → reject; cross-profile overlap → allow"
+        "A pure URL normalisation function (exact name, signature, and module location — `src/influx/urls.py` or `src/influx/notes.py` — left to the implementation per FR-MCP-4) lowercases scheme and host, drops default ports (80 for http, 443 for https), strips `utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, and `ref` query parameters, removes a trailing slash on the path, and preserves the fragment verbatim (FR-MCP-4)",
+        "An arXiv-specific helper (or documented convention) constructs the canonical arXiv URL `https://arxiv.org/abs/{id}` from a raw arXiv ID (FR-MCP-5)",
+        "tests/unit/test_url_normalisation.py covers AC-04-H: `https://arXiv.org:443/abs/2601.12345?utm_source=twitter` normalises to `https://arxiv.org/abs/2601.12345`, and a URL with a `#foo` fragment preserves the fragment",
+        "tests/unit/test_url_normalisation.py also covers: mixed-case host lowercased, default port 80 on http stripped, non-default ports (e.g. 8443) preserved, multiple tracking params stripped while unrelated params preserved, trailing slash on path removed, and fragment preserved when query is stripped",
+        "The normaliser leaves unrelated query parameters untouched (only the documented tracking-param allowlist is stripped)",
+        "Typecheck passes"
       ],
       "priority": 1,
       "passes": true,
@@ -21,32 +21,30 @@
     },
     {
       "id": "US-002",
-      "title": "Create background probe loop with cached Lithos + LLM-credentials state",
-      "description": "As a developer, I want `src/influx/probes.py` to run a background probe loop at ≥30s cadence that caches Lithos reachability (stubbed until PRD 05) and LLM-credential presence in memory with timestamps, so that `/ready` and `/status` can read cached state and never issue fresh probes per request (FR-HTTP-7, master PRD §8.7).",
+      "title": "Create schemas.py with FilterResponse and FilterResult Pydantic models",
+      "description": "As a developer, I want `src/influx/schemas.py` to define the Pydantic models used by the filter pipeline so that LLM JSON-mode responses are strictly validated with bounded score/tag lengths (FR-FLT-3).",
       "acceptanceCriteria": [
-        "The LLM-credentials probe records missing provider credentials (an unset `api_key_env` for a configured provider) in its cached probe state, and `/ready` and `/status.status` reflect that cached degraded state (FR-HTTP-7, §5.3 of PRD 03)",
-        "src/influx/probes.py exposes a probe loop and a cached-state accessor that returns the latest probe results with timestamps (exact API shape left to the implementation)",
-        "The probe loop runs at a fixed interval of at least 30 seconds (§5.3 of PRD 03)",
-        "The Lithos probe is a documented stub in this PRD: it returns `ok` by default, and returns a non-`ok` (degraded) result when env var `INFLUX_TEST_LITHOS_DOWN=1` is set (§5.3 of PRD 03, AC-03-C); PRD 05 replaces the stub body with a real MCP reachability check",
-        "The LLM-credentials probe reports on the presence of each configured provider's `api_key_env` environment variable; providers whose `api_key_env` is the empty string are skipped (keyless case, §5.3 of PRD 03); no remote call is made",
-        "Probe failures do NOT toggle `/live`, but DO cause `/ready` to fail and `/status.status` to become `degraded` (the probe module exposes enough state for the HTTP layer to make that decision)",
-        "tests/unit/test_probes.py covers: Lithos stub returns ok by default and degraded under `INFLUX_TEST_LITHOS_DOWN=1`; LLM-credentials probe passes when all configured providers have their `api_key_env` set; providers with `api_key_env=\"\"` are skipped; the probe can be driven into a degraded state (including a missing-key scenario); stale cached probe results time out and are no longer treated as valid (timestamps may be exposed as supporting detail)"
+        "src/influx/schemas.py defines `FilterResult` with fields `id: str`, `score: int` constrained to `1..10` inclusive, `tags: list[str]` constrained to length `0..5` inclusive, and `reason: str` (FR-FLT-3)",
+        "src/influx/schemas.py defines `FilterResponse` with field `results: list[FilterResult]` (FR-FLT-3)",
+        "Validation errors are raised (Pydantic ValidationError) when score is out of `[1,10]`, tags list exceeds length 5, or required fields are missing — a unit test in tests/unit/test_filter.py (or a dedicated tests/unit/test_schemas.py) asserts each negative case",
+        "A positive unit test confirms a well-formed JSON payload parses into `FilterResponse` with correct field types",
+        "Typecheck passes"
       ],
       "priority": 2,
       "passes": true,
-      "notes": "Implementation guidance: the existing startup check in `src/influx/config.py::_validate_provider_api_keys` (and related tests in `tests/unit/test_config.py`) may need to be relaxed so missing provider keys surface through the probe rather than preventing startup; any resulting wording change in `docs/REQUIREMENTS.md` should land in the same change. These are implementation notes, not acceptance criteria."
+      "notes": ""
     },
     {
       "id": "US-003",
-      "title": "Create APScheduler setup with per-job limits and run_profile stub hook",
-      "description": "As a developer, I want `src/influx/scheduler.py` to configure an in-process APScheduler that registers one job per enabled profile with `max_instances=1`, `coalesce=True`, and `misfire_grace_time=schedule.misfire_grace_seconds`, and to route each fire through a documented `run_profile(profile, kind, range)` seam that is a no-op in this PRD, so that later PRDs (04, 06, 09) can fill the body without touching scheduler wiring.",
+      "title": "Create lithos_client.py and enrich.py stub modules with documented replacement notes",
+      "description": "As a developer, I want `src/influx/lithos_client.py` and `src/influx/enrich.py` as documented stubs so that the arXiv flow can call `lithos_client.write`, `lithos_client.cache_lookup`, and `enrich.tier1_enrich` during this PRD while PRDs 05 and 07 swap in real implementations (Definition of Done items in §10 of PRD 04, §4 internal seams).",
       "acceptanceCriteria": [
-        "src/influx/scheduler.py builds an in-process APScheduler and exposes start/stop entry points that the service layer can call",
-        "Each scheduled job is registered with `max_instances=1`, `coalesce=True`, and `misfire_grace_time=schedule.misfire_grace_seconds` (FR-SCHED-2)",
-        "One scheduler job is registered per enabled profile from the loaded config (AC-M1-3 scheduler portion)",
-        "Each fire routes through a `run_profile(profile, kind, range)` hook that is a no-op in this PRD; the module comment/docstring names which downstream PRDs (04, 06, 09) replace the body",
-        "Scheduled fires acquire and release the per-profile lock through the shared coordinator from US-001 around each call to the `run_profile` stub hook, and a same-profile lock conflict observed by a scheduled fire is handled without crashing the scheduler (FR-SCHED-3); exact integration shape is left to the implementation. End-to-end overlap behaviour against manual `POST /runs` work is asserted in US-005 (AC-03-A) and against backfill work in US-006 (AC-M3-7); US-003 is verified in isolation via scheduler-only unit tests of lock acquisition/release",
-        "AC-M3-1 is satisfied — when the scheduler fires for two configured profiles, both fires are executed via the `run_profile` stub hook through the coordinator without same-profile overlap"
+        "src/influx/lithos_client.py exposes `write(...)` that records every call (arguments retained in-process for test assertions) and `cache_lookup(...)` that always returns a \"not cached\" result (exact API shape and recording mechanism left to the implementation)",
+        "src/influx/lithos_client.py module docstring explicitly says \"replaced by PRD 05\"",
+        "src/influx/enrich.py exposes `tier1_enrich(...)` that returns a canned Tier-1-shape result derived from the provided abstract (exact return shape left to the implementation but must be usable by the note renderer's `## Summary` section)",
+        "src/influx/enrich.py module docstring explicitly says \"replaced by PRD 07\"",
+        "A unit test confirms `lithos_client.write` records its calls in a retrievable way and `lithos_client.cache_lookup` returns a \"not cached\" result, and that `enrich.tier1_enrich` returns a non-empty Tier-1 shape for a sample abstract",
+        "Typecheck passes"
       ],
       "priority": 3,
       "passes": true,
@@ -54,14 +52,15 @@
     },
     {
       "id": "US-004",
-      "title": "Implement /live, /ready, and /status endpoints reading cached probe state",
-      "description": "As an operator, I want `src/influx/http_api.py` to expose FastAPI routes for `GET /live`, `GET /ready`, and `GET /status` that read cached probe state (never issue fresh probes per request) and return the structured bodies mandated by FR-HTTP-1..3, so that liveness, readiness, and rich status are observable without toggling operational state per request.",
+      "title": "Implement notes.py parser for frontmatter, title, sections, and User Notes region",
+      "description": "As a developer, I want `src/influx/notes.py` to expose a parser that splits an existing canonical note into frontmatter, title, Influx-owned body sections, and the `## User Notes` region (everything below the heading) so that rewrites can preserve user content byte-identically (FR-NOTE-1, FR-NOTE-4).",
       "acceptanceCriteria": [
-        "src/influx/http_api.py (FastAPI or Starlette router) exposes `GET /live`, `GET /ready`, and `GET /status`",
-        "`GET /live` returns `200 OK` while the process and event loop are alive, `503` otherwise (FR-HTTP-1, AC-M1-4)",
-        "`GET /ready` returns `200 OK` + `{\"ready\": true}` when all cached readiness checks pass, `503` otherwise; the handler reads the cached probe state from US-002 and MUST NOT trigger a fresh probe (FR-HTTP-2, FR-HTTP-7, AC-M1-5)",
-        "`GET /status` always returns `200 OK` while the process can serve requests and returns a JSON body that satisfies FR-HTTP-3 and the §14.4 status contract of `docs/REQUIREMENTS.md`, including at minimum the PRD-mandated subset: `status ∈ {ok, degraded, starting}`, a `profiles.<name>.next_run_at` that is non-null when the profile is enabled and the scheduler is running, `profiles.<name>.last_run_at` and `profiles.<name>.last_run_status`, `dependencies.lithos.status`, `dependencies.llm_credentials.status`, and `version` (from `influx.__version__`) (FR-HTTP-3, AC-M1-6)",
-        "tests/integration/test_http_api.py (FastAPI TestClient or httpx) covers: `/live` returns 200 under normal conditions; `/ready` returns 200 + `{\"ready\": true}` when probes pass and `503` when they fail; `/status` returns the documented body shape; and AC-03-C — with `INFLUX_TEST_LITHOS_DOWN=1`, within one probe cycle `/ready` returns `503` and `/status.status == \"degraded\"`"
+        "src/influx/notes.py exposes a parser (exact API shape and return representation left to the implementation) that, given a note's text, recovers enough state to support the downstream rewrite pipeline: frontmatter (including tags), title, the Influx-owned body sections encountered above `## User Notes` (generic section capture — the concrete `## Archive` parse contract is owned by US-006), and the `## User Notes` region preserved byte-exactly (FR-NOTE-1, FR-NOTE-4)",
+        "When `## User Notes` is absent, the parser signals that absence (e.g. via a dedicated field or sentinel) so the renderer can append an empty one on rewrite (FR-NOTE-4)",
+        "The parser preserves the `## User Notes` region byte-identically — no whitespace stripping, no line-ending normalisation, no trimming",
+        "The parser is tolerant of notes that contain only frontmatter + title + `## User Notes` (no Influx-owned body sections yet)",
+        "tests/unit/test_notes_parse.py covers: well-formed note with all sections; note missing `## User Notes`; note with only title + `## User Notes`; note whose `## User Notes` region contains blank lines, unicode, and nested markdown headings — all preserved byte-exactly",
+        "Typecheck passes"
       ],
       "priority": 4,
       "passes": true,
@@ -69,14 +68,17 @@
     },
     {
       "id": "US-005",
-      "title": "Implement POST /runs with coordinator integration and one-of scope validation",
-      "description": "As an operator, I want `POST /runs` to accept exactly one of `profile` or `all_profiles`, acquire the per-profile lock via the coordinator, and return `202` with `{status, request_id, kind, scope, submitted_at}` on acceptance or `409` with `reason=\"profile_busy\"` on overlap, so that manual runs serialise correctly against scheduled fires for the same profile (FR-HTTP-4).",
+      "title": "Implement notes.py tag-merging rules for rewrite (FR-NOTE-5/6/7/8)",
+      "description": "As a developer, I want `src/influx/notes.py` to expose a tag-merging helper that computes the rewrite's final tag set from existing tags + newly-computed Influx-owned tags, so that rewrites follow the ownership contract in master PRD §8.1 (FR-NOTE-5, FR-NOTE-6, FR-NOTE-7, FR-NOTE-8).",
       "acceptanceCriteria": [
-        "`POST /runs` accepts a JSON body with exactly one of `profile` or `all_profiles`; supplying both returns `422` (AC-03-B); supplying neither returns `400` or `422` as a validation failure (FR-HTTP-4)",
-        "On acceptance, `POST /runs` returns `202` and a response body containing `status`, `request_id`, `kind`, `scope`, and `submitted_at` (FR-HTTP-4)",
-        "On same-profile overlap, `POST /runs` returns `409 Conflict` with a body whose `reason == \"profile_busy\"` (FR-SCHED-3, AC-M1-8)",
-        "For single-profile manual runs, the accepted path preserves the coordinator/`run_profile()` seam from US-003 so that the scheduled-vs-manual overlap test (AC-03-A) is enforced by the same lock that scheduled fires use; multi-profile (`all_profiles`) fan-out of `run_profile()` execution remains deferred to PRD 09",
-        "Tests in tests/integration/test_http_api.py cover: happy path (`202` + documented response body); duplicate submission while the first run is in flight returns `409` with `reason=\"profile_busy\"` (AC-M1-8); body with both `profile` and `all_profiles` returns `422` (AC-03-B); AC-03-A — a scheduled fire and a `POST /runs` for the same profile arriving concurrently result in exactly one accepted run and a `409` for the other"
+        "src/influx/notes.py exposes a tag-merging helper (exact API shape left to the implementation) that accepts the parsed existing tags and the newly-computed Influx-owned tags and returns the final merged tag set for the rewrite",
+        "The helper fully replaces any existing tag matching the Influx-owned prefixes/values: `source:*`, `arxiv-id:*`, `cat:*`, `text:*`, `ingested-by:*`, `schema:*`, `full-text`, `influx:repair-needed`, `influx:archive-missing`, `influx:deep-extracted`, `influx:text-terminal` (FR-NOTE-5)",
+        "`profile:*` tags are merged as a union of existing and new (FR-NOTE-6)",
+        "When a per-profile `influx:rejected:<profile>` tag is present, the helper MUST NOT re-add the corresponding `profile:<profile>` tag (FR-NOTE-6) — a unit test asserts this guard",
+        "Tags authored outside Influx (anything not matching the Influx-owned list above and not `profile:*`) are preserved verbatim (FR-NOTE-7) — a unit test asserts external tags like `favourite` or `reading-queue` survive a rewrite",
+        "A confidence-recompute helper (or documented convention) computes `max(existing_confidence, current_max_score / 10.0)` (FR-NOTE-8) and a unit test covers both branches (existing > new, and new > existing)",
+        "tests/unit/test_notes_render.py or a dedicated tag-merging test file covers all of FR-NOTE-5/6/7/8 with explicit positive and negative cases",
+        "Typecheck passes"
       ],
       "priority": 5,
       "passes": true,
@@ -84,70 +86,193 @@
     },
     {
       "id": "US-006",
-      "title": "Implement POST /backfills with stub estimator and confirm-required flow",
-      "description": "As an operator, I want `POST /backfills` to accept `profile` or `all_profiles` plus `days` OR (`from`, `to`) plus optional `confirm`, use a constant stub estimator (replaced by PRD 09), and return `400` with `{reason: \"confirm_required\", estimated_items: N}` when `estimated_items > 1000` and `confirm` is missing, so that the CLI can reprompt the operator before large backfills proceed (FR-HTTP-5).",
+      "title": "Implement notes.py Archive section render and parse (FR-NOTE-9)",
+      "description": "As a developer, I want `src/influx/notes.py` to render and parse the `## Archive` section per the exact contract so that archive paths live in exactly one authoritative location and parsers reject malformed bodies (FR-NOTE-9, AC-04-B).",
       "acceptanceCriteria": [
-        "`POST /backfills` accepts a JSON body with exactly one of `profile` or `all_profiles`, plus exactly one of `days` or (`from`, `to`), plus optional `confirm` (FR-HTTP-5); invalid combinations return `400/422` as appropriate",
-        "The backfill estimator is a constant stub in this PRD (e.g. returns 0 by default, with a test-only hook to force a value > 1000); PRD 09 replaces the estimator with the naive `days × categories × avg_results` formula",
-        "When `estimated_items > 1000` and `confirm` is not truthy, the response is `400` with body `{reason: \"confirm_required\", estimated_items: <N>}` (FR-HTTP-5, AC-M3-8)",
-        "When `confirm` is truthy (or the estimate is ≤ 1000), the endpoint returns `202` + `{status, request_id, kind, scope, submitted_at}` (same response envelope as `POST /runs`, FR-HTTP-5); for single-profile backfills the endpoint acquires the profile lock via the coordinator on acceptance, while `all_profiles` request validation/acceptance is in scope here and the multi-profile execution + lock fan-out remain deferred to PRD 09",
-        "A backfill MUST NOT overlap with a scheduled run for the same profile — both paths go through the same coordinator (AC-M3-7)",
-        "Tests in tests/integration/test_http_api.py cover: confirm-required path when estimator is forced > 1000 and `--confirm` is not set (AC-M3-8); acceptance path when `confirm=true` is supplied; acceptance path when estimate ≤ 1000 without `confirm`; AC-M3-7 — backfill for profile X does not overlap with a scheduled run for profile X"
+        "The renderer places the `## Archive` section immediately after `# {Title}` and before any other Influx-owned section (FR-NOTE-9)",
+        "When an archive path is present, the `## Archive` section contains exactly one line of the form `path: <rel-path>` using POSIX separators, relative to `archive_root` (FR-NOTE-9)",
+        "When an archive path is absent, the renderer emits the `## Archive` section with an empty body (the canonical no-path form used by this PRD's failure path); the parser additionally accepts an omitted `## Archive` section as a legal state (FR-NOTE-9)",
+        "The renderer never writes both a `path:` line AND an `influx:archive-missing` tag on the same note — a unit test asserts this invariant is enforced (FR-NOTE-9)",
+        "The parser accepts both legal `## Archive` body states (non-empty `path: <rel-path>`, or empty body / omitted section) and returns the parsed path or None",
+        "The parser rejects (raises) a note whose `## Archive` section contains stray text that is neither empty nor a single `path:` line (AC-04-B)",
+        "No frontmatter field, alternative tag, or alternative body location carries the archive path — a unit test asserts that only `## Archive` is consulted by the parser and renderer (FR-NOTE-9)",
+        "tests/unit/test_notes_render.py and tests/unit/test_notes_parse.py together cover AC-04-B: non-empty `path:` round-trip, empty body round-trip, and malformed stray-text rejection",
+        "Typecheck passes"
       ],
       "priority": 6,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-007",
-      "title": "Create service.py app factory, lifecycle, and local-admin bind guard",
-      "description": "As a developer, I want `src/influx/service.py` to provide a top-level app factory and lifecycle that composes the ASGI app, scheduler, coordinator, and probe loop, and that reads `INFLUX_ADMIN_BIND_HOST` (default `127.0.0.1`) + `INFLUX_ADMIN_PORT` (default `8080`) and refuses to start with a non-loopback bind host unless `security.allow_remote_admin = true`, so that the local-admin constraint is hard to break by accident (§5.5, AC-03-D).",
+      "title": "Implement notes.py full canonical renderer with User Notes round-trip preservation",
+      "description": "As a developer, I want `src/influx/notes.py` to expose a full canonical note renderer that composes frontmatter, title, `## Archive`, `## Summary`, `## Profile Relevance`, and `## User Notes` into a single byte-stable output, with `## User Notes` preserved byte-identically across parse → rewrite cycles (FR-NOTE-1..8, AC-04-A, R-5).",
       "acceptanceCriteria": [
-        "src/influx/service.py exposes an app factory that wires the FastAPI/Starlette router (US-004..006), the scheduler (US-003), the coordinator (US-001), and the probe loop (US-002) into a single startable/stoppable service (exact API shape left to the implementation)",
-        "The bind guard consults `security.allow_remote_admin` from the loaded typed config (the `SecurityConfig` schema is extended as needed to carry this flag; specific default values and loader round-trip tests are implementation/test-plan detail rather than source ACs)",
-        "The service reads bind host from env var `INFLUX_ADMIN_BIND_HOST` (default `127.0.0.1`) and bind port from `INFLUX_ADMIN_PORT` (default `8080`) (§5.5 of PRD 03)",
-        "The service refuses to start when `INFLUX_ADMIN_BIND_HOST` resolves to a non-loopback address AND `security.allow_remote_admin` is not `true`; startup raises a clear error and the process does not begin serving requests (AC-03-D)",
-        "With `security.allow_remote_admin = true`, a non-loopback bind host is accepted (negative-path completeness of AC-03-D)",
-        "A unit or integration test covers AC-03-D: starting the service with `INFLUX_ADMIN_BIND_HOST=0.0.0.0` and `security.allow_remote_admin` unset/false is refused; the same bind host with `security.allow_remote_admin = true` is accepted",
-        "The app factory exposes a self-contained start/stop lifecycle contract that the `serve` handler (US-008) can drive"
+        "src/influx/notes.py exposes a full canonical renderer (exact API shape left to the implementation) that writes a complete note with: frontmatter including `note_type = \"summary\"`, `namespace = \"influx\"`, `source_url` (normalised canonical URL), the merged tag list from US-005, and `confidence` computed as follows — on initial note creation `confidence = max(profile_scores) / 10.0` (FR-NOTE-3); on rewrite `confidence = max(existing_confidence, current_max_score / 10.0)` per FR-NOTE-8 (reusing the US-005 confidence-recompute helper)",
+        "The renderer places `# {Title}` first, then `## Archive` immediately after the title and before any other Influx-owned section (FR-NOTE-9), then the Influx-owned body sections `## Summary` (from the Tier-1 enrich stub) and `## Profile Relevance` (relative order between these two sections is not constrained), and finally `## User Notes` (existing region preserved byte-exactly, or an empty one appended when absent per FR-NOTE-4)",
+        "On rewrite, a per-profile `## Profile Relevance` entry is NOT refreshed when `influx:rejected:<profile>` is set (FR-NOTE-6) — a unit test asserts this",
+        "All Influx-authored notes carry the `ingested-by:influx` tag (FR-RES-6)",
+        "tests/unit/test_user_notes_roundtrip.py covers AC-04-A: a note with a non-trivial `## User Notes` section (including blank lines, unicode, and nested markdown headings) is parsed, re-rendered with updated Influx-owned tags, and the byte-exact user region survives (R-5 mitigation)",
+        "A golden-file test (fixture in tests/fixtures/) backs the round-trip to catch regressions in section ordering or whitespace",
+        "Typecheck passes"
       ],
       "priority": 7,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-008",
-      "title": "Wire `serve` CLI handler to start service and block on SIGINT/SIGTERM",
-      "description": "As an operator, I want `python -m influx serve` to start the ASGI app under uvicorn, start the scheduler, start the probe loop, and block until SIGINT/SIGTERM, with a clean shutdown that lets in-flight runs complete within a bounded `schedule.shutdown_grace_seconds`, so that the service behaves correctly as a long-running process (§5.4, AC-M1-3, AC-03-E).",
+      "title": "Implement storage.py archive path construction and path-safety check",
+      "description": "As a developer, I want `src/influx/storage.py` to construct the archive path for a given source/id and verify it cannot escape `archive_root`, so that a malicious or malformed identifier cannot write outside the archive tree (FR-ST-1, FR-ST-2, FR-ST-3, AC-04-C).",
       "acceptanceCriteria": [
-        "`python -m influx serve` replaces the PRD 02 stub handler and starts the full service via the US-007 app factory: ASGI app under uvicorn, scheduler started, probe loop started (§5.4 of PRD 03)",
-        "Shutdown wait is bounded by `schedule.shutdown_grace_seconds` read from the loaded typed config (the `ScheduleConfig` schema is extended as needed to carry this value; specific default values and loader round-trip tests are implementation/test-plan detail rather than source ACs)",
-        "The handler blocks until SIGINT or SIGTERM is received, then initiates a clean shutdown",
-        "On shutdown the scheduler and ASGI server stop cleanly; in-flight runs are allowed to complete within a bounded wait sourced from `schedule.shutdown_grace_seconds` (§5.4 of PRD 03)",
-        "On clean shutdown the process exits with status 0 (AC-03-E)",
-        "Started service satisfies AC-M1-3: `/live`, `/ready`, and `/status` are bound, and one scheduler job is registered per enabled profile",
-        "Tests cover AC-03-E: `serve` starts the full service, handles SIGINT/SIGTERM, shuts down cleanly, and exits with status 0",
-        "Shutdown is clean: no orphaned threads or scheduler jobs remain after shutdown"
+        "src/influx/storage.py exposes a path-construction helper (exact API shape left to the implementation) that produces, for a given source, id, and published date, (a) a filesystem path under `archive_root / {source}/{YYYY}/{MM}/{id}.{ext}` (FR-ST-1) and (b) a note-facing relative path `{source}/{YYYY}/{MM}/{id}.{ext}` using POSIX separators, suitable for the `## Archive` section's `path:` line (FR-NOTE-9)",
+        "For arXiv, the path uses `source = \"arxiv\"`, extension `.pdf`, and the arXiv ID as-is — the arXiv ID is globally unique so no `{url-hash}` is appended (FR-ST-1)",
+        "Feed slugs used anywhere in the path satisfy `^[a-z0-9]+(-[a-z0-9]+)*$`, max 40 chars — the helper calls into the existing `slugs.py` from PRD 01 rather than re-implementing the regex (FR-ST-2)",
+        "After building the full filesystem archive path, the helper verifies `path.resolve().is_relative_to(archive_root)` and rejects (raises) otherwise (FR-ST-3)",
+        "tests/unit/test_archive_path.py covers AC-04-C: an arXiv ID containing `..` (e.g. `../../etc/passwd`) and an absolute-path injection are both rejected BEFORE any download is attempted (additional hardening such as trailing-slash or encoded-traversal attempts is optional and may be included at the implementer's discretion, but is not required by AC-04-C)",
+        "A positive test confirms a well-formed arXiv ID produces the expected filesystem path under `archive_root` and the expected POSIX-separator note-facing relative path `{source}/{YYYY}/{MM}/{id}.{ext}`",
+        "Typecheck passes"
       ],
       "priority": 8,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-009",
-      "title": "Wire `run` and `backfill` CLI handlers to POST to the running service",
-      "description": "As an operator, I want `python -m influx run --profile X` and `python -m influx backfill --profile X --days N [--confirm]` to be real HTTP clients of the running service — posting to `/runs` and `/backfills` on the configured local admin host+port, printing the returned `request_id`, handling the `confirm_required` reprompt flow for backfills, and exiting with the documented codes — so that the CLI is a first-class client of the admin API (§5.4, FR-CLI-3/4).",
+      "title": "Implement storage.py archive download with guarded HTTP client and failure-path tagging",
+      "description": "As a developer, I want `src/influx/storage.py` to download the archive PDF via the guarded HTTP client from PRD 02, and on any download failure emit the canonical failure signal (empty `## Archive` body + `influx:repair-needed` + `influx:archive-missing` tags) so that PRD 06's repair sweep can pick it up (FR-ST-4, AC-X-4 partial).",
       "acceptanceCriteria": [
-        "`python -m influx run --profile X` POSTs to `http://127.0.0.1:<INFLUX_ADMIN_PORT>/runs` with body `{\"profile\": \"X\"}` and prints the returned `request_id` on acceptance (§5.4 of PRD 03)",
-        "`run` exit codes: `0` on `202`, `1` on `409` (profile busy), `2` on network error (§5.4 of PRD 03)",
-        "`python -m influx backfill --profile X --days N` POSTs to `/backfills` with body `{\"profile\": \"X\", \"days\": N}` (and similarly for `--from/--to`) and prints the returned `request_id` on acceptance",
-        "When the response is `{reason: \"confirm_required\", estimated_items: <N>, ...}` and `--confirm` was NOT passed, the handler prints the estimate in a human-readable form and exits with code `64` (usage error) (§5.4 of PRD 03)",
-        "When `--confirm` IS passed, on receiving a `confirm_required` response the handler re-POSTs the same request with `\"confirm\": true` added to the body, per §5.4 of PRD 03",
-        "Handlers target the running service on loopback (`127.0.0.1`) at the port read from `INFLUX_ADMIN_PORT` (default `8080`), per §5.4 of PRD 03",
-        "Tests cover: `run` happy path (exit 0 + printed request_id), `run` conflict path (exit 1 on 409), `run` network-error path (exit 2); `backfill` confirm-required path without `--confirm` (exit 64 + estimate printed); `backfill` acceptance path with `--confirm`; AC-M3-8 end-to-end — `backfill --days 365` without `--confirm` returns confirm_required, and re-submitting with `--confirm` is accepted (estimator stub may be forced > 1000 for the test)"
+        "The download helper uses the guarded HTTP client from PRD 02 (SSRF guard, oversize abort via `storage.max_download_bytes`, timeouts) rather than a direct `httpx`/`urllib` call",
+        "On successful download, the PDF is written to the path produced by the US-008 helper and the returned archive metadata includes the relative POSIX path suitable for the `## Archive` section's `path:` line",
+        "On download failure (SSRF rejection, timeout, oversize abort, HTTP error, or any archive-step failure), the helper returns a signal that the caller uses to render the note with an EMPTY `## Archive` body (no `path:` line), tagged with BOTH `influx:repair-needed` AND `influx:archive-missing` (FR-ST-4)",
+        "A unit test simulates oversize abort (exceeding `storage.max_download_bytes` mid-stream) and asserts the failure signal is returned and drives the empty `## Archive` body plus `influx:repair-needed` and `influx:archive-missing` tags (AC-X-4 partial setup)",
+        "A unit test simulates SSRF rejection and asserts the failure signal is returned",
+        "Archive-step failures (SSRF rejection, timeout, oversize abort, HTTP error, or any other archive-step failure) are surfaced by `storage.py` in a form that callers can detect and handle — the implementation is free to use the existing typed-exception model (e.g. `NetworkError` from `src/influx/errors.py`) or any other mechanism, as long as the observable behaviour is that the caller can render the note with an empty `## Archive` body plus `influx:repair-needed` and `influx:archive-missing` tags and continue processing the next item; the run-level assertion that the whole run continues across per-item failures (FR-RES-1) is owned by US-015 at the `run_profile` wire-up layer",
+        "Typecheck passes"
       ],
       "priority": 9,
-      "passes": true,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Implement sources/arxiv.py Atom fetcher with client-side date filtering",
+      "description": "As a developer, I want `src/influx/sources/arxiv.py` to query `https://export.arxiv.org/api/query` for configured categories, parse the Atom response with stdlib `xml.etree`, and apply client-side date filtering against `profile.sources.arxiv.lookback_days`, so that profiles receive only recent items per FR-SRC-1 and FR-SRC-2.",
+      "acceptanceCriteria": [
+        "src/influx/sources/__init__.py is created",
+        "src/influx/sources/arxiv.py exposes a fetcher (exact API shape left to the implementation) that queries `https://export.arxiv.org/api/query` using the FR-SRC-1 parameter contract: `search_query` built as an OR-joined expression (`cat:X+OR+cat:Y+...`) from `profile.sources.arxiv.categories` (the existing `ArxivSourceConfig.categories: list[str]` in `src/influx/config.py`), `sortBy=submittedDate`, `sortOrder=descending`, and `max_results=profile.sources.arxiv.max_results_per_category` (FR-SRC-1)",
+        "The fetcher parses the Atom response using stdlib `xml.etree` (no new parsing dependency)",
+        "Date filtering is client-side on `<published>` parsed as UTC, against `profile.sources.arxiv.lookback_days` — items older than the lookback are dropped (FR-SRC-2)",
+        "On arXiv HTTP 429, the fetcher sleeps `resilience.arxiv_429_backoff_seconds` before retry (FR-RES-2); general retries use exponential backoff from `resilience.backoff_base_seconds` (e.g. `base`, `base*2`, `base*4`, …) with max retries default 3 (FR-RES-1)",
+        "tests/fixtures/arxiv/*.atom contains 3–5 recorded Atom fixtures at different dates",
+        "tests/unit/test_arxiv_fetcher.py drives the fetcher against those fixtures (no live network), asserting: correct query URL construction, Atom parsing extracts arXiv id / title / abstract / published / categories, lookback filtering drops older items, and 429 backoff is honoured",
+        "Typecheck passes"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": "Internal request-grouping strategy (one grouped request or multiple per-category requests) is an implementation choice and not constrained by the acceptance criteria, provided the FR-SRC-1 query-parameter contract is observed on the wire."
+    },
+    {
+      "id": "US-011",
+      "title": "Add arXiv global rate limiter and run-scoped shared-fetch cache",
+      "description": "As a developer, I want a module- or service-level rate limiter that enforces `resilience.arxiv_request_min_interval_seconds` GLOBALLY across a run (not just within one caller) AND a run-scoped shared-fetch cache around the arXiv fetcher so that repeated requests for the same category within one run resolve to a single underlying HTTP call, so that we respect arXiv rate limits, avoid redundant work, and satisfy AC-04-E cross-profile de-duplication within this PRD (FR-SRC-3, AC-04-D, AC-04-E, R-8).",
+      "acceptanceCriteria": [
+        "A rate limiter (exact API shape left to the implementation) enforces a minimum interval of `resilience.arxiv_request_min_interval_seconds` (default 3s) between successive requests to `export.arxiv.org`, applied globally across the run rather than per-caller (FR-SRC-3, R-8)",
+        "Within a single run, repeated requests for the same arXiv category resolve to a single underlying HTTP call and all callers receive equivalent parsed results — exact mechanism (cache, context, wrapper, etc.) is left to the implementation (AC-04-E, R-8)",
+        "tests/unit/test_arxiv_fetcher.py covers AC-04-D: three sequential fetches observe an inter-request gap of at least `resilience.arxiv_request_min_interval_seconds` (use a fake clock or sleep-monkeypatch so the test is fast and deterministic)",
+        "A test covers AC-04-E: within a single run, when two profiles share an arXiv category, the run-scoped shared-fetch layer produces exactly one underlying HTTP call for that category and both profiles receive equivalent parsed results",
+        "Typecheck passes"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": "Codebase-constrained proxy for AC-04-E: current `/runs` is single-profile (see `src/influx/http_api.py`) and `src/influx/scheduler.py` already operates per profile in-process, so AC-04-E's two-profiles-in-one-run observable is exercised in this PRD by driving the run-scoped shared-fetch API with the two-profile call pattern directly rather than via a multi-profile `/runs` endpoint. Full multi-profile `/runs` fan-out is owned by PRD 09 and will reuse the same shared-fetch API."
+    },
+    {
+      "id": "US-012",
+      "title": "Implement filter.py prompt rendering with negative examples",
+      "description": "As a developer, I want `src/influx/filter.py` to render the filter prompt from `prompts.filter` with the required variables `{profile_description}`, `{negative_examples}`, and `{min_score_in_results}`, so that the LLM sees the correct context before scoring (FR-FLT-1, FR-FLT-5).",
+      "acceptanceCriteria": [
+        "src/influx/filter.py exposes a prompt-rendering helper (exact API shape left to the implementation) that substitutes `{profile_description}`, `{negative_examples}`, and `{min_score_in_results}` into the template loaded from `prompts.filter` (FR-FLT-1)",
+        "Negative examples are rendered one per line as `- \"{title}\" (rejected)`, with each title truncated to `filter.negative_example_max_title_chars`, and the total list capped at `feedback.negative_examples_per_profile` (FR-FLT-5)",
+        "When the negative-examples input list is empty (the PRD-04 case — PRD 05 wires `lithos_list` for real feedback), the rendered `{negative_examples}` substitution is empty (no negative-example lines emitted and no invented placeholder text) so prompt semantics are not altered beyond what the PRD authorises",
+        "tests/unit/test_filter.py covers: all three variables substituted; title longer than `filter.negative_example_max_title_chars` is truncated; more-than-cap negative examples are truncated to the cap; empty negative-examples list is handled",
+        "Typecheck passes"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Implement filter.py LLM call with JSON-mode validation, retries, and batching",
+      "description": "As a developer, I want `src/influx/filter.py` to call `models.filter` in JSON mode, validate the response against `FilterResponse`, retry on parse failure up to `models.filter.max_retries`, and batch items at `filter.batch_size`, so that scoring is robust under flaky LLM output (FR-FLT-2, FR-FLT-3, FR-FLT-4, FR-FLT-6, AC-04-F, AC-04-G).",
+      "acceptanceCriteria": [
+        "A JSON-mode-capable LLM client permitted by PRD §7 (`litellm` or a direct provider SDK such as OpenAI or Anthropic) is added as a dependency in pyproject.toml and resolves on install",
+        "The filter caller invokes `models.filter` with `response_format={\"type\": \"json_object\"}` when `json_mode = true` (FR-FLT-2)",
+        "Responses are validated against `FilterResponse` from US-002 (FR-FLT-3)",
+        "Items are batched at `filter.batch_size` (default 25) (FR-FLT-4)",
+        "On JSON-mode parse failure (invalid JSON, schema violation, or any validation error), the filter logs the raw response and retries within `models.filter.max_retries` (FR-FLT-6)",
+        "When retries are exhausted, the filter yields zero validated results for that batch and logs the skip — NO regex salvage is attempted (FR-FLT-6); the end-to-end no-partial-write observable at the filter-to-render boundary (AC-04-G) is owned by US-015",
+        "tests/unit/test_filter.py asserts that the filter produces one validated `FilterResult` per input item when the LLM returns well-formed JSON-mode responses (threshold-based acceptance filtering is owned by US-014; the end-to-end filter-to-render call-count observable for AC-04-F is owned by US-015)",
+        "tests/unit/test_filter.py asserts JSON-mode retry-and-skip behaviour at the filter-internal level (this is NOT AC-04-G coverage — AC-04-G's no-partial-write observable is owned by US-015 at the filter-to-render boundary): a malformed JSON-mode response triggers retry up to `max_retries`, after which the batch is skipped and the filter yields zero validated results for that batch with a log entry",
+        "Pre-recorded filter responses keyed by input hash drive the deterministic filter test (no live LLM calls in CI)",
+        "Typecheck passes"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "Implement filter.py threshold behaviour and tier tagging (FR-FLT-7)",
+      "description": "As a developer, I want `src/influx/filter.py` to apply per-profile thresholds (`relevance`, `full_text`, `deep_extract`, `notify_immediate`) to each scored item and emit the correct tier tags, so that downstream PRDs (06 repair sweep, 07 Tier 2/3 enrichment) see the intended signal shape (FR-FLT-7).",
+      "acceptanceCriteria": [
+        "Score < `profile.thresholds.relevance` (default 7) → item is discarded (no note written) (FR-FLT-7)",
+        "Score ≥ `relevance` → item is kept for canonical-note rendering with Tier 1 sections (FR-FLT-7)",
+        "Score ≥ `full_text` → the item carries the `full-text` tag (FR-FLT-7)",
+        "Score ≥ `deep_extract` → the item carries the `influx:deep-extracted` tag (FR-FLT-7)",
+        "Score ≥ `notify_immediate` → the item is flagged for digest highlights (FR-FLT-7) — actual digest wiring is a stub in this PRD (PRD 05), so asserting the flag is sufficient",
+        "For items crossing `full_text` or `deep_extract`, the Tier 2 / Tier 3 BODY SECTIONS are NOT rendered in this PRD — only the corresponding TAG is written, and the item also carries `influx:repair-needed` so PRD 06's sweep picks it up for upgrade (FR-FLT-7 temporary-mismatch seam)",
+        "tests/unit/test_filter.py covers each threshold boundary (score = threshold − 1, = threshold, = threshold + 1) for `relevance`, `full_text`, `deep_extract`, and `notify_immediate`, asserting the correct combination of tags and the `influx:repair-needed` seam",
+        "Typecheck passes"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "Wire run_profile to drive the end-to-end arXiv flow",
+      "description": "As a developer, I want the existing `influx.scheduler.run_profile` hook (the PRD-03 stub called by `http_api.py`) replaced with the real arXiv flow — fetch (US-010/US-011) → filter (US-012/US-013/US-014) → per-accepted-item archive (US-008/US-009) + render note (US-007) → stub `lithos_client.write` (US-003) — with a dedup check via stub `lithos_client.cache_lookup`, so that `POST /runs` produces at least one stub-recorded write with the correct canonical shape (§2 \"Wire a real run_profile\", AC-M1-7, AC-M1-9, AC-M1-10).",
+      "acceptanceCriteria": [
+        "The existing `influx.scheduler.run_profile` hook (the PRD-03 stub called by `http_api.py`) is wired to the real arXiv flow — calling the arXiv fetcher, filter, per-accepted-item archive, and note render in the correct order; the choice of which file owns the implementation is left to the implementer (PRD §6 lists `src/influx/service.py` as the file to modify for the wire-up)",
+        "Before rendering a note, the flow consults `lithos_client.cache_lookup` — when the stub returns \"cached\" the item is skipped (AC-M1-9 via unit test against the dedup call site); when it returns \"not cached\" (the default stub behaviour) the flow proceeds",
+        "After each accepted item is rendered, the flow calls `lithos_client.write` with the canonical note payload (recorded by the stub from US-003) — recorded writes include `source_url = https://arxiv.org/abs/<id>`, tags containing `arxiv-id:<id>`, `profile:<name>`, `source:arxiv`, `ingested-by:influx`, `schema:1`, `confidence = max_score / 10.0`, `namespace = \"influx\"`, `note_type = \"summary\"` (AC-M1-10)",
+        "The digest/webhook hook fires after the run but the actual HTTP POST is NOT required (stubbed here; real webhook is PRD 05) — a unit or integration test asserts the hook fires (AC-M1-7)",
+        "Per-item failures (download failure, filter batch skipped, etc.) do NOT abort the run (FR-RES-1)",
+        "A unit test against the dedup call site asserts that when the stub `cache_lookup` returns a \"cached\" response the item is skipped (AC-M1-9 contract surface)",
+        "A unit test at the filter-to-render boundary covers AC-04-F: when the filter is driven with a batch of 25 items and 3 are above `profile.thresholds.relevance`, the flow makes exactly 3 note-render invocations and exactly 3 stub-recorded `lithos_client.write` calls (no more, no fewer)",
+        "A unit test at the filter-to-render boundary covers AC-04-G: when a malformed JSON-mode filter response causes the batch to be skipped after `models.filter.max_retries` are exhausted, the flow performs ZERO note renders and ZERO stub-recorded `lithos_client.write` calls for that batch (no partial notes written), and the skip is logged",
+        "Typecheck passes"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "Add integration test for end-to-end arXiv flow via POST /runs",
+      "description": "As a developer, I want `tests/integration/test_arxiv_flow.py` to drive `POST /runs {\"profile\": \"<arXiv-enabled-profile>\"}` end-to-end using recorded Atom fixtures (US-010) and pre-recorded filter responses (US-013), so that AC-M1-7 + AC-M1-10 + the repair-needed/archive-missing signals are asserted against stub-recorded `lithos_client.write` calls (§10 Definition of Done).",
+      "acceptanceCriteria": [
+        "tests/integration/test_arxiv_flow.py exercises `POST /runs {\"profile\": \"<arXiv-enabled-profile>\"}` end-to-end against a running service (in-process or subprocess is an implementation choice) and waits for the run to complete",
+        "The test asserts the service returned `202` + `request_id` and that after completion at least one stub-recorded `lithos_client.write` call exists with the canonical shape from AC-M1-10",
+        "The test uses the recorded Atom fixtures from US-010 (no live network) and pre-recorded filter responses (no live LLM)",
+        "The test asserts `AC-M2-3` partial: for an item with only an abstract, the recorded note carries `text:abstract-only`, no Tier 2/3 body, both `influx:repair-needed` AND `influx:archive-missing` when applicable, and does NOT carry `influx:text-terminal`",
+        "The test asserts the digest/webhook hook fired without requiring a real HTTP POST (AC-M1-7)",
+        "Typecheck passes"
+      ],
+      "priority": 16,
+      "passes": false,
       "notes": ""
     }
   ]
