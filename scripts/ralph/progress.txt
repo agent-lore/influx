@@ -8,6 +8,10 @@
 - `ProbeLoop.state` returns `ProbeState` with `.is_ready`, `.overall_status`, `.lithos`, `.llm_credentials`
 - `load_config(check_api_keys=False)` skips provider key validation — use for `serve` mode where probes handle it
 - `_make_config(providers=...)` helper in test_probes.py builds minimal AppConfig for unit tests without TOML files
+- `InfluxScheduler(config, coordinator)` wraps APScheduler; `.start()` registers jobs, `.stop()` shuts down; `._fire_profile()` acquires lock + calls `run_profile`
+- `run_profile(profile, kind, run_range)` is the stub seam — PRDs 04/06/09 replace the body
+- In `_make_config` helpers, use `if x is not None` instead of `x or default` — empty list is falsy in Python
+- APScheduler 3.x `AsyncIOScheduler` needs a running event loop — make registration tests async
 
 # Ralph Progress Log
 Started: Fri Apr 24 14:02:16 UTC 2026
@@ -45,4 +49,23 @@ Started: Fri Apr 24 14:02:16 UTC 2026
   - Ruff SIM105 requires `contextlib.suppress()` instead of bare `try/except/pass`
   - `ProbeLoop.run_once()` is synchronous — good for tests and initial probe before async loop
   - All 187 tests pass (23 new probes + 164 existing)
+---
+
+## 2026-04-24 - US-003
+- Implemented APScheduler setup with per-job limits and run_profile stub hook
+- Created `src/influx/scheduler.py` with `InfluxScheduler` and `run_profile` stub
+- InfluxScheduler registers one cron job per profile with `max_instances=1`, `coalesce=True`, `misfire_grace_time` from config
+- Each fire acquires per-profile lock via Coordinator, calls `run_profile`, releases lock
+- `ProfileBusyError` is caught and logged (not re-raised) to avoid crashing the scheduler
+- `run_profile` is an async no-op stub; docstring names PRDs 04, 06, 09 as downstream replacements
+- Files changed:
+  - src/influx/scheduler.py (new: InfluxScheduler, run_profile)
+  - tests/unit/test_scheduler.py (new: 11 tests covering stub, registration, lock integration, cross-profile parallelism)
+  - scripts/ralph/prd.json (US-003 passes: true)
+- **Learnings for future iterations:**
+  - APScheduler 3.x `CronTrigger.from_crontab(expr, timezone=...)` parses standard 5-field cron expressions
+  - `AsyncIOScheduler` requires a running event loop at `.start()` time — test in async context
+  - APScheduler needs to be installed into the `.venv` site-packages for pyright to resolve imports
+  - `_make_config(profiles=[])` fails with `or` fallback — empty list is falsy; use `is not None` check
+  - All 198 tests pass (11 new scheduler + 187 existing)
 ---

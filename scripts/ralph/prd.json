@@ -49,7 +49,7 @@
         "AC-M3-1 is satisfied — when the scheduler fires for two configured profiles, both fires are executed via the `run_profile` stub hook through the coordinator without same-profile overlap"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
