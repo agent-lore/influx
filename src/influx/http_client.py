@@ -13,15 +13,29 @@ from __future__ import annotations
 import ipaddress
 import socket
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
 
 from influx.errors import NetworkError
 
-__all__ = ["FetchResult", "guarded_fetch"]
+__all__ = ["ContentTypeFamily", "FetchResult", "guarded_fetch"]
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+ContentTypeFamily = Literal["html", "pdf", "xml"]
+
+_CONTENT_TYPE_FAMILIES: dict[ContentTypeFamily, frozenset[str]] = {
+    "html": frozenset({"text/html", "application/xhtml+xml"}),
+    "pdf": frozenset({"application/pdf"}),
+    "xml": frozenset({
+        "text/xml",
+        "application/xml",
+        "application/atom+xml",
+        "application/rss+xml",
+    }),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,14 +128,35 @@ def _ssrf_check(url: str, *, allow_private_ips: bool) -> None:
 # ── Public API ───────────────────────────────────────────────────────
 
 
+def _check_content_type(
+    content_type: str,
+    expected: ContentTypeFamily,
+    url: str,
+) -> None:
+    """Raise ``NetworkError`` if *content_type* doesn't match *expected* family."""
+    mime = content_type.split(";")[0].strip().lower()
+    allowed = _CONTENT_TYPE_FAMILIES[expected]
+    if mime not in allowed:
+        raise NetworkError(
+            f"Content-type {mime!r} does not match expected family {expected!r}",
+            url=url,
+            kind="content_type_mismatch",
+            reason=(
+                f"Expected one of {', '.join(sorted(allowed))}; "
+                f"got {mime!r}"
+            ),
+        )
+
+
 def guarded_fetch(
     url: str,
     *,
     allow_private_ips: bool = False,
     max_download_bytes: int = 52_428_800,
     timeout_seconds: int = 30,
+    expected_content_type: ContentTypeFamily | None = None,
 ) -> FetchResult:
-    """Fetch *url* with scheme, SSRF, size, and timeout guards.
+    """Fetch *url* with scheme, SSRF, size, timeout, and content-type guards.
 
     Returns a :class:`FetchResult` on success.  Raises
     :class:`~influx.errors.NetworkError` when any guard is violated.
@@ -176,6 +211,9 @@ def guarded_fetch(
             kind="network",
             reason=str(exc),
         ) from exc
+
+    if expected_content_type is not None:
+        _check_content_type(content_type, expected_content_type, final_url)
 
     return FetchResult(
         body=body,

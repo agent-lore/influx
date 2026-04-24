@@ -3,6 +3,7 @@
 US-002: scheme allow-list, SSRF IP-classification guard, and
 allow_private_ips bypass.
 US-003: streaming size cap and connect + read timeout.
+US-004: content-type family check (HTML, PDF, XML/Atom).
 """
 
 from __future__ import annotations
@@ -293,3 +294,111 @@ class TestTimeout:
             err = exc_info.value
             assert err.kind == "timeout"
             assert err.url == url
+
+
+# ── Content-type family check (US-004) ───────────────────────────────
+
+
+class TestContentTypeFamilyPositive:
+    """Positive cases: response content-type matches expected family."""
+
+    @respx.mock
+    @pytest.mark.parametrize("ct,family", [
+        ("text/html", "html"),
+        ("text/html; charset=utf-8", "html"),
+        ("application/xhtml+xml", "html"),
+        ("application/pdf", "pdf"),
+        ("text/xml", "xml"),
+        ("application/xml", "xml"),
+        ("application/atom+xml", "xml"),
+        ("application/rss+xml", "xml"),
+    ])
+    def test_matching_content_type_succeeds(
+        self, ct: str, family: str
+    ) -> None:
+        url = "http://example.com/doc"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200, content=b"data", headers={"content-type": ct}
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(
+                url, expected_content_type=family  # type: ignore[arg-type]
+            )
+        assert result.body == b"data"
+
+    @respx.mock
+    def test_no_family_check_when_none(self) -> None:
+        """When expected_content_type is None, any content-type passes."""
+        url = "http://example.com/any"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"ok",
+                headers={"content-type": "application/octet-stream"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(url)
+        assert result.body == b"ok"
+
+
+class TestContentTypeFamilyMismatch:
+    """Mismatch cases: response content-type does NOT match expected."""
+
+    @respx.mock
+    def test_expected_html_got_pdf(self) -> None:
+        """AC-02-D: expected HTML, received application/pdf."""
+        url = "http://example.com/page"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"%PDF-1.4",
+                headers={"content-type": "application/pdf"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, expected_content_type="html")
+            err = exc_info.value
+            assert err.kind == "content_type_mismatch"
+            assert err.url == url
+            assert "application/pdf" in err.reason
+
+    @respx.mock
+    def test_expected_pdf_got_html(self) -> None:
+        url = "http://example.com/file.pdf"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"<html>",
+                headers={"content-type": "text/html"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, expected_content_type="pdf")
+            err = exc_info.value
+            assert err.kind == "content_type_mismatch"
+
+    @respx.mock
+    def test_expected_xml_got_html(self) -> None:
+        url = "http://example.com/feed"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"<html>",
+                headers={"content-type": "text/html"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, expected_content_type="xml")
+            err = exc_info.value
+            assert err.kind == "content_type_mismatch"
