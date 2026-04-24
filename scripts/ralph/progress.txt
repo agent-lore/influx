@@ -26,6 +26,9 @@ Started: Fri Apr 24 20:42:49 UTC 2026
 - `build_profile_relevance_for_rewrite(old_entries=, new_entries=, tags=)` merges profile entries, keeping old for rejected profiles
 - Frontmatter rendered manually (no PyYAML dep): note_type, namespace, source_url, tags, confidence
 - Golden file fixture at `tests/fixtures/golden_note.md` — update it when canonical format changes
+- `storage.py` owns archive path construction; `build_archive_path(archive_root=, source=, item_id=, published_year=, published_month=, ext=)` returns `(Path, str)` tuple of filesystem path and POSIX relative path
+- `ArchivePathError` derives from `InfluxError` — raised for unsafe IDs (traversal, absolute paths) and invalid source slugs
+- Path safety: `_reject_unsafe_id()` checks for `..` components and absolute paths BEFORE `resolve().is_relative_to()` as a defense-in-depth measure
 
 ---
 
@@ -128,4 +131,17 @@ Started: Fri Apr 24 20:42:49 UTC 2026
   - `user_notes` parameter to `render_note()` is the byte-exact string from `parse_note().user_notes` — just append it
   - `build_profile_relevance_for_rewrite()` resolves the rejection guard at the caller level — `render_note()` just renders what it's given
   - `__all__` now also exports: `ProfileRelevanceEntry`, `build_profile_relevance_for_rewrite`, `parse_profile_relevance`, `render_note`
+---
+
+## 2026-04-24 - US-008
+- Implemented `src/influx/storage.py` with `build_archive_path()` and `ArchivePathError`
+- Created `tests/unit/test_archive_path.py` with 12 tests covering all AC
+- Files changed: `src/influx/storage.py`, `tests/unit/test_archive_path.py`
+- **Learnings for future iterations:**
+  - `build_archive_path(archive_root=, source=, item_id=, published_year=, published_month=, ext=)` returns `(Path, str)` — filesystem path and POSIX relative path
+  - Source slug validated via `slugs.is_valid_slug()` — reuses existing FR-ST-2 validation
+  - `_reject_unsafe_id()` does explicit `..` component and absolute-path check BEFORE `resolve().is_relative_to()` — defense-in-depth because shallow traversals (e.g. `../../etc/passwd`) may still resolve within archive_root
+  - `ArchivePathError` derives from `InfluxError` (not from `NoteParseError`)
+  - `PurePosixPath` used for note-facing relative paths to guarantee forward-slash separators on all platforms
+  - `__all__` exports: `ArchivePathError`, `build_archive_path`
 ---
