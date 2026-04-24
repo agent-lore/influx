@@ -1,0 +1,127 @@
+# Ralph Progress Log
+Started: Fri Apr 24 11:54:09 UTC 2026
+
+## Codebase Patterns
+- Error subclasses use keyword-only args for structured context fields (url, kind, reason, etc.)
+- Tests use class-based grouping (TestXxx) with pytest; AAA pattern
+- Quality checks: `uv run pytest tests/`, `uv run pyright <file>`, `uv run ruff check <file>`
+- Config model is in config.py with pydantic v2 BaseModel classes
+- CLI dispatcher is in main.py with argparse subcommands
+- HTTP client uses respx for mocking httpx requests in tests
+- SSRF guard patches `socket.getaddrinfo` via `_fake_getaddrinfo(ip)` helper for controlled IP resolution in tests
+- Ruff line length is 88 chars; use `uv run ruff check --fix` for auto-fixable issues like import sorting
+- Streaming uses `client.stream("GET", url)` + `response.iter_bytes()` with combined `with` statement (ruff SIM117)
+- For timeout tests, patch `influx.http_client.httpx.Client` and set `ctx.stream.side_effect` to httpx timeout exceptions
+- Redirect re-validation: use `follow_redirects=False` + manual for-loop with `_validate_scheme`/`_ssrf_check` at each hop
+- For multi-host redirect tests, use `_multi_resolve({"host": "ip", ...})` helper instead of `_fake_getaddrinfo`
+- CLI exit codes: EXIT_SUCCESS=0, EXIT_PARTIAL=1, EXIT_FAILURE=2, EXIT_USAGE=64 (named constants in main.py)
+- Stub handlers print `[stub] <cmd> not wired yet` to stderr and `sys.exit(EXIT_USAGE)`
+- argparse `dest="from_date"` / `dest="to_date"` used for `--from` / `--to` to avoid Python keyword conflicts
+- Unknown subcommands: intercepted before `parse_args` using `_KNOWN_COMMANDS` frozenset (argparse exits 2, we want 64)
+- migrate-notes handler loads config via `load_config()` and reads `config.influx.note_schema_version`
+
+---
+
+## 2026-04-24 - US-001
+- Implemented NetworkError, LithosError, LCMAError, ExtractionError in src/influx/errors.py
+- NetworkError: url (str), kind (str), reason (str, default "")
+- LithosError: operation (str, default ""), status_code (int|None, default None), detail (str, default "")
+- LCMAError: model (str, default ""), stage (str, default ""), detail (str, default "")
+- ExtractionError: url (str, default ""), stage (str, default ""), detail (str, default "")
+- Created tests/unit/test_errors.py with 16 tests covering isinstance chains, structured context, defaults, and parametrized catchability
+- Files changed: src/influx/errors.py, tests/unit/test_errors.py
+- **Learnings for future iterations:**
+  - All error subclasses use keyword-only constructor args for structured fields
+  - NetworkError requires url and kind (no defaults); other subclasses have all-optional context fields
+  - Full test suite is 100 tests and runs in <0.3s
+---
+
+## 2026-04-24 - US-002
+- Added httpx>=0.27 to project dependencies and respx>=0.22 to dev dependencies
+- Created src/influx/http_client.py with guarded_fetch() returning FetchResult dataclass (body, status_code, content_type, final_url)
+- Implemented scheme allow-list (http/https only) raising NetworkError(kind="scheme")
+- Implemented SSRF IP-classification guard: resolves hostname via socket.getaddrinfo, classifies IPs with ipaddress module (is_loopback, is_link_local, is_private, is_multicast)
+- SSRF guard raises NetworkError(kind="ssrf") with offending URL and resolved IP in reason
+- allow_private_ips=True bypasses SSRF rejection
+- DNS resolution failure raises NetworkError(kind="dns")
+- Created tests/unit/test_http_client.py with 17 tests covering scheme rejection, SSRF for all 4 IP classes, allow-through path, FetchResult attributes, and DNS failure
+- Files changed: pyproject.toml, uv.lock, src/influx/http_client.py, tests/unit/test_http_client.py
+- **Learnings for future iterations:**
+  - respx mocks httpx at the transport level; use `@respx.mock` decorator + `respx.get(url).mock(return_value=...)`
+  - For SSRF tests, patch `influx.http_client.socket.getaddrinfo` not `socket.getaddrinfo` directly
+  - FetchResult is a frozen dataclass with slots for immutability
+  - Future stories (US-003/004/005) will extend guarded_fetch with streaming, content-type check, and redirect re-validation
+---
+
+## 2026-04-24 - US-003
+- Switched guarded_fetch from buffered `response.content` to streaming `response.iter_bytes()` via `client.stream("GET", url)`
+- Added mid-stream abort: raises NetworkError(kind="oversize") when cumulative body exceeds max_download_bytes; partial body is not returned
+- Connect and read timeouts already bounded by timeout_seconds via httpx.Timeout; timeout raises NetworkError(kind="timeout")
+- Added 6 new tests: oversize rejection, no-body-returned assertion, exact-limit success, under-limit success, connect timeout, read timeout
+- Files changed: src/influx/http_client.py, tests/unit/test_http_client.py
+- **Learnings for future iterations:**
+  - respx handles streaming transparently; `httpx.Response` with `content=` works with `iter_bytes()` in tests
+  - Use combined `with` for nested context managers to satisfy ruff SIM117
+  - NetworkError re-raise inside try/except must come before httpx exception handlers to avoid catching it as HTTPError
+  - Full test suite is now 123 tests
+---
+
+## 2026-04-24 - US-004
+- Added ContentTypeFamily literal type ("html", "pdf", "xml") and MIME mapping to http_client.py
+- Added _check_content_type() helper that extracts MIME from content-type header (stripping charset params) and validates against family
+- Added expected_content_type parameter to guarded_fetch (optional, None = skip check)
+- Raises NetworkError(kind="content_type_mismatch") on mismatch with reason containing both expected and actual MIME
+- Added 12 new tests: 8 positive cases (HTML variants, PDF, XML/Atom/RSS), 1 None-skip case, 3 mismatch cases
+- Files changed: src/influx/http_client.py, tests/unit/test_http_client.py
+- **Learnings for future iterations:**
+  - Content-type header parsing: split on ";" first to strip charset/boundary params before matching
+  - ContentTypeFamily is exported from http_client module for type-safe callers
+  - Full test suite is now 135 tests
+---
+
+## 2026-04-24 - US-005
+- Switched guarded_fetch from `follow_redirects=True` to manual redirect loop with `follow_redirects=False`
+- Every redirect hop re-validates scheme (http/https allow-list) and SSRF IP classification via `_validate_scheme` and `_ssrf_check`
+- Added `_MAX_REDIRECTS = 20` constant and `urljoin` for resolving relative Location headers
+- Added `for/else` pattern: exceeding max redirects raises NetworkError(kind="network")
+- `allow_private_ips=True` is honoured consistently at every redirect hop
+- Added 4 new tests: redirect-to-private-IP, redirect-to-loopback, redirect-to-bad-scheme, redirect-allows-private-with-flag
+- Added `_multi_resolve(mapping)` test helper for multi-host DNS resolution
+- Files changed: src/influx/http_client.py, tests/unit/test_http_client.py
+- **Learnings for future iterations:**
+  - httpx `response.is_redirect` checks both status code AND Location header presence — safe to access `response.headers["location"]` after
+  - `continue` inside `with client.stream(...) as response:` properly exits the context manager, closing the stream
+  - respx handles `follow_redirects=False` transparently; mock each URL independently
+  - Full test suite is now 139 tests
+---
+
+## 2026-04-24 - US-006
+- Extended CLI argparse surface with serve, run, and backfill subcommands in src/influx/main.py
+- serve: no flags (FR-CLI-2); stub prints message and exits 64
+- run: --profile (required) (FR-CLI-3); stub prints message with profile name and exits 64
+- backfill: --profile (required), --days, --from, --to, --confirm (FR-CLI-4); stub prints message and exits 64
+- Added FR-CLI-7 exit-code constants: EXIT_SUCCESS=0, EXIT_PARTIAL=1, EXIT_FAILURE=2, EXIT_USAGE=64
+- No-subcommand exit code changed from 2 to EXIT_USAGE (64) for consistency
+- validate-config routing preserved unchanged
+- Created tests/unit/test_cli_dispatch.py with 8 tests covering routing, exit codes, flag enforcement, and validate-config regression
+- Files changed: src/influx/main.py, tests/unit/test_cli_dispatch.py, scripts/ralph/prd.json
+- **Learnings for future iterations:**
+  - argparse uses exit code 2 for its own parse errors (unrecognized args); our EXIT_USAGE=64 is only for application-level usage errors
+  - Use `dest="from_date"` for `--from` flag since `from` is a Python keyword
+  - Stub handlers should print to stderr, not stdout, to avoid polluting piped output
+  - Full test suite is now 147 tests
+---
+
+## 2026-04-24 - US-007
+- Added migrate-notes subcommand to argparse surface in src/influx/main.py
+- Handler `_cmd_migrate_notes()` loads config, prints `note_schema_version: <N>`, exits 0
+- Unknown subcommand handling: pre-parse check against `_KNOWN_COMMANDS` frozenset exits 64 (argparse's own error would exit 2)
+- No-subcommand (AC-X-5) regression preserved: prints help to stderr, exits 64
+- Added 5 new tests: migrate-notes output/exit-0, config-value test, unknown subcommand x2, no-args regression
+- Files changed: src/influx/main.py, tests/unit/test_cli_dispatch.py, scripts/ralph/prd.json
+- **Learnings for future iterations:**
+  - argparse `add_subparsers(dest="command")` silently sets command to None for unknown subcommands but `parse_args` errors with exit 2 — must intercept before `parse_args`
+  - Use `frozenset` for O(1) command lookup in the pre-parse check
+  - For tests needing a custom config value, create a minimal TOML with just the needed section + required `[prompts]`
+  - Full test suite is now 152 tests
+---
