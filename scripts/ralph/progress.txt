@@ -32,6 +32,12 @@ Started: Fri Apr 24 20:42:49 UTC 2026
 - `download_archive(url=, archive_root=, source=, item_id=, ...)` uses `guarded_fetch` from `http_client.py` for SSRF/oversize/timeout protection
 - `ArchiveResult(ok=bool, rel_posix_path=str|None, error=str)` — on failure, caller renders empty `## Archive` body + `influx:repair-needed` + `influx:archive-missing` tags
 - `NetworkError` from `errors.py` carries `kind` field (`ssrf`, `oversize`, `timeout`, `network`) — use it for structured failure handling
+- `src/influx/sources/arxiv.py` owns arXiv Atom feed fetching; `fetch_arxiv(arxiv_config=, resilience=, now=)` returns `list[ArxivItem]`
+- `ArxivItem(arxiv_id, title, abstract, published, categories)` — frozen dataclass with `slots=True`
+- `build_query_url(categories=, max_results=)` constructs the arXiv API URL per FR-SRC-1
+- `_sleep()` wrapper in `sources/arxiv.py` enables deterministic retry tests via monkeypatch
+- Atom fixtures live in `tests/fixtures/arxiv/*.atom` — use `_load_fixture("name.atom")` pattern in tests
+- Mock `guarded_fetch` at `influx.sources.arxiv.guarded_fetch` (patch at import site) for arXiv tests
 
 ---
 
@@ -164,4 +170,22 @@ Started: Fri Apr 24 20:42:49 UTC 2026
   - `_dl()` helper pattern in tests: wrap `download_archive` with defaults to avoid pyright issues with `**kwargs` dict expansion
   - `ArchiveResult` uses `frozen=True, slots=True` for immutability and performance
   - `__all__` now exports: `ArchivePathError`, `ArchiveResult`, `build_archive_path`, `download_archive`
+---
+
+## 2026-04-24 - US-010
+- Implemented `src/influx/sources/arxiv.py` with `fetch_arxiv()`, `build_query_url()`, `_parse_atom()`, `_filter_by_lookback()`, `_fetch_with_retry()`
+- Created `src/influx/sources/__init__.py` package
+- Created 4 Atom fixtures in `tests/fixtures/arxiv/`: `recent_two.atom`, `mixed_dates.atom`, `empty_feed.atom`, `single_entry.atom`
+- Created `tests/unit/test_arxiv_fetcher.py` with 32 tests covering all AC
+- Files changed: `src/influx/sources/__init__.py`, `src/influx/sources/arxiv.py`, `tests/fixtures/arxiv/*.atom`, `tests/unit/test_arxiv_fetcher.py`
+- **Learnings for future iterations:**
+  - `xml.etree.ElementTree` requires full namespace URI in `findall()` — use `f"{{{_ATOM_NS}}}entry"` syntax
+  - arXiv `<id>` elements use `http://arxiv.org/abs/` prefix (not https) — handle both in `_extract_arxiv_id()`
+  - Version suffix stripping uses `rpartition("v")` — works for `v1`, `v2`, etc.
+  - Title text in Atom may contain embedded whitespace/newlines — collapse with `" ".join(text.strip().split())`
+  - `datetime.fromisoformat()` in Python 3.12 handles `Z` suffix natively but replacing with `+00:00` ensures compatibility
+  - `_sleep()` wrapper pattern: define a module-level `_sleep(seconds)` that calls `time.sleep()` — tests patch `influx.sources.arxiv._sleep`
+  - HTTP 429 from arXiv uses `arxiv_429_backoff_seconds` (fixed delay), general failures use `backoff_base_seconds * 2^attempt` (exponential)
+  - `guarded_fetch` does NOT raise on 429 — check `result.status_code == 429` separately from `NetworkError` catch
+  - `__all__` exports: `ArxivItem`, `build_query_url`, `fetch_arxiv`
 ---
