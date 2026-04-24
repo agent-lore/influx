@@ -8,6 +8,11 @@ Started: Fri Apr 24 09:25:46 UTC 2026
 - Python 3.12 strict (`>=3.12,<3.13`), uses `uv` for package management
 - Source layout: `src/influx/` package with `py.typed` marker
 - Tests in `tests/` directory, conftest at `tests/conftest.py`
+- Unit tests go in `tests/unit/` subdirectory (created in US-002)
+- FR-ST-2 slug pattern: `^[a-z0-9]+(-[a-z0-9]+)*$`, max 40 chars
+- `pytest-cov` is not installed; coverage verification is by inspection/line count
+- Prompt template variables use `{var_name}` syntax; `REQUIRED_VARIABLES` in `prompts.py` defines per-key sets
+- `PromptValidationError` for template var errors, `ConfigError` for loading/structural errors
 ---
 
 ## 2026-04-24 - US-001
@@ -19,4 +24,31 @@ Started: Fri Apr 24 09:25:46 UTC 2026
   - pydantic 2.13.3 installed successfully with Python 3.12.12
   - The existing `ConfigError` class is already a subclass of `InfluxError`
   - Existing test in `tests/test_main.py` is a simple greeting smoke test that will be deleted in US-010
+---
+
+## 2026-04-24 - US-002
+- Created `src/influx/slugs.py` with `slugify_feed_name()` and `is_valid_slug()` helpers
+- Created `tests/unit/__init__.py` and `tests/unit/test_slugs.py` with 28 tests
+- `slugify_feed_name()` handles: NFKD normalization, ASCII folding, lowercasing, non-alnum→hyphen collapsing, strip leading/trailing hyphens, truncate to 40 chars
+- Returns empty string for inputs that produce no alphanumeric characters (whitespace-only, all-special-chars)
+- Files changed: `src/influx/slugs.py`, `tests/unit/__init__.py`, `tests/unit/test_slugs.py`
+- **Learnings for future iterations:**
+  - ruff requires `from __future__ import annotations` to be in the same import block (isort I001) — fixed with `--fix`
+  - `tests/unit/` directory did not exist; created with `__init__.py`
+  - `is_valid_slug()` can be used in US-004 to validate RSS feed names at config load time
+---
+
+## 2026-04-24 - US-003
+- Created `src/influx/prompts.py` with `load_prompt()`, `extract_variables()`, `validate_prompt_variables()`, and `REQUIRED_VARIABLES` mapping
+- Created `tests/unit/test_prompts.py` with 19 tests covering all ACs
+- `load_prompt()`: loads from `text` or `path` (exactly one required), relative paths resolved against `config_dir`
+- `extract_variables()`: regex-based `{var}` extraction, ignores `{{escaped}}`
+- `validate_prompt_variables()`: checks unknown vars (AC-01-A) and missing required vars (AC-01-B) for filter, tier1_enrich, tier3_extract
+- Required variable sets: filter={profile_description, negative_examples, min_score_in_results}, tier1_enrich={title, abstract, profile_summary}, tier3_extract={title, full_text}
+- Files changed: `src/influx/prompts.py`, `tests/unit/test_prompts.py`
+- **Learnings for future iterations:**
+  - Template variable regex `(?<!\{)\{(\w+)\}(?!\})` handles escaped braces correctly
+  - `PromptValidationError` (subclass of `ConfigError`) is used for variable validation errors; plain `ConfigError` for loading/mutual-exclusion errors
+  - ruff format may adjust line breaks after `--fix`; always run format after fix
+  - US-004 will need to call `validate_prompt_variables()` during config load for each prompt key
 ---

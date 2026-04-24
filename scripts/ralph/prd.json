@@ -26,7 +26,7 @@
         "Coverage on src/influx/slugs.py is >= 80%"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -45,7 +45,7 @@
         "Coverage on src/influx/prompts.py is >= 80%"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
