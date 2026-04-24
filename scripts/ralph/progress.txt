@@ -7,6 +7,9 @@ Started: Fri Apr 24 11:54:09 UTC 2026
 - Quality checks: `uv run pytest tests/`, `uv run pyright <file>`, `uv run ruff check <file>`
 - Config model is in config.py with pydantic v2 BaseModel classes
 - CLI dispatcher is in main.py with argparse subcommands
+- HTTP client uses respx for mocking httpx requests in tests
+- SSRF guard patches `socket.getaddrinfo` via `_fake_getaddrinfo(ip)` helper for controlled IP resolution in tests
+- Ruff line length is 88 chars; use `uv run ruff check --fix` for auto-fixable issues like import sorting
 
 ---
 
@@ -22,4 +25,21 @@ Started: Fri Apr 24 11:54:09 UTC 2026
   - All error subclasses use keyword-only constructor args for structured fields
   - NetworkError requires url and kind (no defaults); other subclasses have all-optional context fields
   - Full test suite is 100 tests and runs in <0.3s
+---
+
+## 2026-04-24 - US-002
+- Added httpx>=0.27 to project dependencies and respx>=0.22 to dev dependencies
+- Created src/influx/http_client.py with guarded_fetch() returning FetchResult dataclass (body, status_code, content_type, final_url)
+- Implemented scheme allow-list (http/https only) raising NetworkError(kind="scheme")
+- Implemented SSRF IP-classification guard: resolves hostname via socket.getaddrinfo, classifies IPs with ipaddress module (is_loopback, is_link_local, is_private, is_multicast)
+- SSRF guard raises NetworkError(kind="ssrf") with offending URL and resolved IP in reason
+- allow_private_ips=True bypasses SSRF rejection
+- DNS resolution failure raises NetworkError(kind="dns")
+- Created tests/unit/test_http_client.py with 17 tests covering scheme rejection, SSRF for all 4 IP classes, allow-through path, FetchResult attributes, and DNS failure
+- Files changed: pyproject.toml, uv.lock, src/influx/http_client.py, tests/unit/test_http_client.py
+- **Learnings for future iterations:**
+  - respx mocks httpx at the transport level; use `@respx.mock` decorator + `respx.get(url).mock(return_value=...)`
+  - For SSRF tests, patch `influx.http_client.socket.getaddrinfo` not `socket.getaddrinfo` directly
+  - FetchResult is a frozen dataclass with slots for immutability
+  - Future stories (US-003/004/005) will extend guarded_fetch with streaming, content-type check, and redirect re-validation
 ---
