@@ -194,12 +194,17 @@ class TestBackfillSubcommand:
         )
 
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                "backfill",
-                "--profile", "web-tech",
-                "--from", "2026-01-01",
-                "--to", "2026-01-31",
-            ])
+            main(
+                [
+                    "backfill",
+                    "--profile",
+                    "web-tech",
+                    "--from",
+                    "2026-01-01",
+                    "--to",
+                    "2026-01-31",
+                ]
+            )
 
         assert exc_info.value.code == EXIT_SUCCESS
         captured = capsys.readouterr()
@@ -222,11 +227,15 @@ class TestBackfillSubcommand:
         )
 
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                "backfill",
-                "--profile", "ai-robotics",
-                "--days", "365",
-            ])
+            main(
+                [
+                    "backfill",
+                    "--profile",
+                    "ai-robotics",
+                    "--days",
+                    "365",
+                ]
+            )
 
         assert exc_info.value.code == EXIT_USAGE
         captured = capsys.readouterr()
@@ -238,7 +247,14 @@ class TestBackfillSubcommand:
         self,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """confirm_required + --confirm → re-POST with confirm=true (AC-M3-8)."""
+        """confirm_required + --confirm → re-POST with confirm=true (AC-M3-8).
+
+        Also verifies the mandated sequence (§5.4 of PRD 03): the first
+        request MUST NOT carry ``confirm``; only the retry issued after
+        the server replies ``confirm_required`` is allowed to add it.
+        """
+        import json as json_mod
+
         route = respx.post("http://127.0.0.1:8080/backfills")
         route.side_effect = [
             httpx.Response(
@@ -261,18 +277,38 @@ class TestBackfillSubcommand:
         ]
 
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                "backfill",
-                "--profile", "ai-robotics",
-                "--days", "365",
-                "--confirm",
-            ])
+            main(
+                [
+                    "backfill",
+                    "--profile",
+                    "ai-robotics",
+                    "--days",
+                    "365",
+                    "--confirm",
+                ]
+            )
 
         assert exc_info.value.code == EXIT_SUCCESS
         captured = capsys.readouterr()
         assert "bf-confirmed-789" in captured.out
         # Verify two requests were made.
         assert route.call_count == 2
+
+        # First request MUST NOT include ``confirm`` — the reprompt flow
+        # is driven by the server's response, not by the CLI pre-empting it.
+        first_body = json_mod.loads(route.calls[0].request.content)
+        assert "confirm" not in first_body, (
+            f"First POST must not contain 'confirm': {first_body}"
+        )
+        assert first_body == {"profile": "ai-robotics", "days": 365}
+
+        # Second request (retry) MUST include ``confirm: true``.
+        second_body = json_mod.loads(route.calls[1].request.content)
+        assert second_body.get("confirm") is True, (
+            f"Retry POST must include 'confirm: true': {second_body}"
+        )
+        assert second_body["profile"] == "ai-robotics"
+        assert second_body["days"] == 365
 
     @respx.mock
     def test_backfill_conflict_exit_1(
@@ -288,11 +324,15 @@ class TestBackfillSubcommand:
         )
 
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                "backfill",
-                "--profile", "ai-robotics",
-                "--days", "7",
-            ])
+            main(
+                [
+                    "backfill",
+                    "--profile",
+                    "ai-robotics",
+                    "--days",
+                    "7",
+                ]
+            )
 
         assert exc_info.value.code == EXIT_PARTIAL
         captured = capsys.readouterr()
@@ -309,11 +349,15 @@ class TestBackfillSubcommand:
         )
 
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                "backfill",
-                "--profile", "ai-robotics",
-                "--days", "7",
-            ])
+            main(
+                [
+                    "backfill",
+                    "--profile",
+                    "ai-robotics",
+                    "--days",
+                    "7",
+                ]
+            )
 
         assert exc_info.value.code == EXIT_FAILURE
         captured = capsys.readouterr()
@@ -371,7 +415,8 @@ class TestMigrateNotes:
         from textwrap import dedent
 
         config_path = Path(str(tmp_path)) / "influx.toml"
-        config_path.write_text(dedent("""\
+        config_path.write_text(
+            dedent("""\
             [influx]
             note_schema_version = 42
 
@@ -381,7 +426,8 @@ class TestMigrateNotes:
             text = "e"
             [prompts.tier3_extract]
             text = "x"
-        """))
+        """)
+        )
         monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
 
         main(["migrate-notes"])

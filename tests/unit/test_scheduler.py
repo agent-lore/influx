@@ -130,9 +130,7 @@ class TestSchedulerLockIntegration:
             nonlocal lock_held_during_run
             lock_held_during_run = coord.is_busy(profile)
 
-        with patch(
-            "influx.scheduler.run_profile", side_effect=spy_run_profile
-        ):
+        with patch("influx.scheduler.run_profile", side_effect=spy_run_profile):
             await sched._fire_profile("alpha")
 
         assert lock_held_during_run is True
@@ -161,9 +159,7 @@ class TestSchedulerLockIntegration:
         coord = Coordinator()
         sched = InfluxScheduler(config, coord)
 
-        async def failing_run(
-            profile: str, kind: Any, run_range: Any = None
-        ) -> None:
+        async def failing_run(profile: str, kind: Any, run_range: Any = None) -> None:
             raise RuntimeError("boom")
 
         with (
@@ -192,9 +188,7 @@ class TestCrossProfileParallelism:
         ) -> None:
             fired.append(profile)
 
-        with patch(
-            "influx.scheduler.run_profile", side_effect=spy_run_profile
-        ):
+        with patch("influx.scheduler.run_profile", side_effect=spy_run_profile):
             await asyncio.gather(
                 sched._fire_profile("alpha"),
                 sched._fire_profile("beta"),
@@ -219,9 +213,7 @@ class TestCrossProfileParallelism:
             fired_count += 1
             await asyncio.sleep(0)  # Yield to let the other task attempt
 
-        with patch(
-            "influx.scheduler.run_profile", side_effect=spy_run_profile
-        ):
+        with patch("influx.scheduler.run_profile", side_effect=spy_run_profile):
             await asyncio.gather(
                 sched._fire_profile("alpha"),
                 sched._fire_profile("alpha"),

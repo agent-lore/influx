@@ -58,34 +58,67 @@ def _make_config(
 
 
 class TestCmdServeWiring:
-    """Verify _cmd_serve loads config, validates bind, and calls uvicorn."""
+    """Verify _cmd_serve loads config, validates bind, and configures uvicorn."""
 
-    def test_cmd_serve_calls_uvicorn_run(
+    @staticmethod
+    def _patch_uvicorn(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> dict[str, Any]:
+        """Replace ``uvicorn.Config`` + ``uvicorn.Server`` + ``asyncio.run``
+        with capturing stubs so ``_cmd_serve`` returns without binding
+        a real socket."""
+        import asyncio as asyncio_mod
+
+        import uvicorn
+
+        captured: dict[str, Any] = {}
+
+        real_config = uvicorn.Config
+
+        def capturing_config(app: Any, **kwargs: Any) -> Any:
+            captured["app"] = app
+            captured["kwargs"] = kwargs
+            return real_config(app, **kwargs)
+
+        class FakeServer:
+            def __init__(self, cfg: Any) -> None:
+                captured["server_config"] = cfg
+                self.should_exit = False
+
+            def install_signal_handlers(self) -> None:  # pragma: no cover
+                pass
+
+            async def serve(self) -> None:  # pragma: no cover
+                return None
+
+        def fake_run(coro: Any) -> None:
+            # Close the coroutine so pytest doesn't emit a warning.
+            coro.close()
+
+        monkeypatch.setattr(uvicorn, "Config", capturing_config)
+        monkeypatch.setattr(uvicorn, "Server", FakeServer)
+        monkeypatch.setattr(asyncio_mod, "run", fake_run)
+        return captured
+
+    def test_cmd_serve_configures_uvicorn(
         self,
         monkeypatch: pytest.MonkeyPatch,
         influx_config_env: Path,
     ) -> None:
-        """_cmd_serve loads config, creates service, and calls uvicorn.run."""
-        import uvicorn
-
+        """_cmd_serve builds a uvicorn Config with the expected host/port."""
         from influx.main import _cmd_serve
 
-        captured_kwargs: dict[str, Any] = {}
-
-        def fake_uvicorn_run(app: Any, **kwargs: Any) -> None:
-            captured_kwargs.update(kwargs)
-            captured_kwargs["app"] = app
-
-        monkeypatch.setattr(uvicorn, "run", fake_uvicorn_run)
+        captured = self._patch_uvicorn(monkeypatch)
         monkeypatch.delenv("INFLUX_ADMIN_BIND_HOST", raising=False)
         monkeypatch.delenv("INFLUX_ADMIN_PORT", raising=False)
 
         _cmd_serve()
 
-        assert captured_kwargs["host"] == "127.0.0.1"
-        assert captured_kwargs["port"] == 8080
-        assert captured_kwargs["log_level"] == "info"
-        assert captured_kwargs["app"] is not None
+        kwargs = captured["kwargs"]
+        assert kwargs["host"] == "127.0.0.1"
+        assert kwargs["port"] == 8080
+        assert kwargs["log_level"] == "info"
+        assert captured["app"] is not None
 
     def test_cmd_serve_uses_custom_bind(
         self,
@@ -93,23 +126,17 @@ class TestCmdServeWiring:
         influx_config_env: Path,
     ) -> None:
         """_cmd_serve reads custom bind host/port from env."""
-        import uvicorn
-
         from influx.main import _cmd_serve
 
-        captured_kwargs: dict[str, Any] = {}
-
-        def fake_uvicorn_run(app: Any, **kwargs: Any) -> None:
-            captured_kwargs.update(kwargs)
-
-        monkeypatch.setattr(uvicorn, "run", fake_uvicorn_run)
+        captured = self._patch_uvicorn(monkeypatch)
         monkeypatch.setenv("INFLUX_ADMIN_BIND_HOST", "127.0.0.1")
         monkeypatch.setenv("INFLUX_ADMIN_PORT", "9999")
 
         _cmd_serve()
 
-        assert captured_kwargs["host"] == "127.0.0.1"
-        assert captured_kwargs["port"] == 9999
+        kwargs = captured["kwargs"]
+        assert kwargs["host"] == "127.0.0.1"
+        assert kwargs["port"] == 9999
 
     def test_cmd_serve_passes_shutdown_grace(
         self,
@@ -117,23 +144,17 @@ class TestCmdServeWiring:
         influx_config_env: Path,
     ) -> None:
         """_cmd_serve passes shutdown_grace_seconds to uvicorn."""
-        import uvicorn
-
         from influx.main import _cmd_serve
 
-        captured_kwargs: dict[str, Any] = {}
-
-        def fake_uvicorn_run(app: Any, **kwargs: Any) -> None:
-            captured_kwargs.update(kwargs)
-
-        monkeypatch.setattr(uvicorn, "run", fake_uvicorn_run)
+        captured = self._patch_uvicorn(monkeypatch)
         monkeypatch.delenv("INFLUX_ADMIN_BIND_HOST", raising=False)
         monkeypatch.delenv("INFLUX_ADMIN_PORT", raising=False)
 
         _cmd_serve()
 
+        kwargs = captured["kwargs"]
         # Default shutdown_grace_seconds is 30
-        assert captured_kwargs["timeout_graceful_shutdown"] == 30
+        assert kwargs["timeout_graceful_shutdown"] == 30
 
     def test_cmd_serve_refuses_remote_bind_without_flag(
         self,
@@ -148,6 +169,128 @@ class TestCmdServeWiring:
 
         with pytest.raises(ConfigError, match="not a loopback"):
             _cmd_serve()
+
+
+# ── End-to-end shutdown bound (Finding 1 regression) ────────────────
+
+
+_GRACE_ZERO_TOML = dedent("""\
+    [influx]
+    note_schema_version = 1
+
+    [schedule]
+    cron = "0 6 * * *"
+    timezone = "UTC"
+    misfire_grace_seconds = 3600
+    shutdown_grace_seconds = 0
+
+    [[profiles]]
+    name = "ai-robotics"
+
+    [prompts.filter]
+    text = "test"
+    [prompts.tier1_enrich]
+    text = "test"
+    [prompts.tier3_extract]
+    text = "test"
+""")
+
+
+class TestCmdServeShutdownBound:
+    """Finding 1 regression: total ``_cmd_serve`` exit time must stay
+    within ``schedule.shutdown_grace_seconds`` even when an in-flight
+    task swallows cancellation.
+
+    Without manual event-loop ownership in ``_cmd_serve``,
+    ``asyncio.run``'s final cleanup pass would gather every remaining
+    task unbounded and let a stubborn task push the process exit past
+    the configured grace (AC-03-E).
+    """
+
+    def test_cmd_serve_bounds_total_exit_on_stubborn_task(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """End-to-end regression: stubborn post-cancel task must not
+        extend the total serve exit time past the configured grace.
+        """
+        import asyncio as asyncio_mod
+        import time
+
+        import uvicorn
+
+        # grace=0 config so any extension of the post-shutdown wait
+        # shows up as extra wall-clock time.
+        config_path = tmp_path / "influx.toml"
+        config_path.write_text(_GRACE_ZERO_TOML)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.setenv("INFLUX_ADMIN_BIND_HOST", "127.0.0.1")
+        monkeypatch.setenv("INFLUX_ADMIN_PORT", "0")
+
+        captured: dict[str, Any] = {}
+
+        class FakeServer:
+            """Simulates uvicorn: enters/exits the app's lifespan,
+            injects a stubborn task in-between so ``InfluxService.stop``
+            has to cancel it on the way out."""
+
+            def __init__(self, cfg: Any) -> None:
+                self.config = cfg
+                self.should_exit = False
+
+            def install_signal_handlers(self) -> None:
+                pass
+
+            async def serve(self) -> None:
+                app = self.config.app
+                lifespan_cm = app.router.lifespan_context(app)
+                await lifespan_cm.__aenter__()
+                try:
+
+                    async def stubborn() -> None:
+                        # Repeatedly swallow every CancelledError for a
+                        # full 1.0s so ``asyncio.run``'s unbounded final
+                        # cleanup pass has something to actually wait for.
+                        deadline = time.monotonic() + 1.0
+                        while time.monotonic() < deadline:
+                            try:
+                                await asyncio_mod.sleep(0.05)
+                            except asyncio_mod.CancelledError:
+                                current = asyncio_mod.current_task()
+                                if current is not None:
+                                    current.uncancel()
+                                continue
+                        captured["stubborn_done"] = True
+
+                    loop = asyncio_mod.get_event_loop()
+                    task = loop.create_task(stubborn())
+                    app.state.active_tasks.add(task)
+                    task.add_done_callback(app.state.active_tasks.discard)
+                    captured["stubborn_task"] = task
+                    await asyncio_mod.sleep(0)  # let it actually start
+                finally:
+                    # Triggers InfluxService.stop() under the lifespan.
+                    await lifespan_cm.__aexit__(None, None, None)
+
+        monkeypatch.setattr(uvicorn, "Server", FakeServer)
+
+        from influx.main import _cmd_serve
+
+        # Tolerance allows for bookkeeping (loop teardown, shutdown_asyncgens,
+        # the tiny post-cancel epsilon inside _cmd_serve); a full 1.0s
+        # stubborn linger would blow through this bound without the fix.
+        tolerance = 0.5
+
+        start = time.monotonic()
+        _cmd_serve()
+        elapsed = time.monotonic() - start
+
+        assert elapsed < tolerance, (
+            f"_cmd_serve took {elapsed:.3f}s with shutdown_grace_seconds=0; "
+            f"expected < {tolerance:.3f}s — a stubborn post-cancel task "
+            "must not extend total serve exit past the configured grace"
+        )
 
 
 # ── Lifespan integration ────────────────────────────────────────────
@@ -290,18 +433,16 @@ class TestServeSubprocess:
                 proc.kill()
                 proc.wait(timeout=5)
 
-    def test_serve_sigterm_clean_shutdown(
+    def test_serve_sigterm_clean_shutdown_exit_0(
         self,
         serve_env: dict[str, str],
     ) -> None:
-        """AC-03-E: serve handles SIGTERM with a clean shutdown.
+        """AC-03-E: serve handles SIGTERM with a clean shutdown and exit 0.
 
-        uvicorn 0.46+ performs a full graceful shutdown on SIGTERM
-        (scheduler stops, probe loop stops, app shuts down) but may
-        report exit code -15 rather than 0 — the signal terminates
-        the process after the shutdown completes.  We verify the
-        shutdown was clean by checking stderr for the shutdown
-        completion messages.
+        ``_cmd_serve`` installs its own asyncio-level signal handlers
+        (so SIGTERM drives ``server.should_exit = True`` and returns
+        normally), so the process must exit 0 after graceful shutdown
+        — not ``-15`` from the signal.
         """
         port = self._find_free_port()
         serve_env["INFLUX_ADMIN_PORT"] = str(port)
@@ -320,8 +461,9 @@ class TestServeSubprocess:
             proc.send_signal(signal.SIGTERM)
             proc.wait(timeout=15)
 
-            # Process terminated (not stuck)
-            assert proc.returncode is not None
+            assert proc.returncode == 0, (
+                f"Expected exit 0 on SIGTERM, got {proc.returncode}"
+            )
             # Verify clean shutdown happened (uvicorn logs)
             stderr = proc.stderr.read().decode() if proc.stderr else ""
             assert "Application shutdown complete" in stderr

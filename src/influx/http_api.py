@@ -14,11 +14,13 @@ and confirm-required flow (FR-HTTP-5).
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
+from collections.abc import Coroutine
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
@@ -123,9 +125,7 @@ class RunRequest(BaseModel):
                 "Supply exactly one of 'profile' or 'all_profiles', not both"
             )
         if not has_profile and not has_all:
-            raise ValueError(
-                "Supply exactly one of 'profile' or 'all_profiles'"
-            )
+            raise ValueError("Supply exactly one of 'profile' or 'all_profiles'")
         return self
 
 
@@ -168,8 +168,9 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
             )
 
         # Launch the run in the background so the response returns immediately.
-        asyncio.get_event_loop().create_task(
-            _run_and_release(coordinator, body.profile, RunKind.MANUAL)
+        _spawn_tracked_task(
+            request.app,
+            _run_and_release(coordinator, body.profile, RunKind.MANUAL),
         )
 
         return JSONResponse(
@@ -209,6 +210,30 @@ async def _run_and_release(
         coordinator.release(profile)
 
 
+def _spawn_tracked_task(
+    app: FastAPI, coro: Coroutine[Any, Any, Any]
+) -> asyncio.Task[Any]:
+    """Create an ``asyncio.Task`` and register it on ``app.state.active_tasks``.
+
+    The task set is consulted by :meth:`InfluxService.stop` so HTTP-triggered
+    work can complete within ``schedule.shutdown_grace_seconds`` before
+    the service shuts down (US-008 shutdown-grace contract).
+    """
+    # Preserve the existing set even when empty — ``... or set()`` would
+    # treat an empty set as falsy and replace it with a throwaway local
+    # set that is never written back to ``app.state``.
+    active_tasks: set[asyncio.Task[Any]] | None = getattr(
+        app.state, "active_tasks", None
+    )
+    if active_tasks is None:
+        active_tasks = set()
+        app.state.active_tasks = active_tasks
+    task = asyncio.get_event_loop().create_task(coro)
+    active_tasks.add(task)
+    task.add_done_callback(active_tasks.discard)
+    return task
+
+
 # ── POST /backfills ────────────────────────────────────────────────
 
 # Stub backfill estimator — returns 0 by default.  PRD 09 replaces
@@ -227,11 +252,19 @@ def estimate_backfill_items(
 
     This is a **constant stub** in PRD 03.  By default it returns ``0``.
     Set :data:`_backfill_estimate_override` to force a specific value
-    for testing the confirm-required flow.
+    for same-process testing (monkeypatch), or export the env var
+    ``INFLUX_TEST_BACKFILL_ESTIMATE=<int>`` to force the value when the
+    server runs in a subprocess (end-to-end CLI tests for AC-M3-8).
 
     PRD 09 replaces the body with the ``days × categories × avg_results``
     formula.
     """
+    env_override = os.environ.get("INFLUX_TEST_BACKFILL_ESTIMATE")
+    if env_override is not None:
+        try:
+            return int(env_override)
+        except ValueError:
+            pass
     if _backfill_estimate_override is not None:
         return _backfill_estimate_override
     return 0
@@ -259,25 +292,17 @@ class BackfillRequest(BaseModel):
                 "Supply exactly one of 'profile' or 'all_profiles', not both"
             )
         if not has_profile and not has_all:
-            raise ValueError(
-                "Supply exactly one of 'profile' or 'all_profiles'"
-            )
+            raise ValueError("Supply exactly one of 'profile' or 'all_profiles'")
 
         # Exactly one of days / (from, to).
         has_days = self.days is not None
         has_range = self.date_from is not None or self.date_to is not None
         if has_days and has_range:
-            raise ValueError(
-                "Supply exactly one of 'days' or ('from', 'to'), not both"
-            )
+            raise ValueError("Supply exactly one of 'days' or ('from', 'to'), not both")
         if not has_days and not has_range:
-            raise ValueError(
-                "Supply exactly one of 'days' or ('from', 'to')"
-            )
+            raise ValueError("Supply exactly one of 'days' or ('from', 'to')")
         if has_range and (self.date_from is None or self.date_to is None):
-            raise ValueError(
-                "Both 'from' and 'to' are required when using date range"
-            )
+            raise ValueError("Both 'from' and 'to' are required when using date range")
         return self
 
 
@@ -348,10 +373,9 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
             )
 
         # Launch the backfill in the background.
-        asyncio.get_event_loop().create_task(
-            _run_and_release(
-                coordinator, body.profile, RunKind.BACKFILL, run_range
-            )
+        _spawn_tracked_task(
+            request.app,
+            _run_and_release(coordinator, body.profile, RunKind.BACKFILL, run_range),
         )
 
         return JSONResponse(

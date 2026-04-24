@@ -28,12 +28,15 @@ from influx.http_client import (
 class TestSchemeAllowList:
     """The guarded client must reject non-http(s) schemes."""
 
-    @pytest.mark.parametrize("url", [
-        "ftp://example.com/file",
-        "file:///etc/passwd",
-        "gopher://example.com",
-        "javascript:alert(1)",
-    ])
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://example.com/file",
+            "file:///etc/passwd",
+            "gopher://example.com",
+            "javascript:alert(1)",
+        ],
+    )
     def test_rejects_disallowed_scheme(self, url: str) -> None:
         with pytest.raises(NetworkError) as exc_info:
             guarded_fetch(url)
@@ -67,15 +70,16 @@ _PATCH_GAI = "influx.http_client.socket.getaddrinfo"
 class TestSSRFGuardRejectsPrivate:
     """SSRF guard blocks loopback, link-local, private, multicast."""
 
-    @pytest.mark.parametrize("ip,label", [
-        ("127.0.0.1", "loopback"),
-        ("169.254.169.254", "link_local"),
-        ("10.0.0.1", "private"),
-        ("224.0.0.1", "multicast"),
-    ])
-    def test_rejects_ip_class(
-        self, ip: str, label: str
-    ) -> None:
+    @pytest.mark.parametrize(
+        "ip,label",
+        [
+            ("127.0.0.1", "loopback"),
+            ("169.254.169.254", "link_local"),
+            ("10.0.0.1", "private"),
+            ("224.0.0.1", "multicast"),
+        ],
+    )
+    def test_rejects_ip_class(self, ip: str, label: str) -> None:
         url = "http://evil.example.com/path"
         fake = _fake_getaddrinfo(ip)
         with patch(_PATCH_GAI, fake):
@@ -114,12 +118,15 @@ class TestSSRFGuardAllowPrivateIps:
     """When allow_private_ips=True, the SSRF guard is bypassed."""
 
     @respx.mock
-    @pytest.mark.parametrize("ip", [
-        "127.0.0.1",
-        "169.254.169.254",
-        "10.0.0.1",
-        "224.0.0.1",
-    ])
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.1",
+            "224.0.0.1",
+        ],
+    )
     def test_allows_when_flag_true(self, ip: str) -> None:
         url = f"http://{ip}/test"
         respx.get(url).mock(
@@ -267,9 +274,7 @@ class TestTimeout:
             ) as mock_client_cls,
         ):
             ctx = mock_client_cls.return_value.__enter__.return_value
-            ctx.stream.side_effect = httpx.ConnectTimeout(
-                "timed out"
-            )
+            ctx.stream.side_effect = httpx.ConnectTimeout("timed out")
             with pytest.raises(NetworkError) as exc_info:
                 guarded_fetch(url, timeout_seconds=1)
             err = exc_info.value
@@ -287,9 +292,7 @@ class TestTimeout:
             ) as mock_client_cls,
         ):
             ctx = mock_client_cls.return_value.__enter__.return_value
-            ctx.stream.side_effect = httpx.ReadTimeout(
-                "read timed out"
-            )
+            ctx.stream.side_effect = httpx.ReadTimeout("read timed out")
             with pytest.raises(NetworkError) as exc_info:
                 guarded_fetch(url, timeout_seconds=1)
             err = exc_info.value
@@ -304,19 +307,20 @@ class TestContentTypeFamilyPositive:
     """Positive cases: response content-type matches expected family."""
 
     @respx.mock
-    @pytest.mark.parametrize("ct,family", [
-        ("text/html", "html"),
-        ("text/html; charset=utf-8", "html"),
-        ("application/xhtml+xml", "html"),
-        ("application/pdf", "pdf"),
-        ("text/xml", "xml"),
-        ("application/xml", "xml"),
-        ("application/atom+xml", "xml"),
-        ("application/rss+xml", "xml"),
-    ])
-    def test_matching_content_type_succeeds(
-        self, ct: str, family: str
-    ) -> None:
+    @pytest.mark.parametrize(
+        "ct,family",
+        [
+            ("text/html", "html"),
+            ("text/html; charset=utf-8", "html"),
+            ("application/xhtml+xml", "html"),
+            ("application/pdf", "pdf"),
+            ("text/xml", "xml"),
+            ("application/xml", "xml"),
+            ("application/atom+xml", "xml"),
+            ("application/rss+xml", "xml"),
+        ],
+    )
+    def test_matching_content_type_succeeds(self, ct: str, family: str) -> None:
         url = "http://example.com/doc"
         respx.get(url).mock(
             return_value=httpx.Response(
@@ -326,7 +330,8 @@ class TestContentTypeFamilyPositive:
         fake = _fake_getaddrinfo("93.184.216.34")
         with patch(_PATCH_GAI, fake):
             result = guarded_fetch(
-                url, expected_content_type=family  # type: ignore[arg-type]
+                url,
+                expected_content_type=family,  # type: ignore[arg-type]
             )
         assert result.body == b"data"
 
@@ -433,14 +438,14 @@ class TestRedirectRevalidation:
         pub = "http://public.example.com/start"
         prv = "http://internal.example.com/secret"
         respx.get(pub).mock(
-            return_value=httpx.Response(
-                302, headers={"location": prv}
-            ),
+            return_value=httpx.Response(302, headers={"location": prv}),
         )
-        resolver = _multi_resolve({
-            "public.example.com": "93.184.216.34",
-            "internal.example.com": "10.0.0.1",
-        })
+        resolver = _multi_resolve(
+            {
+                "public.example.com": "93.184.216.34",
+                "internal.example.com": "10.0.0.1",
+            }
+        )
         with patch(_PATCH_GAI, resolver):
             with pytest.raises(NetworkError) as exc_info:
                 guarded_fetch(pub)
@@ -454,14 +459,14 @@ class TestRedirectRevalidation:
         pub = "http://public.example.com/go"
         loop = "http://localhost/admin"
         respx.get(pub).mock(
-            return_value=httpx.Response(
-                302, headers={"location": loop}
-            ),
+            return_value=httpx.Response(302, headers={"location": loop}),
         )
-        resolver = _multi_resolve({
-            "public.example.com": "93.184.216.34",
-            "localhost": "127.0.0.1",
-        })
+        resolver = _multi_resolve(
+            {
+                "public.example.com": "93.184.216.34",
+                "localhost": "127.0.0.1",
+            }
+        )
         with patch(_PATCH_GAI, resolver):
             with pytest.raises(NetworkError) as exc_info:
                 guarded_fetch(pub)
@@ -491,9 +496,7 @@ class TestRedirectRevalidation:
         pub = "http://public.example.com/start"
         prv = "http://internal.example.com/data"
         respx.get(pub).mock(
-            return_value=httpx.Response(
-                302, headers={"location": prv}
-            ),
+            return_value=httpx.Response(302, headers={"location": prv}),
         )
         respx.get(prv).mock(
             return_value=httpx.Response(200, text="ok"),

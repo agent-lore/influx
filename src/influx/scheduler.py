@@ -15,6 +15,7 @@ stub** in this PRD.  The following PRDs replace the body:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -69,10 +70,20 @@ class InfluxScheduler:
     :func:`run_profile`.
     """
 
-    def __init__(self, config: AppConfig, coordinator: Coordinator) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        coordinator: Coordinator,
+        active_tasks: set[asyncio.Task[Any]] | None = None,
+    ) -> None:
         self._config = config
         self._coordinator = coordinator
         self._scheduler = AsyncIOScheduler()
+        # Optional shared set for tracking in-flight scheduler fires so
+        # that the service layer can await them within
+        # ``schedule.shutdown_grace_seconds`` during graceful shutdown
+        # (US-008).  ``None`` disables tracking.
+        self._active_tasks = active_tasks
 
     @property
     def jobs(self) -> list[Any]:
@@ -97,6 +108,21 @@ class InfluxScheduler:
             )
         self._scheduler.start()
 
+    def pause(self) -> None:
+        """Stop new fires without cancelling in-flight work.
+
+        Removes all registered jobs so APScheduler won't schedule any
+        more fires, but lets already-running ``_fire_profile`` tasks
+        continue to completion.  Called by :meth:`InfluxService.stop`
+        before the graceful-shutdown grace window begins so that
+        scheduler-fired work gets the same bounded completion window
+        as HTTP-triggered work (US-008).
+        """
+        try:
+            self._scheduler.remove_all_jobs()
+        except Exception:  # pragma: no cover — defensive
+            logger.debug("remove_all_jobs() raised during pause()", exc_info=True)
+
     def stop(self, wait: bool = False) -> None:
         """Shut down the APScheduler.
 
@@ -112,7 +138,17 @@ class InfluxScheduler:
 
         A same-profile lock conflict is logged and swallowed so that
         the scheduler is not crashed by overlap (FR-SCHED-3).
+
+        Registers the current task on the shared ``active_tasks`` set
+        (if provided) so ``InfluxService.stop`` can await this fire
+        within ``schedule.shutdown_grace_seconds`` instead of cancelling
+        it immediately (US-008 bounded graceful-shutdown contract).
         """
+        if self._active_tasks is not None:
+            current = asyncio.current_task()
+            if current is not None:
+                self._active_tasks.add(current)
+                current.add_done_callback(self._active_tasks.discard)
         try:
             async with self._coordinator.hold(profile_name):
                 await run_profile(profile_name, RunKind.SCHEDULED)

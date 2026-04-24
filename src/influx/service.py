@@ -11,6 +11,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import os
@@ -67,9 +68,7 @@ def _is_loopback(host: str) -> bool:
     # Hostname — resolve it.
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-        return all(
-            ipaddress.ip_address(info[4][0]).is_loopback for info in infos
-        )
+        return all(ipaddress.ip_address(info[4][0]).is_loopback for info in infos)
     except (socket.gaierror, OSError):
         return False
 
@@ -107,13 +106,18 @@ def create_app(
     app.include_router(router)
 
     coordinator = Coordinator()
-    scheduler = InfluxScheduler(config, coordinator)
+    # Tracks in-flight run/backfill tasks — both HTTP-triggered and
+    # scheduler-fired — so that shutdown can await them within
+    # ``schedule.shutdown_grace_seconds`` (US-008).
+    active_tasks: set[asyncio.Task[Any]] = set()
+    scheduler = InfluxScheduler(config, coordinator, active_tasks=active_tasks)
     probe_loop = ProbeLoop(config, interval=30.0)
 
     app.state.config = config
     app.state.coordinator = coordinator
     app.state.scheduler = scheduler
     app.state.probe_loop = probe_loop
+    app.state.active_tasks = active_tasks
 
     return app
 
@@ -171,13 +175,46 @@ class InfluxService:
     async def stop(self) -> None:
         """Stop the scheduler and probe loop cleanly.
 
-        In-flight runs are allowed to complete within
-        ``schedule.shutdown_grace_seconds``.
+        In-flight runs — both scheduler-fired and HTTP-triggered — are
+        allowed to complete within ``schedule.shutdown_grace_seconds``;
+        anything still outstanding after that bound is cancelled.
         """
         if not self._started:
             return
         logger.info("Stopping Influx service")
-        self.scheduler.stop(wait=True)
+        grace = float(self._config.schedule.shutdown_grace_seconds)
+
+        # Prevent new scheduler fires without cancelling in-flight
+        # scheduler work.  ``scheduler.stop(wait=False)`` is deferred
+        # until after the grace wait so scheduled fires get the same
+        # bounded completion window as HTTP-triggered work.
+        self.scheduler.pause()
+
+        active_tasks: set[asyncio.Task[Any]] = self._app.state.active_tasks
+        pending = [t for t in active_tasks if not t.done()]
+        if pending:
+            logger.info(
+                "Waiting up to %.1fs for %d in-flight task(s) to finish",
+                grace,
+                len(pending),
+            )
+            _, still_running = await asyncio.wait(pending, timeout=grace)
+            if still_running:
+                logger.warning(
+                    "Cancelling %d task(s) that exceeded shutdown grace",
+                    len(still_running),
+                )
+                for task in still_running:
+                    task.cancel()
+                # Do not await after cancel(): the total shutdown wait is
+                # sourced entirely from schedule.shutdown_grace_seconds.
+                # cancel() has requested cancellation; tasks that ignore
+                # it are left to drain in the background so stop() never
+                # blocks past the configured grace window.
+
+        # Now fully shut down the scheduler — no in-flight work remains.
+        self.scheduler.stop(wait=False)
+
         await self.probe_loop.stop()
         self._started = False
         logger.info("Influx service stopped")

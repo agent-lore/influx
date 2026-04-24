@@ -30,12 +30,13 @@ def _make_config(
     profiles: list[str] | None = None,
     providers: dict[str, Any] | None = None,
     security: SecurityConfig | None = None,
+    schedule: ScheduleConfig | None = None,
 ) -> AppConfig:
     """Build a minimal AppConfig for service tests."""
     profile_names = profiles if profiles is not None else ["ai-robotics"]
     profile_list = [ProfileConfig(name=name) for name in profile_names]
     return AppConfig(
-        schedule=ScheduleConfig(cron="0 6 * * *", timezone="UTC"),
+        schedule=schedule or ScheduleConfig(cron="0 6 * * *", timezone="UTC"),
         profiles=profile_list,
         providers=providers or {},
         security=security or SecurityConfig(),
@@ -177,6 +178,242 @@ class TestInfluxService:
         config = _make_config()
         svc = InfluxService(config)
         await svc.stop()  # should be a no-op
+
+    async def test_stop_awaits_in_flight_http_tasks(self) -> None:
+        """Shutdown waits for HTTP-triggered tasks to complete within grace."""
+        import asyncio
+
+        config = _make_config(
+            schedule=ScheduleConfig(shutdown_grace_seconds=2),
+        )
+        svc = InfluxService(config)
+        await svc.start()
+
+        completed = asyncio.Event()
+        cancel_observed = asyncio.Event()
+
+        async def in_flight_work() -> None:
+            try:
+                # Simulate quick HTTP-triggered work that finishes
+                # well inside the grace window.
+                await asyncio.sleep(0.1)
+                completed.set()
+            except asyncio.CancelledError:
+                cancel_observed.set()
+                raise
+
+        task = asyncio.get_event_loop().create_task(in_flight_work())
+        svc.app.state.active_tasks.add(task)
+        task.add_done_callback(svc.app.state.active_tasks.discard)
+
+        await svc.stop()
+
+        assert completed.is_set(), "Task should have finished within the grace window"
+        assert not cancel_observed.is_set(), (
+            "Task should not have been cancelled within the grace window"
+        )
+
+    async def test_stop_awaits_http_triggered_work_on_real_app(self) -> None:
+        """Regression for Finding 1: ``_spawn_tracked_task`` must register
+        HTTP-triggered tasks on the existing (possibly empty) set on
+        ``app.state`` so ``InfluxService.stop`` can actually await them.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        import httpx
+
+        config = _make_config(
+            schedule=ScheduleConfig(shutdown_grace_seconds=2),
+        )
+        svc = InfluxService(config)
+        await svc.start()
+
+        completed = asyncio.Event()
+        cancel_observed = asyncio.Event()
+
+        async def slow_run_profile(
+            profile: str, kind: Any, run_range: Any = None
+        ) -> None:
+            try:
+                await asyncio.sleep(0.1)  # well inside the grace window
+                completed.set()
+            except asyncio.CancelledError:
+                cancel_observed.set()
+                raise
+
+        transport = httpx.ASGITransport(app=svc.app)
+        with patch("influx.http_api.run_profile", slow_run_profile):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                resp = await client.post("/runs", json={"profile": "ai-robotics"})
+                assert resp.status_code == 202
+
+            # Let the spawned task actually start.
+            await asyncio.sleep(0)
+
+            # The real bug: with the empty-set replacement, this would
+            # stay at 0 because the task went into a throwaway local set.
+            assert len(svc.app.state.active_tasks) >= 1, (
+                "_spawn_tracked_task must register task on app.state.active_tasks"
+            )
+
+            await svc.stop()
+
+        assert completed.is_set(), (
+            "HTTP-triggered task should finish within shutdown grace window"
+        )
+        assert not cancel_observed.is_set(), (
+            "HTTP-triggered task should not be cancelled within grace window"
+        )
+
+    async def test_stop_awaits_scheduler_fire_within_grace(self) -> None:
+        """Regression for Finding 2: scheduled fires must be awaited up to
+        ``schedule.shutdown_grace_seconds`` instead of cancelled immediately.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        config = _make_config(
+            schedule=ScheduleConfig(shutdown_grace_seconds=2),
+        )
+        svc = InfluxService(config)
+        await svc.start()
+
+        fired = asyncio.Event()
+        completed = asyncio.Event()
+        cancel_observed = asyncio.Event()
+
+        async def long_run_profile(
+            profile: str, kind: Any, run_range: Any = None
+        ) -> None:
+            fired.set()
+            try:
+                await asyncio.sleep(0.2)  # well inside the grace window
+                completed.set()
+            except asyncio.CancelledError:
+                cancel_observed.set()
+                raise
+
+        with patch("influx.scheduler.run_profile", long_run_profile):
+            # Directly invoke _fire_profile to simulate a scheduler fire
+            # — avoids waiting for cron while still exercising the real
+            # _fire_profile path that registers the task on active_tasks.
+            fire_task = asyncio.get_event_loop().create_task(
+                svc.scheduler._fire_profile("ai-robotics")
+            )
+            await fired.wait()
+
+            # Task must be tracked so shutdown can await it.
+            assert fire_task in svc.app.state.active_tasks
+
+            await svc.stop()
+
+        assert completed.is_set(), (
+            "Scheduled fire should complete within the grace window, "
+            "not be cancelled immediately"
+        )
+        assert not cancel_observed.is_set(), (
+            "Scheduled fire should NOT observe CancelledError within grace"
+        )
+
+    async def test_stop_cancels_tasks_that_exceed_grace(self) -> None:
+        """Tasks that exceed schedule.shutdown_grace_seconds are cancelled."""
+        import asyncio
+
+        # Bound shutdown tightly so the test runs fast but the task
+        # deliberately exceeds the grace window.
+        config = _make_config(
+            schedule=ScheduleConfig(shutdown_grace_seconds=0),
+        )
+        svc = InfluxService(config)
+        await svc.start()
+
+        cancel_observed = asyncio.Event()
+
+        async def blocked_work() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancel_observed.set()
+                raise
+
+        task = asyncio.get_event_loop().create_task(blocked_work())
+        svc.app.state.active_tasks.add(task)
+        task.add_done_callback(svc.app.state.active_tasks.discard)
+
+        # Give the task a moment to actually start
+        await asyncio.sleep(0)
+
+        await svc.stop()
+
+        assert task.cancelled() or cancel_observed.is_set(), (
+            "Task that exceeded grace should have been cancelled"
+        )
+
+    async def test_stop_returns_within_bound_even_if_cancellation_is_slow(
+        self,
+    ) -> None:
+        """stop() must not block past schedule.shutdown_grace_seconds when a
+        task catches CancelledError and lingers.
+
+        With ``grace=0`` the total shutdown wait must be near-zero — no
+        extra fixed post-cancel window may be added on top of the
+        configured grace.
+        """
+        import asyncio
+        import time
+
+        config = _make_config(
+            schedule=ScheduleConfig(shutdown_grace_seconds=0),
+        )
+        svc = InfluxService(config)
+        await svc.start()
+
+        released = asyncio.Event()
+
+        async def stubborn_work() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                # Swallow cancellation and linger well past any bounded
+                # wait stop() might perform.
+                try:
+                    await asyncio.sleep(1.0)
+                finally:
+                    released.set()
+
+        task = asyncio.get_event_loop().create_task(stubborn_work())
+        svc.app.state.active_tasks.add(task)
+        task.add_done_callback(svc.app.state.active_tasks.discard)
+
+        await asyncio.sleep(0)  # let the task actually start
+
+        # Tolerance covers bookkeeping (scheduler.pause(), probe_loop.stop(),
+        # logger calls); any post-cancel wait tied to a fixed sleep would
+        # blow past this bound when grace=0.
+        tolerance = 0.05
+
+        try:
+            start = time.monotonic()
+            await svc.stop()
+            elapsed = time.monotonic() - start
+        finally:
+            # Cleanup: make sure the lingering task is drained so it
+            # doesn't leak into other tests.
+            if not task.done():
+                await asyncio.wait({task}, timeout=2.0)
+
+        assert elapsed < tolerance, (
+            f"stop() took {elapsed:.3f}s with grace=0; expected < "
+            f"{tolerance:.3f}s — any fixed post-cancel wait would exceed "
+            "the configured grace bound"
+        )
+        assert not released.is_set() or task.done(), (
+            "stop() returned before the stubborn task finished lingering, "
+            "which is the expected bounded behaviour"
+        )
 
 
 # ── Config schema extensions ─────────────────────────────────────────

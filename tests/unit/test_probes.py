@@ -7,7 +7,13 @@ from textwrap import dedent
 
 import pytest
 
-from influx.config import AppConfig, ProviderConfig, load_config
+from influx.config import (
+    AppConfig,
+    PromptEntryConfig,
+    PromptsConfig,
+    ProviderConfig,
+    load_config,
+)
 from influx.probes import ProbeLoop, ProbeResult, ProbeState
 
 # ── Helper: build a minimal AppConfig with providers ─────────────────
@@ -19,11 +25,11 @@ def _make_config(
     """Return a minimal ``AppConfig`` with the given providers."""
     return AppConfig(
         providers=providers or {},
-        prompts={
-            "filter": {"text": "f"},
-            "tier1_enrich": {"text": "e"},
-            "tier3_extract": {"text": "x"},
-        },
+        prompts=PromptsConfig(
+            filter=PromptEntryConfig(text="f"),
+            tier1_enrich=PromptEntryConfig(text="e"),
+            tier3_extract=PromptEntryConfig(text="x"),
+        ),
     )
 
 
@@ -52,9 +58,7 @@ class TestLithosProbe:
         assert loop.state.lithos.status == "degraded"
         assert loop.state.lithos.timestamp > 0
 
-    def test_lithos_ok_when_env_not_set(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_lithos_ok_when_env_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Lithos probe returns ok when INFLUX_TEST_LITHOS_DOWN is unset."""
         monkeypatch.delenv("INFLUX_TEST_LITHOS_DOWN", raising=False)
         cfg = _make_config()
@@ -69,9 +73,7 @@ class TestLithosProbe:
 class TestLLMCredentialsProbe:
     """LLM-credentials probe checks configured providers' api_key_env."""
 
-    def test_all_credentials_present(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_all_credentials_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Probe passes when all configured providers have their api_key_env set."""
         monkeypatch.setenv("MY_API_KEY", "some-value")
         providers = {
@@ -84,9 +86,7 @@ class TestLLMCredentialsProbe:
         loop.run_once()
         assert loop.state.llm_credentials.status == "ok"
 
-    def test_missing_credential_degrades(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_missing_credential_degrades(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Missing provider credential → degraded state."""
         monkeypatch.delenv("MISSING_KEY", raising=False)
         providers = {
@@ -103,9 +103,7 @@ class TestLLMCredentialsProbe:
     def test_keyless_provider_skipped(self) -> None:
         """Providers with api_key_env='' are skipped (keyless, e.g. Ollama)."""
         providers = {
-            "ollama": ProviderConfig(
-                base_url="http://localhost:11434", api_key_env=""
-            ),
+            "ollama": ProviderConfig(base_url="http://localhost:11434", api_key_env=""),
         }
         cfg = _make_config(providers)
         loop = ProbeLoop(cfg, interval=30.0)
@@ -118,9 +116,7 @@ class TestLLMCredentialsProbe:
         """Mix of keyless and keyed providers — all ok when keyed vars are set."""
         monkeypatch.setenv("OPENAI_KEY", "test-key")
         providers = {
-            "ollama": ProviderConfig(
-                base_url="http://localhost:11434", api_key_env=""
-            ),
+            "ollama": ProviderConfig(base_url="http://localhost:11434", api_key_env=""),
             "openai": ProviderConfig(
                 base_url="https://api.openai.com", api_key_env="OPENAI_KEY"
             ),
@@ -130,9 +126,7 @@ class TestLLMCredentialsProbe:
         loop.run_once()
         assert loop.state.llm_credentials.status == "ok"
 
-    def test_mixed_providers_one_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_mixed_providers_one_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """One missing key among several providers → degraded."""
         monkeypatch.setenv("GOOD_KEY", "present")
         monkeypatch.delenv("BAD_KEY", raising=False)
@@ -216,6 +210,92 @@ class TestTimestamps:
         assert t2 >= t1
 
 
+# ── Staleness (US-002 stale-cache requirement) ────────────────────────
+
+
+class TestStaleProbeCache:
+    """Cached probe results that exceed ``max_age`` are treated as stale.
+
+    A stale cache must NOT count as ready (US-002), even if the last
+    cached status was ``ok``.
+    """
+
+    def test_fresh_cache_is_ready(self) -> None:
+        """Recent timestamps → is_ready stays True."""
+        import time as time_mod
+
+        now = time_mod.monotonic()
+        state = ProbeState(
+            lithos=ProbeResult(status="ok", timestamp=now),
+            llm_credentials=ProbeResult(status="ok", timestamp=now),
+            max_age=60.0,
+        )
+        assert state.is_stale() is False
+        assert state.is_ready is True
+        assert state.overall_status == "ok"
+
+    def test_stale_cache_is_not_ready(self) -> None:
+        """Timestamps older than max_age → stale → not ready, degraded."""
+        import time as time_mod
+
+        old = time_mod.monotonic() - 1_000.0
+        state = ProbeState(
+            lithos=ProbeResult(status="ok", timestamp=old),
+            llm_credentials=ProbeResult(status="ok", timestamp=old),
+            max_age=60.0,
+        )
+        assert state.is_stale() is True
+        assert state.is_ready is False
+        assert state.overall_status == "degraded"
+
+    def test_max_age_zero_disables_staleness_check(self) -> None:
+        """max_age=0.0 → staleness check disabled (back-compat)."""
+        import time as time_mod
+
+        old = time_mod.monotonic() - 1_000.0
+        state = ProbeState(
+            lithos=ProbeResult(status="ok", timestamp=old),
+            llm_credentials=ProbeResult(status="ok", timestamp=old),
+            max_age=0.0,
+        )
+        assert state.is_stale() is False
+        assert state.is_ready is True
+
+    def test_starting_state_is_not_stale(self) -> None:
+        """Before the first probe cycle, is_stale() returns False."""
+        state = ProbeState(max_age=60.0)
+        assert state.is_stale() is False
+        assert state.overall_status == "starting"
+
+    def test_probe_loop_sets_max_age_from_interval(self) -> None:
+        """ProbeLoop defaults max_age to 3× interval."""
+        cfg = _make_config()
+        loop = ProbeLoop(cfg, interval=30.0)
+        loop.run_once()
+        assert loop.state.max_age == 90.0
+
+    def test_probe_loop_custom_max_age(self) -> None:
+        """ProbeLoop accepts an explicit max_age override."""
+        cfg = _make_config()
+        loop = ProbeLoop(cfg, interval=30.0, max_age=120.0)
+        loop.run_once()
+        assert loop.state.max_age == 120.0
+
+    def test_stale_cache_forces_degraded_status(self) -> None:
+        """After enough wall-clock time, cached results go stale."""
+        import time as time_mod
+
+        cfg = _make_config()
+        # Very short max_age so the next call is already stale.
+        loop = ProbeLoop(cfg, interval=30.0, max_age=0.01)
+        loop.run_once()
+        # Allow the cached timestamp to age past max_age.
+        time_mod.sleep(0.05)
+        assert loop.state.is_stale() is True
+        assert loop.state.is_ready is False
+        assert loop.state.overall_status == "degraded"
+
+
 # ── ProbeLoop lifecycle ──────────────────────────────────────────────
 
 
@@ -271,9 +351,7 @@ class TestProbeLoopLifecycle:
 class TestDegradedState:
     """The probe can be driven into a degraded state by either probe."""
 
-    def test_degraded_via_lithos(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_degraded_via_lithos(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """INFLUX_TEST_LITHOS_DOWN=1 drives overall state to degraded."""
         monkeypatch.setenv("INFLUX_TEST_LITHOS_DOWN", "1")
         cfg = _make_config()

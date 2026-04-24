@@ -31,12 +31,14 @@ ContentTypeFamily = Literal["html", "pdf", "xml"]
 _CONTENT_TYPE_FAMILIES: dict[ContentTypeFamily, frozenset[str]] = {
     "html": frozenset({"text/html", "application/xhtml+xml"}),
     "pdf": frozenset({"application/pdf"}),
-    "xml": frozenset({
-        "text/xml",
-        "application/xml",
-        "application/atom+xml",
-        "application/rss+xml",
-    }),
+    "xml": frozenset(
+        {
+            "text/xml",
+            "application/xml",
+            "application/atom+xml",
+            "application/rss+xml",
+        }
+    ),
 }
 
 
@@ -143,10 +145,7 @@ def _check_content_type(
             f"Content-type {mime!r} does not match expected family {expected!r}",
             url=url,
             kind="content_type_mismatch",
-            reason=(
-                f"Expected one of {', '.join(sorted(allowed))}; "
-                f"got {mime!r}"
-            ),
+            reason=(f"Expected one of {', '.join(sorted(allowed))}; got {mime!r}"),
         )
 
 
@@ -179,13 +178,9 @@ def guarded_fetch(
     current_url = url
 
     try:
-        with httpx.Client(
-            timeout=timeout, follow_redirects=False
-        ) as client:
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
             for _hop in range(_MAX_REDIRECTS + 1):
-                with client.stream(
-                    "GET", current_url
-                ) as response:
+                with client.stream("GET", current_url) as response:
                     if response.is_redirect:
                         next_url = urljoin(
                             current_url,
@@ -205,9 +200,7 @@ def guarded_fetch(
                         received += len(chunk)
                         if received > max_download_bytes:
                             raise NetworkError(
-                                "Response body exceeds"
-                                f" {max_download_bytes}"
-                                " bytes",
+                                f"Response body exceeds {max_download_bytes} bytes",
                                 url=current_url,
                                 kind="oversize",
                                 reason=(
@@ -219,21 +212,15 @@ def guarded_fetch(
                         chunks.append(chunk)
                     body = b"".join(chunks)
                     status_code = response.status_code
-                    content_type = response.headers.get(
-                        "content-type", ""
-                    )
+                    content_type = response.headers.get("content-type", "")
                     final_url = str(response.url)
                     break
             else:
                 raise NetworkError(
-                    "Too many redirects"
-                    f" (>{_MAX_REDIRECTS})",
+                    f"Too many redirects (>{_MAX_REDIRECTS})",
                     url=url,
                     kind="network",
-                    reason=(
-                        f"Exceeded {_MAX_REDIRECTS}"
-                        " redirects"
-                    ),
+                    reason=(f"Exceeded {_MAX_REDIRECTS} redirects"),
                 )
     except NetworkError:
         raise
@@ -253,9 +240,7 @@ def guarded_fetch(
         ) from exc
 
     if expected_content_type is not None:
-        _check_content_type(
-            content_type, expected_content_type, final_url
-        )
+        _check_content_type(content_type, expected_content_type, final_url)
 
     return FetchResult(
         body=body,

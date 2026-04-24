@@ -279,9 +279,7 @@ class TestPostRuns:
             coordinator.release("ai-robotics")
             loop.close()
 
-    def test_runs_both_profile_and_all_returns_422(
-        self, client: TestClient
-    ) -> None:
+    def test_runs_both_profile_and_all_returns_422(self, client: TestClient) -> None:
         """Body with both profile and all_profiles → 422 (AC-03-B)."""
         resp = client.post(
             "/runs",
@@ -289,23 +287,17 @@ class TestPostRuns:
         )
         assert resp.status_code == 422
 
-    def test_runs_neither_profile_nor_all_returns_422(
-        self, client: TestClient
-    ) -> None:
+    def test_runs_neither_profile_nor_all_returns_422(self, client: TestClient) -> None:
         """Body with neither profile nor all_profiles → 422."""
         resp = client.post("/runs", json={})
         assert resp.status_code == 422
 
-    def test_runs_unknown_profile_returns_422(
-        self, client: TestClient
-    ) -> None:
+    def test_runs_unknown_profile_returns_422(self, client: TestClient) -> None:
         """Unknown profile name → 422."""
         resp = client.post("/runs", json={"profile": "does-not-exist"})
         assert resp.status_code == 422
 
-    def test_runs_all_profiles_returns_202(
-        self, client: TestClient
-    ) -> None:
+    def test_runs_all_profiles_returns_202(self, client: TestClient) -> None:
         """all_profiles=true returns 202 with scope='all'."""
         resp = client.post("/runs", json={"all_profiles": True})
         assert resp.status_code == 202
@@ -345,9 +337,7 @@ class TestPostRunsSchedulerOverlap:
         finally:
             coordinator.release("ai-robotics")
 
-    async def test_cross_profile_runs_allowed(
-        self, app_with_state: FastAPI
-    ) -> None:
+    async def test_cross_profile_runs_allowed(self, app_with_state: FastAPI) -> None:
         """Different profiles can run concurrently."""
         coordinator: Coordinator = app_with_state.state.coordinator
 
@@ -384,9 +374,7 @@ class TestPostBackfills:
         assert body["scope"] == "ai-robotics"
         assert "submitted_at" in body
 
-    def test_backfills_happy_path_with_date_range(
-        self, client: TestClient
-    ) -> None:
+    def test_backfills_happy_path_with_date_range(self, client: TestClient) -> None:
         """Single-profile backfill with from/to returns 202."""
         resp = client.post(
             "/backfills",
@@ -401,9 +389,7 @@ class TestPostBackfills:
         assert body["kind"] == "backfill"
         assert body["scope"] == "ai-robotics"
 
-    def test_backfills_all_profiles_returns_202(
-        self, client: TestClient
-    ) -> None:
+    def test_backfills_all_profiles_returns_202(self, client: TestClient) -> None:
         """all_profiles=true returns 202 with scope='all'."""
         resp = client.post(
             "/backfills",
@@ -428,9 +414,7 @@ class TestPostBackfills:
         )
         assert resp.status_code == 422
 
-    def test_backfills_neither_scope_returns_422(
-        self, client: TestClient
-    ) -> None:
+    def test_backfills_neither_scope_returns_422(self, client: TestClient) -> None:
         """Body with neither profile nor all_profiles → 422."""
         resp = client.post("/backfills", json={"days": 7})
         assert resp.status_code == 422
@@ -460,9 +444,7 @@ class TestPostBackfills:
         )
         assert resp.status_code == 422
 
-    def test_backfills_unknown_profile_returns_422(
-        self, client: TestClient
-    ) -> None:
+    def test_backfills_unknown_profile_returns_422(self, client: TestClient) -> None:
         """Unknown profile name → 422."""
         resp = client.post(
             "/backfills",
