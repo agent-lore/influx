@@ -1,170 +1,25 @@
 # Ralph Progress Log
-Started: Fri Apr 24 09:25:46 UTC 2026
+Started: Fri Apr 24 11:54:09 UTC 2026
 
 ## Codebase Patterns
-- Quality checks: `uv run ruff check src/ tests/`, `uv run ruff format --check src/ tests/`, `uv run pyright`, `uv run pytest` (make not available in this env)
-- Exception hierarchy: `InfluxError` -> `ConfigError` -> `PromptValidationError` in `src/influx/errors.py`
-- Build system: hatchling, dependencies in `pyproject.toml`, lock file `uv.lock`
-- Python 3.12 strict (`>=3.12,<3.13`), uses `uv` for package management
-- Source layout: `src/influx/` package with `py.typed` marker
-- Tests in `tests/` directory, conftest at `tests/conftest.py`
-- Unit tests go in `tests/unit/` subdirectory (created in US-002)
-- FR-ST-2 slug pattern: `^[a-z0-9]+(-[a-z0-9]+)*$`, max 40 chars
-- `pytest-cov` is not installed; coverage verification is by inspection/line count
-- Prompt template variables use `{var_name}` syntax; `REQUIRED_VARIABLES` in `prompts.py` defines per-key sets
-- `PromptValidationError` for template var errors, `ConfigError` for loading/structural errors
-- Config schema root model: `AppConfig` in `config.py`; `load_config()` returns `AppConfig`
-- `load_config(path=)` accepts optional explicit path; otherwise uses `find_config_path()` discovery
-- `ValidationError` from pydantic is caught and wrapped as `ConfigError` in `load_config()`
-- Minimal valid TOML needs `[prompts.filter]`, `[prompts.tier1_enrich]`, `[prompts.tier3_extract]` with `text` keys
-- Pydantic validators that raise `ConfigError` (not `ValueError`) bypass pydantic's `ValidationError` wrapping and propagate directly
-- RSS entry unknown fields and prompts unknown keys use `model_validator(mode="before")` with explicit `ConfigError`
-- TOML `[providers.*]` and `[models.*]` map to `dict[str, ProviderConfig]` and `dict[str, ModelSlotConfig]`
-- Env-var overrides in §19: INFLUX_ARCHIVE_DIR→storage.archive_dir, INFLUX_OTEL_ENABLED→telemetry.enabled, INFLUX_OTEL_CONSOLE_FALLBACK→telemetry.console_fallback, AGENT_ZERO_WEBHOOK_URL→notifications.webhook_url
-- `_apply_env_overrides()` mutates the raw dict before `AppConfig.model_validate()` so pydantic still validates overridden values
-- Profile name regex: `^[a-z][a-z0-9-]{0,31}$` — validated via `field_validator` on `ProfileConfig`, raises `ConfigError` directly
-- Provider `api_key_env` validation runs post-`model_validate()` in `load_config()` via `_validate_provider_api_keys()`; skipped when `api_key_env = ''`
-- RSS `source_tag` missing/invalid cases handled by pydantic's `Literal["rss","blog"]` + required field validation, wrapped as `ConfigError` in `load_config()`
-- `influx.example.toml` at repo root; round-trip tests set fake API keys via `monkeypatch.setenv()` to pass provider validation
-- conftest fixture `influx_config_env` uses a `test-provider` with `TEST_PROVIDER_API_KEY` to avoid requiring real provider keys
-- CLI dispatcher in `main.py` uses `main(argv=)` parameter for testability; `__main__.py` calls `main()` with no args (defaults to `sys.argv[1:]`)
-- `validate-config` subcommand prints `model_dump_json(indent=2)` for the effective config
----
+- Error subclasses use keyword-only args for structured context fields (url, kind, reason, etc.)
+- Tests use class-based grouping (TestXxx) with pytest; AAA pattern
+- Quality checks: `uv run pytest tests/`, `uv run pyright <file>`, `uv run ruff check <file>`
+- Config model is in config.py with pydantic v2 BaseModel classes
+- CLI dispatcher is in main.py with argparse subcommands
 
-## 2026-04-24 - US-010
-- Bumped `__version__` from `0.1.0` to `0.7.0` in `src/influx/__init__.py`
-- Deleted obsolete `tests/test_main.py` (replacement coverage in `tests/unit/test_main.py`)
-- Verified no remaining test imports or code references to the deleted file
-- Full test suite green: ruff (0 errors), pyright (0 errors), pytest (84 passed)
-- Coverage verified by inspection: config.py (29 tests / 472 LOC), prompts.py (24 tests / 97 LOC), slugs.py (28 tests / 38 LOC)
-- Files changed: `src/influx/__init__.py`, `tests/test_main.py` (deleted)
-- **Learnings for future iterations:**
-  - `pytest-cov` is not in project deps and `uv run` doesn't pick up user-site installs; coverage verification is by inspection per codebase pattern
-  - All 10 user stories complete — PRD 01 (Config v0.7 Schema) is done
----
-
-## 2026-04-24 - US-009
-- Replaced entry-point stub in `src/influx/main.py` with argparse CLI dispatcher
-- Subcommands: `validate-config` loads config and prints effective JSON to stdout (exit 0)
-- No subcommand prints help to stderr and exits non-zero (code 2)
-- Config errors caught as `InfluxError` → printed to stderr, exit 1
-- `main(argv=)` parameter enables test injection without subprocess
-- Created `tests/unit/test_main.py` with 3 tests: valid config (AC-M1-1), invalid profile name (AC-M1-2), no subcommand (AC-X-5)
-- Updated `tests/test_main.py` to call `main(["validate-config"])` instead of `main()`
-- Files changed: `src/influx/main.py`, `tests/test_main.py`, `tests/unit/test_main.py`
-- **Learnings for future iterations:**
-  - `argparse` with `dest="command"` on subparsers returns `None` when no subcommand given — easy to check and print help
-  - `main(argv=None)` defaulting to `sys.argv[1:]` is the standard argparse testability pattern
-  - `model_dump_json(indent=2)` on pydantic v2 produces clean JSON output for the effective config
-  - The old `tests/test_main.py` had to be updated since `main()` no longer accepts zero-arg calls silently
----
-
-## 2026-04-24 - US-008
-- Replaced legacy `influx.example.toml` (old flat config) with a complete v0.7 example covering all sections
-- Example includes two profiles: `ai-robotics` (arXiv + RSS) and `web-tech` (RSS-only with arXiv disabled)
-- Example covers providers (openai, anthropic, openrouter), all 3 model slots, all 3 prompt keys, [repair], [telemetry], and influx.note_schema_version
-- Replaced conftest fixture from minimal TOML to a realistic multi-section config with a `test-provider`
-- Added `TestExampleTomlRoundTrip` (4 tests): loads example.toml, checks profiles, providers/models, repair+schema_version
-- Added `TestConftestFixture` (1 test): validates the shared fixture loads successfully
-- Files changed: `influx.example.toml`, `tests/conftest.py`, `tests/unit/test_config.py`
-- **Learnings for future iterations:**
-  - Example TOML needs fake API keys set via monkeypatch for provider validation to pass in tests
-  - Using a `test-provider` in conftest avoids coupling fixtures to real provider names like openai/anthropic
-  - `Path(__file__).resolve().parents[2]` from `tests/unit/test_config.py` reaches repo root
-  - The `influx_config_env` fixture now sets `TEST_PROVIDER_API_KEY` so downstream tests can `load_config()` without extra setup
-
-## 2026-04-24 - US-007
-- Added `_PROFILE_NAME_RE` and `_validate_profile_name` field_validator to `ProfileConfig` — rejects names not matching `^[a-z][a-z0-9-]{0,31}$` with `ConfigError`
-- Added `_validate_provider_api_keys()` called in `load_config()` after model_validate — checks that non-empty `api_key_env` vars are set in the environment
-- RSS source_tag validation was already enforced by `Literal["rss", "blog"]` on `RssSourceEntry` (from US-004); pydantic's `ValidationError` is wrapped as `ConfigError` in `load_config()`
-- Added 7 tests across 3 new test classes: `TestProfileNameValidation` (3), `TestRssSourceTagValidation` (2), `TestProviderApiKeyEnvValidation` (2)
-- Files changed: `src/influx/config.py`, `tests/unit/test_config.py`
-- **Learnings for future iterations:**
-  - Profile name validator raises `ConfigError` (not `ValueError`), so it propagates directly without pydantic wrapping — callers see a clean `ConfigError`
-  - Provider api_key_env check must run after `model_validate()` since it needs the validated `AppConfig` to iterate providers
-  - Source_tag validation was already handled by the `Literal` type from US-004; no additional validator needed
-  - The `api_key_env = ''` default on `ProviderConfig` means keyless providers work out of the box
 ---
 
 ## 2026-04-24 - US-001
-- Added pydantic v2 (`>=2.0,<3`) to pyproject.toml dependencies
-- Added `PromptValidationError(ConfigError)` subclass to `src/influx/errors.py`
-- Files changed: `pyproject.toml`, `src/influx/errors.py`, `uv.lock`
+- Implemented NetworkError, LithosError, LCMAError, ExtractionError in src/influx/errors.py
+- NetworkError: url (str), kind (str), reason (str, default "")
+- LithosError: operation (str, default ""), status_code (int|None, default None), detail (str, default "")
+- LCMAError: model (str, default ""), stage (str, default ""), detail (str, default "")
+- ExtractionError: url (str, default ""), stage (str, default ""), detail (str, default "")
+- Created tests/unit/test_errors.py with 16 tests covering isinstance chains, structured context, defaults, and parametrized catchability
+- Files changed: src/influx/errors.py, tests/unit/test_errors.py
 - **Learnings for future iterations:**
-  - `make` is not available in this environment; run quality checks directly via `uv run`
-  - pydantic 2.13.3 installed successfully with Python 3.12.12
-  - The existing `ConfigError` class is already a subclass of `InfluxError`
-  - Existing test in `tests/test_main.py` is a simple greeting smoke test that will be deleted in US-010
----
-
-## 2026-04-24 - US-002
-- Created `src/influx/slugs.py` with `slugify_feed_name()` and `is_valid_slug()` helpers
-- Created `tests/unit/__init__.py` and `tests/unit/test_slugs.py` with 28 tests
-- `slugify_feed_name()` handles: NFKD normalization, ASCII folding, lowercasing, non-alnum→hyphen collapsing, strip leading/trailing hyphens, truncate to 40 chars
-- Returns empty string for inputs that produce no alphanumeric characters (whitespace-only, all-special-chars)
-- Files changed: `src/influx/slugs.py`, `tests/unit/__init__.py`, `tests/unit/test_slugs.py`
-- **Learnings for future iterations:**
-  - ruff requires `from __future__ import annotations` to be in the same import block (isort I001) — fixed with `--fix`
-  - `tests/unit/` directory did not exist; created with `__init__.py`
-  - `is_valid_slug()` can be used in US-004 to validate RSS feed names at config load time
----
-
-## 2026-04-24 - US-003
-- Created `src/influx/prompts.py` with `load_prompt()`, `extract_variables()`, `validate_prompt_variables()`, and `REQUIRED_VARIABLES` mapping
-- Created `tests/unit/test_prompts.py` with 19 tests covering all ACs
-- `load_prompt()`: loads from `text` or `path` (exactly one required), relative paths resolved against `config_dir`
-- `extract_variables()`: regex-based `{var}` extraction, ignores `{{escaped}}`
-- `validate_prompt_variables()`: checks unknown vars (AC-01-A) and missing required vars (AC-01-B) for filter, tier1_enrich, tier3_extract
-- Required variable sets: filter={profile_description, negative_examples, min_score_in_results}, tier1_enrich={title, abstract, profile_summary}, tier3_extract={title, full_text}
-- Files changed: `src/influx/prompts.py`, `tests/unit/test_prompts.py`
-- **Learnings for future iterations:**
-  - Template variable regex `(?<!\{)\{(\w+)\}(?!\})` handles escaped braces correctly
-  - `PromptValidationError` (subclass of `ConfigError`) is used for variable validation errors; plain `ConfigError` for loading/mutual-exclusion errors
-  - ruff format may adjust line breaks after `--fix`; always run format after fix
-  - US-004 will need to call `validate_prompt_variables()` during config load for each prompt key
----
-
-## 2026-04-24 - US-004
-- Defined pydantic v2 models for the full v0.7 config schema in `src/influx/config.py`
-- Models cover: InfluxSectionConfig, ScheduleConfig, StorageConfig, NotificationsConfig, SecurityConfig, ProfileThresholds, ArxivSourceConfig, RssSourceEntry, ProfileSources, ProfileConfig, ProviderConfig, ModelSlotConfig, PromptEntryConfig, PromptsConfig, FilterTuningConfig, ExtractionConfig, ResilienceConfig, FeedbackConfig, RepairConfig, TelemetryConfig, AppConfig (root)
-- Validators: RSS name slugification, RSS URL http/https scheme, RSS unknown fields, prompts unknown/missing keys, prompt text/path mutual exclusion — all raise ConfigError directly
-- RepairConfig is distinct from FeedbackConfig with max_items_per_run=100
-- Legacy dataclasses renamed to _LegacyStorageConfig, _LegacyLoggingConfig, _LegacyInfluxConfig; legacy load_config() preserved
-- Files changed: `src/influx/config.py`
-- **Learnings for future iterations:**
-  - pydantic v2 validators that raise non-ValueError exceptions (e.g. ConfigError) propagate directly without being wrapped in ValidationError
-  - Use `model_validator(mode="before")` for unknown-field detection to raise ConfigError instead of pydantic's `extra='forbid'` which raises ValidationError
-  - `from __future__ import annotations` works fine with pydantic v2 model definitions
-  - `filter` and `models` as pydantic field names don't conflict with Python builtins or pydantic internals (pydantic v2 reserves `model_*` prefix, not `models`)
-  - US-005 will replace legacy `load_config()` to return `AppConfig` via `AppConfig.model_validate()`
----
-
-## 2026-04-24 - US-005
-- Replaced legacy `load_config()` to return `AppConfig` via `AppConfig.model_validate(raw)`
-- Removed all legacy dataclass code (_LegacyInfluxConfig, _LegacyStorageConfig, etc.) and legacy helpers
-- `load_config()` reads TOML via `tomllib`, validates through pydantic, wraps `ValidationError` as `ConfigError`
-- `find_config_path()` discovery order preserved: INFLUX_CONFIG env → cwd → ~/.influx/ → /etc/influx/
-- Updated `main.py` stub to work with `AppConfig` (prints profile count instead of legacy greeting)
-- Updated `tests/conftest.py` fixture to produce valid v0.7 TOML with required prompts section
-- Updated `tests/test_main.py` to match new main output
-- Created `tests/unit/test_config.py` with 10 tests covering: INFLUX_CONFIG respected, explicit path arg, fallback cwd, fallback home, no-config-found, invalid TOML, defaults, custom values, schema validation error
-- Files changed: `src/influx/config.py`, `src/influx/main.py`, `tests/conftest.py`, `tests/test_main.py`, `tests/unit/test_config.py`
-- **Learnings for future iterations:**
-  - `ValidationError` from pydantic is caught in `load_config()` and re-raised as `ConfigError` — downstream code only sees `ConfigError`
-  - Legacy code (dataclasses, parse helpers, env overrides) fully removed; US-006 will add env-var overrides back via the new schema
-  - `monkeypatch.chdir()` + `monkeypatch.setenv("HOME", ...)` effectively simulates fallback discovery in tests
-  - Minimal valid TOML must include all three prompt keys (filter, tier1_enrich, tier3_extract) with `text` fields
----
-
-## 2026-04-24 - US-006
-- Added `_apply_env_overrides()` and `_parse_bool_env()` to `src/influx/config.py`
-- Env overrides are applied to the raw TOML dict before `AppConfig.model_validate()` so pydantic validates the overridden values
-- Four env vars with 'Overrides config key' in §19: INFLUX_ARCHIVE_DIR (str), INFLUX_OTEL_ENABLED (bool), INFLUX_OTEL_CONSOLE_FALLBACK (bool), AGENT_ZERO_WEBHOOK_URL (str)
-- Added 7 tests in `TestEnvVarOverrides` class covering all four override keys, unset-leaves-untouched, section-created-when-absent, and bool false values
-- Files changed: `src/influx/config.py`, `tests/unit/test_config.py`
-- **Learnings for future iterations:**
-  - Env overrides must be applied to the raw dict (not the validated model) so pydantic type coercion and validation still run
-  - `raw.setdefault(section, {})` ensures overrides work even when the target section is absent from TOML
-  - Bool env vars need explicit parsing since os.environ values are always strings; used `value.lower() in ("true", "1", "yes")`
-  - All four overrideable vars are tested across both str and bool types, fulfilling the PRD note about type diversity
+  - All error subclasses use keyword-only constructor args for structured fields
+  - NetworkError requires url and kind (no defaults); other subclasses have all-optional context fields
+  - Full test suite is 100 tests and runs in <0.3s
 ---
