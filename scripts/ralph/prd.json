@@ -94,7 +94,7 @@
         "tests/unit/test_config.py includes a case covering AC-01-F: at least one env var listed in §19 defeats its TOML counterpart"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": "Consider sampling more than one overrideable key across different value types (e.g. a path key and a bool key from §19) for stronger regression coverage, but this is a test-policy suggestion rather than a product requirement."
     },
     {
@@ -110,7 +110,7 @@
         "All three validations run during load_config(), not lazily on first use"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -127,7 +127,7 @@
         "A round-trip test loads influx.example.toml and asserts the parsed model matches the example's structure"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -142,7 +142,7 @@
         "Automated tests cover AC-M1-1, AC-M1-2, and AC-X-5 (test file layout and invocation style are left to the implementation)"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -157,7 +157,7 @@
         "Coverage on src/influx/config.py, src/influx/prompts.py, src/influx/slugs.py is >= 80%"
       ],
       "priority": 10,
-      "passes": false,
+      "passes": true,
       "notes": ""
     }
   ]
