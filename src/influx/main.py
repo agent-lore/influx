@@ -144,22 +144,159 @@ def _cmd_serve() -> None:
     )
 
 
-def _cmd_run_stub(args: argparse.Namespace) -> None:
-    """Stub handler for run; replaced by a later PRD."""
-    print(
-        f"[stub] run not wired yet (profile={args.profile})",
-        file=sys.stderr,
-    )
-    sys.exit(EXIT_USAGE)
+def _admin_base_url() -> str:
+    """Return the base URL for the running admin service.
+
+    Reads ``INFLUX_ADMIN_PORT`` (default ``8080``) and targets
+    ``127.0.0.1`` on loopback (§5.4 of PRD 03).
+    """
+    import os
+
+    port = os.environ.get("INFLUX_ADMIN_PORT", "8080")
+    return f"http://127.0.0.1:{port}"
 
 
-def _cmd_backfill_stub(args: argparse.Namespace) -> None:
-    """Stub handler for backfill; replaced by a later PRD."""
-    print(
-        f"[stub] backfill not wired yet (profile={args.profile})",
-        file=sys.stderr,
-    )
-    sys.exit(EXIT_USAGE)
+def _cmd_run(args: argparse.Namespace) -> None:
+    """POST to ``/runs`` on the running service and print the request_id.
+
+    Exit codes (§5.4 of PRD 03):
+        0 — accepted (``202``)
+        1 — profile busy (``409``)
+        2 — network error
+    """
+    import httpx
+
+    url = f"{_admin_base_url()}/runs"
+    payload: dict[str, object] = {"profile": args.profile}
+
+    try:
+        resp = httpx.post(url, json=payload, timeout=10.0)
+    except httpx.ConnectError:
+        print(
+            f"influx: could not connect to service at {url}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_FAILURE)
+    except httpx.HTTPError as exc:
+        print(f"influx: network error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_FAILURE)
+
+    if resp.status_code == 202:
+        body = resp.json()
+        print(body["request_id"])
+        sys.exit(EXIT_SUCCESS)
+    elif resp.status_code == 409:
+        body = resp.json()
+        print(
+            f"influx: profile {body.get('profile', args.profile)!r} is busy",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_PARTIAL)
+    else:
+        print(
+            f"influx: unexpected response {resp.status_code}: {resp.text}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_FAILURE)
+
+
+def _cmd_backfill(args: argparse.Namespace) -> None:
+    """POST to ``/backfills`` on the running service.
+
+    Handles the ``confirm_required`` reprompt flow: when the server
+    returns ``400`` with ``reason="confirm_required"`` and ``--confirm``
+    was NOT passed, prints the estimate and exits ``64`` (usage error).
+    When ``--confirm`` IS passed and a ``confirm_required`` response
+    arrives, re-POSTs with ``confirm: true`` added to the body.
+
+    Exit codes (§5.4 of PRD 03):
+        0  — accepted (``202``)
+        1  — profile busy (``409``)
+        2  — network error
+        64 — confirm_required without ``--confirm``
+    """
+    import httpx
+
+    url = f"{_admin_base_url()}/backfills"
+    payload: dict[str, object] = {"profile": args.profile}
+
+    if args.days is not None:
+        payload["days"] = args.days
+    if args.from_date is not None:
+        payload["from"] = args.from_date
+    if args.to_date is not None:
+        payload["to"] = args.to_date
+    if args.confirm:
+        payload["confirm"] = True
+
+    try:
+        resp = httpx.post(url, json=payload, timeout=10.0)
+    except httpx.ConnectError:
+        print(
+            f"influx: could not connect to service at {url}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_FAILURE)
+    except httpx.HTTPError as exc:
+        print(f"influx: network error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_FAILURE)
+
+    if resp.status_code == 202:
+        body = resp.json()
+        print(body["request_id"])
+        sys.exit(EXIT_SUCCESS)
+    elif resp.status_code == 400:
+        body = resp.json()
+        if body.get("reason") == "confirm_required":
+            estimated = body.get("estimated_items", "unknown")
+            if args.confirm:
+                # Re-POST with confirm=true added.
+                payload["confirm"] = True
+                try:
+                    resp2 = httpx.post(url, json=payload, timeout=10.0)
+                except httpx.HTTPError as exc:
+                    print(
+                        f"influx: network error on retry: {exc}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(EXIT_FAILURE)
+                if resp2.status_code == 202:
+                    body2 = resp2.json()
+                    print(body2["request_id"])
+                    sys.exit(EXIT_SUCCESS)
+                else:
+                    print(
+                        f"influx: unexpected response on retry "
+                        f"{resp2.status_code}: {resp2.text}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(EXIT_FAILURE)
+            else:
+                print(
+                    f"Estimated {estimated} items. "
+                    f"Re-run with --confirm to proceed.",
+                    file=sys.stderr,
+                )
+                sys.exit(EXIT_USAGE)
+        else:
+            print(
+                f"influx: bad request: {resp.text}",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_FAILURE)
+    elif resp.status_code == 409:
+        body = resp.json()
+        print(
+            f"influx: profile {body.get('profile', args.profile)!r} is busy",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_PARTIAL)
+    else:
+        print(
+            f"influx: unexpected response {resp.status_code}: {resp.text}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_FAILURE)
 
 
 _KNOWN_COMMANDS = frozenset({
@@ -208,9 +345,9 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "serve":
             _cmd_serve()
         elif args.command == "run":
-            _cmd_run_stub(args)
+            _cmd_run(args)
         elif args.command == "backfill":
-            _cmd_backfill_stub(args)
+            _cmd_backfill(args)
     except InfluxError as exc:
         print(f"influx: {exc}", file=sys.stderr)
         sys.exit(EXIT_FAILURE)

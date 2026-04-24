@@ -29,6 +29,9 @@
 - `uvicorn.run(app, timeout_graceful_shutdown=N)` bounds shutdown wait; uvicorn 0.46+ exits -15 on SIGTERM (clean shutdown but signal-terminated return code), exit 0 on SIGINT
 - To monkeypatch locally-imported `uvicorn.run()`, import uvicorn at test scope and use `monkeypatch.setattr(uvicorn, "run", fake)` — not `"module.uvicorn.run"`
 - Subprocess serve tests: use `_find_free_port()` via `socket.bind(("127.0.0.1", 0))` and `_wait_for_live()` polling `/live` with httpx
+- CLI HTTP client handlers use `httpx.post()` (sync) with `timeout=10.0`; `httpx.ConnectError` maps to exit 2, `409` maps to exit 1
+- Use `respx.mock` decorator + `respx.post(...).mock(return_value=...)` for unit-testing CLI HTTP clients without a running server
+- `_admin_base_url()` reads `INFLUX_ADMIN_PORT` from env, targets `127.0.0.1` — single source of truth for CLI→service URL
 
 # Ralph Progress Log
 Started: Fri Apr 24 14:02:16 UTC 2026
@@ -191,4 +194,25 @@ Started: Fri Apr 24 14:02:16 UTC 2026
   - Monkeypatching locally-imported modules: `import uvicorn; monkeypatch.setattr(uvicorn, "run", fake)` works
   - Subprocess integration tests: use `_find_free_port()` + `_wait_for_live()` polling pattern
   - All 262 tests pass (9 new serve + 253 existing)
+---
+
+## 2026-04-24 - US-009
+- Wired `run` and `backfill` CLI handlers as real HTTP clients of the running service
+- Replaced `_cmd_run_stub` and `_cmd_backfill_stub` with `_cmd_run` and `_cmd_backfill`
+- `_cmd_run`: POSTs to `/runs`, prints `request_id` on 202, exit 0/1/2 per spec
+- `_cmd_backfill`: POSTs to `/backfills`, handles `confirm_required` reprompt flow:
+  - Without `--confirm`: prints estimate, exits 64
+  - With `--confirm`: re-POSTs with `confirm=true`, prints `request_id` on 202
+- `_admin_base_url()` reads `INFLUX_ADMIN_PORT` from env, targets `127.0.0.1`
+- Files changed:
+  - src/influx/main.py (replaced stubs with real HTTP client handlers)
+  - tests/unit/test_cli_dispatch.py (rewrote run/backfill tests with respx mocks: 13 tests)
+  - tests/integration/test_cli_http.py (new: 7 subprocess integration tests against live server)
+  - scripts/ralph/prd.json (US-009 passes: true)
+- **Learnings for future iterations:**
+  - `respx.mock` decorator + `respx.post(...).mock(return_value=...)` cleanly tests CLI HTTP clients
+  - `respx.post(...).side_effect = [resp1, resp2]` handles multi-request flows (confirm re-POST)
+  - `httpx.ConnectError` is the right exception type for "server not running" → exit 2
+  - Subprocess integration tests share `_find_free_port()` + `_wait_for_live()` pattern with test_serve.py
+  - All 276 tests pass (14 new US-009 + 262 existing)
 ---

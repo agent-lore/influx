@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
+import respx
 
-from influx.main import EXIT_SUCCESS, EXIT_USAGE, main
+from influx.main import EXIT_FAILURE, EXIT_PARTIAL, EXIT_SUCCESS, EXIT_USAGE, main
+
+# ── serve ─────────────────────────────────────────────────────────────
 
 
 class TestServeSubcommand:
@@ -33,20 +37,74 @@ class TestServeSubcommand:
         assert exc_info.value.code != 0
 
 
-class TestRunSubcommand:
-    """run subcommand routes to its stub handler."""
+# ── run ───────────────────────────────────────────────────────────────
 
-    def test_run_with_profile_exits_64(
+
+class TestRunSubcommand:
+    """run subcommand is a real HTTP client of POST /runs."""
+
+    @respx.mock
+    def test_run_happy_path_exit_0(
         self,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
+        """202 accepted → exit 0 + printed request_id."""
+        respx.post("http://127.0.0.1:8080/runs").mock(
+            return_value=httpx.Response(
+                202,
+                json={
+                    "status": "accepted",
+                    "request_id": "abc-123",
+                    "kind": "manual",
+                    "scope": "ai-robotics",
+                    "submitted_at": "2026-04-24T00:00:00+00:00",
+                },
+            )
+        )
+
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "--profile", "ai-robotics"])
 
-        assert exc_info.value.code == EXIT_USAGE
+        assert exc_info.value.code == EXIT_SUCCESS
         captured = capsys.readouterr()
-        assert "stub" in captured.err.lower()
-        assert "ai-robotics" in captured.err
+        assert "abc-123" in captured.out
+
+    @respx.mock
+    def test_run_conflict_exit_1(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """409 profile_busy → exit 1."""
+        respx.post("http://127.0.0.1:8080/runs").mock(
+            return_value=httpx.Response(
+                409,
+                json={"reason": "profile_busy", "profile": "ai-robotics"},
+            )
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "--profile", "ai-robotics"])
+
+        assert exc_info.value.code == EXIT_PARTIAL
+        captured = capsys.readouterr()
+        assert "busy" in captured.err.lower()
+
+    @respx.mock
+    def test_run_network_error_exit_2(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Network error → exit 2."""
+        respx.post("http://127.0.0.1:8080/runs").mock(
+            side_effect=httpx.ConnectError("Connection refused")
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "--profile", "ai-robotics"])
+
+        assert exc_info.value.code == EXIT_FAILURE
+        captured = capsys.readouterr()
+        assert "connect" in captured.err.lower()
 
     def test_run_requires_profile(self) -> None:
         """run without --profile exits with an error."""
@@ -55,21 +113,211 @@ class TestRunSubcommand:
 
         assert exc_info.value.code != 0
 
+    @respx.mock
+    def test_run_uses_admin_port_env(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """run reads INFLUX_ADMIN_PORT from env."""
+        monkeypatch.setenv("INFLUX_ADMIN_PORT", "9999")
+        respx.post("http://127.0.0.1:9999/runs").mock(
+            return_value=httpx.Response(
+                202,
+                json={
+                    "status": "accepted",
+                    "request_id": "port-test-id",
+                    "kind": "manual",
+                    "scope": "ai-robotics",
+                    "submitted_at": "2026-04-24T00:00:00+00:00",
+                },
+            )
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "--profile", "ai-robotics"])
+
+        assert exc_info.value.code == EXIT_SUCCESS
+        captured = capsys.readouterr()
+        assert "port-test-id" in captured.out
+
+
+# ── backfill ──────────────────────────────────────────────────────────
+
 
 class TestBackfillSubcommand:
-    """backfill subcommand routes to its stub handler."""
+    """backfill subcommand is a real HTTP client of POST /backfills."""
 
-    def test_backfill_with_profile_exits_64(
+    @respx.mock
+    def test_backfill_happy_path_with_days(
         self,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
+        """202 accepted with --days → exit 0 + printed request_id."""
+        respx.post("http://127.0.0.1:8080/backfills").mock(
+            return_value=httpx.Response(
+                202,
+                json={
+                    "status": "accepted",
+                    "request_id": "bf-123",
+                    "kind": "backfill",
+                    "scope": "ai-robotics",
+                    "submitted_at": "2026-04-24T00:00:00+00:00",
+                },
+            )
+        )
+
         with pytest.raises(SystemExit) as exc_info:
-            main(["backfill", "--profile", "web-tech"])
+            main(["backfill", "--profile", "ai-robotics", "--days", "7"])
+
+        assert exc_info.value.code == EXIT_SUCCESS
+        captured = capsys.readouterr()
+        assert "bf-123" in captured.out
+
+    @respx.mock
+    def test_backfill_happy_path_with_date_range(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """202 accepted with --from/--to → exit 0."""
+        respx.post("http://127.0.0.1:8080/backfills").mock(
+            return_value=httpx.Response(
+                202,
+                json={
+                    "status": "accepted",
+                    "request_id": "bf-range-456",
+                    "kind": "backfill",
+                    "scope": "web-tech",
+                    "submitted_at": "2026-04-24T00:00:00+00:00",
+                },
+            )
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "backfill",
+                "--profile", "web-tech",
+                "--from", "2026-01-01",
+                "--to", "2026-01-31",
+            ])
+
+        assert exc_info.value.code == EXIT_SUCCESS
+        captured = capsys.readouterr()
+        assert "bf-range-456" in captured.out
+
+    @respx.mock
+    def test_backfill_confirm_required_without_confirm_exit_64(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """confirm_required without --confirm → exit 64 + estimate printed."""
+        respx.post("http://127.0.0.1:8080/backfills").mock(
+            return_value=httpx.Response(
+                400,
+                json={
+                    "reason": "confirm_required",
+                    "estimated_items": 5000,
+                },
+            )
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "backfill",
+                "--profile", "ai-robotics",
+                "--days", "365",
+            ])
 
         assert exc_info.value.code == EXIT_USAGE
         captured = capsys.readouterr()
-        assert "stub" in captured.err.lower()
-        assert "web-tech" in captured.err
+        assert "5000" in captured.err
+        assert "--confirm" in captured.err
+
+    @respx.mock
+    def test_backfill_confirm_required_with_confirm_reposts(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """confirm_required + --confirm → re-POST with confirm=true (AC-M3-8)."""
+        route = respx.post("http://127.0.0.1:8080/backfills")
+        route.side_effect = [
+            httpx.Response(
+                400,
+                json={
+                    "reason": "confirm_required",
+                    "estimated_items": 5000,
+                },
+            ),
+            httpx.Response(
+                202,
+                json={
+                    "status": "accepted",
+                    "request_id": "bf-confirmed-789",
+                    "kind": "backfill",
+                    "scope": "ai-robotics",
+                    "submitted_at": "2026-04-24T00:00:00+00:00",
+                },
+            ),
+        ]
+
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "backfill",
+                "--profile", "ai-robotics",
+                "--days", "365",
+                "--confirm",
+            ])
+
+        assert exc_info.value.code == EXIT_SUCCESS
+        captured = capsys.readouterr()
+        assert "bf-confirmed-789" in captured.out
+        # Verify two requests were made.
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_backfill_conflict_exit_1(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """409 profile_busy → exit 1."""
+        respx.post("http://127.0.0.1:8080/backfills").mock(
+            return_value=httpx.Response(
+                409,
+                json={"reason": "profile_busy", "profile": "ai-robotics"},
+            )
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "backfill",
+                "--profile", "ai-robotics",
+                "--days", "7",
+            ])
+
+        assert exc_info.value.code == EXIT_PARTIAL
+        captured = capsys.readouterr()
+        assert "busy" in captured.err.lower()
+
+    @respx.mock
+    def test_backfill_network_error_exit_2(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Network error → exit 2."""
+        respx.post("http://127.0.0.1:8080/backfills").mock(
+            side_effect=httpx.ConnectError("Connection refused")
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "backfill",
+                "--profile", "ai-robotics",
+                "--days", "7",
+            ])
+
+        assert exc_info.value.code == EXIT_FAILURE
+        captured = capsys.readouterr()
+        assert "connect" in captured.err.lower()
 
     def test_backfill_requires_profile(self) -> None:
         """backfill without --profile exits with an error."""
@@ -78,22 +326,8 @@ class TestBackfillSubcommand:
 
         assert exc_info.value.code != 0
 
-    def test_backfill_accepts_all_flags(
-        self,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """backfill accepts --days, --from, --to, --confirm."""
-        with pytest.raises(SystemExit) as exc_info:
-            main([
-                "backfill",
-                "--profile", "ai-robotics",
-                "--days", "7",
-                "--from", "2026-01-01",
-                "--to", "2026-01-07",
-                "--confirm",
-            ])
 
-        assert exc_info.value.code == EXIT_USAGE
+# ── validate-config ───────────────────────────────────────────────────
 
 
 class TestValidateConfigUnchanged:
@@ -108,6 +342,9 @@ class TestValidateConfigUnchanged:
 
         captured = capsys.readouterr()
         assert captured.out.strip().startswith("{")
+
+
+# ── migrate-notes ─────────────────────────────────────────────────────
 
 
 class TestMigrateNotes:
@@ -151,6 +388,9 @@ class TestMigrateNotes:
 
         captured = capsys.readouterr()
         assert captured.out.strip() == "note_schema_version: 42"
+
+
+# ── unknown / no subcommand ───────────────────────────────────────────
 
 
 class TestUnknownSubcommand:

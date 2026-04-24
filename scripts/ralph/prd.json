@@ -147,7 +147,7 @@
         "Tests cover: `run` happy path (exit 0 + printed request_id), `run` conflict path (exit 1 on 409), `run` network-error path (exit 2); `backfill` confirm-required path without `--confirm` (exit 64 + estimate printed); `backfill` acceptance path with `--confirm`; AC-M3-8 end-to-end — `backfill --days 365` without `--confirm` returns confirm_required, and re-submitting with `--confirm` is accepted (estimator stub may be forced > 1000 for the test)"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": ""
     }
   ]
