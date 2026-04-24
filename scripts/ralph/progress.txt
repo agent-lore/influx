@@ -26,9 +26,12 @@ Started: Fri Apr 24 20:42:49 UTC 2026
 - `build_profile_relevance_for_rewrite(old_entries=, new_entries=, tags=)` merges profile entries, keeping old for rejected profiles
 - Frontmatter rendered manually (no PyYAML dep): note_type, namespace, source_url, tags, confidence
 - Golden file fixture at `tests/fixtures/golden_note.md` — update it when canonical format changes
-- `storage.py` owns archive path construction; `build_archive_path(archive_root=, source=, item_id=, published_year=, published_month=, ext=)` returns `(Path, str)` tuple of filesystem path and POSIX relative path
+- `storage.py` owns archive path construction and download; `build_archive_path(...)` returns `(Path, str)` tuple; `download_archive(...)` returns `ArchiveResult(ok, rel_posix_path, error)`
 - `ArchivePathError` derives from `InfluxError` — raised for unsafe IDs (traversal, absolute paths) and invalid source slugs
 - Path safety: `_reject_unsafe_id()` checks for `..` components and absolute paths BEFORE `resolve().is_relative_to()` as a defense-in-depth measure
+- `download_archive(url=, archive_root=, source=, item_id=, ...)` uses `guarded_fetch` from `http_client.py` for SSRF/oversize/timeout protection
+- `ArchiveResult(ok=bool, rel_posix_path=str|None, error=str)` — on failure, caller renders empty `## Archive` body + `influx:repair-needed` + `influx:archive-missing` tags
+- `NetworkError` from `errors.py` carries `kind` field (`ssrf`, `oversize`, `timeout`, `network`) — use it for structured failure handling
 
 ---
 
@@ -144,4 +147,21 @@ Started: Fri Apr 24 20:42:49 UTC 2026
   - `ArchivePathError` derives from `InfluxError` (not from `NoteParseError`)
   - `PurePosixPath` used for note-facing relative paths to guarantee forward-slash separators on all platforms
   - `__all__` exports: `ArchivePathError`, `build_archive_path`
+---
+
+## 2026-04-24 - US-009
+- Implemented `download_archive()` in `src/influx/storage.py` using guarded HTTP client from PRD 02
+- Added `ArchiveResult` frozen dataclass to signal success/failure to callers
+- On success: writes PDF to filesystem path from `build_archive_path()`, returns `ArchiveResult(ok=True, rel_posix_path=...)`
+- On failure (SSRF, oversize, timeout, HTTP error): returns `ArchiveResult(ok=False)` — caller renders empty Archive + repair/missing tags
+- HTTP 4xx/5xx non-exception responses also treated as failure
+- Created `tests/unit/test_archive_download.py` with 11 tests covering all AC
+- Files changed: `src/influx/storage.py`, `tests/unit/test_archive_download.py`
+- **Learnings for future iterations:**
+  - `guarded_fetch` raises `NetworkError` for SSRF/oversize/timeout/network failures — catch it in download helpers
+  - `guarded_fetch` does NOT raise on 4xx status codes — check `result.status_code >= 400` separately
+  - Use `@patch("influx.storage.guarded_fetch")` to mock the HTTP client in tests (patch at import site)
+  - `_dl()` helper pattern in tests: wrap `download_archive` with defaults to avoid pyright issues with `**kwargs` dict expansion
+  - `ArchiveResult` uses `frozen=True, slots=True` for immutability and performance
+  - `__all__` now exports: `ArchivePathError`, `ArchiveResult`, `build_archive_path`, `download_archive`
 ---

@@ -1,21 +1,29 @@
-"""Archive path construction and path-safety verification (FR-ST-1..3).
+"""Archive path construction, download, and path-safety verification.
 
 Builds archive filesystem paths and note-facing relative paths for
 archived PDFs and other source documents.  Path-safety checks prevent
-directory traversal attacks (AC-04-C).
+directory traversal attacks (AC-04-C).  The download helper uses the
+guarded HTTP client from PRD 02 (FR-ST-4).
 """
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from influx.errors import InfluxError
+from influx.errors import InfluxError, NetworkError
+from influx.http_client import guarded_fetch
 from influx.slugs import is_valid_slug
 
 __all__ = [
     "ArchivePathError",
+    "ArchiveResult",
     "build_archive_path",
+    "download_archive",
 ]
+
+_log = logging.getLogger(__name__)
 
 
 class ArchivePathError(InfluxError):
@@ -105,3 +113,112 @@ def build_archive_path(
         )
 
     return fs_path, rel_posix
+
+
+# ── Archive download result ─────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveResult:
+    """Outcome of an archive download attempt.
+
+    On success, *ok* is ``True`` and *rel_posix_path* holds the
+    note-facing relative path for the ``## Archive`` section.
+
+    On failure, *ok* is ``False``, *rel_posix_path* is ``None``, and
+    *error* describes what went wrong.  The caller should render the
+    note with an empty ``## Archive`` body and tag it with
+    ``influx:repair-needed`` + ``influx:archive-missing`` (FR-ST-4).
+    """
+
+    ok: bool
+    rel_posix_path: str | None
+    error: str
+
+
+# ── Archive download ────────────────────────────────────────────────
+
+
+def download_archive(
+    *,
+    url: str,
+    archive_root: Path,
+    source: str,
+    item_id: str,
+    published_year: int,
+    published_month: int,
+    ext: str = ".pdf",
+    allow_private_ips: bool = False,
+    max_download_bytes: int = 52_428_800,
+    timeout_seconds: int = 30,
+) -> ArchiveResult:
+    """Download a file via the guarded HTTP client and archive it.
+
+    Uses :func:`build_archive_path` for path construction and
+    :func:`~influx.http_client.guarded_fetch` for the download with
+    SSRF guard, oversize abort, and timeout enforcement.
+
+    Returns an :class:`ArchiveResult` indicating success or failure.
+    On any archive-step failure the result signals the caller to render
+    the note with an empty ``## Archive`` body + failure tags (FR-ST-4).
+    """
+    # Path construction first — reject unsafe IDs before any download
+    fs_path, rel_posix = build_archive_path(
+        archive_root=archive_root,
+        source=source,
+        item_id=item_id,
+        published_year=published_year,
+        published_month=published_month,
+        ext=ext,
+    )
+
+    try:
+        result = guarded_fetch(
+            url,
+            allow_private_ips=allow_private_ips,
+            max_download_bytes=max_download_bytes,
+            timeout_seconds=timeout_seconds,
+            expected_content_type="pdf",
+        )
+    except NetworkError as exc:
+        _log.warning(
+            "Archive download failed for %s: [%s] %s",
+            url,
+            exc.kind,
+            exc,
+        )
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=f"{exc.kind}: {exc}",
+        )
+
+    if result.status_code >= 400:
+        msg = (
+            f"HTTP {result.status_code} for {url}"
+        )
+        _log.warning("Archive download failed: %s", msg)
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=msg,
+        )
+
+    try:
+        fs_path.parent.mkdir(parents=True, exist_ok=True)
+        fs_path.write_bytes(result.body)
+    except OSError as exc:
+        _log.warning(
+            "Archive write failed for %s: %s", fs_path, exc
+        )
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=f"write: {exc}",
+        )
+
+    return ArchiveResult(
+        ok=True,
+        rel_posix_path=rel_posix,
+        error="",
+    )
