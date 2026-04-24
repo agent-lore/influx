@@ -1,19 +1,19 @@
 {
-  "project": "Influx v1 — Error Hierarchy, CLI Dispatcher, Guarded HTTP Client",
-  "branchName": "ralph/02-cli-errors-http-client",
-  "description": "Extend the InfluxError hierarchy with NetworkError, LithosError, LCMAError, and ExtractionError; replace the PRD 01 minimal dispatcher with the full v1 CLI (serve, run, backfill, validate-config, migrate-notes) using stubs for subcommands that later PRDs fill in; and ship a guarded HTTP client in src/influx/http_client.py that enforces scheme allow-list, SSRF IP-classification (with security.allow_private_ips override), streaming size cap, connect + read timeout, content-type family check (HTML/PDF/XML/Atom), and redirect re-validation at every hop.",
+  "project": "Influx v1 — HTTP API, Probe Cache, Scheduler, Execution Coordinator",
+  "branchName": "ralph/03-http-api-scheduler",
+  "description": "Deliver the long-running `python -m influx serve` surface for Influx v1: a FastAPI/Starlette ASGI app exposing `/live`, `/ready`, `/status`, `POST /runs`, and `POST /backfills` (bound to 127.0.0.1 by default); an in-process APScheduler with `max_instances=1`, `coalesce=True`, and `misfire_grace_time=schedule.misfire_grace_seconds`; a per-profile execution coordinator that enforces non-overlap across scheduled, manual, and backfill work and allows cross-profile parallelism; a background probe loop (≥30s cadence) that caches Lithos reachability (stubbed until PRD 05) and LLM-credential presence so `/ready` and `/status` never issue fresh probes per request; a defensive local-admin bind guard that refuses non-loopback bind hosts unless `security.allow_remote_admin = true`; and CLI wiring that makes `serve` start the full service and makes `run`/`backfill` real clients of `/runs` and `/backfills` with the documented exit-code contract. `run_profile()`, the Lithos probe body, the backfill estimator, and the webhook after-run hook remain documented stubs for later PRDs.",
   "userStories": [
     {
       "id": "US-001",
-      "title": "Extend errors.py with NetworkError, LithosError, LCMAError, ExtractionError",
-      "description": "As a developer, I want the InfluxError hierarchy extended with NetworkError, LithosError, LCMAError, and ExtractionError subclasses so that retry/abort policy in the scheduler and HTTP API can discriminate failure categories and log structured context fields.",
+      "title": "Add fastapi/uvicorn/apscheduler dependencies and create per-profile execution coordinator",
+      "description": "As a developer, I want fastapi, uvicorn, and apscheduler added to project dependencies and a `src/influx/coordinator.py` module that provides a per-profile in-memory lock manager, so that scheduled fires, `POST /runs`, and `POST /backfills` can all consult a single non-overlap authority that allows cross-profile parallelism while rejecting same-profile overlap.",
       "acceptanceCriteria": [
-        "src/influx/errors.py defines NetworkError, LithosError, LCMAError, and ExtractionError, each a subclass of InfluxError (isinstance chain to InfluxError holds for every new subclass)",
-        "All four new subclasses are importable from influx.errors",
-        "NetworkError carries enough context to log the offending URL and the violated constraint (e.g. a kind/reason field plus url; exact attribute names left to the implementation)",
-        "LithosError, LCMAError, and ExtractionError each carry enough context to log structured fields per PRD §5.1 (the source PRD only gives a concrete example for NetworkError; the exact field names for these three subclasses are left to the implementation and may be deferred until the PRDs that introduce their log sites)",
-        "tests/unit/test_errors.py covers: isinstance chain to InfluxError for each new subclass; each subclass exposes the structured context its log sites need (attribute access or equivalent; the exact constructor shape is left to the implementation)",
-        "Typecheck passes"
+        "fastapi, uvicorn, and apscheduler are added to project dependencies in pyproject.toml and resolve on install",
+        "src/influx/coordinator.py exposes an execution coordinator that manages per-profile in-memory locks (exact API shape — e.g. acquire/try-acquire/context-manager — left to the implementation)",
+        "Attempting to acquire a lock for a profile that is already held is rejected by the coordinator in a way the HTTP API layer can translate to `409 Conflict` + `reason=\"profile_busy\"` (FR-SCHED-3)",
+        "Two different profiles MAY hold their locks concurrently (cross-profile parallelism is allowed per Q-4 of the master PRD and §5.1 of PRD 03)",
+        "The coordinator is safe to call from both scheduled fires and HTTP request handlers (exact concurrency primitive — asyncio.Lock, threading lock, or equivalent — left to the implementation)",
+        "tests/unit/test_coordinator.py covers: same-profile overlap → reject; cross-profile overlap → allow"
       ],
       "priority": 1,
       "passes": true,
@@ -21,101 +21,133 @@
     },
     {
       "id": "US-002",
-      "title": "Add httpx dependency and create guarded HTTP client with SSRF guard",
-      "description": "As a developer, I want an httpx-backed guarded HTTP client in src/influx/http_client.py that enforces the http/https scheme allow-list and resolves hostnames to IPs before issuing the request, rejecting loopback, link-local, private, and multicast addresses unless security.allow_private_ips is true, so that every outbound fetch has one SSRF choke point.",
+      "title": "Create background probe loop with cached Lithos + LLM-credentials state",
+      "description": "As a developer, I want `src/influx/probes.py` to run a background probe loop at ≥30s cadence that caches Lithos reachability (stubbed until PRD 05) and LLM-credential presence in memory with timestamps, so that `/ready` and `/status` can read cached state and never issue fresh probes per request (FR-HTTP-7, master PRD §8.7).",
       "acceptanceCriteria": [
-        "httpx is added to project dependencies in pyproject.toml and resolves on install",
-        "src/influx/http_client.py exposes a guarded fetch API that returns an object with body, status_code, content_type, and final_url attributes (per PRD §5.4)",
-        "The guarded client rejects requests whose scheme is not http or https (exact exception type and rejection timing are left to the implementation unless the source PRD specifies them)",
-        "Hostnames are resolved via socket.getaddrinfo BEFORE issuing the request and IPs are classified using the ipaddress module's is_loopback, is_link_local, is_private, and is_multicast methods (per PRD §5.4)",
-        "When security.allow_private_ips is false, requests to loopback, link-local, private, or multicast IPs raise NetworkError with enough structured context for logging; for the concrete AC-X-3 examples (http://169.254.169.254/... and http://127.0.0.1/...) that context MUST include the offending URL and the resolved IP",
-        "When security.allow_private_ips is true, the SSRF guard's rejection is bypassed for loopback, link-local, private, and multicast addresses; in particular, a request to http://127.0.0.1/... succeeds (AC-02-A)",
-        "tests/unit/test_http_client.py covers SSRF rejection for each of the four IP classes (loopback, link-local, private, multicast) when allow_private_ips=false, and the allow-through path when allow_private_ips=true",
-        "Typecheck passes"
+        "The LLM-credentials probe records missing provider credentials (an unset `api_key_env` for a configured provider) in its cached probe state, and `/ready` and `/status.status` reflect that cached degraded state (FR-HTTP-7, §5.3 of PRD 03)",
+        "src/influx/probes.py exposes a probe loop and a cached-state accessor that returns the latest probe results with timestamps (exact API shape left to the implementation)",
+        "The probe loop runs at a fixed interval of at least 30 seconds (§5.3 of PRD 03)",
+        "The Lithos probe is a documented stub in this PRD: it returns `ok` by default, and returns a non-`ok` (degraded) result when env var `INFLUX_TEST_LITHOS_DOWN=1` is set (§5.3 of PRD 03, AC-03-C); PRD 05 replaces the stub body with a real MCP reachability check",
+        "The LLM-credentials probe reports on the presence of each configured provider's `api_key_env` environment variable; providers whose `api_key_env` is the empty string are skipped (keyless case, §5.3 of PRD 03); no remote call is made",
+        "Probe failures do NOT toggle `/live`, but DO cause `/ready` to fail and `/status.status` to become `degraded` (the probe module exposes enough state for the HTTP layer to make that decision)",
+        "tests/unit/test_probes.py covers: Lithos stub returns ok by default and degraded under `INFLUX_TEST_LITHOS_DOWN=1`; LLM-credentials probe passes when all configured providers have their `api_key_env` set; providers with `api_key_env=\"\"` are skipped; the probe can be driven into a degraded state (including a missing-key scenario); stale cached probe results time out and are no longer treated as valid (timestamps may be exposed as supporting detail)"
       ],
       "priority": 2,
-      "passes": true,
-      "notes": ""
+      "passes": false,
+      "notes": "Implementation guidance: the existing startup check in `src/influx/config.py::_validate_provider_api_keys` (and related tests in `tests/unit/test_config.py`) may need to be relaxed so missing provider keys surface through the probe rather than preventing startup; any resulting wording change in `docs/REQUIREMENTS.md` should land in the same change. These are implementation notes, not acceptance criteria."
     },
     {
       "id": "US-003",
-      "title": "Add streaming size cap and connect + read timeout to guarded HTTP client",
-      "description": "As a developer, I want the guarded HTTP client to stream response bodies and abort mid-stream when storage.max_download_bytes is exceeded, and to enforce storage.download_timeout_seconds as both connect and read timeout, so that oversize or slow responses cannot stall or exhaust the process.",
+      "title": "Create APScheduler setup with per-job limits and run_profile stub hook",
+      "description": "As a developer, I want `src/influx/scheduler.py` to configure an in-process APScheduler that registers one job per enabled profile with `max_instances=1`, `coalesce=True`, and `misfire_grace_time=schedule.misfire_grace_seconds`, and to route each fire through a documented `run_profile(profile, kind, range)` seam that is a no-op in this PRD, so that later PRDs (04, 06, 09) can fill the body without touching scheduler wiring.",
       "acceptanceCriteria": [
-        "The guarded client streams response bodies rather than buffering the full response (per PRD §5.4)",
-        "A response whose cumulative body exceeds storage.max_download_bytes is aborted mid-stream and raises NetworkError with kind 'oversize' (AC-02-B); the partial body is NOT returned to the caller",
-        "Connect timeout and read timeout are both bounded by storage.download_timeout_seconds (FR-RES-4); timeout raises NetworkError",
-        "tests/unit/test_http_client.py covers size-cap streaming abort (using a fixture server, respx, or equivalent) and timeout behaviour; oversize case asserts that no body is returned",
-        "Typecheck passes"
+        "src/influx/scheduler.py builds an in-process APScheduler and exposes start/stop entry points that the service layer can call",
+        "Each scheduled job is registered with `max_instances=1`, `coalesce=True`, and `misfire_grace_time=schedule.misfire_grace_seconds` (FR-SCHED-2)",
+        "One scheduler job is registered per enabled profile from the loaded config (AC-M1-3 scheduler portion)",
+        "Each fire routes through a `run_profile(profile, kind, range)` hook that is a no-op in this PRD; the module comment/docstring names which downstream PRDs (04, 06, 09) replace the body",
+        "Scheduled fires acquire and release the per-profile lock through the shared coordinator from US-001 around each call to the `run_profile` stub hook, and a same-profile lock conflict observed by a scheduled fire is handled without crashing the scheduler (FR-SCHED-3); exact integration shape is left to the implementation. End-to-end overlap behaviour against manual `POST /runs` work is asserted in US-005 (AC-03-A) and against backfill work in US-006 (AC-M3-7); US-003 is verified in isolation via scheduler-only unit tests of lock acquisition/release",
+        "AC-M3-1 is satisfied — when the scheduler fires for two configured profiles, both fires are executed via the `run_profile` stub hook through the coordinator without same-profile overlap"
       ],
       "priority": 3,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-004",
-      "title": "Enforce content-type family check (HTML, PDF, XML/Atom)",
-      "description": "As a developer, I want the guarded HTTP client to accept an expected content-type family argument from the caller and raise NetworkError when the response's content-type does not belong to that family, so that callers expecting HTML never silently receive a PDF (or vice versa).",
+      "title": "Implement /live, /ready, and /status endpoints reading cached probe state",
+      "description": "As an operator, I want `src/influx/http_api.py` to expose FastAPI routes for `GET /live`, `GET /ready`, and `GET /status` that read cached probe state (never issue fresh probes per request) and return the structured bodies mandated by FR-HTTP-1..3, so that liveness, readiness, and rich status are observable without toggling operational state per request.",
       "acceptanceCriteria": [
-        "The guarded fetch API accepts an expected content-type family argument with at least HTML, PDF, and XML/Atom families (exact enum/literal naming left to the implementation)",
-        "The check is family-based: a response's content-type is matched against the caller-specified family (HTML, PDF, or XML/Atom); the exact MIME mapping per family is left to the implementation and is not constrained by this PRD",
-        "A response whose content-type does not belong to the expected family raises NetworkError with kind 'content_type_mismatch' (AC-02-D)",
-        "tests/unit/test_http_client.py covers positive cases for each family (HTML/PDF/XML) and at least one mismatch case (e.g. expected HTML, received application/pdf)",
-        "Typecheck passes"
+        "src/influx/http_api.py (FastAPI or Starlette router) exposes `GET /live`, `GET /ready`, and `GET /status`",
+        "`GET /live` returns `200 OK` while the process and event loop are alive, `503` otherwise (FR-HTTP-1, AC-M1-4)",
+        "`GET /ready` returns `200 OK` + `{\"ready\": true}` when all cached readiness checks pass, `503` otherwise; the handler reads the cached probe state from US-002 and MUST NOT trigger a fresh probe (FR-HTTP-2, FR-HTTP-7, AC-M1-5)",
+        "`GET /status` always returns `200 OK` while the process can serve requests and returns a JSON body that satisfies FR-HTTP-3 and the §14.4 status contract of `docs/REQUIREMENTS.md`, including at minimum the PRD-mandated subset: `status ∈ {ok, degraded, starting}`, a `profiles.<name>.next_run_at` that is non-null when the profile is enabled and the scheduler is running, `profiles.<name>.last_run_at` and `profiles.<name>.last_run_status`, `dependencies.lithos.status`, `dependencies.llm_credentials.status`, and `version` (from `influx.__version__`) (FR-HTTP-3, AC-M1-6)",
+        "tests/integration/test_http_api.py (FastAPI TestClient or httpx) covers: `/live` returns 200 under normal conditions; `/ready` returns 200 + `{\"ready\": true}` when probes pass and `503` when they fail; `/status` returns the documented body shape; and AC-03-C — with `INFLUX_TEST_LITHOS_DOWN=1`, within one probe cycle `/ready` returns `503` and `/status.status == \"degraded\"`"
       ],
       "priority": 4,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-005",
-      "title": "Re-validate scheme and IP at every redirect hop",
-      "description": "As a developer, I want the guarded HTTP client to re-apply the scheme allow-list and the SSRF IP classification on every redirect target, so that a redirect from a public host to a private IP (R-4) fails at the redirect hop just as a direct connection to that IP would.",
+      "title": "Implement POST /runs with coordinator integration and one-of scope validation",
+      "description": "As an operator, I want `POST /runs` to accept exactly one of `profile` or `all_profiles`, acquire the per-profile lock via the coordinator, and return `202` with `{status, request_id, kind, scope, submitted_at}` on acceptance or `409` with `reason=\"profile_busy\"` on overlap, so that manual runs serialise correctly against scheduled fires for the same profile (FR-HTTP-4).",
       "acceptanceCriteria": [
-        "Every redirect target has its scheme re-validated against the http/https allow-list and its hostname re-resolved and re-classified against the SSRF IP rules (per PRD §5.3 R-4 mitigation)",
-        "A redirect from a public host to a loopback or private IP raises NetworkError at the redirect hop (AC-02-C), not just on the initial request",
-        "security.allow_private_ips=true is honoured consistently at every hop (same semantics as for the initial request)",
-        "tests/unit/test_http_client.py covers a redirect from a public host to a private IP and asserts the failure is attributable to the redirect hop (e.g. the NetworkError carries the redirect target URL)",
-        "Coverage on src/influx/http_client.py is >= 80%",
-        "Typecheck passes"
+        "`POST /runs` accepts a JSON body with exactly one of `profile` or `all_profiles`; supplying both returns `422` (AC-03-B); supplying neither returns `400` or `422` as a validation failure (FR-HTTP-4)",
+        "On acceptance, `POST /runs` returns `202` and a response body containing `status`, `request_id`, `kind`, `scope`, and `submitted_at` (FR-HTTP-4)",
+        "On same-profile overlap, `POST /runs` returns `409 Conflict` with a body whose `reason == \"profile_busy\"` (FR-SCHED-3, AC-M1-8)",
+        "For single-profile manual runs, the accepted path preserves the coordinator/`run_profile()` seam from US-003 so that the scheduled-vs-manual overlap test (AC-03-A) is enforced by the same lock that scheduled fires use; multi-profile (`all_profiles`) fan-out of `run_profile()` execution remains deferred to PRD 09",
+        "Tests in tests/integration/test_http_api.py cover: happy path (`202` + documented response body); duplicate submission while the first run is in flight returns `409` with `reason=\"profile_busy\"` (AC-M1-8); body with both `profile` and `all_profiles` returns `422` (AC-03-B); AC-03-A — a scheduled fire and a `POST /runs` for the same profile arriving concurrently result in exactly one accepted run and a `409` for the other"
       ],
       "priority": 5,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-006",
-      "title": "Extend CLI argparse surface with serve, run, backfill subcommand stubs",
-      "description": "As an operator, I want the final v1 CLI contract (serve, run --profile, backfill --profile --days/--from/--to [--confirm]) wired into the argparse dispatcher now — with stub handler bodies that print a clear message and exit 64 — so that no later PRD changes user-visible flags when it fills the bodies in.",
+      "title": "Implement POST /backfills with stub estimator and confirm-required flow",
+      "description": "As an operator, I want `POST /backfills` to accept `profile` or `all_profiles` plus `days` OR (`from`, `to`) plus optional `confirm`, use a constant stub estimator (replaced by PRD 09), and return `400` with `{reason: \"confirm_required\", estimated_items: N}` when `estimated_items > 1000` and `confirm` is missing, so that the CLI can reprompt the operator before large backfills proceed (FR-HTTP-5).",
       "acceptanceCriteria": [
-        "src/influx/main.py (or a new src/influx/cli.py if the dispatcher is extracted; main.py may become a thin entry per PRD §6) registers three new subcommands: serve, run (with --profile), and backfill (with --profile, --days, --from, --to, --confirm)",
-        "The argparse surface for serve, run, and backfill matches the final v1 CLI contract per PRD §4 and the Definition of Done: user-visible flag names, help text, and any argument behaviour already specified in FR-CLI-2/3/4 (serve takes no flags; run takes --profile; backfill takes --profile, --days, --from, --to, --confirm) are locked in by this PRD so that no later PRD changes the user-visible CLI surface; only the handler bodies may remain stubs",
-        "The backfill subcommand registers the --confirm flag as part of its final argparse surface so that later PRDs do not change the user-visible CLI contract; the FR-CLI-4 large-job --confirm enforcement semantics (when --confirm is required, any 'large job' threshold, and the associated rejection/acceptance tests) are deferred to the later PRD that wires POST /backfills",
-        "Handler bodies for run and backfill are stubs that print a clear stub / not-implemented message and exit with code 64 (per PRD §2 / §5.2)",
-        "The serve subcommand is registered with its final argparse surface (takes no flags per FR-CLI-2) and routes to a stub handler in this PRD; the exact stub body behaviour is left to the implementation because the source PRD is internally inconsistent on this point (see story note), and PRD 03 replaces the handler body regardless",
-        "The pre-existing validate-config subcommand continues to route to the existing validator unchanged",
-        "tests/unit/test_cli_dispatch.py covers: serve, run, and backfill each route to their registered handler (argparse does not reject the flags); the run and backfill stub handlers exit 64",
-        "Typecheck passes"
+        "`POST /backfills` accepts a JSON body with exactly one of `profile` or `all_profiles`, plus exactly one of `days` or (`from`, `to`), plus optional `confirm` (FR-HTTP-5); invalid combinations return `400/422` as appropriate",
+        "The backfill estimator is a constant stub in this PRD (e.g. returns 0 by default, with a test-only hook to force a value > 1000); PRD 09 replaces the estimator with the naive `days × categories × avg_results` formula",
+        "When `estimated_items > 1000` and `confirm` is not truthy, the response is `400` with body `{reason: \"confirm_required\", estimated_items: <N>}` (FR-HTTP-5, AC-M3-8)",
+        "When `confirm` is truthy (or the estimate is ≤ 1000), the endpoint returns `202` + `{status, request_id, kind, scope, submitted_at}` (same response envelope as `POST /runs`, FR-HTTP-5); for single-profile backfills the endpoint acquires the profile lock via the coordinator on acceptance, while `all_profiles` request validation/acceptance is in scope here and the multi-profile execution + lock fan-out remain deferred to PRD 09",
+        "A backfill MUST NOT overlap with a scheduled run for the same profile — both paths go through the same coordinator (AC-M3-7)",
+        "Tests in tests/integration/test_http_api.py cover: confirm-required path when estimator is forced > 1000 and `--confirm` is not set (AC-M3-8); acceptance path when `confirm=true` is supplied; acceptance path when estimate ≤ 1000 without `confirm`; AC-M3-7 — backfill for profile X does not overlap with a scheduled run for profile X"
       ],
       "priority": 6,
-      "passes": true,
-      "notes": "Source PRD is internally inconsistent about the serve stub body: §2 describes printing a 'starting' message and blocking on a signal, while FR-CLI-2 specifies printing '[stub] serve not wired yet' and exiting 64. The exact stub behaviour needs clarification in the source PRD; the argparse surface is locked in here, and PRD 03 replaces the handler body regardless."
+      "passes": false,
+      "notes": ""
     },
     {
       "id": "US-007",
-      "title": "Add migrate-notes subcommand, exit-code policy, and unknown-subcommand handling",
-      "description": "As an operator, I want `python -m influx migrate-notes` to print `note_schema_version: <N>` (using the value from config, default 1) and exit 0, and I want the dispatcher to return exit code 64 for unknown subcommands while preserving AC-X-5 (no subcommand → help + non-zero), so that the CLI contract in FR-CLI-6 and FR-CLI-7 is fully satisfied.",
+      "title": "Create service.py app factory, lifecycle, and local-admin bind guard",
+      "description": "As a developer, I want `src/influx/service.py` to provide a top-level app factory and lifecycle that composes the ASGI app, scheduler, coordinator, and probe loop, and that reads `INFLUX_ADMIN_BIND_HOST` (default `127.0.0.1`) + `INFLUX_ADMIN_PORT` (default `8080`) and refuses to start with a non-loopback bind host unless `security.allow_remote_admin = true`, so that the local-admin constraint is hard to break by accident (§5.5, AC-03-D).",
       "acceptanceCriteria": [
-        "The dispatcher registers a migrate-notes subcommand whose handler prints exactly 'note_schema_version: <N>' (where N is influx.note_schema_version from the loaded config, default 1) and exits 0 (AC-02-F, FR-CLI-6)",
-        "Exit-code policy is enforced per FR-CLI-7: 0 success, 1 partial failure, 2 total failure, 64 usage error (exit codes may be defined as named constants in the dispatcher module)",
-        "`python -m influx <unknown>` exits 64 (AC-02-E)",
-        "`python -m influx` with no subcommand continues to print help and exit non-zero (AC-X-5 regression)",
-        "tests/unit/test_cli_dispatch.py covers AC-02-F (migrate-notes output and exit 0), AC-02-E (unknown subcommand → exit 64), and the AC-X-5 no-args regression",
-        "Coverage on the CLI dispatcher module (src/influx/main.py and/or src/influx/cli.py) is >= 80%",
-        "Typecheck passes"
+        "src/influx/service.py exposes an app factory that wires the FastAPI/Starlette router (US-004..006), the scheduler (US-003), the coordinator (US-001), and the probe loop (US-002) into a single startable/stoppable service (exact API shape left to the implementation)",
+        "The bind guard consults `security.allow_remote_admin` from the loaded typed config (the `SecurityConfig` schema is extended as needed to carry this flag; specific default values and loader round-trip tests are implementation/test-plan detail rather than source ACs)",
+        "The service reads bind host from env var `INFLUX_ADMIN_BIND_HOST` (default `127.0.0.1`) and bind port from `INFLUX_ADMIN_PORT` (default `8080`) (§5.5 of PRD 03)",
+        "The service refuses to start when `INFLUX_ADMIN_BIND_HOST` resolves to a non-loopback address AND `security.allow_remote_admin` is not `true`; startup raises a clear error and the process does not begin serving requests (AC-03-D)",
+        "With `security.allow_remote_admin = true`, a non-loopback bind host is accepted (negative-path completeness of AC-03-D)",
+        "A unit or integration test covers AC-03-D: starting the service with `INFLUX_ADMIN_BIND_HOST=0.0.0.0` and `security.allow_remote_admin` unset/false is refused; the same bind host with `security.allow_remote_admin = true` is accepted",
+        "The app factory exposes a self-contained start/stop lifecycle contract that the `serve` handler (US-008) can drive"
       ],
       "priority": 7,
-      "passes": true,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Wire `serve` CLI handler to start service and block on SIGINT/SIGTERM",
+      "description": "As an operator, I want `python -m influx serve` to start the ASGI app under uvicorn, start the scheduler, start the probe loop, and block until SIGINT/SIGTERM, with a clean shutdown that lets in-flight runs complete within a bounded `schedule.shutdown_grace_seconds`, so that the service behaves correctly as a long-running process (§5.4, AC-M1-3, AC-03-E).",
+      "acceptanceCriteria": [
+        "`python -m influx serve` replaces the PRD 02 stub handler and starts the full service via the US-007 app factory: ASGI app under uvicorn, scheduler started, probe loop started (§5.4 of PRD 03)",
+        "Shutdown wait is bounded by `schedule.shutdown_grace_seconds` read from the loaded typed config (the `ScheduleConfig` schema is extended as needed to carry this value; specific default values and loader round-trip tests are implementation/test-plan detail rather than source ACs)",
+        "The handler blocks until SIGINT or SIGTERM is received, then initiates a clean shutdown",
+        "On shutdown the scheduler and ASGI server stop cleanly; in-flight runs are allowed to complete within a bounded wait sourced from `schedule.shutdown_grace_seconds` (§5.4 of PRD 03)",
+        "On clean shutdown the process exits with status 0 (AC-03-E)",
+        "Started service satisfies AC-M1-3: `/live`, `/ready`, and `/status` are bound, and one scheduler job is registered per enabled profile",
+        "Tests cover AC-03-E: `serve` starts the full service, handles SIGINT/SIGTERM, shuts down cleanly, and exits with status 0",
+        "Shutdown is clean: no orphaned threads or scheduler jobs remain after shutdown"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Wire `run` and `backfill` CLI handlers to POST to the running service",
+      "description": "As an operator, I want `python -m influx run --profile X` and `python -m influx backfill --profile X --days N [--confirm]` to be real HTTP clients of the running service — posting to `/runs` and `/backfills` on the configured local admin host+port, printing the returned `request_id`, handling the `confirm_required` reprompt flow for backfills, and exiting with the documented codes — so that the CLI is a first-class client of the admin API (§5.4, FR-CLI-3/4).",
+      "acceptanceCriteria": [
+        "`python -m influx run --profile X` POSTs to `http://127.0.0.1:<INFLUX_ADMIN_PORT>/runs` with body `{\"profile\": \"X\"}` and prints the returned `request_id` on acceptance (§5.4 of PRD 03)",
+        "`run` exit codes: `0` on `202`, `1` on `409` (profile busy), `2` on network error (§5.4 of PRD 03)",
+        "`python -m influx backfill --profile X --days N` POSTs to `/backfills` with body `{\"profile\": \"X\", \"days\": N}` (and similarly for `--from/--to`) and prints the returned `request_id` on acceptance",
+        "When the response is `{reason: \"confirm_required\", estimated_items: <N>, ...}` and `--confirm` was NOT passed, the handler prints the estimate in a human-readable form and exits with code `64` (usage error) (§5.4 of PRD 03)",
+        "When `--confirm` IS passed, on receiving a `confirm_required` response the handler re-POSTs the same request with `\"confirm\": true` added to the body, per §5.4 of PRD 03",
+        "Handlers target the running service on loopback (`127.0.0.1`) at the port read from `INFLUX_ADMIN_PORT` (default `8080`), per §5.4 of PRD 03",
+        "Tests cover: `run` happy path (exit 0 + printed request_id), `run` conflict path (exit 1 on 409), `run` network-error path (exit 2); `backfill` confirm-required path without `--confirm` (exit 64 + estimate printed); `backfill` acceptance path with `--confirm`; AC-M3-8 end-to-end — `backfill --days 365` without `--confirm` returns confirm_required, and re-submitting with `--confirm` is accepted (estimator stub may be forced > 1000 for the test)"
+      ],
+      "priority": 9,
+      "passes": false,
       "notes": ""
     }
   ]
