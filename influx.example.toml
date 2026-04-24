@@ -1,13 +1,239 @@
-# Influx configuration.
+# Influx v0.7 Example Configuration
 # Copy to influx.toml (cwd), ~/.influx/influx.toml, or /etc/influx/influx.toml
-# and adjust to taste. Alternatively point INFLUX_CONFIG at this file.
+# and adjust to taste.  Alternatively set INFLUX_CONFIG to point here.
+
+# ---------------------------------------------------------------------------
+# Core settings
+# ---------------------------------------------------------------------------
 
 [influx]
-environment = "dev"
-greeting = "Hello"
+note_schema_version = 1         # stamped on every Influx-authored note
 
-[influx.storage]
-data_dir = "~/.influx/data"
+[schedule]
+cron = "0 6 * * *"              # daily at 06:00
+timezone = "UTC"
+misfire_grace_seconds = 3600    # tolerate missed fires within an hour
 
-[influx.logging]
-level = "info"   # one of: debug, info, warning, error
+[storage]
+archive_dir = "/archive"
+retain_days = 3650              # ~10 years
+max_download_bytes = 52_428_800 # 50 MB per file
+download_timeout_seconds = 30
+
+[notifications]
+webhook_url = ""                # override via env AGENT_ZERO_WEBHOOK_URL
+timeout_seconds = 5
+
+[security]
+allow_private_ips = false
+
+# ---------------------------------------------------------------------------
+# Interest Profiles
+# Profile names MUST match: ^[a-z][a-z0-9-]{0,31}$
+# ---------------------------------------------------------------------------
+
+[[profiles]]
+name = "ai-robotics"
+description = """
+  HIGH INTEREST: Multi-agent systems, agent memory and knowledge graphs,
+  humanoid and social robotics, LLM reasoning and planning, emotional models
+  for robots, intelligent AI companions, neurosymbolic reasoning.
+
+  MEDIUM INTEREST: LLM agents with tool use or memory, reinforcement learning
+  for robotics, vision-language-action models, cognitive architectures.
+
+  LOW INTEREST / EXCLUDE: General ML without agent/robot angle, CV without
+  robotics context, federated learning, model compression, medical imaging,
+  benchmarks-only papers.
+  """
+
+[profiles.thresholds]
+relevance = 7
+full_text = 8
+deep_extract = 9
+notify_immediate = 8
+lcma_edge_score = 0.75
+
+[profiles.sources.arxiv]
+enabled = true
+categories = ["cs.AI", "cs.RO", "cs.MA", "cs.NE", "cs.CL", "cs.LO"]
+max_results_per_category = 200
+lookback_days = 1
+
+[[profiles.sources.rss]]
+name = "Andrej Karpathy"
+url = "https://karpathy.github.io/feed.xml"
+source_tag = "blog"
+
+[[profiles.sources.rss]]
+name = "Lilian Weng"
+url = "https://lilianweng.github.io/index.xml"
+source_tag = "blog"
+
+# Second profile — RSS-only example
+[[profiles]]
+name = "web-tech"
+description = """
+  Web platform standards, browser internals, JavaScript engines, WASM,
+  CSS Houdini, and novel front-end architectures.
+  """
+
+[profiles.thresholds]
+relevance = 6
+full_text = 7
+deep_extract = 9
+notify_immediate = 7
+lcma_edge_score = 0.80
+
+[profiles.sources.arxiv]
+enabled = false
+
+[[profiles.sources.rss]]
+name = "Mozilla Hacks"
+url = "https://hacks.mozilla.org/feed/"
+source_tag = "rss"
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+extra_headers = { "HTTP-Referer" = "https://example.invalid/influx", "X-Title" = "Influx" }
+
+# ---------------------------------------------------------------------------
+# Models (filter / enrich / extract)
+# ---------------------------------------------------------------------------
+
+[models.filter]
+provider = "openai"
+model = "openai/gpt-4.1-mini"
+temperature = 0.0
+max_tokens = 2048
+request_timeout = 30
+max_retries = 2
+json_mode = true
+
+[models.enrich]
+provider = "openai"
+model = "openai/gpt-4.1-mini"
+temperature = 0.2
+request_timeout = 30
+max_retries = 2
+json_mode = true
+
+[models.extract]
+provider = "anthropic"
+model = "anthropic/claude-sonnet-4.6"
+temperature = 0.2
+request_timeout = 60
+max_retries = 2
+json_mode = true
+
+# ---------------------------------------------------------------------------
+# Prompts (filter / tier1_enrich / tier3_extract)
+# Each entry requires exactly one of `text` or `path`.
+# ---------------------------------------------------------------------------
+
+[prompts.filter]
+text = """
+You are a research paper relevance filter.  Score each paper for relevance
+to the following interest profile.
+
+## INTEREST PROFILE
+{profile_description}
+
+## NEGATIVE EXAMPLES
+{negative_examples}
+
+## OUTPUT FORMAT
+Return JSON with "results" array.  For each paper with score >= {min_score_in_results}:
+  "id", "score" (1-10), "tags" (2-5 keywords), "reason" (one sentence).
+"""
+
+[prompts.tier1_enrich]
+text = """
+Given the paper title and abstract, extract:
+1. Key contributions (3-5 bullet points)
+2. Primary method (1-2 sentences)
+3. Main result (1-2 sentences)
+4. Relevance to: {profile_summary}
+
+Title: {title}
+Abstract: {abstract}
+
+Return JSON: {{"contributions": [...], "method": "...", "result": "...", "relevance": "..."}}
+"""
+
+[prompts.tier3_extract]
+text = """
+From the full text of the paper, extract structured information.
+
+Title: {title}
+Full text: {full_text}
+
+Return JSON with: claims, datasets, builds_on, open_questions, potential_connections.
+"""
+
+# ---------------------------------------------------------------------------
+# Filter tuning
+# ---------------------------------------------------------------------------
+
+[filter]
+batch_size = 25
+min_score_in_results = 6
+negative_example_max_title_chars = 200
+
+# ---------------------------------------------------------------------------
+# Extraction tuning
+# ---------------------------------------------------------------------------
+
+[extraction]
+min_html_chars = 1000
+min_web_chars = 500
+strip_tags = ["script", "iframe", "object", "embed"]
+
+# ---------------------------------------------------------------------------
+# Resilience
+# ---------------------------------------------------------------------------
+
+[resilience]
+max_retries = 3
+backoff_base_seconds = 1
+arxiv_request_min_interval_seconds = 3
+arxiv_429_backoff_seconds = 10
+lithos_write_conflict_max_retries = 1
+
+# ---------------------------------------------------------------------------
+# Feedback
+# ---------------------------------------------------------------------------
+
+[feedback]
+negative_examples_per_profile = 20
+recalibrate_after_runs = 7
+
+# ---------------------------------------------------------------------------
+# Repair
+# ---------------------------------------------------------------------------
+
+[repair]
+max_items_per_run = 100
+
+# ---------------------------------------------------------------------------
+# Telemetry
+# ---------------------------------------------------------------------------
+
+[telemetry]
+enabled = false
+console_fallback = false
+service_name = "influx"
+export_interval_ms = 30000

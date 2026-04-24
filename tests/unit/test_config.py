@@ -554,3 +554,110 @@ class TestProviderApiKeyEnvValidation:
         cfg = load_config()
 
         assert cfg.providers["ollama"].api_key_env == ""
+
+
+# ── influx.example.toml round-trip (US-008) ──────────────────────────
+
+
+class TestExampleTomlRoundTrip:
+    """influx.example.toml loads successfully and matches expected structure."""
+
+    @staticmethod
+    def _example_path() -> Path:
+        """Return the repo-root influx.example.toml path."""
+        return Path(__file__).resolve().parents[2] / "influx.example.toml"
+
+    def test_example_toml_loads_successfully(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """load_config() accepts influx.example.toml without error."""
+        example = self._example_path()
+        assert example.exists(), f"influx.example.toml not found at {example}"
+
+        # Set provider API keys so api_key_env validation passes.
+        monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+
+        cfg = load_config(path=example)
+
+        assert isinstance(cfg, AppConfig)
+
+    def test_example_toml_has_expected_profiles(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Example includes one arXiv profile and one RSS-only profile."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+
+        cfg = load_config(path=self._example_path())
+
+        assert len(cfg.profiles) == 2
+        names = {p.name for p in cfg.profiles}
+        assert "ai-robotics" in names
+        assert "web-tech" in names
+
+        # ai-robotics has arXiv enabled and RSS feeds
+        arxiv_profile = next(p for p in cfg.profiles if p.name == "ai-robotics")
+        assert arxiv_profile.sources.arxiv.enabled is True
+        assert len(arxiv_profile.sources.rss) >= 1
+
+        # web-tech has arXiv disabled
+        rss_profile = next(p for p in cfg.profiles if p.name == "web-tech")
+        assert rss_profile.sources.arxiv.enabled is False
+        assert len(rss_profile.sources.rss) >= 1
+
+    def test_example_toml_has_providers_and_models(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Example covers providers, all three model slots, and prompts."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+
+        cfg = load_config(path=self._example_path())
+
+        # Providers
+        assert "openai" in cfg.providers
+        assert "anthropic" in cfg.providers
+        assert "openrouter" in cfg.providers
+
+        # Model slots (filter, enrich, extract)
+        assert "filter" in cfg.models
+        assert "enrich" in cfg.models
+        assert "extract" in cfg.models
+
+        # Prompts (filter, tier1_enrich, tier3_extract)
+        assert cfg.prompts.filter.text is not None
+        assert cfg.prompts.tier1_enrich.text is not None
+        assert cfg.prompts.tier3_extract.text is not None
+
+    def test_example_toml_has_repair_and_schema_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Example covers [repair] and influx.note_schema_version."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+
+        cfg = load_config(path=self._example_path())
+
+        assert cfg.influx.note_schema_version == 1
+        assert cfg.repair.max_items_per_run == 100
+
+
+class TestConftestFixture:
+    """The conftest influx_config_env fixture yields a loadable config."""
+
+    def test_fixture_loads_successfully(self, influx_config_env: Path) -> None:
+        """The conftest fixture produces a valid multi-section config."""
+        cfg = load_config()
+
+        assert isinstance(cfg, AppConfig)
+        assert len(cfg.profiles) == 2
+        assert "test-provider" in cfg.providers
+        assert "filter" in cfg.models
+        assert "enrich" in cfg.models
+        assert "extract" in cfg.models
+        assert cfg.repair.max_items_per_run == 100
