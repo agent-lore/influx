@@ -79,7 +79,7 @@
         "Tests in tests/integration/test_http_api.py cover: happy path (`202` + documented response body); duplicate submission while the first run is in flight returns `409` with `reason=\"profile_busy\"` (AC-M1-8); body with both `profile` and `all_profiles` returns `422` (AC-03-B); AC-03-A — a scheduled fire and a `POST /runs` for the same profile arriving concurrently result in exactly one accepted run and a `409` for the other"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

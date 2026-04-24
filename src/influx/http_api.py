@@ -1,21 +1,27 @@
-"""FastAPI routes for ``/live``, ``/ready``, and ``/status``.
+"""FastAPI routes for the Influx admin HTTP API.
 
-All three endpoints read cached state from the probe loop, coordinator,
-and scheduler — they MUST NOT issue fresh probes per request (FR-HTTP-7).
+Health endpoints (``/live``, ``/ready``, ``/status``) read cached state
+from the probe loop, coordinator, and scheduler — they MUST NOT issue
+fresh probes per request (FR-HTTP-7).
 
-Later user stories (US-005, US-006) extend this module with
-``POST /runs`` and ``POST /backfills``.
+``POST /runs`` accepts manual run requests with coordinator-based
+overlap protection (FR-HTTP-4, FR-SCHED-3).
 """
 
 from __future__ import annotations
 
-from datetime import UTC
+import asyncio
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, model_validator
 
 import influx
+from influx.coordinator import Coordinator, ProfileBusyError, RunKind
+from influx.scheduler import run_profile
 
 router = APIRouter()
 
@@ -51,7 +57,6 @@ async def status(request: Request) -> JSONResponse:
     ``docs/REQUIREMENTS.md``.
     """
     from influx.config import AppConfig
-    from influx.coordinator import Coordinator
     from influx.probes import ProbeLoop
     from influx.scheduler import InfluxScheduler
 
@@ -95,3 +100,104 @@ async def status(request: Request) -> JSONResponse:
         "profiles": profiles,
     }
     return JSONResponse(body, status_code=200)
+
+
+# ── POST /runs ──────────────────────────────────────────────────────
+
+
+class RunRequest(BaseModel):
+    """Request body for ``POST /runs`` (FR-HTTP-4)."""
+
+    profile: str | None = None
+    all_profiles: bool | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_scope(self) -> RunRequest:
+        has_profile = self.profile is not None
+        has_all = self.all_profiles is not None and self.all_profiles
+        if has_profile and has_all:
+            raise ValueError(
+                "Supply exactly one of 'profile' or 'all_profiles', not both"
+            )
+        if not has_profile and not has_all:
+            raise ValueError(
+                "Supply exactly one of 'profile' or 'all_profiles'"
+            )
+        return self
+
+
+@router.post("/runs")
+async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
+    """Accept a manual run request (FR-HTTP-4).
+
+    Acquires the per-profile lock via the coordinator.  Returns ``202``
+    on acceptance or ``409 Conflict`` with ``reason="profile_busy"``
+    when the profile is already running.
+
+    Multi-profile (``all_profiles``) fan-out of ``run_profile()``
+    execution is deferred to PRD 09.
+    """
+    from influx.config import AppConfig
+
+    coordinator: Coordinator = request.app.state.coordinator
+    config: AppConfig = request.app.state.config
+
+    request_id = str(uuid.uuid4())
+    submitted_at = datetime.now(UTC).isoformat()
+
+    if body.profile is not None:
+        # Validate the profile name exists in config.
+        known = {p.name for p in config.profiles}
+        if body.profile not in known:
+            return JSONResponse(
+                {"detail": f"Unknown profile: {body.profile!r}"},
+                status_code=422,
+            )
+
+        try:
+            acquired = await coordinator.try_acquire(body.profile)
+            if not acquired:
+                raise ProfileBusyError(body.profile)
+        except ProfileBusyError:
+            return JSONResponse(
+                {"reason": "profile_busy", "profile": body.profile},
+                status_code=409,
+            )
+
+        # Launch the run in the background so the response returns immediately.
+        asyncio.get_event_loop().create_task(
+            _run_and_release(coordinator, body.profile, RunKind.MANUAL)
+        )
+
+        return JSONResponse(
+            {
+                "status": "accepted",
+                "request_id": request_id,
+                "kind": "manual",
+                "scope": body.profile,
+                "submitted_at": submitted_at,
+            },
+            status_code=202,
+        )
+
+    # all_profiles path — accept but defer multi-profile execution to PRD 09.
+    return JSONResponse(
+        {
+            "status": "accepted",
+            "request_id": request_id,
+            "kind": "manual",
+            "scope": "all",
+            "submitted_at": submitted_at,
+        },
+        status_code=202,
+    )
+
+
+async def _run_and_release(
+    coordinator: Coordinator, profile: str, kind: RunKind
+) -> None:
+    """Run ``run_profile`` and release the coordinator lock afterward."""
+    try:
+        await run_profile(profile, kind)
+    finally:
+        coordinator.release(profile)

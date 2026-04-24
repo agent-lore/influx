@@ -15,6 +15,9 @@
 - HTTP API router in `src/influx/http_api.py` — dependencies stored on `app.state` (config, coordinator, scheduler, probe_loop)
 - FastAPI TestClient (sync) works for most tests; scheduler start requires `async def` test (needs event loop)
 - Ruff UP017: use `datetime.UTC` alias instead of `datetime.timezone.utc`
+- POST /runs uses Pydantic `model_validator(mode="after")` for exactly-one-of validation — FastAPI auto-returns 422 on failure
+- Background task via `asyncio.get_event_loop().create_task()` — acquires lock before responding 202, releases in background after `run_profile`
+- To test 409 overlap with sync TestClient, pre-acquire the lock via `asyncio.new_event_loop()` or use `async def` test
 
 # Ralph Progress Log
 Started: Fri Apr 24 14:02:16 UTC 2026
@@ -92,4 +95,23 @@ Started: Fri Apr 24 14:02:16 UTC 2026
   - Ruff B007 catches unused loop variables — use `_name` prefix
   - `.venv` symlinks may break if pyenv python is unavailable — recreate with `python -m venv .venv --clear`
   - All 211 tests pass (13 new HTTP API + 198 existing)
+---
+
+## 2026-04-24 - US-005
+- Implemented `POST /runs` endpoint with coordinator integration and one-of scope validation
+- `RunRequest` Pydantic model validates exactly one of `profile` or `all_profiles` (422 on both or neither)
+- Single-profile path acquires coordinator lock, returns 202 on acceptance, 409 with `reason="profile_busy"` on overlap
+- Background task runs `run_profile` stub and releases lock after completion
+- Unknown profile names return 422
+- `all_profiles` path returns 202 (multi-profile execution deferred to PRD 09)
+- Files changed:
+  - src/influx/http_api.py (added RunRequest model, POST /runs endpoint, _run_and_release helper)
+  - tests/integration/test_http_api.py (added 9 tests: happy path, conflict 409, both/neither validation, unknown profile, all_profiles, unique request_id, scheduler overlap AC-03-A, cross-profile allowed)
+  - scripts/ralph/prd.json (US-005 passes: true)
+- **Learnings for future iterations:**
+  - Pydantic `model_validator(mode="after")` gives clean exactly-one-of validation; FastAPI auto-handles 422 responses
+  - When importing at top level (e.g. `Coordinator`), remove redundant local imports in existing functions to avoid ruff F401
+  - `asyncio.get_event_loop().create_task()` works in FastAPI async handlers for fire-and-forget background work
+  - To test 409 with sync TestClient, use `asyncio.new_event_loop().run_until_complete(coordinator.try_acquire(...))` or `async def` test
+  - All 220 tests pass (9 new POST /runs + 211 existing)
 ---

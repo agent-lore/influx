@@ -1,12 +1,13 @@
-"""Integration tests for the HTTP API endpoints (US-004).
+"""Integration tests for the HTTP API endpoints (US-004, US-005).
 
 Uses FastAPI's ``TestClient`` (backed by httpx) to exercise
-``/live``, ``/ready``, and ``/status`` against a wired-up app with
-real coordinator, scheduler, and probe loop instances.
+``/live``, ``/ready``, ``/status``, and ``POST /runs`` against a
+wired-up app with real coordinator, scheduler, and probe loop instances.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -242,3 +243,121 @@ class TestDegradedStateAC03C:
             body = tc.get("/status").json()
         assert body["status"] == "degraded"
         assert body["dependencies"]["lithos"]["status"] == "degraded"
+
+
+# ── POST /runs (US-005) ─────────────────────────────────────────────
+
+
+class TestPostRuns:
+    """``POST /runs`` accepts manual run requests (FR-HTTP-4)."""
+
+    def test_runs_happy_path_202(self, client: TestClient) -> None:
+        """Single-profile run returns 202 + documented response body."""
+        resp = client.post("/runs", json={"profile": "ai-robotics"})
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["status"] == "accepted"
+        assert "request_id" in body
+        assert body["kind"] == "manual"
+        assert body["scope"] == "ai-robotics"
+        assert "submitted_at" in body
+
+    def test_runs_conflict_409(self, app_with_state: FastAPI) -> None:
+        """Duplicate submission while run in flight → 409 + profile_busy (AC-M1-8)."""
+        coordinator: Coordinator = app_with_state.state.coordinator
+
+        # Simulate an in-flight run by holding the lock.
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(coordinator.try_acquire("ai-robotics"))
+        try:
+            with TestClient(app_with_state) as tc:
+                resp = tc.post("/runs", json={"profile": "ai-robotics"})
+            assert resp.status_code == 409
+            assert resp.json()["reason"] == "profile_busy"
+        finally:
+            coordinator.release("ai-robotics")
+            loop.close()
+
+    def test_runs_both_profile_and_all_returns_422(
+        self, client: TestClient
+    ) -> None:
+        """Body with both profile and all_profiles → 422 (AC-03-B)."""
+        resp = client.post(
+            "/runs",
+            json={"profile": "ai-robotics", "all_profiles": True},
+        )
+        assert resp.status_code == 422
+
+    def test_runs_neither_profile_nor_all_returns_422(
+        self, client: TestClient
+    ) -> None:
+        """Body with neither profile nor all_profiles → 422."""
+        resp = client.post("/runs", json={})
+        assert resp.status_code == 422
+
+    def test_runs_unknown_profile_returns_422(
+        self, client: TestClient
+    ) -> None:
+        """Unknown profile name → 422."""
+        resp = client.post("/runs", json={"profile": "does-not-exist"})
+        assert resp.status_code == 422
+
+    def test_runs_all_profiles_returns_202(
+        self, client: TestClient
+    ) -> None:
+        """all_profiles=true returns 202 with scope='all'."""
+        resp = client.post("/runs", json={"all_profiles": True})
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["scope"] == "all"
+        assert body["kind"] == "manual"
+
+    def test_runs_request_id_is_unique(self, client: TestClient) -> None:
+        """Each accepted run gets a unique request_id."""
+        r1 = client.post("/runs", json={"profile": "ai-robotics"})
+        # Wait briefly for the background task to release the lock.
+        import time
+
+        time.sleep(0.05)
+        r2 = client.post("/runs", json={"profile": "ai-robotics"})
+        assert r1.status_code == 202
+        assert r2.status_code == 202
+        assert r1.json()["request_id"] != r2.json()["request_id"]
+
+
+class TestPostRunsSchedulerOverlap:
+    """AC-03-A: scheduled fire + POST /runs for same profile → exactly one accepted."""
+
+    async def test_scheduled_and_manual_overlap_same_profile(
+        self, app_with_state: FastAPI
+    ) -> None:
+        """A scheduled fire holds the lock → POST /runs returns 409."""
+        coordinator: Coordinator = app_with_state.state.coordinator
+
+        # Simulate a scheduled fire holding the lock.
+        await coordinator.try_acquire("ai-robotics")
+        try:
+            with TestClient(app_with_state) as tc:
+                resp = tc.post("/runs", json={"profile": "ai-robotics"})
+            assert resp.status_code == 409
+            assert resp.json()["reason"] == "profile_busy"
+        finally:
+            coordinator.release("ai-robotics")
+
+    async def test_cross_profile_runs_allowed(
+        self, app_with_state: FastAPI
+    ) -> None:
+        """Different profiles can run concurrently."""
+        coordinator: Coordinator = app_with_state.state.coordinator
+
+        # Hold lock for ai-robotics.
+        await coordinator.try_acquire("ai-robotics")
+        try:
+            with TestClient(app_with_state) as tc:
+                resp = tc.post("/runs", json={"profile": "web-tech"})
+            assert resp.status_code == 202
+        finally:
+            coordinator.release("ai-robotics")
+            # Also release web-tech if the run acquired it.
+            if coordinator.is_busy("web-tech"):
+                coordinator.release("web-tech")
