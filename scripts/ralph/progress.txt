@@ -1,0 +1,22 @@
+# Ralph Progress Log
+Started: Fri Apr 24 09:25:46 UTC 2026
+
+## Codebase Patterns
+- Quality checks: `uv run ruff check src/ tests/`, `uv run ruff format --check src/ tests/`, `uv run pyright`, `uv run pytest` (make not available in this env)
+- Exception hierarchy: `InfluxError` -> `ConfigError` -> `PromptValidationError` in `src/influx/errors.py`
+- Build system: hatchling, dependencies in `pyproject.toml`, lock file `uv.lock`
+- Python 3.12 strict (`>=3.12,<3.13`), uses `uv` for package management
+- Source layout: `src/influx/` package with `py.typed` marker
+- Tests in `tests/` directory, conftest at `tests/conftest.py`
+---
+
+## 2026-04-24 - US-001
+- Added pydantic v2 (`>=2.0,<3`) to pyproject.toml dependencies
+- Added `PromptValidationError(ConfigError)` subclass to `src/influx/errors.py`
+- Files changed: `pyproject.toml`, `src/influx/errors.py`, `uv.lock`
+- **Learnings for future iterations:**
+  - `make` is not available in this environment; run quality checks directly via `uv run`
+  - pydantic 2.13.3 installed successfully with Python 3.12.12
+  - The existing `ConfigError` class is already a subclass of `InfluxError`
+  - Existing test in `tests/test_main.py` is a simple greeting smoke test that will be deleted in US-010
+---

@@ -13,3 +13,7 @@ class InfluxError(Exception):
 
 class ConfigError(InfluxError):
     """Raised when required configuration is missing or invalid."""
+
+
+class PromptValidationError(ConfigError):
+    """Raised when a prompt template has invalid or missing variables."""

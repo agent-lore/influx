@@ -1,0 +1,164 @@
+{
+  "project": "Influx v1 — Config v0.7 Schema + validate-config",
+  "branchName": "ralph/config-schema",
+  "description": "Replace the stub config loader with the full Influx v0.7 TOML schema (profiles, providers, models, prompts, thresholds, extraction, resilience, feedback, repair, telemetry, security, notifications, schedule, note_schema_version), add prompt-template and RSS-feed validation, and ship a `validate-config` CLI entry point that prints the effective config and fails fast on any schema error.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add pydantic v2 dependency and extend errors module",
+      "description": "As a developer, I want pydantic v2 available and the errors module extended with config-specific exception subclasses, so that later stories can build validated schema models and raise clearly-typed failures.",
+      "acceptanceCriteria": [
+        "pydantic v2 is added to project dependencies (pyproject.toml) and resolves on install",
+        "src/influx/errors.py adds any needed ConfigError subclass(es) for config and prompt validation (e.g. PromptValidationError); each such subclass is a subclass of ConfigError and importable from influx.errors"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Create slugs module with FR-ST-2 feed-name slugifier",
+      "description": "As a developer, I want a slugs.py module that slugifies feed names and validates them against FR-ST-2, so that RSS feed entries can produce canonical slugs downstream.",
+      "acceptanceCriteria": [
+        "src/influx/slugs.py exposes a feed-name slugification helper that produces a slug compliant with FR-ST-2 (pattern ^[a-z0-9]+(-[a-z0-9]+)*$, max length 40) for well-formed input (the exact symbol name and public surface are left to the implementation)",
+        "slugs.py makes the empty-after-slugification case detectable by callers (e.g. the slugification helper returns an empty string, raises, or exposes a companion validator) so that the RSS-entry validator in a later story can reject such inputs",
+        "tests/unit/test_slugs.py covers representative free-form slugification cases (including inputs that contain uppercase letters or spaces and should slugify to valid FR-ST-2 slugs), asserts the slugification output satisfies FR-ST-2 (pattern ^[a-z0-9]+(-[a-z0-9]+)*$, max length 40), and covers the empty-after-slugification case in the shape exposed by slugs.py",
+        "Coverage on src/influx/slugs.py is >= 80%"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Create prompts module with template-variable validation",
+      "description": "As a developer, I want a prompts.py module that loads prompt text (inline or from a file path) and validates its template variable set against the required set for each canonical prompt key, so that misconfigured prompts fail fast at startup.",
+      "acceptanceCriteria": [
+        "src/influx/prompts.py exposes a function that loads prompt content given either `text` or `path` (exactly one must be provided; both or neither raise ConfigError)",
+        "Relative `path` values are resolved against the config file directory",
+        "prompts.filter requires exactly {profile_description, negative_examples, min_score_in_results}",
+        "prompts.tier1_enrich requires exactly {title, abstract, profile_summary}",
+        "prompts.tier3_extract requires exactly {title, full_text}",
+        "Validation raises ConfigError (or a prompt-specific ConfigError subclass) naming the offending variable when a prompt contains an unknown variable (AC-01-A)",
+        "Validation raises ConfigError (or a prompt-specific ConfigError subclass) when one or more required variables are absent (AC-01-B)",
+        "tests/unit/test_prompts.py covers template-variable extraction and required-set assertion across the three canonical keys (prompts.filter, prompts.tier1_enrich, prompts.tier3_extract), plus the inline/path mutual-exclusion error; AC-01-A and AC-01-B coverage may live wherever the implementation organizes it",
+        "Coverage on src/influx/prompts.py is >= 80%"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Define pydantic v2 models for the full v0.7 config schema",
+      "description": "As a developer, I want pydantic v2 models covering every v0.7 section (influx, storage, logging, profiles, providers, models, prompts, thresholds, extraction, resilience, feedback, repair, telemetry, security, notifications, schedule), so that structural validation is centralised and typed.",
+      "acceptanceCriteria": [
+        "src/influx/config.py defines pydantic v2 models covering every config section in the v0.7 schema described by docs/REQUIREMENTS.md §4.2 (and §5.7 of PRD 01 for [repair]): [influx] (including note_schema_version), [schedule], [storage], [notifications], [security], [[profiles]] with [profiles.thresholds], [profiles.sources.arxiv], and [[profiles.sources.rss]], [providers.*], [models.*] (filter/enrich/extract), [prompts.*] (filter/tier1_enrich/tier3_extract), [filter], [extraction], [resilience], [feedback], [repair], and [telemetry]",
+        "Top-level model includes influx.note_schema_version (int, default 1)",
+        "[repair] is a distinct top-level section with repair.max_items_per_run (int, default 100) and is NOT an alias for [feedback]",
+        "[[profiles.sources.rss]] model requires fields: name (str, validated to be non-empty after FR-ST-2 slugification), url (str, must use http or https scheme per FR-RES-4; other schemes raise ConfigError), source_tag (Literal['rss','blog']); unknown fields on an RSS entry raise ConfigError",
+        "[providers.*] model includes base_url, api_key_env, and optional extra_headers",
+        "[models.*] model references a provider name and supports the FR-CFG-6 fields (model, temperature, max_tokens, request_timeout, max_retries, json_mode)",
+        "Defaults for every tunable named in FR-CFG-5 live within the config-parsing layer (e.g. pydantic model defaults or model construction code), with no hardcoded tunable constants in downstream code paths",
+        "The [prompts] section requires all three canonical keys (prompts.filter, prompts.tier1_enrich, prompts.tier3_extract) to be present; a loaded config missing any of them raises ConfigError during config validation (FR-CFG-7)",
+        "Unknown top-level keys under [prompts] and unknown fields on a [[profiles.sources.rss]] entry surface as ConfigError"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Add TOML file loading with discovery order",
+      "description": "As an operator, I want config loaded via stdlib tomllib from the first of $INFLUX_CONFIG, ./influx.toml, ~/.influx/influx.toml, /etc/influx/influx.toml, so that install layouts and per-invocation overrides both work.",
+      "acceptanceCriteria": [
+        "src/influx/config.py exposes a load_config() (or equivalent) that reads TOML via stdlib tomllib (Python 3.12)",
+        "INFLUX_CONFIG takes precedence over the fallback discovery order when set (FR-CFG-2)",
+        "When INFLUX_CONFIG is unset, the loader tries ./influx.toml, then ~/.influx/influx.toml, then /etc/influx/influx.toml, and the first match wins (FR-CFG-2)",
+        "The loaded TOML is parsed into the pydantic schema from US-004 and returned as a typed config object",
+        "Invalid TOML fails load with a clear error (exception wrapping and message formatting are left as implementation choices)",
+        "tests/unit/test_config.py covers: INFLUX_CONFIG path respected, fallback ordering (mock filesystem/tmp_path), TOML syntax error"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Apply environment variable overrides per REQUIREMENTS §19",
+      "description": "As an operator, I want env vars listed in docs/REQUIREMENTS.md §19 to beat values set in the TOML file, so that deployments can override config without rewriting files.",
+      "acceptanceCriteria": [
+        "The effective config returned by load_config() reflects the env-var overrides from docs/REQUIREMENTS.md §19 taking precedence over values set in the TOML file (FR-CFG-3, AC-01-F)",
+        "For each env var in docs/REQUIREMENTS.md §19 that has an 'Overrides config key' entry, setting the env var overrides the corresponding config key (provider API-key presence checks are covered by the separate validation story)",
+        "Unset env vars leave the TOML value untouched",
+        "tests/unit/test_config.py includes a case covering AC-01-F: at least one env var listed in §19 defeats its TOML counterpart"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": "Consider sampling more than one overrideable key across different value types (e.g. a path key and a bool key from §19) for stronger regression coverage, but this is a test-policy suggestion rather than a product requirement."
+    },
+    {
+      "id": "US-007",
+      "title": "Enforce profile-name, RSS source_tag, and provider api_key_env validations",
+      "description": "As an operator, I want load_config() to fail fast when profile names break the regex, RSS entries are missing/bad source_tag, or a provider's api_key_env is unset in the environment, so that misconfiguration is caught before the service starts.",
+      "acceptanceCriteria": [
+        "Profile names are validated against ^[a-z][a-z0-9-]{0,31}$; invalid names raise ConfigError naming the offending profile (FR-CFG-4, AC-M1-2). No silent slugification.",
+        "Each [[profiles.sources.rss]] entry requires source_tag and its value must be exactly 'rss' or 'blog'; missing source_tag raises ConfigError (AC-01-C); any other value raises ConfigError (AC-01-D)",
+        "For every configured [providers.*] block, if api_key_env != '' then the named environment variable must be set and non-empty; otherwise load_config() raises ConfigError (FR-CFG-8, AC-01-E)",
+        "api_key_env = '' is accepted and the env check is skipped (keyless providers like Ollama)",
+        "tests/unit/test_config.py covers AC-M1-2 (invalid profile name), AC-01-C (missing source_tag), AC-01-D (source_tag='web'), AC-01-E (missing env var) and the keyless-provider skip path",
+        "All three validations run during load_config(), not lazily on first use"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Write influx.example.toml and replace the conftest fixture",
+      "description": "As a developer, I want a complete v0.7 influx.example.toml covering one arXiv profile and one RSS profile, plus a realistic multi-section tests/conftest.py:influx_config_env fixture, so that downstream PRDs have a working reference config and fixtures.",
+      "acceptanceCriteria": [
+        "influx.example.toml at repo root is a valid, complete v0.7 example that load_config() accepts without error, covering every section of the v0.7 schema defined in PRD 01 §5 and docs/REQUIREMENTS.md §4.2",
+        "influx.example.toml includes one [[profiles]] arXiv profile AND one [[profiles]] RSS profile with at least one [[profiles.sources.rss]] entry carrying source_tag='rss' or 'blog'",
+        "influx.example.toml covers [providers.*], all three [models.*] (filter/enrich/extract), all three [prompts.*] canonical keys, [repair], and influx.note_schema_version",
+        "load_config() of influx.example.toml succeeds when the referenced api_key_env vars are set in the test environment",
+        "tests/conftest.py replaces the old influx_config_env fixture with one that yields a realistic multi-section config dict/TOML usable by later PRDs",
+        "Test setup provides whatever environment conditions are required for load_config() to succeed against the new fixture (specific mechanism — e.g. fixture-scoped env vars, monkeypatch in individual tests — is left to the implementation)",
+        "A round-trip test loads influx.example.toml and asserts the parsed model matches the example's structure"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Add argparse CLI dispatcher in main.py with validate-config",
+      "description": "As an operator, I want `python -m influx validate-config` to run the real validator and print the effective config, and `python -m influx` with no subcommand to print help and exit non-zero, so that I can diagnose configuration before starting the service.",
+      "acceptanceCriteria": [
+        "src/influx/main.py exposes a minimal argparse dispatcher that supports the `validate-config` subcommand (PRD 02 will extend the surface with additional subcommands)",
+        "`python -m influx validate-config` on a valid influx.toml exits 0 and prints the effective config to stdout (AC-M1-1)",
+        "`python -m influx validate-config` on a config with an invalid profile name exits non-zero and prints a message naming the offending profile (AC-M1-2)",
+        "`python -m influx` with no subcommand prints help to stderr (or stdout) and exits with a non-zero status (AC-X-5)",
+        "Automated tests cover AC-M1-1, AC-M1-2, and AC-X-5 (test file layout and invocation style are left to the implementation)"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Bump version to 0.7.0 and remove obsolete test_main.py",
+      "description": "As a maintainer, I want __version__ bumped to 0.7.0 and the legacy tests/test_main.py greeting smoke test deleted now that CLI coverage lives elsewhere, so that the package reflects the v0.7 schema release and the test suite has no stale coverage.",
+      "acceptanceCriteria": [
+        "src/influx/__init__.py sets __version__ = '0.7.0'",
+        "tests/test_main.py is deleted from the repository",
+        "No remaining test imports or references to the deleted tests/test_main.py",
+        "Full test suite runs green with ruff, pyright, and pytest",
+        "Coverage on src/influx/config.py, src/influx/prompts.py, src/influx/slugs.py is >= 80%"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
