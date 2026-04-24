@@ -1,8 +1,20 @@
-"""Unit tests for tag-merging and confidence helpers (US-005, FR-NOTE-5/6/7/8)."""
+"""Unit tests for tag-merging, confidence, and Archive render helpers.
+
+US-005: FR-NOTE-5/6/7/8
+US-006: FR-NOTE-9 (Archive section render + invariant)
+"""
 
 from __future__ import annotations
 
-from influx.notes import merge_tags, recompute_confidence
+import pytest
+
+from influx.notes import (
+    ArchiveInvariantError,
+    merge_tags,
+    recompute_confidence,
+    render_archive_section,
+    validate_archive_tag_invariant,
+)
 
 # ── FR-NOTE-5: Influx-owned tags fully replaced ─────────────────────
 
@@ -314,3 +326,66 @@ class TestFullMergeScenario:
         # external preserved
         assert "favourite" in result
         assert "reading-queue" in result
+
+
+# ── FR-NOTE-9: Archive section render ────────────────────────────────
+
+
+class TestRenderArchiveSection:
+    """render_archive_section produces the correct ## Archive text."""
+
+    def test_with_path(self) -> None:
+        result = render_archive_section("arxiv/2026/01/2601.12345.pdf")
+        assert result == "## Archive\npath: arxiv/2026/01/2601.12345.pdf\n"
+
+    def test_without_path(self) -> None:
+        result = render_archive_section(None)
+        assert result == "## Archive\n"
+
+    def test_posix_separators(self) -> None:
+        result = render_archive_section("arxiv/2026/04/2604.99999.pdf")
+        assert "/" in result
+        assert "\\" not in result
+
+    def test_starts_with_heading(self) -> None:
+        result = render_archive_section("some/path.pdf")
+        assert result.startswith("## Archive\n")
+
+
+class TestArchiveTagInvariant:
+    """Never write both path: line AND influx:archive-missing."""
+
+    def test_path_with_archive_missing_raises(self) -> None:
+        with pytest.raises(ArchiveInvariantError):
+            validate_archive_tag_invariant(
+                archive_path="arxiv/2026/01/2601.12345.pdf",
+                tags=["source:arxiv", "influx:archive-missing"],
+            )
+
+    def test_path_without_archive_missing_ok(self) -> None:
+        validate_archive_tag_invariant(
+            archive_path="arxiv/2026/01/2601.12345.pdf",
+            tags=["source:arxiv", "ingested-by:influx"],
+        )
+
+    def test_no_path_with_archive_missing_ok(self) -> None:
+        validate_archive_tag_invariant(
+            archive_path=None,
+            tags=["source:arxiv", "influx:archive-missing"],
+        )
+
+    def test_no_path_without_archive_missing_ok(self) -> None:
+        validate_archive_tag_invariant(
+            archive_path=None,
+            tags=["source:arxiv"],
+        )
+
+    def test_only_archive_consulted_for_path(self) -> None:
+        """Archive path lives only in ## Archive, not tags/frontmatter."""
+        # Rendering with a path should put it in the section, not tags
+        rendered = render_archive_section("arxiv/2026/01/2601.12345.pdf")
+        assert "path:" in rendered
+        # No tag carries the path
+        tags = ["source:arxiv", "ingested-by:influx"]
+        for tag in tags:
+            assert "arxiv/2026/01/2601.12345.pdf" not in tag

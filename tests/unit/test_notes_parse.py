@@ -1,4 +1,4 @@
-"""Unit tests for src/influx/notes.py parser (US-004).
+"""Unit tests for src/influx/notes.py parser (US-004, US-006).
 
 Covers:
 - Well-formed note with all sections
@@ -6,13 +6,19 @@ Covers:
 - Note with only title + ``## User Notes``
 - Note whose ``## User Notes`` contains blank lines, unicode, nested headings
 - All preserved byte-exactly
+- Archive section parse: non-empty path, empty body, omitted, malformed (AC-04-B)
 """
 
 from __future__ import annotations
 
 import pytest
 
-from influx.notes import NoteParseError, parse_note
+from influx.notes import (
+    ArchiveParseError,
+    NoteParseError,
+    parse_archive_path,
+    parse_note,
+)
 
 
 class TestParseNoteWellFormed:
@@ -240,3 +246,136 @@ class TestFrontmatterContent:
         result = parse_note(self.NOTE)
         assert not result.frontmatter_raw.startswith("---")
         assert not result.frontmatter_raw.endswith("---")
+
+
+# ── FR-NOTE-9 / AC-04-B: Archive section parse ──────────────────────
+
+
+class TestParseArchivePathNonEmpty:
+    """Archive section with a valid path: line round-trips."""
+
+    NOTE = (
+        "---\n"
+        "note_type: summary\n"
+        "---\n"
+        "# Paper Title\n"
+        "\n"
+        "## Archive\n"
+        "path: arxiv/2026/01/2601.12345.pdf\n"
+        "\n"
+        "## Summary\n"
+        "Content.\n"
+    )
+
+    def test_returns_path(self) -> None:
+        parsed = parse_note(self.NOTE)
+        assert parse_archive_path(parsed) == "arxiv/2026/01/2601.12345.pdf"
+
+    def test_path_is_posix(self) -> None:
+        parsed = parse_note(self.NOTE)
+        path = parse_archive_path(parsed)
+        assert path is not None
+        assert "/" in path
+        assert "\\" not in path
+
+
+class TestParseArchivePathEmpty:
+    """Archive section with empty body (failure-path form)."""
+
+    NOTE = (
+        "---\n"
+        "note_type: summary\n"
+        "---\n"
+        "# Paper Title\n"
+        "\n"
+        "## Archive\n"
+        "\n"
+        "## Summary\n"
+        "Content.\n"
+    )
+
+    def test_returns_none(self) -> None:
+        parsed = parse_note(self.NOTE)
+        assert parse_archive_path(parsed) is None
+
+
+class TestParseArchivePathOmitted:
+    """Archive section entirely absent is legal."""
+
+    NOTE = (
+        "---\n"
+        "note_type: summary\n"
+        "---\n"
+        "# Paper Title\n"
+        "\n"
+        "## Summary\n"
+        "Content.\n"
+    )
+
+    def test_returns_none(self) -> None:
+        parsed = parse_note(self.NOTE)
+        assert parse_archive_path(parsed) is None
+
+
+class TestParseArchivePathMalformed:
+    """Stray text in ## Archive body raises ArchiveParseError (AC-04-B)."""
+
+    STRAY_TEXT = (
+        "---\n"
+        "note_type: summary\n"
+        "---\n"
+        "# Paper Title\n"
+        "\n"
+        "## Archive\n"
+        "this is not a path line\n"
+        "\n"
+        "## Summary\n"
+        "Content.\n"
+    )
+
+    MULTIPLE_LINES = (
+        "---\n"
+        "note_type: summary\n"
+        "---\n"
+        "# Paper Title\n"
+        "\n"
+        "## Archive\n"
+        "path: arxiv/2026/01/2601.12345.pdf\n"
+        "extra stray line\n"
+        "\n"
+        "## Summary\n"
+        "Content.\n"
+    )
+
+    def test_stray_text_raises(self) -> None:
+        parsed = parse_note(self.STRAY_TEXT)
+        with pytest.raises(ArchiveParseError, match="Malformed"):
+            parse_archive_path(parsed)
+
+    def test_multiple_lines_raises(self) -> None:
+        parsed = parse_note(self.MULTIPLE_LINES)
+        with pytest.raises(ArchiveParseError, match="Malformed"):
+            parse_archive_path(parsed)
+
+
+class TestArchiveOnlyInSection:
+    """Archive path is only consulted from ## Archive, not frontmatter."""
+
+    NOTE = (
+        "---\n"
+        "note_type: summary\n"
+        "namespace: influx\n"
+        "---\n"
+        "# Paper Title\n"
+        "\n"
+        "## Summary\n"
+        "Content.\n"
+    )
+
+    def test_no_frontmatter_archive_path(self) -> None:
+        """Only ## Archive carries the archive path."""
+        parsed = parse_note(self.NOTE)
+        # No ## Archive section, so path is None
+        assert parse_archive_path(parsed) is None
+        # Frontmatter does not contain path info
+        assert "path:" not in parsed.frontmatter_raw

@@ -17,6 +17,9 @@ Started: Fri Apr 24 20:42:49 UTC 2026
 - `merge_tags(existing_tags=..., new_tags=...)` handles Influx-owned replacement, profile union with rejection guard, external preservation
 - `recompute_confidence(existing_confidence=..., current_max_score=...)` returns `max(existing, score/10.0)`
 - Influx-owned prefixes: `source:`, `arxiv-id:`, `cat:`, `text:`, `ingested-by:`, `schema:`; exact: `full-text`, `influx:repair-needed`, `influx:archive-missing`, `influx:deep-extracted`, `influx:text-terminal`
+- `render_archive_section(path)` renders `## Archive` section; `parse_archive_path(note)` extracts path from parsed note
+- `validate_archive_tag_invariant(archive_path=, tags=)` enforces path + archive-missing mutual exclusion
+- Archive path lives ONLY in `## Archive` section body — never in frontmatter or tags
 
 ---
 
@@ -79,4 +82,18 @@ Started: Fri Apr 24 20:42:49 UTC 2026
   - `influx:rejected:<profile>` tags must be collected from BOTH existing and new tags before filtering profiles
   - Rejection tags are preserved in the output (they're not Influx-owned replaceable tags, they're guards)
   - `__all__` now exports: `NoteParseError`, `ParsedNote`, `ParsedSection`, `merge_tags`, `parse_note`, `recompute_confidence`
+---
+
+## 2026-04-24 - US-006
+- Implemented `render_archive_section()`, `parse_archive_path()`, and `validate_archive_tag_invariant()` in `src/influx/notes.py`
+- Added `ArchiveParseError` and `ArchiveInvariantError` exception classes
+- Added 5 render tests in `tests/unit/test_notes_render.py` and 7 parse tests in `tests/unit/test_notes_parse.py`
+- Files changed: `src/influx/notes.py`, `tests/unit/test_notes_render.py`, `tests/unit/test_notes_parse.py`
+- **Learnings for future iterations:**
+  - `render_archive_section(path)` returns `"## Archive\npath: {path}\n"` or `"## Archive\n"` for None
+  - `parse_archive_path(parsed_note)` extracts path from the Archive `ParsedSection`, returns `str | None`
+  - `validate_archive_tag_invariant(archive_path=, tags=)` raises if both path and `influx:archive-missing` are present
+  - `_ARCHIVE_PATH_RE = re.compile(r"^path:\s*(.+)$")` — regex without MULTILINE correctly rejects multiline bodies
+  - `ArchiveParseError` derives from `NoteParseError` (which derives from `InfluxError`)
+  - `__all__` now also exports: `ArchiveInvariantError`, `ArchiveParseError`, `parse_archive_path`, `render_archive_section`, `validate_archive_tag_invariant`
 ---

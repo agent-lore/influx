@@ -27,12 +27,17 @@ from dataclasses import dataclass, field
 from influx.errors import InfluxError
 
 __all__ = [
+    "ArchiveInvariantError",
+    "ArchiveParseError",
     "NoteParseError",
     "ParsedNote",
     "ParsedSection",
     "merge_tags",
+    "parse_archive_path",
     "parse_note",
     "recompute_confidence",
+    "render_archive_section",
+    "validate_archive_tag_invariant",
 ]
 
 # ── Exceptions ───────────────────────────────────────────────────────
@@ -40,6 +45,14 @@ __all__ = [
 
 class NoteParseError(InfluxError):
     """Raised when a note cannot be parsed."""
+
+
+class ArchiveParseError(NoteParseError):
+    """Raised when the ``## Archive`` section body is malformed."""
+
+
+class ArchiveInvariantError(InfluxError):
+    """Raised when a path: line and influx:archive-missing co-exist."""
 
 
 # ── Data structures ──────────────────────────────────────────────────
@@ -313,3 +326,105 @@ def recompute_confidence(
     Returns ``max(existing_confidence, current_max_score / 10.0)``.
     """
     return max(existing_confidence, current_max_score / 10.0)
+
+
+# ── Archive section render / parse (FR-NOTE-9) ──────────────────────
+
+_ARCHIVE_PATH_RE = re.compile(r"^path:\s*(.+)$")
+
+
+def render_archive_section(archive_path: str | None) -> str:
+    """Render the ``## Archive`` section body.
+
+    Parameters
+    ----------
+    archive_path:
+        A POSIX-separator relative path for the ``path:`` line, or
+        ``None`` for the empty-body (failure-path) form.
+
+    Returns
+    -------
+    str
+        The rendered section text starting with ``## Archive\\n``.
+    """
+    if archive_path is not None:
+        return f"## Archive\npath: {archive_path}\n"
+    return "## Archive\n"
+
+
+def parse_archive_path(note: ParsedNote) -> str | None:
+    """Extract the archive path from a parsed note (FR-NOTE-9).
+
+    Parameters
+    ----------
+    note:
+        A ``ParsedNote`` returned by :func:`parse_note`.
+
+    Returns
+    -------
+    str | None
+        The relative POSIX path from the ``path:`` line, or ``None``
+        when the ``## Archive`` section is absent or has an empty body.
+
+    Raises
+    ------
+    ArchiveParseError
+        When the ``## Archive`` section contains stray text that is
+        neither empty nor a single ``path:`` line (AC-04-B).
+    """
+    archive_section: ParsedSection | None = None
+    for section in note.sections:
+        if section.heading == "Archive":
+            archive_section = section
+            break
+
+    if archive_section is None:
+        return None
+
+    body = archive_section.body.strip()
+    if not body:
+        return None
+
+    m = _ARCHIVE_PATH_RE.match(body)
+    if m is None:
+        raise ArchiveParseError(
+            f"Malformed ## Archive body: expected 'path: <rel-path>' "
+            f"or empty, got: {body!r}"
+        )
+
+    # Ensure the body is exactly one path: line (no extra lines)
+    lines = [ln for ln in body.split("\n") if ln.strip()]
+    if len(lines) != 1:
+        raise ArchiveParseError(
+            "## Archive body must contain exactly one 'path:' line, "
+            f"found {len(lines)} non-empty lines"
+        )
+
+    return m.group(1).strip()
+
+
+def validate_archive_tag_invariant(
+    *,
+    archive_path: str | None,
+    tags: list[str],
+) -> None:
+    """Enforce: never write both a path: line AND influx:archive-missing.
+
+    Parameters
+    ----------
+    archive_path:
+        The archive path that will be rendered (or ``None``).
+    tags:
+        The tag list that will be written to frontmatter.
+
+    Raises
+    ------
+    ArchiveInvariantError
+        When *archive_path* is not ``None`` and *tags* contains
+        ``influx:archive-missing``.
+    """
+    if archive_path is not None and "influx:archive-missing" in tags:
+        raise ArchiveInvariantError(
+            "Cannot write both a path: line and influx:archive-missing "
+            "tag on the same note"
+        )
