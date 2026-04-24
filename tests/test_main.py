@@ -14,7 +14,7 @@ def test_main_prints_status(
     # Silence unused-arg warning — the fixture sets INFLUX_CONFIG.
     assert influx_config_env.exists()
 
-    main()
+    main(["validate-config"])
 
     captured = capsys.readouterr()
-    assert "Influx v0.7 config OK" in captured.out
+    assert '"profiles"' in captured.out
