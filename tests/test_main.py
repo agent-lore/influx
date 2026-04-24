@@ -7,7 +7,7 @@ import pytest
 from influx.main import main
 
 
-def test_main_prints_greeting(
+def test_main_prints_status(
     influx_config_env: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -17,4 +17,4 @@ def test_main_prints_greeting(
     main()
 
     captured = capsys.readouterr()
-    assert captured.out.strip() == "Hello from Influx (test)"
+    assert "Influx v0.7 config OK" in captured.out

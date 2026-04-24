@@ -13,6 +13,13 @@ Started: Fri Apr 24 09:25:46 UTC 2026
 - `pytest-cov` is not installed; coverage verification is by inspection/line count
 - Prompt template variables use `{var_name}` syntax; `REQUIRED_VARIABLES` in `prompts.py` defines per-key sets
 - `PromptValidationError` for template var errors, `ConfigError` for loading/structural errors
+- Config schema root model: `AppConfig` in `config.py`; `load_config()` returns `AppConfig`
+- `load_config(path=)` accepts optional explicit path; otherwise uses `find_config_path()` discovery
+- `ValidationError` from pydantic is caught and wrapped as `ConfigError` in `load_config()`
+- Minimal valid TOML needs `[prompts.filter]`, `[prompts.tier1_enrich]`, `[prompts.tier3_extract]` with `text` keys
+- Pydantic validators that raise `ConfigError` (not `ValueError`) bypass pydantic's `ValidationError` wrapping and propagate directly
+- RSS entry unknown fields and prompts unknown keys use `model_validator(mode="before")` with explicit `ConfigError`
+- TOML `[providers.*]` and `[models.*]` map to `dict[str, ProviderConfig]` and `dict[str, ModelSlotConfig]`
 ---
 
 ## 2026-04-24 - US-001
@@ -51,4 +58,36 @@ Started: Fri Apr 24 09:25:46 UTC 2026
   - `PromptValidationError` (subclass of `ConfigError`) is used for variable validation errors; plain `ConfigError` for loading/mutual-exclusion errors
   - ruff format may adjust line breaks after `--fix`; always run format after fix
   - US-004 will need to call `validate_prompt_variables()` during config load for each prompt key
+---
+
+## 2026-04-24 - US-004
+- Defined pydantic v2 models for the full v0.7 config schema in `src/influx/config.py`
+- Models cover: InfluxSectionConfig, ScheduleConfig, StorageConfig, NotificationsConfig, SecurityConfig, ProfileThresholds, ArxivSourceConfig, RssSourceEntry, ProfileSources, ProfileConfig, ProviderConfig, ModelSlotConfig, PromptEntryConfig, PromptsConfig, FilterTuningConfig, ExtractionConfig, ResilienceConfig, FeedbackConfig, RepairConfig, TelemetryConfig, AppConfig (root)
+- Validators: RSS name slugification, RSS URL http/https scheme, RSS unknown fields, prompts unknown/missing keys, prompt text/path mutual exclusion — all raise ConfigError directly
+- RepairConfig is distinct from FeedbackConfig with max_items_per_run=100
+- Legacy dataclasses renamed to _LegacyStorageConfig, _LegacyLoggingConfig, _LegacyInfluxConfig; legacy load_config() preserved
+- Files changed: `src/influx/config.py`
+- **Learnings for future iterations:**
+  - pydantic v2 validators that raise non-ValueError exceptions (e.g. ConfigError) propagate directly without being wrapped in ValidationError
+  - Use `model_validator(mode="before")` for unknown-field detection to raise ConfigError instead of pydantic's `extra='forbid'` which raises ValidationError
+  - `from __future__ import annotations` works fine with pydantic v2 model definitions
+  - `filter` and `models` as pydantic field names don't conflict with Python builtins or pydantic internals (pydantic v2 reserves `model_*` prefix, not `models`)
+  - US-005 will replace legacy `load_config()` to return `AppConfig` via `AppConfig.model_validate()`
+---
+
+## 2026-04-24 - US-005
+- Replaced legacy `load_config()` to return `AppConfig` via `AppConfig.model_validate(raw)`
+- Removed all legacy dataclass code (_LegacyInfluxConfig, _LegacyStorageConfig, etc.) and legacy helpers
+- `load_config()` reads TOML via `tomllib`, validates through pydantic, wraps `ValidationError` as `ConfigError`
+- `find_config_path()` discovery order preserved: INFLUX_CONFIG env → cwd → ~/.influx/ → /etc/influx/
+- Updated `main.py` stub to work with `AppConfig` (prints profile count instead of legacy greeting)
+- Updated `tests/conftest.py` fixture to produce valid v0.7 TOML with required prompts section
+- Updated `tests/test_main.py` to match new main output
+- Created `tests/unit/test_config.py` with 10 tests covering: INFLUX_CONFIG respected, explicit path arg, fallback cwd, fallback home, no-config-found, invalid TOML, defaults, custom values, schema validation error
+- Files changed: `src/influx/config.py`, `src/influx/main.py`, `tests/conftest.py`, `tests/test_main.py`, `tests/unit/test_config.py`
+- **Learnings for future iterations:**
+  - `ValidationError` from pydantic is caught in `load_config()` and re-raised as `ConfigError` — downstream code only sees `ConfigError`
+  - Legacy code (dataclasses, parse helpers, env overrides) fully removed; US-006 will add env-var overrides back via the new schema
+  - `monkeypatch.chdir()` + `monkeypatch.setenv("HOME", ...)` effectively simulates fallback discovery in tests
+  - Minimal valid TOML must include all three prompt keys (filter, tier1_enrich, tier3_extract) with `text` fields
 ---

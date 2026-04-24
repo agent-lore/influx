@@ -64,7 +64,7 @@
         "Unknown top-level keys under [prompts] and unknown fields on a [[profiles.sources.rss]] entry surface as ConfigError"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -80,7 +80,7 @@
         "tests/unit/test_config.py covers: INFLUX_CONFIG path respected, fallback ordering (mock filesystem/tmp_path), TOML syntax error"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

@@ -2,21 +2,20 @@
 
 Influx is configured by a TOML file (``influx.toml``).  This module
 defines pydantic v2 schema models for the full v0.7 config structure
-and maintains a legacy ``load_config()`` entry point for backward
-compatibility until it is replaced in US-005.
+and a ``load_config()`` entry point that reads TOML, validates via
+pydantic, and returns a typed ``AppConfig``.
 """
 
 from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from influx.errors import ConfigError
 from influx.slugs import slugify_feed_name
@@ -44,7 +43,7 @@ __all__ = [
     "SecurityConfig",
     "StorageConfig",
     "TelemetryConfig",
-    # Legacy API (kept until US-005)
+    # Config loading API
     "find_config_path",
     "load_config",
 ]
@@ -343,44 +342,8 @@ class AppConfig(BaseModel):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Legacy config loading (to be replaced in US-005)
+# Config loading (US-005)
 # ══════════════════════════════════════════════════════════════════════
-
-LogLevel = Literal["debug", "info", "warning", "error"]
-
-_VALID_LOG_LEVEL: set[str] = {"debug", "info", "warning", "error"}
-
-DEFAULT_DATA_DIR = Path.home() / ".influx" / "data"
-DEFAULT_ENVIRONMENT = "dev"
-DEFAULT_GREETING = "Hello"
-DEFAULT_LOG_LEVEL: LogLevel = "info"
-
-
-def parse_log_level(value: str) -> LogLevel:
-    """Validate and narrow a string to a ``LogLevel`` literal."""
-    if value not in _VALID_LOG_LEVEL:
-        raise ConfigError(
-            f"Invalid log level {value!r}. Valid values: {sorted(_VALID_LOG_LEVEL)}"
-        )
-    return cast(LogLevel, value)
-
-
-@dataclass(frozen=True)
-class _LegacyStorageConfig:
-    data_dir: Path = DEFAULT_DATA_DIR
-
-
-@dataclass(frozen=True)
-class _LegacyLoggingConfig:
-    level: LogLevel = DEFAULT_LOG_LEVEL
-
-
-@dataclass(frozen=True)
-class _LegacyInfluxConfig:
-    environment: str
-    greeting: str
-    storage: _LegacyStorageConfig
-    logging: _LegacyLoggingConfig
 
 
 def _default_config_candidates() -> list[Path]:
@@ -418,10 +381,11 @@ def find_config_path() -> Path:
     )
 
 
-def load_config(path: Path | None = None) -> _LegacyInfluxConfig:
-    """Load and return a legacy config object.
+def load_config(path: Path | None = None) -> AppConfig:
+    """Load, validate, and return the v0.7 ``AppConfig``.
 
-    This function will be replaced in US-005 to return ``AppConfig``.
+    Reads TOML via stdlib ``tomllib``, validates the raw dict through
+    the pydantic schema, and returns a typed ``AppConfig`` instance.
     """
     load_dotenv()
     config_path = path if path is not None else find_config_path()
@@ -434,117 +398,7 @@ def load_config(path: Path | None = None) -> _LegacyInfluxConfig:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{config_path}: invalid TOML: {exc}") from exc
 
-    influx_section = raw.get("influx", {})
-    if not isinstance(influx_section, dict):
-        raise ConfigError(f"{config_path}: 'influx' must be a table")
-
-    environment = _optional_str(
-        influx_section,
-        "environment",
-        DEFAULT_ENVIRONMENT,
-        config_path,
-        "influx",
-    )
-    greeting = _optional_str(
-        influx_section,
-        "greeting",
-        DEFAULT_GREETING,
-        config_path,
-        "influx",
-    )
-    storage = _parse_storage(influx_section.get("storage", {}), config_path)
-    logging_cfg = _parse_logging(influx_section.get("logging", {}), config_path)
-
-    cfg = _LegacyInfluxConfig(
-        environment=environment,
-        greeting=greeting,
-        storage=storage,
-        logging=logging_cfg,
-    )
-    return _apply_env_overrides(cfg)
-
-
-# ── Internal helpers (legacy) ────────────────────────────────────────
-
-
-def _parse_storage(data: Any, config_path: Path) -> _LegacyStorageConfig:
-    if not isinstance(data, dict):
-        raise ConfigError(f"{config_path}: [influx.storage] must be a table")
-    data_dir = _optional_path(
-        data,
-        "data_dir",
-        DEFAULT_DATA_DIR,
-        config_path,
-        "influx.storage",
-    )
-    return _LegacyStorageConfig(data_dir=data_dir)
-
-
-def _parse_logging(data: Any, config_path: Path) -> _LegacyLoggingConfig:
-    if not isinstance(data, dict):
-        raise ConfigError(f"{config_path}: [influx.logging] must be a table")
-    level_raw = data.get("level", DEFAULT_LOG_LEVEL)
-    if not isinstance(level_raw, str):
-        raise ConfigError(f"{config_path}: [influx.logging].level must be a string")
     try:
-        level = parse_log_level(level_raw)
-    except ConfigError as exc:
-        raise ConfigError(f"{config_path}: [influx.logging]: {exc}") from exc
-    return _LegacyLoggingConfig(level=level)
-
-
-def _optional_str(
-    data: dict[str, Any],
-    key: str,
-    default: str,
-    config_path: Path,
-    section: str,
-) -> str:
-    if key not in data:
-        return default
-    value = data[key]
-    if not isinstance(value, str):
-        raise ConfigError(f"{config_path}: [{section}].{key} must be a string")
-    return value
-
-
-def _optional_path(
-    data: dict[str, Any],
-    key: str,
-    default: Path,
-    config_path: Path,
-    section: str,
-) -> Path:
-    if key not in data:
-        return default
-    value = data[key]
-    if not isinstance(value, str):
-        raise ConfigError(f"{config_path}: [{section}].{key} must be a string path")
-    return Path(value).expanduser()
-
-
-def _apply_env_overrides(
-    cfg: _LegacyInfluxConfig,
-) -> _LegacyInfluxConfig:
-    env_override = os.environ.get("INFLUX_ENVIRONMENT", "")
-    data_dir_override = os.environ.get("INFLUX_DATA_DIR", "")
-    log_level_override = os.environ.get("INFLUX_LOG_LEVEL", "")
-
-    if not env_override and not data_dir_override and not log_level_override:
-        return cfg
-
-    new_cfg = cfg
-    if env_override:
-        new_cfg = replace(new_cfg, environment=env_override)
-    if data_dir_override:
-        new_storage = replace(
-            new_cfg.storage,
-            data_dir=Path(data_dir_override).expanduser(),
-        )
-        new_cfg = replace(new_cfg, storage=new_storage)
-    if log_level_override:
-        new_logging = replace(
-            new_cfg.logging, level=parse_log_level(log_level_override)
-        )
-        new_cfg = replace(new_cfg, logging=new_logging)
-    return new_cfg
+        return AppConfig.model_validate(raw)
+    except ValidationError as exc:
+        raise ConfigError(f"{config_path}: {exc}") from exc
