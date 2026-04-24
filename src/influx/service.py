@@ -15,6 +15,9 @@ import ipaddress
 import logging
 import os
 import socket
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -85,13 +88,22 @@ def validate_bind_host(host: str, *, allow_remote_admin: bool) -> None:
         )
 
 
-def create_app(config: AppConfig) -> FastAPI:
+def create_app(
+    config: AppConfig,
+    lifespan: Any | None = None,
+) -> FastAPI:
     """Build and return the FastAPI app with all dependencies on ``app.state``.
 
     Does NOT start the scheduler or probe loop — call
     :meth:`InfluxService.start` for that.
+
+    Parameters
+    ----------
+    lifespan:
+        Optional FastAPI lifespan context manager (async generator).
+        When provided, wired into the app for startup/shutdown handling.
     """
-    app = FastAPI(title="Influx Admin API")
+    app = FastAPI(title="Influx Admin API", lifespan=lifespan)
     app.include_router(router)
 
     coordinator = Coordinator()
@@ -113,9 +125,12 @@ class InfluxService:
     handler drives.
     """
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, with_lifespan: bool = False) -> None:
         self._config = config
-        self._app = create_app(config)
+        self._app = create_app(
+            config,
+            lifespan=self.lifespan if with_lifespan else None,
+        )
         self._started = False
 
     @property
@@ -166,3 +181,16 @@ class InfluxService:
         await self.probe_loop.stop()
         self._started = False
         logger.info("Influx service stopped")
+
+    @asynccontextmanager
+    async def lifespan(self, _app: FastAPI) -> AsyncIterator[None]:
+        """FastAPI lifespan context manager.
+
+        Starts the service on enter and stops it on exit, so that
+        uvicorn's signal handling triggers a clean shutdown.
+        """
+        await self.start()
+        try:
+            yield
+        finally:
+            await self.stop()

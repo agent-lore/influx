@@ -8,18 +8,22 @@ from influx.main import EXIT_SUCCESS, EXIT_USAGE, main
 
 
 class TestServeSubcommand:
-    """serve subcommand routes to its stub handler."""
+    """serve subcommand dispatches to the real serve handler."""
 
-    def test_serve_exits_64(
+    def test_serve_calls_cmd_serve(
         self,
-        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        with pytest.raises(SystemExit) as exc_info:
-            main(["serve"])
+        """serve routes to _cmd_serve (no longer a stub)."""
+        called = False
 
-        assert exc_info.value.code == EXIT_USAGE
-        captured = capsys.readouterr()
-        assert "stub" in captured.err.lower()
+        def fake_serve() -> None:
+            nonlocal called
+            called = True
+
+        monkeypatch.setattr("influx.main._cmd_serve", fake_serve)
+        main(["serve"])
+        assert called
 
     def test_serve_takes_no_flags(self) -> None:
         """serve rejects unknown flags (argparse enforces no extra args)."""

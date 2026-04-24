@@ -108,10 +108,40 @@ def _cmd_migrate_notes() -> None:
     print(f"note_schema_version: {config.influx.note_schema_version}")
 
 
-def _cmd_serve_stub() -> None:
-    """Stub handler for serve; replaced by PRD 03."""
-    print("[stub] serve not wired yet", file=sys.stderr)
-    sys.exit(EXIT_USAGE)
+def _cmd_serve() -> None:
+    """Start the Influx HTTP API server under uvicorn.
+
+    Loads config (with ``check_api_keys=False`` since probes handle
+    credential checks), validates the bind address, creates the
+    :class:`~influx.service.InfluxService` with lifespan wiring,
+    and runs uvicorn.  Blocks until SIGINT/SIGTERM, then performs a
+    clean shutdown bounded by ``schedule.shutdown_grace_seconds``.
+
+    Replaces the PRD 02 stub (§5.4, AC-03-E).
+    """
+    import uvicorn
+
+    from influx.service import (
+        InfluxService,
+        resolve_bind_address,
+        validate_bind_host,
+    )
+
+    config = load_config(check_api_keys=False)
+    host, port = resolve_bind_address()
+    validate_bind_host(
+        host, allow_remote_admin=config.security.allow_remote_admin
+    )
+
+    service = InfluxService(config, with_lifespan=True)
+
+    uvicorn.run(
+        service.app,
+        host=host,
+        port=port,
+        timeout_graceful_shutdown=config.schedule.shutdown_grace_seconds,
+        log_level="info",
+    )
 
 
 def _cmd_run_stub(args: argparse.Namespace) -> None:
@@ -176,7 +206,7 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "migrate-notes":
             _cmd_migrate_notes()
         elif args.command == "serve":
-            _cmd_serve_stub()
+            _cmd_serve()
         elif args.command == "run":
             _cmd_run_stub(args)
         elif args.command == "backfill":

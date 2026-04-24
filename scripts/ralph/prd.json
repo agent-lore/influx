@@ -130,7 +130,7 @@
         "Shutdown is clean: no orphaned threads or scheduler jobs remain after shutdown"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

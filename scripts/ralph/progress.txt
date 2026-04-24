@@ -25,6 +25,10 @@
 - `validate_bind_host(host, allow_remote_admin=...)` uses `ipaddress.ip_address().is_loopback` for the bind guard (AC-03-D)
 - `resolve_bind_address()` reads `INFLUX_ADMIN_BIND_HOST` (default `127.0.0.1`) and `INFLUX_ADMIN_PORT` (default `8080`)
 - `SecurityConfig.allow_remote_admin` (default False) and `ScheduleConfig.shutdown_grace_seconds` (default 30) are the US-007 schema extensions
+- `InfluxService(config, with_lifespan=True)` wires the lifespan context manager into the FastAPI app for uvicorn-driven startup/shutdown
+- `uvicorn.run(app, timeout_graceful_shutdown=N)` bounds shutdown wait; uvicorn 0.46+ exits -15 on SIGTERM (clean shutdown but signal-terminated return code), exit 0 on SIGINT
+- To monkeypatch locally-imported `uvicorn.run()`, import uvicorn at test scope and use `monkeypatch.setattr(uvicorn, "run", fake)` — not `"module.uvicorn.run"`
+- Subprocess serve tests: use `_find_free_port()` via `socket.bind(("127.0.0.1", 0))` and `_wait_for_live()` polling `/live` with httpx
 
 # Ralph Progress Log
 Started: Fri Apr 24 14:02:16 UTC 2026
@@ -163,4 +167,28 @@ Started: Fri Apr 24 14:02:16 UTC 2026
   - `InfluxService.start()` is idempotent; `.stop()` before `.start()` is a safe no-op
   - Scheduler `.stop(wait=True)` blocks until running jobs complete — used for graceful shutdown
   - All 253 tests pass (19 new service + 234 existing)
+---
+
+## 2026-04-24 - US-008
+- Wired `serve` CLI handler to start the full service under uvicorn
+- Replaced `_cmd_serve_stub()` with `_cmd_serve()` in `src/influx/main.py`
+- Added `lifespan` method to `InfluxService` — async context manager for FastAPI lifespan protocol
+- Added `with_lifespan` parameter to `InfluxService.__init__` and `lifespan` parameter to `create_app()`
+- `_cmd_serve()` loads config (check_api_keys=False), validates bind, creates service with lifespan, runs uvicorn
+- `timeout_graceful_shutdown` read from `config.schedule.shutdown_grace_seconds` (AC-03-E)
+- SIGINT triggers clean shutdown → exit 0; SIGTERM triggers clean shutdown → exit -15 (uvicorn 0.46 behavior)
+- Updated test_cli_dispatch.py: serve test now verifies dispatch to _cmd_serve (no longer a stub)
+- Files changed:
+  - src/influx/service.py (added lifespan method, with_lifespan param, create_app lifespan param)
+  - src/influx/main.py (replaced _cmd_serve_stub with _cmd_serve)
+  - tests/unit/test_cli_dispatch.py (updated serve test for non-stub dispatch)
+  - tests/integration/test_serve.py (new: 9 tests — wiring, lifespan, subprocess SIGINT/SIGTERM, AC-M1-3)
+  - scripts/ralph/prd.json (US-008 passes: true)
+- **Learnings for future iterations:**
+  - `InfluxService.lifespan(app)` is the FastAPI lifespan — starts service on enter, stops on exit
+  - `uvicorn.run(app, timeout_graceful_shutdown=N)` is the preferred way to wire graceful shutdown
+  - uvicorn 0.46+ on Linux: SIGINT → exit 0, SIGTERM → exit -15 (clean shutdown but signal-terminated)
+  - Monkeypatching locally-imported modules: `import uvicorn; monkeypatch.setattr(uvicorn, "run", fake)` works
+  - Subprocess integration tests: use `_find_free_port()` + `_wait_for_live()` polling pattern
+  - All 262 tests pass (9 new serve + 253 existing)
 ---
