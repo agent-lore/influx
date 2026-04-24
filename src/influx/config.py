@@ -1,9 +1,9 @@
 """Configuration and environment loading.
 
-Influx is configured by a TOML file (``influx.toml``). This module defines
-the in-memory representation of that file, validates it on load, and
-applies a small set of environment-variable overrides so that env beats
-file beats built-in default.
+Influx is configured by a TOML file (``influx.toml``).  This module
+defines pydantic v2 schema models for the full v0.7 config structure
+and maintains a legacy ``load_config()`` entry point for backward
+compatibility until it is replaced in US-005.
 """
 
 from __future__ import annotations
@@ -13,34 +13,342 @@ import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from influx.errors import ConfigError
+from influx.slugs import slugify_feed_name
 
 __all__ = [
-    "DEFAULT_DATA_DIR",
-    "DEFAULT_ENVIRONMENT",
-    "DEFAULT_GREETING",
-    "DEFAULT_LOG_LEVEL",
-    "ConfigError",
-    "InfluxConfig",
-    "LogLevel",
-    "LoggingConfig",
+    # v0.7 pydantic schema models
+    "AppConfig",
+    "ArxivSourceConfig",
+    "ExtractionConfig",
+    "FeedbackConfig",
+    "FilterTuningConfig",
+    "InfluxSectionConfig",
+    "ModelSlotConfig",
+    "NotificationsConfig",
+    "ProfileConfig",
+    "ProfileSources",
+    "ProfileThresholds",
+    "PromptEntryConfig",
+    "PromptsConfig",
+    "ProviderConfig",
+    "RepairConfig",
+    "ResilienceConfig",
+    "RssSourceEntry",
+    "ScheduleConfig",
+    "SecurityConfig",
     "StorageConfig",
+    "TelemetryConfig",
+    # Legacy API (kept until US-005)
     "find_config_path",
     "load_config",
-    "parse_log_level",
 ]
 
-# ── Literal types + validators ─────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# v0.7 pydantic v2 schema models (US-004)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class InfluxSectionConfig(BaseModel):
+    """``[influx]`` top-level settings."""
+
+    note_schema_version: int = 1
+
+
+class ScheduleConfig(BaseModel):
+    """``[schedule]`` cron schedule for ingestion runs."""
+
+    cron: str = "0 6 * * *"
+    timezone: str = "UTC"
+    misfire_grace_seconds: int = 3600
+
+
+class StorageConfig(BaseModel):
+    """``[storage]`` archive storage settings."""
+
+    archive_dir: str = "/archive"
+    retain_days: int = 3650
+    max_download_bytes: int = 52_428_800
+    download_timeout_seconds: int = 30
+
+
+class NotificationsConfig(BaseModel):
+    """``[notifications]`` webhook notification settings."""
+
+    webhook_url: str = ""
+    timeout_seconds: int = 5
+
+
+class SecurityConfig(BaseModel):
+    """``[security]`` SSRF guard and security settings."""
+
+    allow_private_ips: bool = False
+
+
+# ── Profiles ─────────────────────────────────────────────────────────
+
+
+class ProfileThresholds(BaseModel):
+    """``[profiles.thresholds]`` score thresholds per profile."""
+
+    relevance: int = 7
+    full_text: int = 8
+    deep_extract: int = 9
+    notify_immediate: int = 8
+    lcma_edge_score: float = 0.75
+
+
+class ArxivSourceConfig(BaseModel):
+    """``[profiles.sources.arxiv]`` arXiv source settings."""
+
+    enabled: bool = True
+    categories: list[str] = Field(
+        default_factory=lambda: [
+            "cs.AI",
+            "cs.RO",
+            "cs.MA",
+            "cs.NE",
+            "cs.CL",
+            "cs.LO",
+        ]
+    )
+    max_results_per_category: int = 200
+    lookback_days: int = 1
+
+
+class RssSourceEntry(BaseModel):
+    """``[[profiles.sources.rss]]`` one RSS feed entry.
+
+    Unknown fields are rejected via a ``mode='before'`` validator so
+    that the error surfaces as ``ConfigError`` rather than a generic
+    pydantic ``ValidationError``.
+    """
+
+    name: str
+    url: str
+    source_tag: Literal["rss", "blog"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unknown_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            known = {"name", "url", "source_tag"}
+            unknown = set(data.keys()) - known
+            if unknown:
+                raise ConfigError(
+                    "Unknown field(s) on RSS source entry: "
+                    f"{', '.join(sorted(unknown))}"
+                )
+        return data
+
+    @field_validator("name")
+    @classmethod
+    def _name_must_slugify(cls, v: str) -> str:
+        if not slugify_feed_name(v):
+            raise ConfigError(
+                f"RSS feed name {v!r} produces an empty slug "
+                "after FR-ST-2 slugification"
+            )
+        return v
+
+    @field_validator("url")
+    @classmethod
+    def _url_must_be_http(cls, v: str) -> str:
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https"):
+            raise ConfigError(
+                f"RSS feed URL must use http or https scheme, got {parsed.scheme!r}"
+            )
+        return v
+
+
+class ProfileSources(BaseModel):
+    """``[profiles.sources]`` source configuration per profile."""
+
+    arxiv: ArxivSourceConfig = Field(default_factory=ArxivSourceConfig)
+    rss: list[RssSourceEntry] = Field(default_factory=list)
+
+
+class ProfileConfig(BaseModel):
+    """``[[profiles]]`` one interest profile."""
+
+    name: str
+    description: str = ""
+    thresholds: ProfileThresholds = Field(default_factory=ProfileThresholds)
+    sources: ProfileSources = Field(default_factory=ProfileSources)
+
+
+# ── Providers & Models ───────────────────────────────────────────────
+
+
+class ProviderConfig(BaseModel):
+    """``[providers.*]`` LLM provider connection info."""
+
+    base_url: str
+    api_key_env: str = ""
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+
+
+class ModelSlotConfig(BaseModel):
+    """``[models.*]`` LLM model slot configuration (FR-CFG-6)."""
+
+    provider: str
+    model: str
+    temperature: float = 0.0
+    max_tokens: int | None = None
+    request_timeout: int = 30
+    max_retries: int = 2
+    json_mode: bool = False
+
+
+# ── Prompts ──────────────────────────────────────────────────────────
+
+
+class PromptEntryConfig(BaseModel):
+    """One prompt entry — inline ``text`` or file ``path``."""
+
+    text: str | None = None
+    path: str | None = None
+
+    @model_validator(mode="after")
+    def _check_exactly_one_source(self) -> PromptEntryConfig:
+        if self.text is not None and self.path is not None:
+            raise ConfigError(
+                "Prompt specifies both 'text' and 'path'; exactly one is required"
+            )
+        if self.text is None and self.path is None:
+            raise ConfigError(
+                "Prompt specifies neither 'text' nor 'path'; exactly one is required"
+            )
+        return self
+
+
+class PromptsConfig(BaseModel):
+    """``[prompts]`` all three canonical prompt keys required (FR-CFG-7).
+
+    Unknown top-level keys are rejected via a ``mode='before'``
+    validator so that the error surfaces as ``ConfigError``.
+    """
+
+    filter: PromptEntryConfig
+    tier1_enrich: PromptEntryConfig
+    tier3_extract: PromptEntryConfig
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_prompt_keys(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            known = {"filter", "tier1_enrich", "tier3_extract"}
+            unknown = set(data.keys()) - known
+            if unknown:
+                raise ConfigError(
+                    f"Unknown key(s) under [prompts]: {', '.join(sorted(unknown))}"
+                )
+            missing = known - set(data.keys())
+            if missing:
+                raise ConfigError(
+                    f"Missing required prompt key(s): {', '.join(sorted(missing))}"
+                )
+        return data
+
+
+# ── Tuning sections ──────────────────────────────────────────────────
+
+
+class FilterTuningConfig(BaseModel):
+    """``[filter]`` filter batch and scoring parameters."""
+
+    batch_size: int = 25
+    min_score_in_results: int = 6
+    negative_example_max_title_chars: int = 200
+
+
+class ExtractionConfig(BaseModel):
+    """``[extraction]`` text extraction quality gates."""
+
+    min_html_chars: int = 1000
+    min_web_chars: int = 500
+    strip_tags: list[str] = Field(
+        default_factory=lambda: [
+            "script",
+            "iframe",
+            "object",
+            "embed",
+        ]
+    )
+
+
+class ResilienceConfig(BaseModel):
+    """``[resilience]`` retry and backoff settings."""
+
+    max_retries: int = 3
+    backoff_base_seconds: int = 1
+    arxiv_request_min_interval_seconds: int = 3
+    arxiv_429_backoff_seconds: int = 10
+    lithos_write_conflict_max_retries: int = 1
+
+
+class FeedbackConfig(BaseModel):
+    """``[feedback]`` negative-example injection settings."""
+
+    negative_examples_per_profile: int = 20
+    recalibrate_after_runs: int = 7
+
+
+class RepairConfig(BaseModel):
+    """``[repair]`` repair/upgrade batch limits.
+
+    Distinct from ``[feedback]``; controls repair pipeline limits.
+    """
+
+    max_items_per_run: int = 100
+
+
+class TelemetryConfig(BaseModel):
+    """``[telemetry]`` OTEL observability settings."""
+
+    enabled: bool = False
+    console_fallback: bool = False
+    service_name: str = "influx"
+    export_interval_ms: int = 30000
+
+
+# ── Root model ───────────────────────────────────────────────────────
+
+
+class AppConfig(BaseModel):
+    """Root configuration model for the full v0.7 TOML schema."""
+
+    influx: InfluxSectionConfig = Field(default_factory=InfluxSectionConfig)
+    schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
+    notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
+    profiles: list[ProfileConfig] = Field(default_factory=list)
+    providers: dict[str, ProviderConfig] = Field(default_factory=dict)
+    models: dict[str, ModelSlotConfig] = Field(default_factory=dict)
+    prompts: PromptsConfig
+    filter: FilterTuningConfig = Field(default_factory=FilterTuningConfig)
+    extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
+    resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
+    feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
+    repair: RepairConfig = Field(default_factory=RepairConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Legacy config loading (to be replaced in US-005)
+# ══════════════════════════════════════════════════════════════════════
 
 LogLevel = Literal["debug", "info", "warning", "error"]
 
 _VALID_LOG_LEVEL: set[str] = {"debug", "info", "warning", "error"}
-
-
-# ── Defaults ───────────────────────────────────────────────────────────
 
 DEFAULT_DATA_DIR = Path.home() / ".influx" / "data"
 DEFAULT_ENVIRONMENT = "dev"
@@ -57,36 +365,26 @@ def parse_log_level(value: str) -> LogLevel:
     return cast(LogLevel, value)
 
 
-# ── Dataclasses ────────────────────────────────────────────────────────
-
-
 @dataclass(frozen=True)
-class StorageConfig:
+class _LegacyStorageConfig:
     data_dir: Path = DEFAULT_DATA_DIR
 
 
 @dataclass(frozen=True)
-class LoggingConfig:
+class _LegacyLoggingConfig:
     level: LogLevel = DEFAULT_LOG_LEVEL
 
 
 @dataclass(frozen=True)
-class InfluxConfig:
+class _LegacyInfluxConfig:
     environment: str
     greeting: str
-    storage: StorageConfig
-    logging: LoggingConfig
-
-
-# ── Discovery and loading ──────────────────────────────────────────────
+    storage: _LegacyStorageConfig
+    logging: _LegacyLoggingConfig
 
 
 def _default_config_candidates() -> list[Path]:
-    """Return the filesystem candidates checked when INFLUX_CONFIG is unset.
-
-    Exposed as a helper so tests can monkeypatch the search locations
-    without having to override HOME and /etc.
-    """
+    """Return filesystem candidates checked when INFLUX_CONFIG is unset."""
     return [
         Path.cwd() / "influx.toml",
         Path.home() / ".influx" / "influx.toml",
@@ -120,13 +418,10 @@ def find_config_path() -> Path:
     )
 
 
-def load_config(path: Path | None = None) -> InfluxConfig:
-    """Load, validate, and return an ``InfluxConfig``.
+def load_config(path: Path | None = None) -> _LegacyInfluxConfig:
+    """Load and return a legacy config object.
 
-    When ``path`` is ``None`` the config file is located via
-    :func:`find_config_path`. Env-var overrides (``INFLUX_ENVIRONMENT``,
-    ``INFLUX_DATA_DIR``, ``INFLUX_LOG_LEVEL``) are applied after file
-    parsing so that env beats file beats built-in default.
+    This function will be replaced in US-005 to return ``AppConfig``.
     """
     load_dotenv()
     config_path = path if path is not None else find_config_path()
@@ -144,15 +439,23 @@ def load_config(path: Path | None = None) -> InfluxConfig:
         raise ConfigError(f"{config_path}: 'influx' must be a table")
 
     environment = _optional_str(
-        influx_section, "environment", DEFAULT_ENVIRONMENT, config_path, "influx"
+        influx_section,
+        "environment",
+        DEFAULT_ENVIRONMENT,
+        config_path,
+        "influx",
     )
     greeting = _optional_str(
-        influx_section, "greeting", DEFAULT_GREETING, config_path, "influx"
+        influx_section,
+        "greeting",
+        DEFAULT_GREETING,
+        config_path,
+        "influx",
     )
     storage = _parse_storage(influx_section.get("storage", {}), config_path)
     logging_cfg = _parse_logging(influx_section.get("logging", {}), config_path)
 
-    cfg = InfluxConfig(
+    cfg = _LegacyInfluxConfig(
         environment=environment,
         greeting=greeting,
         storage=storage,
@@ -161,19 +464,23 @@ def load_config(path: Path | None = None) -> InfluxConfig:
     return _apply_env_overrides(cfg)
 
 
-# ── Internal parsing helpers ───────────────────────────────────────────
+# ── Internal helpers (legacy) ────────────────────────────────────────
 
 
-def _parse_storage(data: Any, config_path: Path) -> StorageConfig:
+def _parse_storage(data: Any, config_path: Path) -> _LegacyStorageConfig:
     if not isinstance(data, dict):
         raise ConfigError(f"{config_path}: [influx.storage] must be a table")
     data_dir = _optional_path(
-        data, "data_dir", DEFAULT_DATA_DIR, config_path, "influx.storage"
+        data,
+        "data_dir",
+        DEFAULT_DATA_DIR,
+        config_path,
+        "influx.storage",
     )
-    return StorageConfig(data_dir=data_dir)
+    return _LegacyStorageConfig(data_dir=data_dir)
 
 
-def _parse_logging(data: Any, config_path: Path) -> LoggingConfig:
+def _parse_logging(data: Any, config_path: Path) -> _LegacyLoggingConfig:
     if not isinstance(data, dict):
         raise ConfigError(f"{config_path}: [influx.logging] must be a table")
     level_raw = data.get("level", DEFAULT_LOG_LEVEL)
@@ -183,7 +490,7 @@ def _parse_logging(data: Any, config_path: Path) -> LoggingConfig:
         level = parse_log_level(level_raw)
     except ConfigError as exc:
         raise ConfigError(f"{config_path}: [influx.logging]: {exc}") from exc
-    return LoggingConfig(level=level)
+    return _LegacyLoggingConfig(level=level)
 
 
 def _optional_str(
@@ -216,7 +523,9 @@ def _optional_path(
     return Path(value).expanduser()
 
 
-def _apply_env_overrides(cfg: InfluxConfig) -> InfluxConfig:
+def _apply_env_overrides(
+    cfg: _LegacyInfluxConfig,
+) -> _LegacyInfluxConfig:
     env_override = os.environ.get("INFLUX_ENVIRONMENT", "")
     data_dir_override = os.environ.get("INFLUX_DATA_DIR", "")
     log_level_override = os.environ.get("INFLUX_LOG_LEVEL", "")
@@ -229,7 +538,8 @@ def _apply_env_overrides(cfg: InfluxConfig) -> InfluxConfig:
         new_cfg = replace(new_cfg, environment=env_override)
     if data_dir_override:
         new_storage = replace(
-            new_cfg.storage, data_dir=Path(data_dir_override).expanduser()
+            new_cfg.storage,
+            data_dir=Path(data_dir_override).expanduser(),
         )
         new_cfg = replace(new_cfg, storage=new_storage)
     if log_level_override:
