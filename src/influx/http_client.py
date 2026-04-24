@@ -14,7 +14,7 @@ import ipaddress
 import socket
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -23,6 +23,8 @@ from influx.errors import NetworkError
 __all__ = ["ContentTypeFamily", "FetchResult", "guarded_fetch"]
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+_MAX_REDIRECTS = 20
 
 ContentTypeFamily = Literal["html", "pdf", "xml"]
 
@@ -158,6 +160,9 @@ def guarded_fetch(
 ) -> FetchResult:
     """Fetch *url* with scheme, SSRF, size, timeout, and content-type guards.
 
+    Every redirect hop is re-validated against the scheme allow-list and
+    the SSRF IP classifier (PRD §5.3 R-4).
+
     Returns a :class:`FetchResult` on success.  Raises
     :class:`~influx.errors.NetworkError` when any guard is violated.
     """
@@ -171,49 +176,86 @@ def guarded_fetch(
         pool=timeout_seconds,
     )
 
+    current_url = url
+
     try:
-        with (
-            httpx.Client(timeout=timeout, follow_redirects=True) as client,
-            client.stream("GET", url) as response,
-        ):
-                chunks: list[bytes] = []
-                received = 0
-                for chunk in response.iter_bytes():
-                    received += len(chunk)
-                    if received > max_download_bytes:
-                        raise NetworkError(
-                            f"Response body exceeds {max_download_bytes} bytes",
-                            url=url,
-                            kind="oversize",
-                            reason=(
-                                f"Received {received} bytes, "
-                                f"limit is {max_download_bytes}"
-                            ),
+        with httpx.Client(
+            timeout=timeout, follow_redirects=False
+        ) as client:
+            for _hop in range(_MAX_REDIRECTS + 1):
+                with client.stream(
+                    "GET", current_url
+                ) as response:
+                    if response.is_redirect:
+                        next_url = urljoin(
+                            current_url,
+                            response.headers["location"],
                         )
-                    chunks.append(chunk)
-                body = b"".join(chunks)
-                status_code = response.status_code
-                content_type = response.headers.get("content-type", "")
-                final_url = str(response.url)
+                        _validate_scheme(next_url)
+                        _ssrf_check(
+                            next_url,
+                            allow_private_ips=allow_private_ips,
+                        )
+                        current_url = next_url
+                        continue
+
+                    chunks: list[bytes] = []
+                    received = 0
+                    for chunk in response.iter_bytes():
+                        received += len(chunk)
+                        if received > max_download_bytes:
+                            raise NetworkError(
+                                "Response body exceeds"
+                                f" {max_download_bytes}"
+                                " bytes",
+                                url=current_url,
+                                kind="oversize",
+                                reason=(
+                                    f"Received {received}"
+                                    " bytes, limit is"
+                                    f" {max_download_bytes}"
+                                ),
+                            )
+                        chunks.append(chunk)
+                    body = b"".join(chunks)
+                    status_code = response.status_code
+                    content_type = response.headers.get(
+                        "content-type", ""
+                    )
+                    final_url = str(response.url)
+                    break
+            else:
+                raise NetworkError(
+                    "Too many redirects"
+                    f" (>{_MAX_REDIRECTS})",
+                    url=url,
+                    kind="network",
+                    reason=(
+                        f"Exceeded {_MAX_REDIRECTS}"
+                        " redirects"
+                    ),
+                )
     except NetworkError:
         raise
     except httpx.TimeoutException as exc:
         raise NetworkError(
             f"Request timed out: {exc}",
-            url=url,
+            url=current_url,
             kind="timeout",
             reason=str(exc),
         ) from exc
     except httpx.HTTPError as exc:
         raise NetworkError(
             f"HTTP error: {exc}",
-            url=url,
+            url=current_url,
             kind="network",
             reason=str(exc),
         ) from exc
 
     if expected_content_type is not None:
-        _check_content_type(content_type, expected_content_type, final_url)
+        _check_content_type(
+            content_type, expected_content_type, final_url
+        )
 
     return FetchResult(
         body=body,

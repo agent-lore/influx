@@ -4,6 +4,7 @@ US-002: scheme allow-list, SSRF IP-classification guard, and
 allow_private_ips bypass.
 US-003: streaming size cap and connect + read timeout.
 US-004: content-type family check (HTML, PDF, XML/Atom).
+US-005: redirect re-validation at every hop.
 """
 
 from __future__ import annotations
@@ -402,3 +403,101 @@ class TestContentTypeFamilyMismatch:
                 guarded_fetch(url, expected_content_type="xml")
             err = exc_info.value
             assert err.kind == "content_type_mismatch"
+
+
+# ── Redirect re-validation (US-005) ──────────────────────────────────
+
+
+def _multi_resolve(mapping: dict[str, str]):
+    """Return a getaddrinfo fake resolving hosts per *mapping*."""
+
+    def _inner(
+        host: str,
+        port: Any,
+        family: int = 0,
+        type: int = 0,
+        **kw: Any,
+    ):
+        ip = mapping.get(host, "93.184.216.34")
+        return [(2, 1, 6, "", (ip, 0))]
+
+    return _inner
+
+
+class TestRedirectRevalidation:
+    """US-005: scheme + SSRF re-validation at every redirect hop."""
+
+    @respx.mock
+    def test_redirect_to_private_ip_raises(self) -> None:
+        """AC-02-C: redirect from public to private IP is caught."""
+        pub = "http://public.example.com/start"
+        prv = "http://internal.example.com/secret"
+        respx.get(pub).mock(
+            return_value=httpx.Response(
+                302, headers={"location": prv}
+            ),
+        )
+        resolver = _multi_resolve({
+            "public.example.com": "93.184.216.34",
+            "internal.example.com": "10.0.0.1",
+        })
+        with patch(_PATCH_GAI, resolver):
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(pub)
+            err = exc_info.value
+            assert err.kind == "ssrf"
+            assert err.url == prv
+
+    @respx.mock
+    def test_redirect_to_loopback_raises(self) -> None:
+        """AC-02-C: redirect to loopback is caught."""
+        pub = "http://public.example.com/go"
+        loop = "http://localhost/admin"
+        respx.get(pub).mock(
+            return_value=httpx.Response(
+                302, headers={"location": loop}
+            ),
+        )
+        resolver = _multi_resolve({
+            "public.example.com": "93.184.216.34",
+            "localhost": "127.0.0.1",
+        })
+        with patch(_PATCH_GAI, resolver):
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(pub)
+            err = exc_info.value
+            assert err.kind == "ssrf"
+            assert err.url == loop
+
+    @respx.mock
+    def test_redirect_to_bad_scheme_raises(self) -> None:
+        """Redirect to ftp:// is rejected at the redirect hop."""
+        pub = "http://public.example.com/redir"
+        respx.get(pub).mock(
+            return_value=httpx.Response(
+                302,
+                headers={"location": "ftp://evil.com/f"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(pub)
+            assert exc_info.value.kind == "scheme"
+
+    @respx.mock
+    def test_redirect_allows_private_with_flag(self) -> None:
+        """allow_private_ips=True is honoured at redirect hops."""
+        pub = "http://public.example.com/start"
+        prv = "http://internal.example.com/data"
+        respx.get(pub).mock(
+            return_value=httpx.Response(
+                302, headers={"location": prv}
+            ),
+        )
+        respx.get(prv).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        result = guarded_fetch(pub, allow_private_ips=True)
+        assert result.status_code == 200
+        assert result.body == b"ok"

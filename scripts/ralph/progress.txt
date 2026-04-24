@@ -10,6 +10,10 @@ Started: Fri Apr 24 11:54:09 UTC 2026
 - HTTP client uses respx for mocking httpx requests in tests
 - SSRF guard patches `socket.getaddrinfo` via `_fake_getaddrinfo(ip)` helper for controlled IP resolution in tests
 - Ruff line length is 88 chars; use `uv run ruff check --fix` for auto-fixable issues like import sorting
+- Streaming uses `client.stream("GET", url)` + `response.iter_bytes()` with combined `with` statement (ruff SIM117)
+- For timeout tests, patch `influx.http_client.httpx.Client` and set `ctx.stream.side_effect` to httpx timeout exceptions
+- Redirect re-validation: use `follow_redirects=False` + manual for-loop with `_validate_scheme`/`_ssrf_check` at each hop
+- For multi-host redirect tests, use `_multi_resolve({"host": "ip", ...})` helper instead of `_fake_getaddrinfo`
 
 ---
 
@@ -42,4 +46,46 @@ Started: Fri Apr 24 11:54:09 UTC 2026
   - For SSRF tests, patch `influx.http_client.socket.getaddrinfo` not `socket.getaddrinfo` directly
   - FetchResult is a frozen dataclass with slots for immutability
   - Future stories (US-003/004/005) will extend guarded_fetch with streaming, content-type check, and redirect re-validation
+---
+
+## 2026-04-24 - US-003
+- Switched guarded_fetch from buffered `response.content` to streaming `response.iter_bytes()` via `client.stream("GET", url)`
+- Added mid-stream abort: raises NetworkError(kind="oversize") when cumulative body exceeds max_download_bytes; partial body is not returned
+- Connect and read timeouts already bounded by timeout_seconds via httpx.Timeout; timeout raises NetworkError(kind="timeout")
+- Added 6 new tests: oversize rejection, no-body-returned assertion, exact-limit success, under-limit success, connect timeout, read timeout
+- Files changed: src/influx/http_client.py, tests/unit/test_http_client.py
+- **Learnings for future iterations:**
+  - respx handles streaming transparently; `httpx.Response` with `content=` works with `iter_bytes()` in tests
+  - Use combined `with` for nested context managers to satisfy ruff SIM117
+  - NetworkError re-raise inside try/except must come before httpx exception handlers to avoid catching it as HTTPError
+  - Full test suite is now 123 tests
+---
+
+## 2026-04-24 - US-004
+- Added ContentTypeFamily literal type ("html", "pdf", "xml") and MIME mapping to http_client.py
+- Added _check_content_type() helper that extracts MIME from content-type header (stripping charset params) and validates against family
+- Added expected_content_type parameter to guarded_fetch (optional, None = skip check)
+- Raises NetworkError(kind="content_type_mismatch") on mismatch with reason containing both expected and actual MIME
+- Added 12 new tests: 8 positive cases (HTML variants, PDF, XML/Atom/RSS), 1 None-skip case, 3 mismatch cases
+- Files changed: src/influx/http_client.py, tests/unit/test_http_client.py
+- **Learnings for future iterations:**
+  - Content-type header parsing: split on ";" first to strip charset/boundary params before matching
+  - ContentTypeFamily is exported from http_client module for type-safe callers
+  - Full test suite is now 135 tests
+---
+
+## 2026-04-24 - US-005
+- Switched guarded_fetch from `follow_redirects=True` to manual redirect loop with `follow_redirects=False`
+- Every redirect hop re-validates scheme (http/https allow-list) and SSRF IP classification via `_validate_scheme` and `_ssrf_check`
+- Added `_MAX_REDIRECTS = 20` constant and `urljoin` for resolving relative Location headers
+- Added `for/else` pattern: exceeding max redirects raises NetworkError(kind="network")
+- `allow_private_ips=True` is honoured consistently at every redirect hop
+- Added 4 new tests: redirect-to-private-IP, redirect-to-loopback, redirect-to-bad-scheme, redirect-allows-private-with-flag
+- Added `_multi_resolve(mapping)` test helper for multi-host DNS resolution
+- Files changed: src/influx/http_client.py, tests/unit/test_http_client.py
+- **Learnings for future iterations:**
+  - httpx `response.is_redirect` checks both status code AND Location header presence — safe to access `response.headers["location"]` after
+  - `continue` inside `with client.stream(...) as response:` properly exits the context manager, closing the stream
+  - respx handles `follow_redirects=False` transparently; mock each URL independently
+  - Full test suite is now 139 tests
 ---
