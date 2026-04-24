@@ -1,8 +1,7 @@
 """CLI entry point with argparse dispatcher.
 
-Provides the ``validate-config`` subcommand that loads and validates
-``influx.toml``, prints the effective config, and exits 0 on success
-or non-zero on error.
+Provides subcommands for the v1 CLI surface: ``validate-config``,
+``serve``, ``run``, ``backfill``, and ``migrate-notes``.
 
 Running ``python -m influx`` with no subcommand prints help and exits
 with a non-zero status.
@@ -15,6 +14,12 @@ import sys
 
 from influx.config import load_config
 from influx.errors import InfluxError
+
+# FR-CLI-7 exit-code policy
+EXIT_SUCCESS = 0
+EXIT_PARTIAL = 1
+EXIT_FAILURE = 2
+EXIT_USAGE = 64
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -30,6 +35,58 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Load influx.toml, validate, and print the effective config.",
     )
 
+    # FR-CLI-2: serve takes no flags
+    sub.add_parser(
+        "serve",
+        help="Start the Influx HTTP API server.",
+    )
+
+    # FR-CLI-3: run --profile
+    run_parser = sub.add_parser(
+        "run",
+        help="Run a single ingestion cycle for a profile.",
+    )
+    run_parser.add_argument(
+        "--profile",
+        required=True,
+        help="Profile name to run ingestion for.",
+    )
+
+    # FR-CLI-4: backfill --profile --days/--from/--to [--confirm]
+    backfill_parser = sub.add_parser(
+        "backfill",
+        help="Backfill historical data for a profile.",
+    )
+    backfill_parser.add_argument(
+        "--profile",
+        required=True,
+        help="Profile name to backfill.",
+    )
+    backfill_parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Number of days to backfill.",
+    )
+    backfill_parser.add_argument(
+        "--from",
+        dest="from_date",
+        default=None,
+        help="Start date for backfill range (ISO format).",
+    )
+    backfill_parser.add_argument(
+        "--to",
+        dest="to_date",
+        default=None,
+        help="End date for backfill range (ISO format).",
+    )
+    backfill_parser.add_argument(
+        "--confirm",
+        action="store_true",
+        default=False,
+        help="Confirm large backfill jobs.",
+    )
+
     return parser
 
 
@@ -37,6 +94,30 @@ def _cmd_validate_config() -> None:
     """Load config, print the effective config model, and exit 0."""
     config = load_config()
     print(config.model_dump_json(indent=2))
+
+
+def _cmd_serve_stub() -> None:
+    """Stub handler for serve; replaced by PRD 03."""
+    print("[stub] serve not wired yet", file=sys.stderr)
+    sys.exit(EXIT_USAGE)
+
+
+def _cmd_run_stub(args: argparse.Namespace) -> None:
+    """Stub handler for run; replaced by a later PRD."""
+    print(
+        f"[stub] run not wired yet (profile={args.profile})",
+        file=sys.stderr,
+    )
+    sys.exit(EXIT_USAGE)
+
+
+def _cmd_backfill_stub(args: argparse.Namespace) -> None:
+    """Stub handler for backfill; replaced by a later PRD."""
+    print(
+        f"[stub] backfill not wired yet (profile={args.profile})",
+        file=sys.stderr,
+    )
+    sys.exit(EXIT_USAGE)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -52,11 +133,17 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command is None:
         parser.print_help(sys.stderr)
-        sys.exit(2)
+        sys.exit(EXIT_USAGE)
 
     try:
         if args.command == "validate-config":
             _cmd_validate_config()
+        elif args.command == "serve":
+            _cmd_serve_stub()
+        elif args.command == "run":
+            _cmd_run_stub(args)
+        elif args.command == "backfill":
+            _cmd_backfill_stub(args)
     except InfluxError as exc:
         print(f"influx: {exc}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_FAILURE)

@@ -98,7 +98,7 @@
         "Typecheck passes"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": "Source PRD is internally inconsistent about the serve stub body: §2 describes printing a 'starting' message and blocking on a signal, while FR-CLI-2 specifies printing '[stub] serve not wired yet' and exiting 64. The exact stub behaviour needs clarification in the source PRD; the argparse surface is locked in here, and PRD 03 replaces the handler body regardless."
     },
     {

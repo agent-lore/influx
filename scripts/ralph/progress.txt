@@ -14,6 +14,9 @@ Started: Fri Apr 24 11:54:09 UTC 2026
 - For timeout tests, patch `influx.http_client.httpx.Client` and set `ctx.stream.side_effect` to httpx timeout exceptions
 - Redirect re-validation: use `follow_redirects=False` + manual for-loop with `_validate_scheme`/`_ssrf_check` at each hop
 - For multi-host redirect tests, use `_multi_resolve({"host": "ip", ...})` helper instead of `_fake_getaddrinfo`
+- CLI exit codes: EXIT_SUCCESS=0, EXIT_PARTIAL=1, EXIT_FAILURE=2, EXIT_USAGE=64 (named constants in main.py)
+- Stub handlers print `[stub] <cmd> not wired yet` to stderr and `sys.exit(EXIT_USAGE)`
+- argparse `dest="from_date"` / `dest="to_date"` used for `--from` / `--to` to avoid Python keyword conflicts
 
 ---
 
@@ -88,4 +91,21 @@ Started: Fri Apr 24 11:54:09 UTC 2026
   - `continue` inside `with client.stream(...) as response:` properly exits the context manager, closing the stream
   - respx handles `follow_redirects=False` transparently; mock each URL independently
   - Full test suite is now 139 tests
+---
+
+## 2026-04-24 - US-006
+- Extended CLI argparse surface with serve, run, and backfill subcommands in src/influx/main.py
+- serve: no flags (FR-CLI-2); stub prints message and exits 64
+- run: --profile (required) (FR-CLI-3); stub prints message with profile name and exits 64
+- backfill: --profile (required), --days, --from, --to, --confirm (FR-CLI-4); stub prints message and exits 64
+- Added FR-CLI-7 exit-code constants: EXIT_SUCCESS=0, EXIT_PARTIAL=1, EXIT_FAILURE=2, EXIT_USAGE=64
+- No-subcommand exit code changed from 2 to EXIT_USAGE (64) for consistency
+- validate-config routing preserved unchanged
+- Created tests/unit/test_cli_dispatch.py with 8 tests covering routing, exit codes, flag enforcement, and validate-config regression
+- Files changed: src/influx/main.py, tests/unit/test_cli_dispatch.py, scripts/ralph/prd.json
+- **Learnings for future iterations:**
+  - argparse uses exit code 2 for its own parse errors (unrecognized args); our EXIT_USAGE=64 is only for application-level usage errors
+  - Use `dest="from_date"` for `--from` flag since `from` is a Python keyword
+  - Stub handlers should print to stderr, not stdout, to avoid polluting piped output
+  - Full test suite is now 147 tests
 ---
