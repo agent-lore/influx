@@ -2,6 +2,7 @@
 
 US-002: scheme allow-list, SSRF IP-classification guard, and
 allow_private_ips bypass.
+US-003: streaming size cap and connect + read timeout.
 """
 
 from __future__ import annotations
@@ -186,3 +187,109 @@ class TestDNSFailure:
             with pytest.raises(NetworkError) as exc_info:
                 guarded_fetch("http://no-such-host.invalid/x")
             assert exc_info.value.kind == "dns"
+
+
+# ── Streaming size cap (US-003) ──────────────────────────────────────
+
+
+class TestStreamingSizeCap:
+    """The guarded client must abort mid-stream when body exceeds limit."""
+
+    @respx.mock
+    def test_oversize_response_raises_network_error(self) -> None:
+        """AC-02-B: body exceeding max_download_bytes raises oversize."""
+        url = "http://example.com/big"
+        # 100 bytes body, limit to 50
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=b"x" * 100),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, max_download_bytes=50)
+            err = exc_info.value
+            assert err.kind == "oversize"
+            assert err.url == url
+
+    @respx.mock
+    def test_oversize_no_body_returned(self) -> None:
+        """AC-02-B: partial body is NOT returned to the caller."""
+        url = "http://example.com/big2"
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=b"y" * 200),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake), pytest.raises(NetworkError):
+            guarded_fetch(url, max_download_bytes=100)
+            # No FetchResult is returned — the exception is the only outcome
+
+    @respx.mock
+    def test_body_at_exact_limit_succeeds(self) -> None:
+        """Body exactly at limit should succeed (not exceed)."""
+        url = "http://example.com/exact"
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=b"z" * 50),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(url, max_download_bytes=50)
+        assert result.body == b"z" * 50
+
+    @respx.mock
+    def test_body_under_limit_succeeds(self) -> None:
+        """Body under limit returns normally."""
+        url = "http://example.com/small"
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=b"abc"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(url, max_download_bytes=1000)
+        assert result.body == b"abc"
+
+
+# ── Timeout (US-003) ──────────────────────────────────────────────────
+
+
+class TestTimeout:
+    """Connect and read timeouts raise NetworkError with kind='timeout'."""
+
+    def test_connect_timeout_raises_network_error(self) -> None:
+        """FR-RES-4: connect timeout raises NetworkError."""
+        url = "http://example.com/slow"
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with (
+            patch(_PATCH_GAI, fake),
+            patch(
+                "influx.http_client.httpx.Client",
+            ) as mock_client_cls,
+        ):
+            ctx = mock_client_cls.return_value.__enter__.return_value
+            ctx.stream.side_effect = httpx.ConnectTimeout(
+                "timed out"
+            )
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, timeout_seconds=1)
+            err = exc_info.value
+            assert err.kind == "timeout"
+            assert err.url == url
+
+    def test_read_timeout_raises_network_error(self) -> None:
+        """FR-RES-4: read timeout raises NetworkError."""
+        url = "http://example.com/stall"
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with (
+            patch(_PATCH_GAI, fake),
+            patch(
+                "influx.http_client.httpx.Client",
+            ) as mock_client_cls,
+        ):
+            ctx = mock_client_cls.return_value.__enter__.return_value
+            ctx.stream.side_effect = httpx.ReadTimeout(
+                "read timed out"
+            )
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, timeout_seconds=1)
+            err = exc_info.value
+            assert err.kind == "timeout"
+            assert err.url == url

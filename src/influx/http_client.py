@@ -137,8 +137,31 @@ def guarded_fetch(
     )
 
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            response = client.get(url)
+        with (
+            httpx.Client(timeout=timeout, follow_redirects=True) as client,
+            client.stream("GET", url) as response,
+        ):
+                chunks: list[bytes] = []
+                received = 0
+                for chunk in response.iter_bytes():
+                    received += len(chunk)
+                    if received > max_download_bytes:
+                        raise NetworkError(
+                            f"Response body exceeds {max_download_bytes} bytes",
+                            url=url,
+                            kind="oversize",
+                            reason=(
+                                f"Received {received} bytes, "
+                                f"limit is {max_download_bytes}"
+                            ),
+                        )
+                    chunks.append(chunk)
+                body = b"".join(chunks)
+                status_code = response.status_code
+                content_type = response.headers.get("content-type", "")
+                final_url = str(response.url)
+    except NetworkError:
+        raise
     except httpx.TimeoutException as exc:
         raise NetworkError(
             f"Request timed out: {exc}",
@@ -155,8 +178,8 @@ def guarded_fetch(
         ) from exc
 
     return FetchResult(
-        body=response.content,
-        status_code=response.status_code,
-        content_type=response.headers.get("content-type", ""),
-        final_url=str(response.url),
+        body=body,
+        status_code=status_code,
+        content_type=content_type,
+        final_url=final_url,
     )
