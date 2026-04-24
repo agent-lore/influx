@@ -442,12 +442,26 @@ def _validate_provider_api_keys(cfg: AppConfig) -> None:
             )
 
 
-def load_config(path: Path | None = None) -> AppConfig:
+def load_config(
+    path: Path | None = None,
+    *,
+    check_api_keys: bool = True,
+) -> AppConfig:
     """Load, validate, and return the v0.7 ``AppConfig``.
 
     Reads TOML via stdlib ``tomllib``, validates the raw dict through
     the pydantic schema, and returns a typed ``AppConfig`` instance.
     Environment variable overrides (§19) are applied before validation.
+
+    Parameters
+    ----------
+    path:
+        Explicit path to ``influx.toml``; ``None`` uses discovery.
+    check_api_keys:
+        When ``True`` (default), raise ``ConfigError`` if any
+        provider's ``api_key_env`` is unset.  Set to ``False`` for
+        long-running ``serve`` mode where the background probe loop
+        (``probes.py``) monitors credential presence instead.
     """
     load_dotenv()
     config_path = path if path is not None else find_config_path()
@@ -467,6 +481,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     except ValidationError as exc:
         raise ConfigError(f"{config_path}: {exc}") from exc
 
-    _validate_provider_api_keys(cfg)
+    if check_api_keys:
+        _validate_provider_api_keys(cfg)
 
     return cfg

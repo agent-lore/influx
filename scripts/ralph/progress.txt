@@ -4,6 +4,10 @@
 - Ruff enforces import sorting (I001) and combined `with` statements (SIM117) — run `ruff check --fix` after creating new files
 - Test fixture `influx_config_env` in conftest.py provides realistic v0.7 TOML + TEST_PROVIDER_API_KEY env var
 - pytest-asyncio configured with `asyncio_mode = "auto"` — no need for `@pytest.mark.asyncio` decorators (but they don't hurt)
+- `ProbeLoop(config, interval=30.0)` is the probe entry point; `.run_once()` for sync, `.start()`/`.stop()` for async background
+- `ProbeLoop.state` returns `ProbeState` with `.is_ready`, `.overall_status`, `.lithos`, `.llm_credentials`
+- `load_config(check_api_keys=False)` skips provider key validation — use for `serve` mode where probes handle it
+- `_make_config(providers=...)` helper in test_probes.py builds minimal AppConfig for unit tests without TOML files
 
 # Ralph Progress Log
 Started: Fri Apr 24 14:02:16 UTC 2026
@@ -22,4 +26,23 @@ Started: Fri Apr 24 14:02:16 UTC 2026
   - `ProfileBusyError` carries `.profile` attribute for HTTP layer to build 409 response
   - `Coordinator.hold()` context manager is the preferred API for acquire-or-raise + auto-release
   - All 164 tests pass (12 new coordinator + 152 existing)
+---
+
+## 2026-04-24 - US-002
+- Implemented background probe loop with cached Lithos + LLM-credentials state
+- Created `src/influx/probes.py` with `ProbeLoop`, `ProbeState`, `ProbeResult`
+- Lithos probe is a documented stub (ok by default, degraded under `INFLUX_TEST_LITHOS_DOWN=1`)
+- LLM-credentials probe checks each provider's `api_key_env` presence; skips `api_key_env=""` providers
+- Added `check_api_keys` parameter to `load_config()` so `serve` mode can skip startup key validation
+- Files changed:
+  - src/influx/probes.py (new: ProbeLoop, ProbeState, ProbeResult, _probe_lithos, _probe_llm_credentials)
+  - src/influx/config.py (added `check_api_keys` parameter to `load_config()`)
+  - tests/unit/test_probes.py (new: 23 tests covering all ACs)
+  - scripts/ralph/prd.json (US-002 passes: true)
+- **Learnings for future iterations:**
+  - `ProbeState.overall_status` derives "starting"/"ok"/"degraded" from probe timestamps and statuses
+  - `time.monotonic()` used for timestamps — immune to wall-clock adjustments
+  - Ruff SIM105 requires `contextlib.suppress()` instead of bare `try/except/pass`
+  - `ProbeLoop.run_once()` is synchronous — good for tests and initial probe before async loop
+  - All 187 tests pass (23 new probes + 164 existing)
 ---

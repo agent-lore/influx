@@ -33,7 +33,7 @@
         "tests/unit/test_probes.py covers: Lithos stub returns ok by default and degraded under `INFLUX_TEST_LITHOS_DOWN=1`; LLM-credentials probe passes when all configured providers have their `api_key_env` set; providers with `api_key_env=\"\"` are skipped; the probe can be driven into a degraded state (including a missing-key scenario); stale cached probe results time out and are no longer treated as valid (timestamps may be exposed as supporting detail)"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "notes": "Implementation guidance: the existing startup check in `src/influx/config.py::_validate_provider_api_keys` (and related tests in `tests/unit/test_config.py`) may need to be relaxed so missing provider keys surface through the probe rather than preventing startup; any resulting wording change in `docs/REQUIREMENTS.md` should land in the same change. These are implementation notes, not acceptance criteria."
     },
     {
