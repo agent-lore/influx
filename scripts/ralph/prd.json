@@ -112,7 +112,7 @@
         "The app factory exposes a self-contained start/stop lifecycle contract that the `serve` handler (US-008) can drive"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

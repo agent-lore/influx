@@ -20,6 +20,11 @@
 - `_backfill_estimate_override` module-level var in `http_api.py` is the test hook for forcing estimator values — use `monkeypatch.setattr`
 - Background task via `asyncio.get_event_loop().create_task()` — acquires lock before responding 202, releases in background after `run_profile`
 - To test 409 overlap with sync TestClient, pre-acquire the lock via `asyncio.new_event_loop()` or use `async def` test
+- `InfluxService(config)` is the top-level service; `.start()` starts probe loop + scheduler, `.stop()` shuts down cleanly
+- `create_app(config)` builds FastAPI app with all deps on `app.state` without starting background tasks
+- `validate_bind_host(host, allow_remote_admin=...)` uses `ipaddress.ip_address().is_loopback` for the bind guard (AC-03-D)
+- `resolve_bind_address()` reads `INFLUX_ADMIN_BIND_HOST` (default `127.0.0.1`) and `INFLUX_ADMIN_PORT` (default `8080`)
+- `SecurityConfig.allow_remote_admin` (default False) and `ScheduleConfig.shutdown_grace_seconds` (default 30) are the US-007 schema extensions
 
 # Ralph Progress Log
 Started: Fri Apr 24 14:02:16 UTC 2026
@@ -136,4 +141,26 @@ Started: Fri Apr 24 14:02:16 UTC 2026
   - Pydantic `Field` must be explicitly imported — not included in the `BaseModel, model_validator` import line by default
   - Module-level `_backfill_estimate_override` + `monkeypatch.setattr` is a clean test hook pattern for stub estimators
   - All 234 tests pass (14 new POST /backfills + 220 existing)
+---
+
+## 2026-04-24 - US-007
+- Implemented service.py app factory, lifecycle, and local-admin bind guard
+- Extended `SecurityConfig` with `allow_remote_admin: bool = False`
+- Extended `ScheduleConfig` with `shutdown_grace_seconds: int = 30`
+- Created `src/influx/service.py` with:
+  - `resolve_bind_address()` — reads INFLUX_ADMIN_BIND_HOST / INFLUX_ADMIN_PORT
+  - `validate_bind_host()` — loopback check via `ipaddress.ip_address().is_loopback` (AC-03-D)
+  - `create_app(config)` — FastAPI factory wiring router, coordinator, scheduler, probe_loop on app.state
+  - `InfluxService(config)` — top-level service with start/stop lifecycle
+- Files changed:
+  - src/influx/config.py (added allow_remote_admin, shutdown_grace_seconds)
+  - src/influx/service.py (new: InfluxService, create_app, validate_bind_host, resolve_bind_address)
+  - tests/unit/test_service.py (new: 19 tests covering bind guard, resolve, app factory, lifecycle, config extensions)
+  - scripts/ralph/prd.json (US-007 passes: true)
+- **Learnings for future iterations:**
+  - `ipaddress.ip_address(host).is_loopback` handles both IPv4 and IPv6; falls back to `socket.getaddrinfo` for hostnames
+  - `getattr(r, "path", None)` avoids pyright reportAttributeAccessIssue on Starlette BaseRoute (which lacks .path)
+  - `InfluxService.start()` is idempotent; `.stop()` before `.start()` is a safe no-op
+  - Scheduler `.stop(wait=True)` blocks until running jobs complete — used for graceful shutdown
+  - All 253 tests pass (19 new service + 234 existing)
 ---

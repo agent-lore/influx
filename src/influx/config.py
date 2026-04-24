@@ -67,6 +67,7 @@ class ScheduleConfig(BaseModel):
     cron: str = "0 6 * * *"
     timezone: str = "UTC"
     misfire_grace_seconds: int = 3600
+    shutdown_grace_seconds: int = 30
 
 
 class StorageConfig(BaseModel):
@@ -89,6 +90,7 @@ class SecurityConfig(BaseModel):
     """``[security]`` SSRF guard and security settings."""
 
     allow_private_ips: bool = False
+    allow_remote_admin: bool = False
 
 
 # ── Profiles ─────────────────────────────────────────────────────────
