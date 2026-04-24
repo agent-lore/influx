@@ -20,6 +20,12 @@ Started: Fri Apr 24 20:42:49 UTC 2026
 - `render_archive_section(path)` renders `## Archive` section; `parse_archive_path(note)` extracts path from parsed note
 - `validate_archive_tag_invariant(archive_path=, tags=)` enforces path + archive-missing mutual exclusion
 - Archive path lives ONLY in `## Archive` section body — never in frontmatter or tags
+- `render_note(title=, source_url=, tags=, confidence=, archive_path=, summary=, keywords=, profile_entries=, user_notes=)` renders full canonical note
+- `ProfileRelevanceEntry(profile_name, score, reason)` is the data class for profile relevance entries
+- `parse_profile_relevance(parsed_note)` extracts `ProfileRelevanceEntry` list from `## Profile Relevance` section
+- `build_profile_relevance_for_rewrite(old_entries=, new_entries=, tags=)` merges profile entries, keeping old for rejected profiles
+- Frontmatter rendered manually (no PyYAML dep): note_type, namespace, source_url, tags, confidence
+- Golden file fixture at `tests/fixtures/golden_note.md` — update it when canonical format changes
 
 ---
 
@@ -96,4 +102,30 @@ Started: Fri Apr 24 20:42:49 UTC 2026
   - `_ARCHIVE_PATH_RE = re.compile(r"^path:\s*(.+)$")` — regex without MULTILINE correctly rejects multiline bodies
   - `ArchiveParseError` derives from `NoteParseError` (which derives from `InfluxError`)
   - `__all__` now also exports: `ArchiveInvariantError`, `ArchiveParseError`, `parse_archive_path`, `render_archive_section`, `validate_archive_tag_invariant`
+---
+
+## 2026-04-24 - US-007
+- Implemented `render_note()` full canonical renderer in `src/influx/notes.py`
+- Added `ProfileRelevanceEntry` dataclass, `parse_profile_relevance()`, `build_profile_relevance_for_rewrite()`
+- Created golden file fixture at `tests/fixtures/golden_note.md`
+- Created `tests/unit/test_user_notes_roundtrip.py` with 24 tests covering:
+  - Golden file render match and parse-rerender match
+  - User Notes byte-exact preservation (unicode, blank lines, nested headings)
+  - Absent User Notes gets empty heading
+  - Rejected profile keeps old entry (FR-NOTE-6)
+  - ingested-by:influx tag presence (FR-RES-6)
+  - Confidence computation for initial creation and rewrite (FR-NOTE-3/8)
+  - Section ordering (Archive before Summary before Profile Relevance before User Notes)
+  - Archive immediately after title
+  - Archive invariant enforced by renderer
+  - Frontmatter fields (note_type, namespace, source_url, tags)
+  - parse_profile_relevance extraction
+- Files changed: `src/influx/notes.py`, `tests/unit/test_user_notes_roundtrip.py`, `tests/fixtures/golden_note.md`
+- **Learnings for future iterations:**
+  - Frontmatter is rendered manually (no PyYAML dependency) — field order: note_type, namespace, source_url, tags, confidence
+  - `_format_confidence()` uses `round(val, 4)` then `str()` to avoid float repr noise
+  - `render_archive_section()` returns text ending with `\n`; add another `\n` after it to separate from next section
+  - `user_notes` parameter to `render_note()` is the byte-exact string from `parse_note().user_notes` — just append it
+  - `build_profile_relevance_for_rewrite()` resolves the rejection guard at the caller level — `render_note()` just renders what it's given
+  - `__all__` now also exports: `ProfileRelevanceEntry`, `build_profile_relevance_for_rewrite`, `parse_profile_relevance`, `render_note`
 ---

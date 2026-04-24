@@ -32,11 +32,15 @@ __all__ = [
     "NoteParseError",
     "ParsedNote",
     "ParsedSection",
+    "ProfileRelevanceEntry",
+    "build_profile_relevance_for_rewrite",
     "merge_tags",
     "parse_archive_path",
     "parse_note",
+    "parse_profile_relevance",
     "recompute_confidence",
     "render_archive_section",
+    "render_note",
     "validate_archive_tag_invariant",
 ]
 
@@ -428,3 +432,260 @@ def validate_archive_tag_invariant(
             "Cannot write both a path: line and influx:archive-missing "
             "tag on the same note"
         )
+
+
+# ── Full canonical renderer (FR-NOTE-1..8, US-007) ──────────────────
+
+
+@dataclass(frozen=True)
+class ProfileRelevanceEntry:
+    """One profile's relevance data for the ``## Profile Relevance`` section."""
+
+    profile_name: str
+    score: int
+    reason: str
+
+
+def _format_confidence(confidence: float) -> str:
+    """Format confidence as a clean decimal string for frontmatter."""
+    val = round(confidence, 4)
+    if val == int(val):
+        return f"{int(val)}.0"
+    return str(val)
+
+
+def _render_frontmatter(
+    *,
+    source_url: str,
+    tags: list[str],
+    confidence: float,
+) -> str:
+    """Render the YAML frontmatter content (between ``---`` fences)."""
+    lines = [
+        "note_type: summary",
+        "namespace: influx",
+        f"source_url: {source_url}",
+    ]
+    if tags:
+        lines.append("tags:")
+        for tag in tags:
+            lines.append(f"  - {tag}")
+    else:
+        lines.append("tags: []")
+    lines.append(f"confidence: {_format_confidence(confidence)}")
+    return "\n".join(lines)
+
+
+def _render_profile_relevance_body(
+    entries: list[ProfileRelevanceEntry],
+) -> str:
+    """Render the body of the ``## Profile Relevance`` section."""
+    parts: list[str] = []
+    for entry in entries:
+        parts.append(
+            f"### {entry.profile_name}\n"
+            f"Score: {entry.score}/10\n"
+            f"{entry.reason}"
+        )
+    return "\n\n".join(parts)
+
+
+def render_note(
+    *,
+    title: str,
+    source_url: str,
+    tags: list[str],
+    confidence: float,
+    archive_path: str | None,
+    summary: str,
+    keywords: list[str],
+    profile_entries: list[ProfileRelevanceEntry],
+    user_notes: str | None = None,
+) -> str:
+    """Render a full canonical Lithos note (FR-NOTE-1..8).
+
+    Parameters
+    ----------
+    title:
+        The ``# <Title>`` text (without the ``# `` prefix).
+    source_url:
+        Normalised canonical URL for frontmatter.
+    tags:
+        The final merged tag list (from :func:`merge_tags`).
+    confidence:
+        The confidence value for frontmatter.
+    archive_path:
+        POSIX-separator relative path or ``None`` for empty Archive.
+    summary:
+        The Tier-1 summary text for the ``## Summary`` section.
+    keywords:
+        Keywords from Tier-1 enrichment (may be empty).
+    profile_entries:
+        Profile relevance entries to render. For rewrites, use
+        :func:`build_profile_relevance_for_rewrite` to resolve
+        entries that honour the rejection guard.
+    user_notes:
+        Byte-exact ``## User Notes`` region from a previous parse,
+        or ``None`` to append an empty ``## User Notes`` heading.
+
+    Returns
+    -------
+    str
+        The complete canonical note text.
+
+    Raises
+    ------
+    ArchiveInvariantError
+        When *archive_path* is not ``None`` and *tags* contains
+        ``influx:archive-missing``.
+    """
+    validate_archive_tag_invariant(archive_path=archive_path, tags=tags)
+
+    frontmatter = _render_frontmatter(
+        source_url=source_url,
+        tags=tags,
+        confidence=confidence,
+    )
+    archive_section = render_archive_section(archive_path)
+
+    # Summary body
+    summary_body = summary
+    if keywords:
+        summary_body += f"\n\nKeywords: {', '.join(keywords)}"
+
+    # Compose note
+    output = f"---\n{frontmatter}\n---\n"
+    output += f"# {title}\n\n"
+    output += archive_section + "\n"
+    output += f"## Summary\n{summary_body}\n"
+
+    # Profile Relevance section
+    if profile_entries:
+        output += "\n"
+        pr_body = _render_profile_relevance_body(profile_entries)
+        output += f"## Profile Relevance\n{pr_body}\n"
+
+    # User Notes — preserved byte-exactly or empty heading appended
+    output += "\n"
+    if user_notes is not None:
+        output += user_notes
+    else:
+        output += "## User Notes\n"
+
+    return output
+
+
+# ── Profile relevance parse / rewrite helpers ────────────────────────
+
+_H3_RE = re.compile(r"^### (.+)$", re.MULTILINE)
+_SCORE_RE = re.compile(r"^Score:\s*(\d+)/10$", re.MULTILINE)
+
+
+def parse_profile_relevance(
+    note: ParsedNote,
+) -> list[ProfileRelevanceEntry]:
+    """Extract per-profile entries from ``## Profile Relevance``.
+
+    Parameters
+    ----------
+    note:
+        A ``ParsedNote`` from :func:`parse_note`.
+
+    Returns
+    -------
+    list[ProfileRelevanceEntry]
+        Entries in document order.  Empty when the section is absent.
+    """
+    section: ParsedSection | None = None
+    for s in note.sections:
+        if s.heading == "Profile Relevance":
+            section = s
+            break
+    if section is None:
+        return []
+
+    body = section.body
+    matches = list(_H3_RE.finditer(body))
+    entries: list[ProfileRelevanceEntry] = []
+
+    for idx, match in enumerate(matches):
+        profile_name = match.group(1)
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
+        entry_body = body[start:end].strip()
+
+        # Extract score
+        score = 0
+        score_match = _SCORE_RE.search(entry_body)
+        if score_match:
+            score = int(score_match.group(1))
+
+        # Reason is everything after the Score: line
+        reason_lines: list[str] = []
+        past_score = False
+        for line in entry_body.split("\n"):
+            if _SCORE_RE.match(line):
+                past_score = True
+                continue
+            if past_score:
+                reason_lines.append(line)
+        reason = "\n".join(reason_lines).strip()
+
+        entries.append(
+            ProfileRelevanceEntry(
+                profile_name=profile_name,
+                score=score,
+                reason=reason,
+            )
+        )
+
+    return entries
+
+
+def build_profile_relevance_for_rewrite(
+    *,
+    old_entries: list[ProfileRelevanceEntry],
+    new_entries: list[ProfileRelevanceEntry],
+    tags: list[str],
+) -> list[ProfileRelevanceEntry]:
+    """Resolve profile relevance entries for a rewrite (FR-NOTE-6).
+
+    Rejected profiles (``influx:rejected:<profile>`` in *tags*) keep
+    their old entries unchanged.  Non-rejected profiles use new entries.
+
+    Parameters
+    ----------
+    old_entries:
+        Entries from the previously parsed note.
+    new_entries:
+        Freshly computed entries for the current rewrite cycle.
+    tags:
+        The final merged tag list (used to detect rejection guards).
+
+    Returns
+    -------
+    list[ProfileRelevanceEntry]
+        The resolved entries to pass to :func:`render_note`.
+    """
+    rejected = {
+        t[len("influx:rejected:") :]
+        for t in tags
+        if t.startswith("influx:rejected:")
+    }
+
+    result: list[ProfileRelevanceEntry] = []
+    seen: set[str] = set()
+
+    # Non-rejected profiles use new entries
+    for entry in new_entries:
+        if entry.profile_name not in rejected:
+            result.append(entry)
+            seen.add(entry.profile_name)
+
+    # Rejected profiles keep old entries
+    for entry in old_entries:
+        if entry.profile_name in rejected and entry.profile_name not in seen:
+            result.append(entry)
+            seen.add(entry.profile_name)
+
+    return result
