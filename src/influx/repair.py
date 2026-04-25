@@ -14,8 +14,14 @@ implementations ship with PRD 07.
 from __future__ import annotations
 
 import enum
+import json
+import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from influx.config import AppConfig
+    from influx.lithos_client import LithosClient
 
 __all__ = [
     "ExtractionOutcome",
@@ -23,7 +29,10 @@ __all__ = [
     "ReExtractArchiveHook",
     "Tier2EnrichHook",
     "Tier3ExtractHook",
+    "sweep",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 # ── Abstract-only re-extraction outcome discriminator ────────────────
@@ -176,3 +185,55 @@ class Tier3ExtractHook(Protocol):
     """
 
     def __call__(self, note: dict[str, object]) -> None: ...
+
+
+# ── Sweep entry point ──────────────────────────────────────────────
+
+
+async def sweep(
+    profile: str,
+    *,
+    client: LithosClient,
+    config: AppConfig,
+) -> list[dict[str, Any]]:
+    """Run the repair sweep for *profile* (PRD 06 §5.1 FR-REP-1).
+
+    Fetches up to ``repair.max_items_per_run`` notes tagged
+    ``influx:repair-needed`` + ``profile:<profile>``, ordered by
+    ``updated_at`` ascending (oldest first).  Each candidate is
+    re-read via ``lithos_read`` before further processing.
+
+    Returns the list of re-read note dicts so downstream stages
+    (US-005+) can hang per-note logic off this loop.
+    """
+    limit = config.repair.max_items_per_run
+    list_result = await client.list_notes(
+        tags=["influx:repair-needed", f"profile:{profile}"],
+        limit=limit,
+        order_by="updated_at",
+        order="asc",
+    )
+
+    text = list_result.content[0].text  # type: ignore[union-attr]
+    body = json.loads(text)
+    items: list[dict[str, Any]] = body.get("items", [])
+
+    if not items:
+        logger.debug("repair sweep for %r: no candidates found", profile)
+        return []
+
+    logger.info(
+        "repair sweep for %r: visiting %d candidate(s)",
+        profile,
+        len(items),
+    )
+
+    visited: list[dict[str, Any]] = []
+    for item in items:
+        note_id = item.get("id", "")
+        if not note_id:
+            continue
+        note = await client.read_note(note_id=note_id)
+        visited.append(note)
+
+    return visited
