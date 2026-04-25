@@ -15,8 +15,10 @@ import asyncio
 import dataclasses
 import json
 import logging
+import re
 from contextlib import AsyncExitStack
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp import types as mcp_types
 from mcp.client.session import ClientSession
@@ -31,14 +33,69 @@ __all__ = ["LithosClient", "WriteResult"]
 class WriteResult:
     """Result of a ``write_note`` call after envelope handling (FR-MCP-7).
 
-    *status*: ``"created"`` for a successful write, ``"duplicate"``
+    *status*: ``"created"`` / ``"updated"`` for success, ``"duplicate"``
     for an already-ingested item (caller increments ``dedup_skipped``),
-    ``"invalid_input"`` for a malformed payload (logged + skipped).
+    ``"invalid_input"`` for a malformed payload (logged + skipped),
+    ``"slug_collision"`` when both retries exhausted (logged + skipped),
+    ``"version_conflict"`` when both retries exhausted (logged + skipped).
     """
 
     status: str
     source_url: str
     detail: str = ""
+
+
+# ── Pure helpers ────────────────────────────────────────────────────
+
+_ARXIV_ID_RE = re.compile(r"arxiv\.org/abs/([^\s?#]+)")
+
+
+def _extract_slug_suffix(source_url: str) -> str:
+    """Compute disambiguating title suffix for slug_collision retry.
+
+    arXiv URLs get `` [arXiv <id>]``; all others get `` [<host>]``
+    (FR-MCP-7, AC-05-D).
+    """
+    m = _ARXIV_ID_RE.search(source_url)
+    if m:
+        return f" [arXiv {m.group(1)}]"
+    host = urlparse(source_url).hostname or urlparse(source_url).netloc
+    return f" [{host}]"
+
+
+def _merge_tags(
+    existing_tags: list[str], new_tags: list[str]
+) -> list[str]:
+    """Merge tags: new tags first, then existing tags not already present."""
+    seen = set(new_tags)
+    merged = list(new_tags)
+    for tag in existing_tags:
+        if tag not in seen:
+            merged.append(tag)
+            seen.add(tag)
+    return merged
+
+
+_USER_NOTES_MARKER = "## User Notes"
+
+
+def _preserve_user_notes(
+    existing_content: str, new_content: str
+) -> str:
+    """Merge content, preserving ``## User Notes`` from the existing note.
+
+    The ``## User Notes`` section and everything beneath it in
+    *existing_content* replaces any ``## User Notes`` already present
+    in *new_content* (AC-05-E).
+    """
+    idx = existing_content.find(_USER_NOTES_MARKER)
+    if idx == -1:
+        return new_content
+    user_notes_block = existing_content[idx:]
+
+    new_idx = new_content.find(_USER_NOTES_MARKER)
+    base = new_content[:new_idx].rstrip() if new_idx != -1 else new_content.rstrip()
+    return base + "\n\n" + user_notes_block
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +214,12 @@ class LithosClient:
             {"query": query, "source_url": source_url},
         )
 
+    async def read_note(self, *, note_id: str) -> dict[str, Any]:
+        """Read a note by ID (used for version_conflict re-reads)."""
+        result = await self.call_tool("lithos_read", {"id": note_id})
+        text = result.content[0].text  # type: ignore[union-attr]
+        return json.loads(text)
+
     async def write_note(
         self,
         *,
@@ -173,8 +236,11 @@ class LithosClient:
     ) -> WriteResult:
         """Write a note to Lithos with envelope handling (FR-MCP-6/7).
 
-        Handles ``duplicate`` (treated as hit, no retry) and
-        ``invalid_input`` (logged + skipped, no exception) envelopes.
+        Handles ``duplicate`` (treated as hit, no retry),
+        ``invalid_input`` (logged + skipped, no exception),
+        ``slug_collision`` (retry once with disambiguating title suffix,
+        AC-05-D), and ``version_conflict`` (re-read + tag-merge +
+        user-notes preservation + retry once, AC-05-E).
         Returns a :class:`WriteResult` so callers can inspect the
         outcome and increment counters (e.g. ``dedup_skipped``).
         """
@@ -184,7 +250,7 @@ class LithosClient:
             "agent": agent,
             "path": path,
             "source_url": source_url,
-            "tags": tags,
+            "tags": list(tags),
             "confidence": confidence,
             "note_type": note_type,
             "namespace": namespace,
@@ -192,7 +258,82 @@ class LithosClient:
         if expires_at is not None:
             args["expires_at"] = expires_at
         result = await self.call_tool("lithos_write", args)
-        return self._parse_write_response(result, source_url=source_url)
+        parsed = self._parse_write_response(result, source_url=source_url)
+
+        if parsed.status == "slug_collision":
+            return await self._retry_slug_collision(
+                args, source_url=source_url
+            )
+
+        if parsed.status == "version_conflict":
+            return await self._retry_version_conflict(
+                args,
+                note_id=parsed.detail,
+                source_url=source_url,
+                original_tags=tags,
+            )
+
+        return parsed
+
+    # ── Slug-collision retry (AC-05-D) ──────────────────────────────
+
+    async def _retry_slug_collision(
+        self,
+        args: dict[str, Any],
+        *,
+        source_url: str,
+    ) -> WriteResult:
+        """Retry once with a disambiguating title suffix (AC-05-D)."""
+        suffix = _extract_slug_suffix(source_url)
+        retry_args = {**args, "title": args["title"] + suffix}
+        result = await self.call_tool("lithos_write", retry_args)
+        parsed = self._parse_write_response(result, source_url=source_url)
+        if parsed.status == "slug_collision":
+            logger.warning(
+                "lithos_write slug_collision retry failed for %s",
+                source_url,
+            )
+        return parsed
+
+    # ── Version-conflict retry (AC-05-E) ────────────────────────────
+
+    async def _retry_version_conflict(
+        self,
+        args: dict[str, Any],
+        *,
+        note_id: str,
+        source_url: str,
+        original_tags: list[str],
+    ) -> WriteResult:
+        """Re-read, merge tags + user notes, retry once (AC-05-E)."""
+        existing = await self.read_note(note_id=note_id)
+        existing_tags: list[str] = existing.get("tags", [])
+        merged_tags = _merge_tags(existing_tags, original_tags)
+        existing_content: str = existing.get("content", "")
+        merged_content = _preserve_user_notes(
+            existing_content, args["content"]
+        )
+        retry_args = {
+            **args,
+            "tags": merged_tags,
+            "content": merged_content,
+        }
+        version = existing.get("version")
+        if version is not None:
+            retry_args["expected_version"] = version
+        if note_id:
+            retry_args["id"] = note_id
+
+        result = await self.call_tool("lithos_write", retry_args)
+        parsed = self._parse_write_response(result, source_url=source_url)
+        if parsed.status == "version_conflict":
+            logger.warning(
+                "lithos_write version_conflict retry failed for %s",
+                source_url,
+            )
+        return parsed
+
+    # ── Response parsing ────────────────────────────────────────────
 
     def _parse_write_response(
         self,
@@ -221,6 +362,19 @@ class LithosClient:
                 status="invalid_input",
                 source_url=source_url,
                 detail=reason,
+            )
+
+        if status == "slug_collision":
+            return WriteResult(
+                status="slug_collision", source_url=source_url
+            )
+
+        if status == "version_conflict":
+            note_id = body.get("note_id", "")
+            return WriteResult(
+                status="version_conflict",
+                source_url=source_url,
+                detail=note_id,
             )
 
         return WriteResult(status=status, source_url=source_url)

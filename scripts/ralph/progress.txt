@@ -23,8 +23,16 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - FakeLithosServer has `lithos_write` tool registered; returns `{"status": "created"}` by default
 - FakeLithosServer has `write_responses: list[str]` queue for configurable write responses (FIFO, pops from front; falls back to default when empty)
 - `write_note()` returns `WriteResult(status, source_url, detail)` dataclass instead of raw `CallToolResult`; callers check `result.status` to determine outcome
-- `_parse_write_response()` private method handles envelope parsing; future stories extend it for slug_collision, version_conflict, content_too_large
-- 550 tests passing after US-008
+- `_parse_write_response()` private method handles envelope parsing for all write statuses (duplicate, invalid_input, slug_collision, version_conflict, content_too_large)
+- `_extract_slug_suffix(source_url)` module-level helper: arXiv → ` [arXiv <id>]`, web → ` [<host>]`
+- `_merge_tags(existing, new)` module-level helper: new tags first, then existing not already present
+- `_preserve_user_notes(existing_content, new_content)` module-level helper: preserves `## User Notes` section from existing note
+- `LithosClient.read_note(note_id=...)` wraps `lithos_read` MCP tool for version_conflict re-reads
+- FakeLithosServer has `read_responses: list[str]` queue (FIFO) for `lithos_read` tool; also has `lithos_read` tool registered
+- FakeLithosServer `lithos_write` tool accepts optional `id` and `expected_version` params (for retry writes)
+- `write_note()` handles slug_collision via `_retry_slug_collision()` and version_conflict via `_retry_version_conflict()`; each retries exactly once
+- version_conflict response includes `note_id` in body: `{"status": "version_conflict", "note_id": "..."}`
+- 558 tests passing after US-009
 
 ---
 
@@ -126,4 +134,23 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - `clear_fake_calls` fixture now also clears `write_responses` — tests that set overrides don't leak to other tests
   - `caplog.at_level(logging.WARNING)` in async pytest tests works with `pytest.LogCaptureFixture` type annotation
   - 550 tests pass (6 new contract tests added)
+---
+
+## 2026-04-25 - US-009
+- Implemented slug_collision retry: `_retry_slug_collision()` with title suffix disambiguation (arXiv → ` [arXiv <id>]`, web → ` [<host>]`)
+- Implemented version_conflict retry: `_retry_version_conflict()` with re-read + tag-merge + `## User Notes` preservation
+- Added `read_note()` method to `LithosClient` wrapping `lithos_read` MCP tool
+- Added 3 module-level pure helpers: `_extract_slug_suffix()`, `_merge_tags()`, `_preserve_user_notes()`
+- Extended `_parse_write_response()` to handle `slug_collision` and `version_conflict` statuses
+- Added `lithos_read` tool + `read_responses` queue to `FakeLithosServer`
+- Updated `lithos_write` fake tool to accept optional `id` and `expected_version` params
+- Added 8 contract tests: 4 for slug_collision (arXiv suffix, web suffix, second collision skip, log), 4 for version_conflict (merge + retry, user-notes preservation, second conflict skip, log)
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `_retry_slug_collision` and `_retry_version_conflict` are private async methods that handle the retry loop; `write_note()` dispatches to them based on `_parse_write_response()` status
+  - For version_conflict, the server response body must include `note_id` so the wrapper can re-read: `{"status": "version_conflict", "note_id": "..."}`
+  - Tag merge is order-preserving: new tags first, then existing tags not already present (simple set-union approach)
+  - `_preserve_user_notes()` finds `## User Notes` marker in existing content and replaces/appends it to new content
+  - `clear_fake_calls` fixture also clears `read_responses` to prevent test leakage
+  - 558 tests pass (8 new contract tests added)
 ---

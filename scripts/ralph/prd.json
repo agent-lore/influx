@@ -128,7 +128,7 @@
         "tests/contract/test_lithos_client.py covers AC-05-E: re-read + tag-merge + user-notes preservation on first conflict (assert the second write payload contains merged tags AND the original `## User Notes` block is preserved), skip + log on second conflict"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
