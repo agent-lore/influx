@@ -267,3 +267,19 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - Low-score notes (score < thresholds) naturally bypass Tier 2/3 clearing requirements, making archive-only repair testable
   - All tests pass: 771 passed, pyright 0 errors, ruff clean
 ---
+
+## 2026-04-25 - US-017
+- Created `tests/integration/test_repair_sweep_abstract_only.py` with 6 tests across 3 test classes
+- Outcome (a) Upgrade: fake hook returns Upgrade; text:abstract-only replaced with text:html, no influx:text-terminal, influx:repair-needed cleared
+- Outcome (b) Terminal: fake hook returns Terminal; text:abstract-only kept, influx:text-terminal added; low-score variant clears repair-needed
+- Outcome (c) Transient: fake hook returns Transient; tags unchanged (text:abstract-only + influx:repair-needed kept, no influx:text-terminal)
+- ExtractionError variant: treated as Transient (same tag assertions)
+- Re-entry test: transient failure in run 1, upgrade succeeds in run 2 — proves note re-enters the sweep
+- Each test starts from note tagged `text:abstract-only` + `influx:repair-needed` with non-empty `path:` line in `## Archive`
+- Files changed: `tests/integration/test_repair_sweep_abstract_only.py` (created), `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - Same `_queue_single_note()` + `FakeLithosServer` pattern works for all sweep integration tests
+  - Fake hooks are plain functions matching Protocol signatures (e.g. `ReExtractArchiveHook`)
+  - Multi-run tests: clear `fake_lithos.calls`, rebuild note with run 1's written tags, re-queue
+  - All tests pass: 777 passed, pyright 0 errors, ruff clean
+---
