@@ -6,8 +6,10 @@ Started: Sat Apr 25 19:50:21 UTC 2026
 - Test style: classes grouped by `TestXPositive` / `TestXNegative` with `pytest.raises(ValidationError)` for negative cases
 - Test file naming: `tests/unit/test_<topic>.py`
 - Existing enrich.py has a stub `Tier1Result` dataclass + `tier1_enrich` function that PRD 07 replaces
-- Full test suite (829 tests) runs in ~90s via `uv run pytest`
+- Full test suite (878 tests) runs in ~93s via `uv run pytest`
 - Ruff + pyright are the quality gates (`uv run ruff check`, `uv run ruff format --check`, `uv run pyright`)
+- Tier3Extraction uses `field_validator` with `mode="before"` for trim+truncate, `mode="after"` for non-empty check
+- Use `_valid(**overrides)` helper in test files for concise payload construction with overrides
 ---
 
 ## 2026-04-25 - US-001
@@ -18,4 +20,39 @@ Started: Sat Apr 25 19:50:21 UTC 2026
   - Pydantic `Field(min_length=1, max_length=6)` on `list[str]` enforces list length bounds cleanly
   - The existing `FilterResult`/`FilterResponse` in schemas.py follows the same bounded-list pattern — good reference
   - Virtual env may need recreation if Python interpreter changed (uv handles this automatically)
+---
+
+## 2026-04-25 - US-002
+- Added `Tier3Extraction` Pydantic schema to `src/influx/schemas.py` with `claims` [1,10], `datasets`/`builds_on`/`open_questions`/`potential_connections` [0,10], 500-char truncation via `field_validator`, non-empty string validation
+- Created `tests/unit/test_tier3_schema.py` with 25 tests (12 positive, 13 negative) covering all list-length bounds and non-empty string validation
+- Created `tests/unit/test_tier3_truncation.py` with 9 tests covering 500-char truncation across all fields
+- Files changed: `src/influx/schemas.py`, `tests/unit/test_tier3_schema.py`, `tests/unit/test_tier3_truncation.py`
+- **Learnings for future iterations:**
+  - Pydantic `field_validator` with `mode="before"` runs before Pydantic's own validation — ideal for trim+truncate that must happen before length checks
+  - `mode="after"` runs after Pydantic validation — good for semantic checks like non-empty after trim
+  - `default_factory=list` on optional list fields avoids mutable default pitfalls and lets callers omit them
+  - Full test suite is 863 tests after US-001 + US-002, all passing
+---
+
+## 2026-04-25 - US-003
+- Added 7 unit tests to `tests/unit/test_config.py`: 3 for ExtractionConfig defaults (min_html_chars=1000, min_web_chars=500, strip_tags=[script,iframe,object,embed]) and 4 for user-supplied overrides flowing through
+- No code changes needed — ExtractionConfig already had correct defaults in `src/influx/config.py` and `influx.example.toml`
+- Files changed: `tests/unit/test_config.py`
+- **Learnings for future iterations:**
+  - ExtractionConfig is already fully declared with PRD 07 defaults; US-003 was test-only
+  - Config test pattern: `_write_config(tmp_path, toml)` + `monkeypatch.setenv("INFLUX_CONFIG", ...)` + `load_config()`
+  - Full test suite is 870 tests after US-001 + US-002 + US-003, all passing
+---
+
+## 2026-04-25 - US-004
+- Created `tests/unit/test_prompt_contracts.py` with 8 tests validating the shipped tier1_enrich and tier3_extract prompt variable contracts
+- Tests load prompt text directly from `influx.example.toml` to verify variable sets match the `REQUIRED_VARIABLES` contract
+- Covers: load_prompt returns text, validate_prompt_variables accepts shipped prompts, tampered prompts (extra/missing variable) rejected with PromptValidationError
+- No code changes needed — prompts already shipped in `influx.example.toml` with correct variables; `REQUIRED_VARIABLES` already declares the contract in `src/influx/prompts.py`
+- Files changed: `tests/unit/test_prompt_contracts.py`
+- **Learnings for future iterations:**
+  - Shipped prompts live in `influx.example.toml` under `[prompts.tier1_enrich]` and `[prompts.tier3_extract]`
+  - TOML multiline strings (`"""..."""`) include leading/trailing newlines — use `.strip()` for comparison
+  - `validate_prompt_variables` correctly ignores `{{escaped}}` braces in prompt text (JSON examples in prompts)
+  - Full test suite is 878 tests after US-001…US-004, all passing
 ---
