@@ -253,7 +253,7 @@
         "A successful-dry-connect test against a fake Lithos SSE server confirms the agent_register payload reaches the server and `validate-config` exits zero"
       ],
       "priority": 17,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

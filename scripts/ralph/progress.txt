@@ -58,6 +58,8 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - `post_run_webhook_hook(result, config, *, kind)` in `service.py` — no-op for `RunKind.BACKFILL`, reads threshold from profile config, delegates to `send_digest`
 - Fake HTTP receiver pattern for tests: `HTTPServer(("127.0.0.1", 0), Handler)` with class-level `received` list and `request_count`; fixture yields URL, shuts down server on teardown
 - 605 tests passing after US-016
+- `_cmd_validate_config()` in `main.py` does Lithos SSE dry-connect after config validation; skipped when `lithos.url` is empty
+- 607 tests passing after US-017
 
 ---
 
@@ -297,4 +299,21 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - Hanging handler tests: `time.sleep(30)` in handler + `timeout_seconds=1` in sender creates reliable timeout; test takes ~1s not 30s
   - Pyright requires `Generator[str]` return type on pytest fixtures that use `yield`; plain `-> str` causes `reportReturnType` error
   - 605 tests pass (11 new unit tests added)
+---
+
+## 2026-04-25 - US-017
+- Extended `_cmd_validate_config()` in `main.py` to dry-connect to Lithos via SSE + auto-`agent_register` (FR-CLI-5)
+- Uses `LithosClient._ensure_connected()` which lazily opens SSE and auto-calls `lithos_agent_register`
+- Skips dry-connect when `lithos.url` is empty (existing behavior preserved)
+- On failure, exits non-zero with error message naming the configured SSE endpoint URL (AC-05-K)
+- Added 2 tests in `tests/unit/test_cli_dispatch.py`:
+  - AC-05-K: unreachable Lithos → exit 2 with SSE endpoint in error message
+  - Successful dry-connect: fake FastMCP server receives `agent_register` payload, exit 0
+- Files changed: `src/influx/main.py`, `tests/unit/test_cli_dispatch.py`
+- **Learnings for future iterations:**
+  - `LithosClient._ensure_connected()` auto-calls `lithos_agent_register` on every new connection — no need to call it separately
+  - `asyncio.run()` in a synchronous function works cleanly for one-shot async operations in CLI commands
+  - For fake MCP servers in non-contract tests: inline `FastMCP` + `uvicorn.Server` in a daemon thread works; remember to wait for socket readiness
+  - Existing validate-config tests with `influx_config_env` fixture are unaffected because config has empty `lithos.url` → dry-connect skipped
+  - 607 tests pass (2 new unit tests added)
 ---

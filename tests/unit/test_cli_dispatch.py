@@ -388,6 +388,138 @@ class TestValidateConfigUnchanged:
         assert captured.out.strip().startswith("{")
 
 
+def _write_config_with_lithos(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, lithos_url: str
+) -> None:
+    """Write a minimal config pointing at *lithos_url* and set env."""
+    from pathlib import Path
+    from textwrap import dedent
+
+    config_path = Path(str(tmp_path)) / "influx.toml"
+    config_path.write_text(
+        dedent(f"""\
+            [lithos]
+            url = "{lithos_url}"
+            transport = "sse"
+
+            [prompts.filter]
+            text = "f"
+            [prompts.tier1_enrich]
+            text = "e"
+            [prompts.tier3_extract]
+            text = "x"
+        """)
+    )
+    monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+
+class TestValidateConfigLithosUnreachable:
+    """AC-05-K: Lithos unreachable → exit non-zero naming SSE endpoint."""
+
+    def test_unreachable_lithos_exits_nonzero_with_endpoint(
+        self,
+        tmp_path: object,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import socket
+
+        # Find a port that nothing is listening on.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        unreachable_url = f"http://127.0.0.1:{port}/sse"
+        _write_config_with_lithos(tmp_path, monkeypatch, unreachable_url)
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate-config"])
+
+        assert exc_info.value.code == EXIT_FAILURE
+        captured = capsys.readouterr()
+        # Error message MUST name the configured SSE endpoint (AC-05-K).
+        assert unreachable_url in captured.err
+
+
+class TestValidateConfigLithosDryConnect:
+    """Successful dry-connect against a fake Lithos MCP SSE server."""
+
+    def test_dry_connect_success_registers_agent(
+        self,
+        tmp_path: object,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """validate-config opens SSE + sends agent_register, exits 0."""
+        import socket
+        import threading
+        import time
+
+        import uvicorn
+        from mcp.server.fastmcp import FastMCP
+
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        mcp_app = FastMCP("fake-lithos-vc")
+
+        @mcp_app.tool(name="lithos_agent_register")
+        async def lithos_agent_register(
+            id: str = "", name: str = "", type: str = ""
+        ) -> str:
+            calls.append(
+                ("lithos_agent_register", {"id": id, "name": name, "type": type})
+            )
+            return '{"registered": true}'
+
+        # Find a free port.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        config = uvicorn.Config(
+            mcp_app.sse_app(),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        # Wait for the server to start.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise RuntimeError("Fake Lithos server did not start")
+
+        lithos_url = f"http://127.0.0.1:{port}/sse"
+        _write_config_with_lithos(tmp_path, monkeypatch, lithos_url)
+
+        try:
+            # Should NOT raise SystemExit — exit 0.
+            main(["validate-config"])
+
+            captured = capsys.readouterr()
+            assert captured.out.strip().startswith("{")
+
+            # The fake server must have received agent_register.
+            register_calls = [
+                c for c in calls if c[0] == "lithos_agent_register"
+            ]
+            assert len(register_calls) >= 1
+            payload = register_calls[0][1]
+            assert payload["id"] == "influx"
+            assert payload["name"] == "Influx Pipeline"
+            assert payload["type"] == "ingestion-pipeline"
+        finally:
+            server.should_exit = True
+
+
 # ── migrate-notes ─────────────────────────────────────────────────────
 
 

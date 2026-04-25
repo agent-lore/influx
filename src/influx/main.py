@@ -97,9 +97,45 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_validate_config() -> None:
-    """Load config, print the effective config model, and exit 0."""
+    """Load config, print the effective config, dry-connect to Lithos, and exit 0.
+
+    After config validation, opens an SSE connection to the configured
+    Lithos endpoint and calls ``lithos_agent_register`` to verify
+    connectivity (FR-CLI-5, AC-05-K).  On connection failure, exits
+    non-zero with an error naming the SSE endpoint.
+    """
+    import asyncio
+
+    from influx.lithos_client import LithosClient
+
     config = load_config()
     print(config.model_dump_json(indent=2))
+
+    # Skip Lithos dry-connect if no URL is configured.
+    if not config.lithos.url:
+        return
+
+    lithos_url = config.lithos.url
+
+    async def _dry_connect() -> None:
+        client = LithosClient(
+            url=lithos_url,
+            transport=config.lithos.transport,
+        )
+        try:
+            # _ensure_connected opens SSE + auto-calls agent_register.
+            await client._ensure_connected()  # noqa: SLF001
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(_dry_connect())
+    except Exception as exc:
+        print(
+            f"influx: Lithos dry-connect failed for {lithos_url}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_FAILURE)
 
 
 def _cmd_migrate_notes() -> None:
