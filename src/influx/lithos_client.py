@@ -20,7 +20,7 @@ from mcp import types as mcp_types
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 
-from influx.errors import ConfigError
+from influx.errors import ConfigError, LithosError
 
 __all__ = ["LithosClient"]
 
@@ -114,6 +114,32 @@ class LithosClient:
         """
         await self.close()
         await self._ensure_connected()
+
+    async def cache_lookup(
+        self, *, query: str | None, source_url: str | None
+    ) -> mcp_types.CallToolResult:
+        """Look up a note in the Lithos cache (FR-MCP-3, AC-05-A).
+
+        Both *query* and *source_url* are required — the chokepoint
+        raises ``LithosError("missing_lookup_arg")`` BEFORE any RPC
+        when either argument is ``None`` or an empty string.
+        """
+        if not query:
+            raise LithosError(
+                "missing_lookup_arg",
+                operation="cache_lookup",
+                detail="query is required",
+            )
+        if not source_url:
+            raise LithosError(
+                "missing_lookup_arg",
+                operation="cache_lookup",
+                detail="source_url is required",
+            )
+        return await self.call_tool(
+            "lithos_cache_lookup",
+            {"query": query, "source_url": source_url},
+        )
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None

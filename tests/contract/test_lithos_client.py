@@ -16,7 +16,7 @@ import pytest
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 
-from influx.errors import ConfigError
+from influx.errors import ConfigError, LithosError
 from influx.lithos_client import LithosClient
 
 # ── Fake Lithos SSE server ──────────────────────────────────────────
@@ -284,5 +284,117 @@ class TestAgentRegister:
             # Both calls carry identical payload.
             assert register_calls[0][1] == _EXPECTED_REGISTER_PAYLOAD
             assert register_calls[1][1] == _EXPECTED_REGISTER_PAYLOAD
+        finally:
+            await client.close()
+
+
+# ── Cache lookup chokepoint (FR-MCP-3, AC-05-A) ───────────────────
+
+
+class TestCacheLookupChokepoint:
+    """``cache_lookup`` enforces both query and source_url (AC-05-A)."""
+
+    async def test_empty_query_raises_before_rpc(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Empty string query raises LithosError; zero RPCs sent."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with pytest.raises(LithosError, match="missing_lookup_arg"):
+                await client.cache_lookup(query="", source_url="https://x")
+            # No connection was made, so zero calls total.
+            lookup_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
+            ]
+            assert len(lookup_calls) == 0
+        finally:
+            await client.close()
+
+    async def test_none_query_raises_before_rpc(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """None query raises LithosError; zero RPCs sent."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with pytest.raises(LithosError, match="missing_lookup_arg"):
+                await client.cache_lookup(query=None, source_url="https://x")
+            lookup_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
+            ]
+            assert len(lookup_calls) == 0
+        finally:
+            await client.close()
+
+    async def test_empty_source_url_raises_before_rpc(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Empty source_url raises LithosError; zero RPCs sent."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with pytest.raises(LithosError, match="missing_lookup_arg"):
+                await client.cache_lookup(query="some query", source_url="")
+            lookup_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
+            ]
+            assert len(lookup_calls) == 0
+        finally:
+            await client.close()
+
+    async def test_none_source_url_raises_before_rpc(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """None source_url raises LithosError; zero RPCs sent."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with pytest.raises(LithosError, match="missing_lookup_arg"):
+                await client.cache_lookup(query="some query", source_url=None)
+            lookup_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
+            ]
+            assert len(lookup_calls) == 0
+        finally:
+            await client.close()
+
+    async def test_happy_path_reaches_server(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Well-formed cache_lookup reaches server; response forwarded."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.cache_lookup(
+                query="Attention Is All You Need",
+                source_url="https://arxiv.org/abs/1706.03762",
+            )
+            # The wrapper forwards the Lithos response unchanged.
+            assert result is not None
+            # Verify the fake server received the correct arguments.
+            lookup_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
+            ]
+            assert len(lookup_calls) == 1
+            assert lookup_calls[0][1] == {
+                "query": "Attention Is All You Need",
+                "source_url": "https://arxiv.org/abs/1706.03762",
+            }
+            # Response content should contain the fake server's response.
+            assert len(result.content) > 0
+            text_content = result.content[0]
+            assert text_content.type == "text"
+            assert "hit" in text_content.text  # type: ignore[union-attr]
         finally:
             await client.close()
