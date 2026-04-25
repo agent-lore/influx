@@ -238,7 +238,7 @@
         "A test covers timeout/no-retry: a fake receiver that hangs longer than the configured `notifications.timeout_seconds` causes the sender to time out, log, and return — and the receiver records exactly ONE request attempt (no retry)"
       ],
       "priority": 16,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

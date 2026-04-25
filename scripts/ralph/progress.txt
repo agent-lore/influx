@@ -53,6 +53,11 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - §11.1 full digest: `type`, `run_date`, `profile`, `stats` (with `high_relevance`), `highlights`, `all_ingested`
 - §11.2 quiet digest: `type`, `run_date`, `profile`, `stats` (no `high_relevance`), `message` — NO `highlights`/`all_ingested` keys
 - 594 tests passing after US-015
+- `guarded_post_json(url, payload, *, allow_private_ips, timeout_seconds)` in `http_client.py` does POST with SSRF+scheme guards; returns HTTP status code
+- `send_digest(digest, *, webhook_url, timeout_seconds, allow_private_ips)` in `notifications.py` — silently skips on empty URL, catches/logs all errors
+- `post_run_webhook_hook(result, config, *, kind)` in `service.py` — no-op for `RunKind.BACKFILL`, reads threshold from profile config, delegates to `send_digest`
+- Fake HTTP receiver pattern for tests: `HTTPServer(("127.0.0.1", 0), Handler)` with class-level `received` list and `request_count`; fixture yields URL, shuts down server on teardown
+- 605 tests passing after US-016
 
 ---
 
@@ -272,4 +277,24 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - US-016 will add the HTTP sender and service.py post-run hook to this same module
   - `HighlightItem.to_dict()` and `IngestedItem.to_dict()` handle JSON serialisation
   - 594 tests pass (10 new unit tests added)
+---
+
+## 2026-04-25 - US-016
+- Added `guarded_post_json()` to `http_client.py` — POST with SSRF+scheme guards, configurable timeout, no retry
+- Added `send_digest()` sender to `notifications.py` — POSTs digest JSON via guarded client, silently skips empty URL (FR-NOT-5), catches/logs all errors
+- Added `post_run_webhook_hook()` to `service.py` — callable seam: no-op for backfills (FR-NOT-4), reads `notify_immediate` threshold from profile config, delegates to `send_digest`
+- Created `tests/unit/test_webhook_sender.py` with 11 tests covering all ACs:
+  - AC-05-I: digest POST reaches fake receiver with FR-NOT-2 body keys + threshold-based highlights
+  - AC-05-J: empty webhook URL → zero requests
+  - FR-NOT-4: backfill kind → zero requests; manual/scheduled → request sent
+  - Timeout/no-retry: hanging receiver → exactly 1 request attempt, warning logged, no raise
+  - Hook integration: threshold from config, empty URL skip
+- Files changed: `src/influx/http_client.py`, `src/influx/notifications.py`, `src/influx/service.py`, `tests/unit/test_webhook_sender.py` (new)
+- **Learnings for future iterations:**
+  - `guarded_post_json` reuses `_validate_scheme` and `_ssrf_check` from `guarded_fetch` — keeps all HTTP guards in one module
+  - `send_digest` uses deferred import `from influx.http_client import guarded_post_json` to avoid circular imports
+  - For fake HTTP servers in tests: use `HTTPServer(("127.0.0.1", 0), Handler)` with class-level mutable state (`received`, `request_count`); fixture yields URL string
+  - Hanging handler tests: `time.sleep(30)` in handler + `timeout_seconds=1` in sender creates reliable timeout; test takes ~1s not 30s
+  - Pyright requires `Generator[str]` return type on pytest fixtures that use `yield`; plain `-> str` causes `reportReturnType` error
+  - 605 tests pass (11 new unit tests added)
 ---
