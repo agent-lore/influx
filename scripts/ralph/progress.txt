@@ -48,6 +48,11 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - FakeLithosServer has `list_responses: list[str]` queue (FIFO) for configurable `lithos_list` responses
 - §6.3 negative-example format: `- "{title}" (rejected)` — one line per title, truncated at `filter.negative_example_max_title_chars` (default 200)
 - 584 tests passing after US-014
+- `build_digest()` in `notifications.py` is the pure digest builder; takes `ProfileRunResult` + `notify_immediate_threshold` kwarg, returns JSON-serialisable dict
+- `HighlightItem`, `IngestedItem`, `RunStats`, `ProfileRunResult` are frozen dataclasses in `notifications.py` — all have `.to_dict()` or dict conversion
+- §11.1 full digest: `type`, `run_date`, `profile`, `stats` (with `high_relevance`), `highlights`, `all_ingested`
+- §11.2 quiet digest: `type`, `run_date`, `profile`, `stats` (no `high_relevance`), `message` — NO `highlights`/`all_ingested` keys
+- 594 tests passing after US-015
 
 ---
 
@@ -251,4 +256,20 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - `format_negative_examples` is pure (no I/O); `fetch_rejection_titles` is async (needs LithosClient); `build_negative_examples_block` is the async convenience that combines both
   - Tag integrity test verifies FR-FB-3 behaviorally: exercises write wrappers and asserts no `influx:rejected:*` tag is synthesized by Influx
   - 584 tests pass (12 new tests added: 6 unit + 6 contract)
+---
+
+## 2026-04-25 - US-015
+- Created `src/influx/notifications.py` with pure `build_digest()` function producing §11.1 (full) and §11.2 (quiet) JSON shapes
+- Defined frozen dataclasses: `HighlightItem`, `IngestedItem`, `RunStats`, `ProfileRunResult`
+- `highlights` selected by `score >= notify_immediate_threshold` (from config, not hardcoded — AC-X-1, AC-05-I)
+- `related_in_lithos` always `[]` until PRD 08 (FR-NOT-6)
+- Zero-ingest runs produce quiet digest with `message` and no `highlights`/`all_ingested` keys (§11.2)
+- Created `tests/unit/test_webhook_digest.py` with 10 tests: 7 non-zero-ingest (shape, threshold selection, threshold-not-hardcoded, highlight entry shape, related_in_lithos empty, all_ingested, no highlights), 3 zero-ingest (quiet shape, sources-checked variant, no high_relevance key)
+- Files changed: `src/influx/notifications.py` (new), `tests/unit/test_webhook_digest.py` (new)
+- **Learnings for future iterations:**
+  - `build_digest()` is pure — no I/O, no async; takes `ProfileRunResult` + threshold kwarg, returns dict
+  - Two internal helpers: `_build_quiet_digest()` and `_build_full_digest()` — branched on `ingested == 0`
+  - US-016 will add the HTTP sender and service.py post-run hook to this same module
+  - `HighlightItem.to_dict()` and `IngestedItem.to_dict()` handle JSON serialisation
+  - 594 tests pass (10 new unit tests added)
 ---

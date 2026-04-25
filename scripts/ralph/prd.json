@@ -221,7 +221,7 @@
         "tests/unit/test_webhook_digest.py covers: a non-zero-ingest digest matching the FR-NOT-2 body shape with `highlights` selected by `score >= profiles.thresholds.notify_immediate` (threshold sourced from config, not hardcoded; per AC-05-I), a zero-ingest quiet digest matching §11.2, and `related_in_lithos` is `[]` for every highlight"
       ],
       "priority": 15,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
