@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head><title>Article with Script</title></head>
+<body>
+<article>
+<h1>Article with Embedded Script</h1>
+<script type="text/javascript">
+var malicious = "this should not appear in output";
+document.write("injected content via script tag");
+alert("xss attempt");
+</script>
+<p>This is the actual article content about machine learning research. The study examines
+various approaches to transfer learning in natural language processing. We find that
+pre-trained language models provide significant advantages when fine-tuned on domain-specific
+corpora. Our experiments demonstrate improvements across multiple downstream tasks.</p>
+</article>
+</body>
+</html>

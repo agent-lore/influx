@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head><title>Neural Architecture Search for Robotics</title></head>
+<body>
+<article>
+<h1>Neural Architecture Search for Robotics</h1>
+<p>This paper presents a novel approach to neural architecture search (NAS) specifically
+designed for robotic control systems. Traditional NAS methods focus on image classification
+tasks, but robotic applications require architectures that can process multi-modal sensor
+inputs and produce continuous control outputs in real-time.</p>
+
+<p>We introduce RoboNAS, a hardware-aware search algorithm that considers the computational
+constraints of embedded systems commonly used in robotics. Our method explores architectures
+that balance accuracy with inference latency, ensuring that the discovered networks can run
+within the strict timing requirements of control loops.</p>
+
+<p>The search space includes convolutional layers for visual processing, recurrent layers for
+temporal dependencies, and attention mechanisms for sensor fusion. We demonstrate that
+RoboNAS discovers architectures that outperform hand-designed baselines on three benchmarks:
+indoor navigation, manipulation tasks, and multi-robot coordination.</p>
+
+<p>Our experimental evaluation shows that RoboNAS-discovered architectures achieve 15% higher
+success rates on navigation tasks while requiring 40% fewer floating-point operations compared
+to ResNet-based baselines. For manipulation tasks, the discovered architectures reduce grasp
+failure rates by 22% and improve cycle times by 18%.</p>
+
+<p>We also analyze the discovered architectures to understand what structural patterns emerge
+when optimizing for robotic control. Interestingly, the search consistently discovers
+architectures with skip connections between sensor fusion layers and output heads, suggesting
+that direct sensor-to-action pathways are important for reactive control behaviors.</p>
+
+<p>The implications of this work extend beyond the specific benchmarks studied. By automating
+architecture design for robotics, we reduce the expertise barrier for deploying deep learning
+in robotic systems. We release our search framework and pre-trained architectures as an
+open-source toolkit to accelerate research in this area.</p>
+</article>
+</body>
+</html>
