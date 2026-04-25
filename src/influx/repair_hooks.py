@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import trafilatura
@@ -25,6 +26,7 @@ from influx.extraction.html import _clean_html_fragments, _strip_tags
 from influx.extraction.pdf import extract_pdf
 from influx.notes import parse_archive_path, parse_note
 from influx.repair import (
+    ArchiveDownloadHook,
     ExtractionOutcome,
     ReExtractArchiveHook,
     ReExtractionResult,
@@ -34,7 +36,7 @@ from influx.repair import (
 )
 from influx.schemas import Tier3Extraction
 
-__all__ = ["make_default_sweep_hooks"]
+__all__ = ["DefaultSweepHooks", "make_default_sweep_hooks"]
 
 _log = logging.getLogger(__name__)
 
@@ -317,14 +319,48 @@ def _make_tier3_extract_hook(config: AppConfig) -> Tier3ExtractHook:
 # ── Public factory ──────────────────────────────────────────────────
 
 
-def make_default_sweep_hooks(config: AppConfig) -> SweepHooks:
-    """Create production-default ``SweepHooks`` for the repair sweep.
+@dataclass(frozen=True, slots=True)
+class DefaultSweepHooks:
+    """Production-default sweep hook wiring with non-optional callables.
+
+    Holds the three production hooks with non-``Optional`` types so
+    pyright can statically know they are wired, while the parent
+    :class:`~influx.repair.SweepHooks` keeps them ``| None`` to preserve
+    the test-injection seam.  ``archive_download`` remains optional —
+    it is owned by PRD 04 and not wired here.
+
+    Use :meth:`to_sweep_hooks` to obtain a ``SweepHooks`` instance for
+    passing into :func:`influx.repair.sweep`.
+    """
+
+    re_extract_archive: ReExtractArchiveHook
+    tier2_enrich: Tier2EnrichHook
+    tier3_extract: Tier3ExtractHook
+    archive_download: ArchiveDownloadHook | None = None
+
+    def to_sweep_hooks(self) -> SweepHooks:
+        """Return a :class:`SweepHooks` carrying these production hooks."""
+        return SweepHooks(
+            archive_download=self.archive_download,
+            re_extract_archive=self.re_extract_archive,
+            tier2_enrich=self.tier2_enrich,
+            tier3_extract=self.tier3_extract,
+        )
+
+
+def make_default_sweep_hooks(config: AppConfig) -> DefaultSweepHooks:
+    """Create production-default sweep hooks for the repair sweep.
 
     Each hook bridges the PRD 06 hook signature to the lower-level
     extraction and enrichment helpers from PRD 07.  The
     ``archive_download`` hook is left ``None`` (PRD 04 responsibility).
+
+    Returns :class:`DefaultSweepHooks` (typed with non-optional
+    callables) so callers and tests do not need to narrow ``Optional``
+    attributes before invoking them.  Convert to a ``SweepHooks`` for
+    the sweep entrypoint via :meth:`DefaultSweepHooks.to_sweep_hooks`.
     """
-    return SweepHooks(
+    return DefaultSweepHooks(
         re_extract_archive=_make_re_extract_archive_hook(config),
         tier2_enrich=_make_tier2_enrich_hook(config),
         tier3_extract=_make_tier3_extract_hook(config),

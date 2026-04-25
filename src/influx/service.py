@@ -29,6 +29,7 @@ from influx.http_api import router
 from influx.notifications import ProfileRunResult, build_digest, send_digest
 from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler
+from influx.sources.arxiv import make_arxiv_item_provider
 
 __all__ = [
     "InfluxService",
@@ -113,11 +114,21 @@ def create_app(
     # ``schedule.shutdown_grace_seconds`` (US-008).
     active_tasks: set[asyncio.Task[Any]] = set()
     probe_loop = ProbeLoop(config, interval=30.0)
+
+    # Production default item provider — drives arXiv fetch +
+    # extraction cascade via ``run_profile`` for any profile that has
+    # ``[profiles.sources.arxiv].enabled = true``.  RSS sources and
+    # the LLM filter remain future-PRD scope.  Tests still override
+    # this seam by setting ``app.state.item_provider`` and passing a
+    # custom provider into ``InfluxScheduler``.
+    item_provider: Any = make_arxiv_item_provider(config)
+
     scheduler = InfluxScheduler(
         config,
         coordinator,
         active_tasks=active_tasks,
         probe_loop=probe_loop,
+        item_provider=item_provider,
     )
 
     app.state.config = config
@@ -125,11 +136,7 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.probe_loop = probe_loop
     app.state.active_tasks = active_tasks
-    # Default no-op item provider — replaced by PRD 04 with the real
-    # arXiv + RSS pipeline.  Stored on app.state so the HTTP run path
-    # can pass it through to ``run_profile`` (US-013).  ``None`` means
-    # "use ``default_item_provider``" inside ``run_profile``.
-    app.state.item_provider = None
+    app.state.item_provider = item_provider
 
     return app
 

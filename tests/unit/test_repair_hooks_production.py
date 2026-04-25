@@ -22,6 +22,7 @@ from influx.repair import (
     SweepHooks,
 )
 from influx.repair_hooks import (
+    DefaultSweepHooks,
     _extract_full_text_body,
     _extract_title,
     _insert_full_text_section,
@@ -121,17 +122,19 @@ def _make_note_dict(
 
 
 class TestMakeDefaultSweepHooks:
-    def test_returns_sweep_hooks_instance(self, tmp_path: Path) -> None:
+    def test_returns_default_sweep_hooks_instance(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
-        assert isinstance(hooks, SweepHooks)
+        assert isinstance(hooks, DefaultSweepHooks)
 
-    def test_all_three_hooks_populated(self, tmp_path: Path) -> None:
+    def test_converts_to_sweep_hooks(self, tmp_path: Path) -> None:
+        """``to_sweep_hooks()`` returns a ``SweepHooks`` for the sweep entrypoint."""
         config = _make_config(tmp_path)
-        hooks = make_default_sweep_hooks(config)
-        assert hooks.re_extract_archive is not None
-        assert hooks.tier2_enrich is not None
-        assert hooks.tier3_extract is not None
+        sweep_hooks = make_default_sweep_hooks(config).to_sweep_hooks()
+        assert isinstance(sweep_hooks, SweepHooks)
+        assert sweep_hooks.re_extract_archive is not None
+        assert sweep_hooks.tier2_enrich is not None
+        assert sweep_hooks.tier3_extract is not None
 
     def test_archive_download_left_none(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
@@ -524,6 +527,9 @@ class TestSweepHooksInjectionSeam:
             call_count += 1
 
         hooks = SweepHooks(tier3_extract=fake_tier3)
+        # Narrow the optional callable; this is the test-injection seam,
+        # not the production-default factory.
+        assert hooks.tier3_extract is not None
         hooks.tier3_extract({"id": "n1"})
         assert call_count == 1
 

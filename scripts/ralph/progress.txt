@@ -253,3 +253,15 @@ Started: Sat Apr 25 19:50:21 UTC 2026
   - `SweepHooks()` with no args gives all-None hooks — useful for test isolation from production defaults
   - Full test suite is 1058 tests after US-001…US-016, all passing
 ---
+
+## 2026-04-25 - US-017
+- Created `tests/integration/test_arxiv_html_to_full_text.py` with 7 tests covering AC-M2-1
+- Tests mock `guarded_fetch` at the HTTP layer and exercise the real extraction pipeline (tag-stripping → trafilatura → pipeline.py → build_arxiv_note_item → render_note)
+- Asserts: `text:html` tag, `full-text` tag, `## Full Text` section populated with extracted content >= 1000 chars, no HTML fragments, no `influx:repair-needed`, correct HTML URL fetched
+- Files changed: `tests/integration/test_arxiv_html_to_full_text.py` (new)
+- **Learnings for future iterations:**
+  - Integration tests mock `influx.extraction.html.guarded_fetch` (the import site in html.py) — this lets the real extraction pipeline run while controlling HTTP responses
+  - The HTML fixture needs to be substantial enough for trafilatura to extract >= 1000 chars — short HTML snippets may get below the threshold after extraction
+  - Set enrichment thresholds high (relevance=100, deep_extract=100) to isolate extraction-only integration tests from enrichment behavior
+  - Full test suite is 1065 tests after US-001…US-017, all passing
+---

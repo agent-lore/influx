@@ -993,7 +993,7 @@ async def sweep(
     else:
         from influx.repair_hooks import make_default_sweep_hooks
 
-        effective_hooks = make_default_sweep_hooks(config)
+        effective_hooks = make_default_sweep_hooks(config).to_sweep_hooks()
 
     limit = config.repair.max_items_per_run
     list_result = await client.list_notes(

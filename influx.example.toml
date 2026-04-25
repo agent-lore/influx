@@ -97,13 +97,16 @@ source_tag = "rss"
 # Providers
 # ---------------------------------------------------------------------------
 
+# NOTE: the shipped JSON-mode caller (src/influx/enrich.py) speaks
+# OpenAI-compatible /chat/completions only. Provider entries below
+# must expose an OpenAI-compatible API surface (OpenAI itself,
+# OpenRouter, etc.). Anthropic's native API is NOT compatible —
+# route Claude through OpenRouter or OpenAI-compatible gateway
+# instead of binding [models.*].provider to Anthropic directly.
+
 [providers.openai]
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
-
-[providers.anthropic]
-base_url = "https://api.anthropic.com"
-api_key_env = "ANTHROPIC_API_KEY"
 
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
@@ -132,7 +135,7 @@ max_retries = 2
 json_mode = true
 
 [models.extract]
-provider = "anthropic"
+provider = "openrouter"
 model = "anthropic/claude-sonnet-4.6"
 temperature = 0.2
 request_timeout = 60

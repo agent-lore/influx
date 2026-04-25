@@ -190,19 +190,26 @@ class TestBackfillExclusion:
     ) -> None:
         """Finding #1: default ``create_app`` wiring runs the sweep.
 
-        With no manually injected ``item_provider``, ``run_profile``
-        must still execute the repair sweep — production scheduled and
-        manual runs cannot rely on a test-injected provider to enter
-        the sweep code path.  Uses the real ``service.create_app``
-        factory rather than the test-only ``_make_app`` shim.
+        With the production-default arXiv item provider wired in, a
+        manual run through ``POST /runs`` must still execute the repair
+        sweep — production scheduled and manual runs cannot rely on a
+        test-injected provider to enter the sweep code path.  Uses the
+        real ``service.create_app`` factory rather than the test-only
+        ``_make_app`` shim.
         """
         from influx.service import create_app
 
         config = _make_config(lithos_url=fake_lithos_url)
+        # Disable the arXiv source so the default provider yields zero
+        # items without needing a mocked HTTP layer; this test only
+        # cares that the sweep runs, not that any items are written.
+        for profile in config.profiles:
+            profile.sources.arxiv.enabled = False
+
         app = create_app(config)
-        # Crucially: do NOT inject an item_provider here.  The default
-        # wiring must drive the sweep on its own.
-        assert getattr(app.state, "item_provider", "missing") is None
+        # The default wiring now installs the production arXiv item
+        # provider; with arXiv disabled it short-circuits to zero items.
+        assert app.state.item_provider is not None
 
         with patch(
             "influx.scheduler.repair_sweep",

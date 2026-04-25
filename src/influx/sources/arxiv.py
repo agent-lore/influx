@@ -21,9 +21,10 @@ from __future__ import annotations
 import logging
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from influx.config import (
     AppConfig,
@@ -38,11 +39,15 @@ from influx.http_client import guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 
+if TYPE_CHECKING:
+    from influx.coordinator import RunKind
+
 __all__ = [
     "ArxivItem",
     "build_arxiv_note_item",
     "build_query_url",
     "fetch_arxiv",
+    "make_arxiv_item_provider",
 ]
 
 _log = logging.getLogger(__name__)
@@ -497,3 +502,73 @@ def build_arxiv_note_item(
         "path": path,
         "abstract_or_summary": item.abstract,
     }
+
+
+# ── Production-default item provider (PRD 07 finding #1) ──────────────
+
+
+def make_arxiv_item_provider(
+    config: AppConfig,
+) -> Any:
+    """Build the production-default ``item_provider`` for arXiv profiles.
+
+    Returns an async callable that conforms to
+    :data:`~influx.scheduler.ItemProvider`: it iterates each profile's
+    enabled arXiv source, fetches items via :func:`fetch_arxiv`, and
+    maps each result through :func:`build_arxiv_note_item` so the
+    scheduler's ``run_profile`` drives the real HTML → PDF →
+    abstract-only extraction stack and the Tier 1 / Tier 3 enrichment
+    callers end-to-end.
+
+    LLM-filter scoring (PRD 04) is not yet wired into this provider:
+    each fetched item is admitted with the profile's ``full_text``
+    threshold as a placeholder score so the extraction cascade is
+    exercised; downstream PRDs replace this placeholder with real
+    LLM filter output.  RSS sources are likewise out of scope here.
+    """
+
+    async def provider(
+        profile: str,
+        kind: "RunKind",
+        run_range: dict[str, str | int] | None,
+        filter_prompt: str,
+    ) -> Iterable[dict[str, Any]]:
+        del kind, run_range, filter_prompt
+
+        profile_cfg = next((p for p in config.profiles if p.name == profile), None)
+        if profile_cfg is None:
+            return ()
+        if not profile_cfg.sources.arxiv.enabled:
+            return ()
+
+        try:
+            items = fetch_arxiv(
+                arxiv_config=profile_cfg.sources.arxiv,
+                resilience=config.resilience,
+            )
+        except NetworkError:
+            _log.warning(
+                "arxiv fetch failed for profile %r; yielding zero items",
+                profile,
+                exc_info=True,
+            )
+            return ()
+
+        # Placeholder score until PRD 04's LLM filter is wired: admit
+        # every fetched item at the profile's full_text threshold so the
+        # extraction cascade is exercised end-to-end.
+        score = profile_cfg.thresholds.full_text
+
+        return [
+            build_arxiv_note_item(
+                item=arxiv_item,
+                score=score,
+                confidence=1.0,
+                reason="arxiv-source",
+                profile_name=profile,
+                config=config,
+            )
+            for arxiv_item in items
+        ]
+
+    return provider

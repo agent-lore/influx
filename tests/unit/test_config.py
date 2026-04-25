@@ -613,20 +613,27 @@ class TestExampleTomlRoundTrip:
     ) -> None:
         """Example covers providers, all three model slots, and prompts."""
         monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
         monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
 
         cfg = load_config(path=self._example_path())
 
-        # Providers
+        # Providers — only OpenAI-compatible providers ship by default
+        # because the JSON-mode caller in src/influx/enrich.py speaks
+        # OpenAI-compatible /chat/completions only (finding #2).
         assert "openai" in cfg.providers
-        assert "anthropic" in cfg.providers
         assert "openrouter" in cfg.providers
 
-        # Model slots (filter, enrich, extract)
+        # Model slots (filter, enrich, extract); each must bind to an
+        # OpenAI-compatible provider so the JSON-mode caller works.
         assert "filter" in cfg.models
         assert "enrich" in cfg.models
         assert "extract" in cfg.models
+        compatible = {"openai", "openrouter"}
+        for slot_name, slot in cfg.models.items():
+            assert slot.provider in compatible, (
+                f"models.{slot_name} provider {slot.provider!r} is not "
+                f"OpenAI-compatible — finding #2"
+            )
 
         # Prompts (filter, tier1_enrich, tier3_extract)
         assert cfg.prompts.filter.text is not None

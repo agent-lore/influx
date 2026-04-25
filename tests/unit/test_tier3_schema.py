@@ -8,9 +8,9 @@ from pydantic import ValidationError
 from influx.schemas import Tier3Extraction
 
 
-def _valid(**overrides: object) -> dict[str, object]:
+def _valid(**overrides: list[str]) -> dict[str, list[str]]:
     """Return a minimal valid Tier3Extraction payload, with overrides."""
-    base: dict[str, object] = {
+    base: dict[str, list[str]] = {
         "claims": ["claim1"],
         "datasets": [],
         "builds_on": [],

@@ -47,6 +47,16 @@ def _call_json_model(
     OpenAI-compatible ``/chat/completions`` request, and parses the
     JSON content from the response.
 
+    Provider compatibility
+    ----------------------
+    This caller only speaks the OpenAI-compatible ``/chat/completions``
+    API surface — providers must expose that contract.  OpenAI itself
+    and OpenRouter are compatible; Anthropic's native ``/v1/messages``
+    API is NOT.  To use Anthropic models, route them through OpenRouter
+    (``providers.openrouter``) rather than binding ``[models.*].provider``
+    to ``"anthropic"`` directly.  The shipped ``influx.example.toml``
+    illustrates this routing.
+
     Raises :class:`~influx.errors.LCMAError` on transport, HTTP, or
     parse failure.
     """
