@@ -27,12 +27,14 @@ from influx.config import (
     ExtractionConfig,
     FeedbackConfig,
     LithosConfig,
+    ModelSlotConfig,
     NotificationsConfig,
     ProfileConfig,
     ProfileSources,
     ProfileThresholds,
     PromptEntryConfig,
     PromptsConfig,
+    ProviderConfig,
     ScheduleConfig,
     SecurityConfig,
 )
@@ -457,3 +459,223 @@ class TestRunProfileSkipsWhenSourceDisabled:
 
         write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         assert write_calls == []
+
+
+# ── Default LLM filter scorer (finding #1 production-default path) ────
+
+
+def _make_config_with_filter(lithos_url: str) -> AppConfig:
+    """AppConfig with ``[models.filter]`` configured so the default scorer wires.
+
+    Same shape as :func:`_make_config` but adds a ``providers.openai``
+    entry and a ``models.filter`` slot so
+    :func:`influx.filter.make_default_arxiv_filter_scorer` returns a
+    real scorer (instead of falling through to the no-scorer default).
+    Thresholds are kept deterministic so the score-gating tests can
+    pin behaviour to specific scores.
+    """
+    return AppConfig(
+        lithos=LithosConfig(url=lithos_url),
+        schedule=ScheduleConfig(cron="0 6 * * *", timezone="UTC"),
+        profiles=[
+            ProfileConfig(
+                name="ai-robotics",
+                description="Robotics papers",
+                thresholds=ProfileThresholds(
+                    relevance=100,  # disable Tier 1 (no enrich slot mocked)
+                    full_text=8,
+                    deep_extract=9,
+                    notify_immediate=8,
+                ),
+                sources=ProfileSources(
+                    arxiv=ArxivSourceConfig(
+                        enabled=True,
+                        categories=["cs.RO"],
+                        max_results_per_category=10,
+                        lookback_days=30,
+                    ),
+                ),
+            ),
+        ],
+        providers={
+            "openai": ProviderConfig(base_url="https://api.openai.invalid/v1"),
+        },
+        models={
+            "filter": ModelSlotConfig(
+                provider="openai",
+                model="gpt-test",
+                json_mode=True,
+            ),
+        },
+        prompts=PromptsConfig(
+            filter=PromptEntryConfig(text="Filter rubric"),
+            tier1_enrich=PromptEntryConfig(text="x"),
+            tier3_extract=PromptEntryConfig(text="x"),
+        ),
+        notifications=NotificationsConfig(webhook_url="", timeout_seconds=5),
+        security=SecurityConfig(allow_private_ips=True),
+        extraction=ExtractionConfig(),
+        feedback=FeedbackConfig(),
+    )
+
+
+def _filter_response(arxiv_id: str, score: int) -> dict[str, object]:
+    """Build a fake OpenAI-compatible filter response for one item."""
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        '{"results": [{'
+                        f'"id": "{arxiv_id}", '
+                        f'"score": {score}, '
+                        '"tags": ["robotics"], '
+                        '"reason": "stub"'
+                        "}]}"
+                    ),
+                },
+            },
+        ],
+    }
+
+
+class _FakeFilterResponse:
+    """Minimal stand-in for ``httpx.Response`` returned by the filter call."""
+
+    def __init__(self, body: dict[str, object]) -> None:
+        self._body = body
+        self.status_code = 200
+        self.text = ""
+
+    def json(self) -> dict[str, object]:
+        return self._body
+
+
+class TestDefaultFilterScorerEndToEnd:
+    """Default LLM filter scorer drives score gating without a test override.
+
+    These tests do NOT pass ``arxiv_scorer`` or ``arxiv_filter_scorer``
+    to :func:`create_app` — they exercise the production-default scorer
+    that ``create_app`` installs from ``[models.filter]``, mocking only
+    the underlying ``httpx.post`` so the filter LLM call is
+    deterministic.  This proves the finding's recommended fix: the
+    shipped service / serve path now drives score-gated extraction +
+    enrichment behaviour from US-014/US-015.
+    """
+
+    def test_default_scorer_below_full_text_yields_abstract_only(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Default LLM filter returns score < full_text → abstract-only note."""
+        config = _make_config_with_filter(fake_lithos_url)
+
+        # No scorer override — create_app installs the default LLM filter.
+        app = create_app(config)
+        assert app.state.item_provider is not None
+
+        with (
+            patch(
+                "influx.sources.arxiv.guarded_fetch",
+                return_value=_atom_fetch_result(),
+            ),
+            patch(
+                "influx.extraction.html.guarded_fetch",
+            ) as mock_html,
+            patch(
+                "influx.filter.httpx.post",
+                return_value=_FakeFilterResponse(_filter_response(_ARXIV_ID, 5)),
+            ) as mock_filter_post,
+        ):
+            import asyncio
+
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=app.state.item_provider,
+                )
+            )
+
+            # Default scorer was invoked exactly once (batched).
+            assert mock_filter_post.call_count == 1
+            # Below-full_text scores must NOT trigger HTML extraction.
+            assert mock_html.call_count == 0
+
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1
+        payload = write_calls[0][1]
+
+        assert "text:abstract-only" in payload["tags"]
+        assert "text:html" not in payload["tags"]
+        assert "full-text" not in payload["tags"]
+        assert "## Full Text" not in payload["content"]
+        assert "influx:deep-extracted" not in payload["tags"]
+        # Score from the LLM filter response is propagated through.
+        assert payload["confidence"] == 1.0
+
+    def test_default_scorer_at_deep_extract_triggers_tier3(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Default LLM filter returns score ≥ deep_extract → Tier 3 invoked."""
+        config = _make_config_with_filter(fake_lithos_url)
+
+        # No scorer override — create_app installs the default LLM filter.
+        app = create_app(config)
+
+        from influx.schemas import Tier3Extraction
+
+        tier3_stub = Tier3Extraction(
+            claims=["claim"],
+            datasets=[],
+            builds_on=[],
+            open_questions=[],
+            potential_connections=[],
+        )
+
+        with (
+            patch(
+                "influx.sources.arxiv.guarded_fetch",
+                return_value=_atom_fetch_result(),
+            ),
+            patch(
+                "influx.extraction.html.guarded_fetch",
+                return_value=_html_fetch_result(),
+            ),
+            patch(
+                "influx.filter.httpx.post",
+                return_value=_FakeFilterResponse(_filter_response(_ARXIV_ID, 9)),
+            ) as mock_filter_post,
+            patch(
+                "influx.sources.arxiv.tier3_extract",
+                return_value=tier3_stub,
+            ) as mock_tier3,
+        ):
+            import asyncio
+
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=app.state.item_provider,
+                )
+            )
+
+            # Default scorer was invoked once.
+            assert mock_filter_post.call_count == 1
+            # Score ≥ deep_extract MUST invoke Tier 3 exactly once.
+            assert mock_tier3.call_count == 1
+
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1
+        payload = write_calls[0][1]
+
+        assert "text:html" in payload["tags"]
+        assert "full-text" in payload["tags"]
+        assert "influx:deep-extracted" in payload["tags"]
+        assert "## Claims" in payload["content"]

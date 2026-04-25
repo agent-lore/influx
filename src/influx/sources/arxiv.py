@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -41,6 +41,7 @@ from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 
 __all__ = [
+    "ArxivFilterScorer",
     "ArxivItem",
     "ArxivScorer",
     "ArxivScoreResult",
@@ -101,11 +102,23 @@ class ArxivScoreResult:
 
 # A scorer maps each fetched arXiv item + the active profile name to a
 # concrete ``ArxivScoreResult`` (or ``None`` to drop the item from the
-# run).  The seam exists so the production-default item provider does
-# NOT fabricate a synthetic score: the caller must supply real scoring
-# (LLM filter wiring lives outside PRD 07's scope, but the seam keeps
-# the score-gated contract from US-014/US-015 honest).
+# run).  The seam exists so unit/integration tests can drive the
+# score-gated extraction / enrichment paths from US-014/US-015 with a
+# deterministic per-item scorer.  Production scoring uses the batched
+# LLM-driven :data:`ArxivFilterScorer` instead.
 ArxivScorer = Callable[[ArxivItem, str], ArxivScoreResult | None]
+
+
+# A batch scorer maps the full list of fetched arXiv items + the active
+# profile name + the rendered ``filter_prompt`` (composed by
+# :func:`influx.scheduler.run_profile`) to a mapping of arXiv id →
+# ``ArxivScoreResult``.  Items omitted from the mapping are dropped.
+# This is the production-default scoring shape — see
+# :func:`influx.filter.make_default_arxiv_filter_scorer`.
+ArxivFilterScorer = Callable[
+    [list[ArxivItem], str, str],
+    Awaitable[dict[str, ArxivScoreResult]],
+]
 
 
 # ── Query URL construction ─────────────────────────────────────────
@@ -537,6 +550,7 @@ def make_arxiv_item_provider(
     config: AppConfig,
     *,
     scorer: ArxivScorer | None = None,
+    filter_scorer: ArxivFilterScorer | None = None,
 ) -> Any:
     """Build the production-default ``item_provider`` for arXiv profiles.
 
@@ -548,13 +562,23 @@ def make_arxiv_item_provider(
     abstract-only extraction stack and the Tier 1 / Tier 3 enrichment
     callers end-to-end.
 
-    *scorer* is the score-gating seam.  PRD 04's LLM filter is the
-    eventual production wiring; until that lands, callers (production
-    bootstrapping and tests) must supply a scorer or items receive a
-    score of ``0`` and are written abstract-only with no extraction or
-    enrichment — the provider does NOT fabricate a score equal to
-    ``thresholds.full_text``.  Returning ``None`` from the scorer drops
-    the item entirely.
+    Score-gating seams
+    ------------------
+    *filter_scorer* is the production-default batched scoring seam: it
+    receives the fetched item list + profile + the rendered
+    ``filter_prompt`` and returns a mapping of arXiv id → score.  The
+    production default is :func:`influx.filter.make_default_arxiv_filter_scorer`,
+    which wraps the configured ``[models.filter]`` slot.  When supplied,
+    items missing from the returned mapping are dropped from the run.
+
+    *scorer* is a per-item synchronous seam used by unit/integration
+    tests that want deterministic scoring without standing up a real
+    LLM.  When set it takes precedence over *filter_scorer*.
+
+    When NEITHER scorer is configured the provider falls back to
+    score ``0`` (abstract-only, no extraction or enrichment) so a
+    misconfigured deployment still produces notes — it does NOT
+    fabricate a score equal to ``thresholds.full_text``.
     """
 
     async def provider(
@@ -563,7 +587,7 @@ def make_arxiv_item_provider(
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
     ) -> Iterable[dict[str, Any]]:
-        del kind, run_range, filter_prompt
+        del kind, run_range
 
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
         if profile_cfg is None:
@@ -584,18 +608,42 @@ def make_arxiv_item_provider(
             )
             return ()
 
+        # Batched LLM filter takes precedence as the production default.
+        # The per-item ``scorer`` seam stays available for tests that
+        # want deterministic, synchronous scoring without an LLM.
+        batch_scores: dict[str, ArxivScoreResult] = {}
+        if scorer is None and filter_scorer is not None:
+            try:
+                batch_scores = await filter_scorer(items, profile, filter_prompt)
+            except Exception:  # pragma: no cover — defensive  # noqa: BLE001
+                _log.warning(
+                    "filter_scorer raised for profile %r; "
+                    "falling back to abstract-only ingestion",
+                    profile,
+                    exc_info=True,
+                )
+                batch_scores = {}
+
         results: list[dict[str, Any]] = []
         for arxiv_item in items:
-            if scorer is None:
-                score_result: ArxivScoreResult | None = ArxivScoreResult(
+            if scorer is not None:
+                score_result: ArxivScoreResult | None = scorer(arxiv_item, profile)
+                if score_result is None:
+                    continue
+            elif filter_scorer is not None:
+                # Items absent from the LLM filter response are dropped
+                # entirely — the filter explicitly chose not to score
+                # them (typically because they fell below
+                # ``filter.min_score_in_results``).
+                if arxiv_item.arxiv_id not in batch_scores:
+                    continue
+                score_result = batch_scores[arxiv_item.arxiv_id]
+            else:
+                score_result = ArxivScoreResult(
                     score=0,
                     confidence=0.0,
                     reason="no-scorer-configured",
                 )
-            else:
-                score_result = scorer(arxiv_item, profile)
-                if score_result is None:
-                    continue
 
             results.append(
                 build_arxiv_note_item(

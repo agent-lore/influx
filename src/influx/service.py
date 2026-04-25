@@ -25,11 +25,16 @@ from fastapi import FastAPI
 from influx.config import AppConfig
 from influx.coordinator import Coordinator, RunKind
 from influx.errors import ConfigError
+from influx.filter import make_default_arxiv_filter_scorer
 from influx.http_api import router
 from influx.notifications import ProfileRunResult, build_digest, send_digest
 from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler
-from influx.sources.arxiv import ArxivScorer, make_arxiv_item_provider
+from influx.sources.arxiv import (
+    ArxivFilterScorer,
+    ArxivScorer,
+    make_arxiv_item_provider,
+)
 
 __all__ = [
     "InfluxService",
@@ -95,6 +100,7 @@ def create_app(
     lifespan: Any | None = None,
     *,
     arxiv_scorer: ArxivScorer | None = None,
+    arxiv_filter_scorer: ArxivFilterScorer | None = None,
 ) -> FastAPI:
     """Build and return the FastAPI app with all dependencies on ``app.state``.
 
@@ -107,13 +113,20 @@ def create_app(
         Optional FastAPI lifespan context manager (async generator).
         When provided, wired into the app for startup/shutdown handling.
     arxiv_scorer:
-        Optional score-gating callback for the arXiv item provider.
-        See :func:`~influx.sources.arxiv.make_arxiv_item_provider` —
-        when ``None``, fetched arXiv items receive a placeholder
-        score of ``0`` (abstract-only, no extraction or enrichment)
-        until PRD 04's LLM filter is wired through this seam.  Tests
-        inject a deterministic scorer to exercise the score-gated
-        extraction / enrichment paths from US-014/US-015.
+        Per-item synchronous score-gating override used by tests that
+        want deterministic scoring without standing up a real LLM.
+        When set, takes precedence over *arxiv_filter_scorer*.  See
+        :func:`~influx.sources.arxiv.make_arxiv_item_provider`.
+    arxiv_filter_scorer:
+        Optional override for the batched LLM filter scorer.  When
+        ``None`` the production default
+        :func:`~influx.filter.make_default_arxiv_filter_scorer` is
+        installed automatically — that default reads ``[models.filter]``
+        + ``[prompts.filter]`` from *config* and drives the real
+        score-gating contract from US-014/US-015 on the production
+        ``InfluxService`` path.  Tests can pass a deterministic batch
+        scorer here to exercise the score-gating behaviour without
+        mocking HTTP.
     """
     app = FastAPI(title="Influx Admin API", lifespan=lifespan)
     app.include_router(router)
@@ -127,11 +140,19 @@ def create_app(
 
     # Production default item provider — drives arXiv fetch +
     # extraction cascade via ``run_profile`` for any profile that has
-    # ``[profiles.sources.arxiv].enabled = true``.  RSS sources and
-    # the LLM filter remain future-PRD scope.  Tests still override
-    # this seam by setting ``app.state.item_provider`` and passing a
-    # custom provider into ``InfluxScheduler``.
-    item_provider: Any = make_arxiv_item_provider(config, scorer=arxiv_scorer)
+    # ``[profiles.sources.arxiv].enabled = true``.  When no per-item
+    # ``arxiv_scorer`` override is supplied, the batched LLM filter
+    # default is installed so the production ``InfluxService`` /
+    # ``serve`` path actually drives the score-gated extraction +
+    # enrichment behaviour from US-014/US-015 instead of writing every
+    # item abstract-only.
+    if arxiv_scorer is None and arxiv_filter_scorer is None:
+        arxiv_filter_scorer = make_default_arxiv_filter_scorer(config)
+    item_provider: Any = make_arxiv_item_provider(
+        config,
+        scorer=arxiv_scorer,
+        filter_scorer=arxiv_filter_scorer,
+    )
 
     scheduler = InfluxScheduler(
         config,
