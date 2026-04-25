@@ -448,6 +448,10 @@ class TestNegativeExamples:
             webhook_url=fake_webhook.url,
         )
 
+        # Repair sweep calls lithos_list first (influx:repair-needed);
+        # queue an empty response so it does not consume the rejection
+        # list response below.
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
         # Queue lithos_list to return 3 rejection items.
         fake_lithos.list_responses.append(
             json.dumps(
@@ -474,10 +478,16 @@ class TestNegativeExamples:
         assert "Rejected Paper B" in prompt
         assert "Rejected Paper C" in prompt
 
-        # lithos_list was called with the right tag.
+        # lithos_list was called: first by repair sweep, then by feedback.
         list_calls = [c for c in fake_lithos.calls if c[0] == "lithos_list"]
-        assert len(list_calls) == 1
-        assert list_calls[0][1]["tags"] == ["influx:rejected:ai-robotics"]
+        assert len(list_calls) == 2
+        # First call: repair sweep (influx:repair-needed).
+        assert list_calls[0][1]["tags"] == [
+            "influx:repair-needed",
+            "profile:ai-robotics",
+        ]
+        # Second call: feedback rejection list.
+        assert list_calls[1][1]["tags"] == ["influx:rejected:ai-robotics"]
 
 
 # ── AC-05-I: webhook fires for non-backfill, skips backfill ──────

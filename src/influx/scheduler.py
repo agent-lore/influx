@@ -31,6 +31,7 @@ from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.feedback import build_negative_examples_block
 from influx.lithos_client import LithosClient
 from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+from influx.repair import sweep as repair_sweep
 
 __all__ = [
     "InfluxScheduler",
@@ -127,6 +128,11 @@ async def run_profile(
 
     client = LithosClient(url=config.lithos.url, transport=config.lithos.transport)
     try:
+        # 0. Repair sweep — durable retry for failed enrichment (PRD 06 §5.1).
+        #    Runs for scheduled and manual runs only; backfills skip (FR-REP-2).
+        if kind != RunKind.BACKFILL:
+            await repair_sweep(profile, client=client, config=config)
+
         # 1. Feedback ingestion → negative examples block (FR-FB-1..3, AC-05-H).
         neg_block = await build_negative_examples_block(
             client,
