@@ -26,7 +26,7 @@
         "tests/contract/test_lithos_client.py is created with a connection-lifecycle test that exercises lazy-connect + reuse against a fake Lithos SSE server fixture"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

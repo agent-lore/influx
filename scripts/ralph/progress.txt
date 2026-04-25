@@ -4,9 +4,14 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 ## Codebase Patterns
 - Dev tools (ruff, pyright, pytest) are installed via `pip install` to `~/.local/bin`; PATH must include `$HOME/.local/bin`
 - Dependency style in pyproject.toml: `"pkg>=X.Y,<Z"` with next-major ceiling
-- Existing stub `lithos_client.py` has `write`, `cache_lookup`, `WriteRecord`, `get_write_log`, `clear_write_log` — all to be replaced by PRD 05
 - `LithosError` and `LCMAError` already exist in `src/influx/errors.py` — reuse, don't recreate
-- All 505 tests passing on the base branch
+- `LithosClient` is class-based in `src/influx/lithos_client.py` with lazy SSE connection via `_ensure_connected()`
+- MCP client uses: `from mcp.client.sse import sse_client` + `from mcp.client.session import ClientSession`
+- MCP server for tests uses: `from mcp.server.fastmcp import FastMCP` + `app.sse_app()` for Starlette app
+- Fake Lithos SSE server fixture pattern: `FakeLithosServer` class in `tests/contract/test_lithos_client.py` with uvicorn on random port
+- `.venv` python symlink is broken (points to missing pyenv); system python3 at `/usr/local/bin/python3` works; need `pip install --target .venv/lib/python3.12/site-packages` for new pyright-visible packages
+- `LithosConfig` added to `config.py` with `url` and `transport` fields, env overrides `LITHOS_URL` and `LITHOS_MCP_TRANSPORT`
+- 509 tests passing after US-002
 
 ---
 
@@ -17,4 +22,19 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - The `mcp` SDK (v1.27.0) installs `httpx-sse` as a transitive dep — SSE transport works out of the box
   - `tail`, `head` not available in this container; pipe-less commands only
   - 505 existing tests all pass; no test breakage from adding the dependency
+---
+
+## 2026-04-25 - US-002
+- Replaced stub `lithos_client.py` with real SSE-backed `LithosClient` class
+- Added `LithosConfig` to `config.py` with `url` and `transport` fields + env overrides
+- Created `tests/contract/test_lithos_client.py` with fake Lithos SSE server and lifecycle tests
+- Updated `tests/unit/test_lithos_client.py` to test construction validation only
+- Files changed: `src/influx/lithos_client.py`, `src/influx/config.py`, `tests/unit/test_lithos_client.py`, `tests/contract/__init__.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `FastMCP("name")` + `.sse_app()` is the cleanest way to create a fake MCP SSE server for tests
+  - `FakeLithosServer` uses uvicorn in a daemon thread + `_wait_for_ready()` socket polling
+  - The `.venv` python symlink is broken; mcp needed `pip install --target` to appear in .venv for pyright
+  - `LithosClient` uses `AsyncExitStack` to manage nested `sse_client` + `ClientSession` context managers
+  - Lazy connection via `_ensure_connected()` with double-checked locking
+  - 509 tests pass (4 new contract + 3 new unit + replaced 5 old stub tests)
 ---

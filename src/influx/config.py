@@ -29,6 +29,7 @@ __all__ = [
     "FeedbackConfig",
     "FilterTuningConfig",
     "InfluxSectionConfig",
+    "LithosConfig",
     "ModelSlotConfig",
     "NotificationsConfig",
     "ProfileConfig",
@@ -84,6 +85,13 @@ class NotificationsConfig(BaseModel):
 
     webhook_url: str = ""
     timeout_seconds: int = 5
+
+
+class LithosConfig(BaseModel):
+    """``[lithos]`` Lithos MCP connection settings (§19)."""
+
+    url: str = ""
+    transport: str = "sse"
 
 
 class SecurityConfig(BaseModel):
@@ -341,6 +349,7 @@ class AppConfig(BaseModel):
     """Root configuration model for the full v0.7 TOML schema."""
 
     influx: InfluxSectionConfig = Field(default_factory=InfluxSectionConfig)
+    lithos: LithosConfig = Field(default_factory=LithosConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
@@ -409,6 +418,8 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
     take precedence over values set in the TOML file (FR-CFG-3).
     """
     overrides: list[tuple[str, str, str, type]] = [
+        ("LITHOS_URL", "lithos", "url", str),
+        ("LITHOS_MCP_TRANSPORT", "lithos", "transport", str),
         ("INFLUX_ARCHIVE_DIR", "storage", "archive_dir", str),
         ("INFLUX_OTEL_ENABLED", "telemetry", "enabled", bool),
         ("INFLUX_OTEL_CONSOLE_FALLBACK", "telemetry", "console_fallback", bool),
