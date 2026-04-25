@@ -1,10 +1,13 @@
-"""Tier-1 enrichment — JSON-mode LLM caller (PRD 07 §5.2 FR-ENR-4).
+"""Tier-1 enrichment & Tier-3 extraction — JSON-mode LLM callers.
 
-Replaces the PRD 04 stub with a real LLM-backed enrichment pipeline.
-``tier1_enrich`` renders the ``prompts.tier1_enrich`` prompt with the
-candidate's title, abstract, and profile summary, dispatches it to the
-``models.enrich`` model slot in JSON mode, and validates the response
-against ``Tier1Enrichment``.
+``tier1_enrich`` renders ``prompts.tier1_enrich`` against the
+``models.enrich`` slot and validates against ``Tier1Enrichment``
+(PRD 07 §5.2 FR-ENR-4).
+
+``tier3_extract`` renders ``prompts.tier3_extract`` against the
+``models.extract`` slot and validates against ``Tier3Extraction``
+(PRD 07 §5.3 FR-ENR-5).  Oversize string elements (> 500 chars) are
+truncated on ingest by the schema's ``field_validator``.
 """
 
 from __future__ import annotations
@@ -20,10 +23,11 @@ from pydantic import ValidationError
 from influx.config import AppConfig
 from influx.errors import LCMAError
 from influx.prompts import load_prompt
-from influx.schemas import Tier1Enrichment
+from influx.schemas import Tier1Enrichment, Tier3Extraction
 
 __all__ = [
     "tier1_enrich",
+    "tier3_extract",
 ]
 
 logger = logging.getLogger(__name__)
@@ -195,6 +199,65 @@ def tier1_enrich(
         raise LCMAError(
             f"Tier 1 enrichment response failed validation: {exc}",
             model="enrich",
+            stage="validate",
+            detail=str(raw)[:500],
+        ) from exc
+
+
+# ── Tier 3 extraction caller ────────────────────────────────────────
+
+
+def tier3_extract(
+    *,
+    title: str,
+    full_text: str,
+    config: AppConfig,
+) -> Tier3Extraction:
+    """Invoke Tier-3 deep extraction against the ``models.extract`` slot (FR-ENR-5).
+
+    Renders ``prompts.tier3_extract`` with ``{title}`` and ``{full_text}``
+    and dispatches it to the configured JSON-mode extraction model slot.
+    The response is validated against :class:`~influx.schemas.Tier3Extraction`
+    — oversize string elements (> 500 chars) are truncated by the schema's
+    ``field_validator``, not rejected.
+
+    Parameters
+    ----------
+    title:
+        Paper or article title.
+    full_text:
+        Extracted full text (Tier 2 body).
+    config:
+        Loaded :class:`~influx.config.AppConfig` — the model slot and
+        prompt are resolved from this at runtime.
+
+    Returns
+    -------
+    Tier3Extraction
+        Validated extraction result with truncated strings.
+
+    Raises
+    ------
+    LCMAError
+        On transport failure, HTTP error, JSON parse failure, or
+        schema validation failure — the caller can handle this per
+        FR-ENR-6 (no placeholder text on failure).
+    """
+    prompt_cfg = config.prompts.tier3_extract
+    prompt_text = load_prompt(text=prompt_cfg.text, path=prompt_cfg.path)
+    rendered = prompt_text.format(
+        title=title,
+        full_text=full_text,
+    )
+
+    raw = _call_json_model(config, "extract", rendered)
+
+    try:
+        return Tier3Extraction.model_validate(raw)
+    except ValidationError as exc:
+        raise LCMAError(
+            f"Tier 3 extraction response failed validation: {exc}",
+            model="extract",
             stage="validate",
             detail=str(raw)[:500],
         ) from exc
