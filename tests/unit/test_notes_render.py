@@ -241,34 +241,49 @@ class TestRecomputeConfidence:
     """Confidence = max(existing, current_max_score / 10.0)."""
 
     def test_existing_higher(self) -> None:
-        assert recompute_confidence(
-            existing_confidence=0.9,
-            current_max_score=7,
-        ) == 0.9
+        assert (
+            recompute_confidence(
+                existing_confidence=0.9,
+                current_max_score=7,
+            )
+            == 0.9
+        )
 
     def test_new_higher(self) -> None:
-        assert recompute_confidence(
-            existing_confidence=0.5,
-            current_max_score=8,
-        ) == 0.8
+        assert (
+            recompute_confidence(
+                existing_confidence=0.5,
+                current_max_score=8,
+            )
+            == 0.8
+        )
 
     def test_equal(self) -> None:
-        assert recompute_confidence(
-            existing_confidence=0.7,
-            current_max_score=7,
-        ) == 0.7
+        assert (
+            recompute_confidence(
+                existing_confidence=0.7,
+                current_max_score=7,
+            )
+            == 0.7
+        )
 
     def test_zero_existing(self) -> None:
-        assert recompute_confidence(
-            existing_confidence=0.0,
-            current_max_score=9,
-        ) == 0.9
+        assert (
+            recompute_confidence(
+                existing_confidence=0.0,
+                current_max_score=9,
+            )
+            == 0.9
+        )
 
     def test_perfect_score(self) -> None:
-        assert recompute_confidence(
-            existing_confidence=0.8,
-            current_max_score=10,
-        ) == 1.0
+        assert (
+            recompute_confidence(
+                existing_confidence=0.8,
+                current_max_score=10,
+            )
+            == 1.0
+        )
 
 
 # ── Full merge scenario ─────────────────────────────────────────────

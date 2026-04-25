@@ -61,21 +61,14 @@ class TestBuildQueryUrl:
             categories=["cs.AI", "cs.RO", "cs.MA"],
             max_results=200,
         )
-        assert (
-            "search_query=cat:cs.AI+OR+cat:cs.RO+OR+cat:cs.MA"
-            in url
-        )
+        assert "search_query=cat:cs.AI+OR+cat:cs.RO+OR+cat:cs.MA" in url
 
     def test_base_url(self) -> None:
         url = build_query_url(categories=["cs.AI"], max_results=50)
-        assert url.startswith(
-            "https://export.arxiv.org/api/query?"
-        )
+        assert url.startswith("https://export.arxiv.org/api/query?")
 
     def test_max_results_from_config(self) -> None:
-        url = build_query_url(
-            categories=["cs.CL"], max_results=42
-        )
+        url = build_query_url(categories=["cs.CL"], max_results=42)
         assert "max_results=42" in url
 
 
@@ -98,8 +91,7 @@ class TestParseAtom:
         body = _load_fixture("recent_two.atom")
         items = _parse_atom(body)
         assert items[0].title == (
-            "Emergent Planning in Multi-Agent "
-            "Reinforcement Learning"
+            "Emergent Planning in Multi-Agent Reinforcement Learning"
         )
 
     def test_extracts_abstract(self) -> None:
@@ -161,20 +153,10 @@ class TestParseAtom:
 
 class TestExtractArxivId:
     def test_http_url_with_version(self) -> None:
-        assert (
-            _extract_arxiv_id(
-                "http://arxiv.org/abs/2604.11111v1"
-            )
-            == "2604.11111"
-        )
+        assert _extract_arxiv_id("http://arxiv.org/abs/2604.11111v1") == "2604.11111"
 
     def test_https_url_with_version(self) -> None:
-        assert (
-            _extract_arxiv_id(
-                "https://arxiv.org/abs/2604.11111v2"
-            )
-            == "2604.11111"
-        )
+        assert _extract_arxiv_id("https://arxiv.org/abs/2604.11111v2") == "2604.11111"
 
     def test_bare_id_no_version(self) -> None:
         assert _extract_arxiv_id("2604.11111") == "2604.11111"
@@ -200,9 +182,7 @@ class TestFilterByLookback:
         now = datetime(2026, 4, 24, 0, 0, 0, tzinfo=UTC)
         body = _load_fixture("mixed_dates.atom")
         items = _parse_atom(body)
-        filtered = _filter_by_lookback(
-            items, lookback_days=7, now=now
-        )
+        filtered = _filter_by_lookback(items, lookback_days=7, now=now)
         # Items from 2026-04-17 and later: 2604.33333 (Apr 23),
         # 2604.44444 (Apr 20)
         assert len(filtered) == 2
@@ -213,18 +193,14 @@ class TestFilterByLookback:
         items = _parse_atom(body)
         # With lookback_days=0 and now at 20:00 Apr 24,
         # cutoff = Apr 24 20:00 — only items >= that time survive
-        filtered = _filter_by_lookback(
-            items, lookback_days=0, now=now
-        )
+        filtered = _filter_by_lookback(items, lookback_days=0, now=now)
         assert len(filtered) == 0
 
     def test_large_lookback_keeps_all(self) -> None:
         now = datetime(2026, 4, 24, 0, 0, 0, tzinfo=UTC)
         body = _load_fixture("mixed_dates.atom")
         items = _parse_atom(body)
-        filtered = _filter_by_lookback(
-            items, lookback_days=365, now=now
-        )
+        filtered = _filter_by_lookback(items, lookback_days=365, now=now)
         assert len(filtered) == 4
 
 
@@ -233,9 +209,7 @@ class TestFilterByLookback:
 
 class TestFetchArxiv:
     @patch("influx.sources.arxiv.guarded_fetch")
-    def test_successful_fetch_and_filter(
-        self, mock_fetch: MagicMock
-    ) -> None:
+    def test_successful_fetch_and_filter(self, mock_fetch: MagicMock) -> None:
         body = _load_fixture("recent_two.atom")
         mock_fetch.return_value = _make_fetch_result(body)
 
@@ -254,9 +228,7 @@ class TestFetchArxiv:
         assert all(isinstance(i, ArxivItem) for i in items)
 
     @patch("influx.sources.arxiv.guarded_fetch")
-    def test_query_url_passed_to_fetch(
-        self, mock_fetch: MagicMock
-    ) -> None:
+    def test_query_url_passed_to_fetch(self, mock_fetch: MagicMock) -> None:
         body = _load_fixture("empty_feed.atom")
         mock_fetch.return_value = _make_fetch_result(body)
 
@@ -269,15 +241,11 @@ class TestFetchArxiv:
             resilience=_default_resilience(),
         )
         url_arg = mock_fetch.call_args[0][0]
-        assert (
-            "search_query=cat:cs.CL+OR+cat:cs.LO" in url_arg
-        )
+        assert "search_query=cat:cs.CL+OR+cat:cs.LO" in url_arg
         assert "max_results=50" in url_arg
 
     @patch("influx.sources.arxiv.guarded_fetch")
-    def test_lookback_filtering_applied(
-        self, mock_fetch: MagicMock
-    ) -> None:
+    def test_lookback_filtering_applied(self, mock_fetch: MagicMock) -> None:
         body = _load_fixture("mixed_dates.atom")
         mock_fetch.return_value = _make_fetch_result(body)
 
@@ -361,12 +329,8 @@ class TestFetchRetry:
         """NetworkError triggers exponential backoff (FR-RES-1)."""
         body = _load_fixture("empty_feed.atom")
         mock_fetch.side_effect = [
-            NetworkError(
-                "timeout", url="http://x", kind="timeout"
-            ),
-            NetworkError(
-                "timeout", url="http://x", kind="timeout"
-            ),
+            NetworkError("timeout", url="http://x", kind="timeout"),
+            NetworkError("timeout", url="http://x", kind="timeout"),
             _make_fetch_result(body),
         ]
 
@@ -374,12 +338,8 @@ class TestFetchRetry:
             backoff_base_seconds=1,
             max_retries=3,
         )
-        cfg = ArxivSourceConfig(
-            categories=["cs.AI"], lookback_days=365
-        )
-        fetch_arxiv(
-            arxiv_config=cfg, resilience=resilience
-        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=365)
+        fetch_arxiv(arxiv_config=cfg, resilience=resilience)
         # Expect exponential backoff: 1*2^0=1, 1*2^1=2
         assert mock_sleep.call_args_list == [
             call(1),
@@ -394,16 +354,12 @@ class TestFetchRetry:
         mock_sleep: MagicMock,
     ) -> None:
         """All retries exhausted raises the last NetworkError."""
-        mock_fetch.side_effect = NetworkError(
-            "dns fail", url="http://x", kind="dns"
-        )
+        mock_fetch.side_effect = NetworkError("dns fail", url="http://x", kind="dns")
 
         resilience = ResilienceConfig(max_retries=2)
         cfg = ArxivSourceConfig(categories=["cs.AI"])
         with pytest.raises(NetworkError, match="dns fail"):
-            fetch_arxiv(
-                arxiv_config=cfg, resilience=resilience
-            )
+            fetch_arxiv(arxiv_config=cfg, resilience=resilience)
         # 3 attempts total (initial + 2 retries)
         assert mock_fetch.call_count == 3
 
@@ -426,9 +382,7 @@ class TestFetchRetry:
             backoff_base_seconds=1,
             max_retries=3,
         )
-        cfg = ArxivSourceConfig(
-            categories=["cs.AI"], lookback_days=30
-        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=30)
         now = datetime(2026, 4, 24, 0, 0, 0, tzinfo=UTC)
         items = fetch_arxiv(
             arxiv_config=cfg,
@@ -460,9 +414,7 @@ class TestFetchRetry:
         )
         cfg = ArxivSourceConfig(categories=["cs.AI"])
         with pytest.raises(NetworkError, match="503"):
-            fetch_arxiv(
-                arxiv_config=cfg, resilience=resilience
-            )
+            fetch_arxiv(arxiv_config=cfg, resilience=resilience)
         # 3 attempts total (initial + 2 retries)
         assert mock_fetch.call_count == 3
         # Exponential backoff between retries: 1*2^0, 1*2^1
@@ -476,9 +428,7 @@ class TestFetchRetry:
         mock_sleep: MagicMock,
     ) -> None:
         """Non-retryable 4xx (not 429) raises NetworkError without retry."""
-        mock_fetch.return_value = _make_fetch_result(
-            b"", status_code=400
-        )
+        mock_fetch.return_value = _make_fetch_result(b"", status_code=400)
 
         cfg = ArxivSourceConfig(categories=["cs.AI"])
         with pytest.raises(NetworkError, match="400"):
@@ -565,9 +515,7 @@ class TestFetchRetry:
         )
 
         cfg = ArxivSourceConfig(categories=["cs.AI"])
-        with pytest.raises(
-            NetworkError, match="Content-type"
-        ):
+        with pytest.raises(NetworkError, match="Content-type"):
             fetch_arxiv(
                 arxiv_config=cfg,
                 resilience=_default_resilience(),

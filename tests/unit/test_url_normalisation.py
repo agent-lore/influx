@@ -78,8 +78,7 @@ class TestNormaliseUrl:
 
     def test_multiple_non_enumerated_utm_params_stripped(self) -> None:
         raw = (
-            "https://example.com/path"
-            "?utm_id=1&utm_brand=foo&utm_creative=bar&keep=yes"
+            "https://example.com/path?utm_id=1&utm_brand=foo&utm_creative=bar&keep=yes"
         )
         result = normalise_url(raw)
         assert result == "https://example.com/path?keep=yes"
@@ -125,7 +124,12 @@ class TestArxivCanonicalUrl:
         assert arxiv_canonical_url("2601.12345") == "https://arxiv.org/abs/2601.12345"
 
     def test_versioned_id(self) -> None:
-        assert arxiv_canonical_url("2601.12345v2") == "https://arxiv.org/abs/2601.12345v2"
+        assert (
+            arxiv_canonical_url("2601.12345v2") == "https://arxiv.org/abs/2601.12345v2"
+        )
 
     def test_old_format_id(self) -> None:
-        assert arxiv_canonical_url("hep-ph/0601001") == "https://arxiv.org/abs/hep-ph/0601001"
+        assert (
+            arxiv_canonical_url("hep-ph/0601001")
+            == "https://arxiv.org/abs/hep-ph/0601001"
+        )

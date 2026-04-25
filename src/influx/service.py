@@ -255,9 +255,7 @@ def post_run_webhook_hook(
         (p for p in config.profiles if p.name == result.profile),
         None,
     )
-    threshold = (
-        profile_cfg.thresholds.notify_immediate if profile_cfg else 8
-    )
+    threshold = profile_cfg.thresholds.notify_immediate if profile_cfg else 8
 
     digest = build_digest(result, notify_immediate_threshold=threshold)
     send_digest(

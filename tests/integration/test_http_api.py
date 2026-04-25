@@ -120,9 +120,7 @@ class TestReady:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
-        app_with_state.state.config.lithos.url = (
-            f"http://127.0.0.1:{port}/sse"
-        )
+        app_with_state.state.config.lithos.url = f"http://127.0.0.1:{port}/sse"
         probe_loop: ProbeLoop = app_with_state.state.probe_loop
         probe_loop.run_once()
 
@@ -258,9 +256,7 @@ class TestDegradedStateLithosUnreachable:
             resp = tc.get("/ready")
         assert resp.status_code == 503
 
-    def test_lithos_down_status_degraded(
-        self, app_lithos_down: FastAPI
-    ) -> None:
+    def test_lithos_down_status_degraded(self, app_lithos_down: FastAPI) -> None:
         """/status reports degraded with lithos dependency not ok (AC-M1-11)."""
         with TestClient(app_lithos_down) as tc:
             body = tc.get("/status").json()

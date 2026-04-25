@@ -321,32 +321,20 @@ def merge_tags(
     ]
 
     # 2. Influx-owned tags: fully replaced by new_tags
-    influx_owned = [
-        t for t in new_tags if _is_influx_owned(t)
-    ]
+    influx_owned = [t for t in new_tags if _is_influx_owned(t)]
 
     # 3. profile:* union merge with rejection guard (FR-NOTE-6)
-    existing_profiles = {
-        t for t in existing_tags if t.startswith("profile:")
-    }
-    new_profiles = {
-        t for t in new_tags if t.startswith("profile:")
-    }
+    existing_profiles = {t for t in existing_tags if t.startswith("profile:")}
+    new_profiles = {t for t in new_tags if t.startswith("profile:")}
     union_profiles = existing_profiles | new_profiles
     # Remove profiles that have been rejected
     guarded_profiles = sorted(
-        t
-        for t in union_profiles
-        if t[len("profile:") :] not in rejected_profiles
+        t for t in union_profiles if t[len("profile:") :] not in rejected_profiles
     )
 
     # 4. Rejection tags: preserve from both sets
     rejection_tags = sorted(
-        {
-            t
-            for t in (*existing_tags, *new_tags)
-            if t.startswith("influx:rejected:")
-        }
+        {t for t in (*existing_tags, *new_tags) if t.startswith("influx:rejected:")}
     )
 
     return influx_owned + guarded_profiles + rejection_tags + external
@@ -519,9 +507,7 @@ def _render_profile_relevance_body(
     parts: list[str] = []
     for entry in entries:
         parts.append(
-            f"### {entry.profile_name}\n"
-            f"Score: {entry.score}/10\n"
-            f"{entry.reason}"
+            f"### {entry.profile_name}\nScore: {entry.score}/10\n{entry.reason}"
         )
     return "\n\n".join(parts)
 
@@ -579,8 +565,7 @@ def render_note(
     """
     if "ingested-by:influx" not in tags:
         raise MissingIngestedByTagError(
-            "Influx-authored notes must carry the 'ingested-by:influx' tag "
-            "(FR-RES-6)"
+            "Influx-authored notes must carry the 'ingested-by:influx' tag (FR-RES-6)"
         )
     validate_archive_tag_invariant(archive_path=archive_path, tags=tags)
 
@@ -720,9 +705,7 @@ def build_profile_relevance_for_rewrite(
         The resolved entries to pass to :func:`render_note`.
     """
     rejected = {
-        t[len("influx:rejected:") :]
-        for t in tags
-        if t.startswith("influx:rejected:")
+        t[len("influx:rejected:") :] for t in tags if t.startswith("influx:rejected:")
     }
 
     result: list[ProfileRelevanceEntry] = []

@@ -33,14 +33,10 @@ class ArchivePathError(InfluxError):
 def _reject_unsafe_id(item_id: str) -> None:
     """Raise if *item_id* contains path-traversal or absolute-path components."""
     if item_id.startswith("/"):
-        raise ArchivePathError(
-            f"Item ID {item_id!r} is an absolute path"
-        )
+        raise ArchivePathError(f"Item ID {item_id!r} is an absolute path")
     parts = Path(item_id).parts
     if ".." in parts:
-        raise ArchivePathError(
-            f"Item ID {item_id!r} contains '..' traversal component"
-        )
+        raise ArchivePathError(f"Item ID {item_id!r} contains '..' traversal component")
 
 
 def build_archive_path(
@@ -85,9 +81,7 @@ def build_archive_path(
         path escapes *archive_root* (directory traversal).
     """
     if not is_valid_slug(source):
-        raise ArchivePathError(
-            f"Source {source!r} is not a valid FR-ST-2 slug"
-        )
+        raise ArchivePathError(f"Source {source!r} is not a valid FR-ST-2 slug")
 
     # Reject traversal components in item_id before building the path
     # (AC-04-C: reject BEFORE any download is attempted).
@@ -98,9 +92,7 @@ def build_archive_path(
 
     filename = f"{item_id}{ext}"
 
-    rel_posix = str(
-        PurePosixPath(source) / year_str / month_str / filename
-    )
+    rel_posix = str(PurePosixPath(source) / year_str / month_str / filename)
 
     fs_path = archive_root / source / year_str / month_str / filename
     resolved = fs_path.resolve()
@@ -194,9 +186,7 @@ def download_archive(
         )
 
     if result.status_code >= 400:
-        msg = (
-            f"HTTP {result.status_code} for {url}"
-        )
+        msg = f"HTTP {result.status_code} for {url}"
         _log.warning("Archive download failed: %s", msg)
         return ArchiveResult(
             ok=False,
@@ -208,9 +198,7 @@ def download_archive(
         fs_path.parent.mkdir(parents=True, exist_ok=True)
         fs_path.write_bytes(result.body)
     except OSError as exc:
-        _log.warning(
-            "Archive write failed for %s: %s", fs_path, exc
-        )
+        _log.warning("Archive write failed for %s: %s", fs_path, exc)
         return ArchiveResult(
             ok=False,
             rel_posix_path=None,

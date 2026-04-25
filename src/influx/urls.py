@@ -26,6 +26,7 @@ def _is_tracking_param(key: str) -> bool:
     """Return True if *key* is a tracking query parameter (FR-MCP-4)."""
     return key.startswith("utm_") or key in _TRACKING_PARAMS
 
+
 # Default ports that are stripped when they match the scheme.
 _DEFAULT_PORTS: dict[str, int] = {
     "http": 80,

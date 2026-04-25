@@ -1,8 +1,10 @@
 """Integration tests for full arXiv → Lithos → webhook path (US-019).
 
-Exercises POST /runs → real-MCP-write → webhook-POST path against a
-local fake Lithos SSE server and a local fake webhook receiver,
-replacing PRD 04's stub-recorder assertions.
+Drives the real production ``run_profile`` body through ``POST /runs``
+against a local fake Lithos SSE server and a local fake webhook
+receiver — no monkeypatching of ``influx.http_api.run_profile``.
+Source acquisition is supplied by the ``app.state.item_provider``
+seam that PRD 04 will replace with the real arXiv + RSS fetcher.
 
 Covers: AC-M1-7, AC-M1-9, AC-M1-10, AC-M1-11, AC-05-H, AC-05-I.
 """
@@ -14,7 +16,7 @@ import json
 import socket
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from typing import Any
 
 import pytest
@@ -34,9 +36,7 @@ from influx.config import (
     SecurityConfig,
 )
 from influx.coordinator import Coordinator, RunKind
-from influx.feedback import build_negative_examples_block
 from influx.http_api import router
-from influx.lithos_client import LithosClient
 from influx.notifications import (
     HighlightItem,
     ProfileRunResult,
@@ -72,9 +72,7 @@ class FakeWebhookServer:
     """Simple HTTP server that records incoming POST requests."""
 
     def __init__(self) -> None:
-        self._srv = http.server.HTTPServer(
-            ("127.0.0.1", 0), _WebhookHandler
-        )
+        self._srv = http.server.HTTPServer(("127.0.0.1", 0), _WebhookHandler)
         self._srv.received = []  # type: ignore[attr-defined]
         self.port = self._srv.server_address[1]
         self._thread: threading.Thread | None = None
@@ -88,9 +86,7 @@ class FakeWebhookServer:
         return f"http://127.0.0.1:{self.port}"
 
     def start(self) -> None:
-        self._thread = threading.Thread(
-            target=self._srv.serve_forever, daemon=True
-        )
+        self._thread = threading.Thread(target=self._srv.serve_forever, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -144,7 +140,7 @@ def clear_fakes(
 
 # ── Helpers ────────────────────────────────────────────────────────
 
-_SAMPLE_ITEMS = [
+_SAMPLE_ITEMS: list[dict[str, Any]] = [
     {
         "title": "Attention Is All You Need",
         "source_url": "https://arxiv.org/abs/1706.03762",
@@ -156,6 +152,10 @@ _SAMPLE_ITEMS = [
         ],
         "score": 9,
         "confidence": 0.9,
+        "path": "papers/arxiv/2026/04",
+        "abstract_or_summary": (
+            "We propose a new architecture called the Transformer."
+        ),
     },
     {
         "title": "BERT: Pre-training of Deep Bidirectional Transformers",
@@ -168,6 +168,10 @@ _SAMPLE_ITEMS = [
         ],
         "score": 7,
         "confidence": 0.8,
+        "path": "papers/arxiv/2026/04",
+        "abstract_or_summary": (
+            "BERT obtains new state-of-the-art results on a range of tasks."
+        ),
     },
 ]
 
@@ -183,6 +187,7 @@ def _make_config(
     profile_list = [
         ProfileConfig(
             name=name,
+            description=f"Profile {name}",
             thresholds=ProfileThresholds(notify_immediate=8),
         )
         for name in profile_names
@@ -212,8 +217,38 @@ def _make_config(
     )
 
 
-def _make_app(config: AppConfig) -> FastAPI:
-    """Create a FastAPI app wired for integration testing."""
+def _make_item_provider(
+    items: list[dict[str, Any]],
+    captured: dict[str, Any] | None = None,
+) -> Any:
+    """Build an item provider that yields *items* and captures the prompt."""
+
+    async def provider(
+        profile: str,
+        kind: RunKind,
+        run_range: dict[str, str | int] | None,
+        filter_prompt: str,
+    ) -> Iterable[dict[str, Any]]:
+        del profile, kind, run_range
+        if captured is not None:
+            captured["filter_prompt"] = filter_prompt
+        return list(items)
+
+    return provider
+
+
+def _make_app(
+    config: AppConfig,
+    *,
+    items: list[dict[str, Any]] | None = None,
+    captured: dict[str, Any] | None = None,
+) -> FastAPI:
+    """Create a FastAPI app wired for integration testing.
+
+    The injected ``app.state.item_provider`` plugs source acquisition
+    into the real production ``run_profile`` so tests do NOT
+    monkeypatch ``influx.http_api.run_profile`` (US-019).
+    """
     app = FastAPI()
     app.include_router(router)
     coordinator = Coordinator()
@@ -225,6 +260,8 @@ def _make_app(config: AppConfig) -> FastAPI:
     app.state.scheduler = scheduler
     app.state.probe_loop = probe_loop
     app.state.active_tasks = set()  # type: ignore[assignment]
+    if items is not None:
+        app.state.item_provider = _make_item_provider(items, captured)
     return app
 
 
@@ -242,100 +279,6 @@ def _wait_for_idle(
     raise TimeoutError(f"Profile {profile!r} still busy after {timeout}s")
 
 
-def _make_fake_run_profile(
-    lithos_url: str,
-    config: AppConfig,
-    items: list[dict[str, Any]],
-) -> tuple[Any, dict[str, Any]]:
-    """Create a fake ``run_profile`` that exercises real MCP tool calls.
-
-    Returns ``(fake_run_profile_coroutine, shared_state_dict)``.
-    The state dict is populated by the run and accessible to tests.
-    """
-    state: dict[str, Any] = {
-        "filter_prompt": "",
-        "result": None,
-        "error": None,
-    }
-
-    async def fake_run_profile(
-        profile: str,
-        kind: RunKind,
-        run_range: dict[str, str | int] | None = None,
-    ) -> None:
-        client = LithosClient(url=lithos_url)
-        try:
-            # 1. Feedback — build negative examples block (AC-05-H).
-            neg_block = await build_negative_examples_block(
-                client,
-                profile=profile,
-                limit=config.feedback.negative_examples_per_profile,
-            )
-
-            # 2. Build filter prompt (simulating the pipeline).
-            prompt_text = config.prompts.filter.text or ""
-            state["filter_prompt"] = prompt_text.format(
-                profile_description=profile,
-                negative_examples=neg_block,
-                min_score_in_results=config.filter.min_score_in_results,
-            )
-
-            # 3. Process items: cache_lookup → write_note.
-            ingested: list[HighlightItem] = []
-            for item in items:
-                cache_result = await client.cache_lookup(
-                    query=item["title"],
-                    source_url=item["source_url"],
-                )
-                cache_body = json.loads(
-                    cache_result.content[0].text  # type: ignore[union-attr]
-                )
-                if cache_body.get("hit"):
-                    continue
-
-                write_result = await client.write_note(
-                    title=item["title"],
-                    content=item.get("content", "# Summary\nContent."),
-                    path=item.get("path", "papers/arxiv/2026/04"),
-                    source_url=item["source_url"],
-                    tags=item.get("tags", [f"profile:{profile}"]),
-                    confidence=item.get("confidence", 0.85),
-                )
-                if write_result.status in ("created", "updated"):
-                    ingested.append(
-                        HighlightItem(
-                            id=f"note-{len(ingested) + 1}",
-                            title=item["title"],
-                            score=item.get("score", 9),
-                            tags=item.get("tags", [f"profile:{profile}"]),
-                            reason="High relevance.",
-                            url=item["source_url"],
-                        )
-                    )
-
-            # 4. Build ProfileRunResult.
-            result = ProfileRunResult(
-                run_date="2026-04-25",
-                profile=profile,
-                stats=RunStats(
-                    sources_checked=len(items),
-                    ingested=len(ingested),
-                ),
-                items=ingested,
-            )
-            state["result"] = result
-
-            # 5. Fire webhook hook (AC-05-I).
-            post_run_webhook_hook(result, config, kind=kind)
-        except Exception as exc:
-            state["error"] = exc
-            raise
-        finally:
-            await client.close()
-
-    return fake_run_profile, state
-
-
 # ── AC-M1-7, AC-M1-10: full path with lithos_write + webhook ─────
 
 
@@ -347,18 +290,13 @@ class TestFullPath:
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
         fake_webhook: FakeWebhookServer,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """AC-M1-7: lithos_write calls recorded + digest POST received."""
         config = _make_config(
             lithos_url=fake_lithos_url,
             webhook_url=fake_webhook.url,
         )
-        fake_run, state = _make_fake_run_profile(
-            fake_lithos_url, config, _SAMPLE_ITEMS
-        )
-        monkeypatch.setattr("influx.http_api.run_profile", fake_run)
-        app = _make_app(config)
+        app = _make_app(config, items=_SAMPLE_ITEMS)
 
         with TestClient(app) as tc:
             resp = tc.post("/runs", json={"profile": "ai-robotics"})
@@ -366,9 +304,7 @@ class TestFullPath:
             _wait_for_idle(app.state.coordinator, "ai-robotics")
 
         # AC-M1-7: fake Lithos recorded lithos_write calls.
-        write_calls = [
-            c for c in fake_lithos.calls if c[0] == "lithos_write"
-        ]
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         assert len(write_calls) == 2
 
         # AC-M1-7: fake webhook received a digest POST.
@@ -383,26 +319,19 @@ class TestFullPath:
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
         fake_webhook: FakeWebhookServer,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """AC-M1-10: lithos_write payloads contain FR-MCP-6 fields."""
         config = _make_config(
             lithos_url=fake_lithos_url,
             webhook_url=fake_webhook.url,
         )
-        fake_run, _ = _make_fake_run_profile(
-            fake_lithos_url, config, _SAMPLE_ITEMS[:1]
-        )
-        monkeypatch.setattr("influx.http_api.run_profile", fake_run)
-        app = _make_app(config)
+        app = _make_app(config, items=_SAMPLE_ITEMS[:1])
 
         with TestClient(app) as tc:
             tc.post("/runs", json={"profile": "ai-robotics"})
             _wait_for_idle(app.state.coordinator, "ai-robotics")
 
-        write_calls = [
-            c for c in fake_lithos.calls if c[0] == "lithos_write"
-        ]
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         assert len(write_calls) == 1
         payload = write_calls[0][1]
 
@@ -421,18 +350,13 @@ class TestFullPath:
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
         fake_webhook: FakeWebhookServer,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """AC-05-I: highlights filtered by notify_immediate threshold."""
         config = _make_config(
             lithos_url=fake_lithos_url,
             webhook_url=fake_webhook.url,
         )
-        fake_run, _ = _make_fake_run_profile(
-            fake_lithos_url, config, _SAMPLE_ITEMS
-        )
-        monkeypatch.setattr("influx.http_api.run_profile", fake_run)
-        app = _make_app(config)
+        app = _make_app(config, items=_SAMPLE_ITEMS)
 
         with TestClient(app) as tc:
             tc.post("/runs", json={"profile": "ai-robotics"})
@@ -456,7 +380,6 @@ class TestDedupSkip:
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
         fake_webhook: FakeWebhookServer,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """AC-M1-9: second run → cache_lookup returns hit → no write."""
         config = _make_config(
@@ -466,19 +389,13 @@ class TestDedupSkip:
         items = _SAMPLE_ITEMS[:1]
 
         # --- First run: item is new (cache miss → write). ---
-        fake_run_1, _ = _make_fake_run_profile(
-            fake_lithos_url, config, items
-        )
-        monkeypatch.setattr("influx.http_api.run_profile", fake_run_1)
-        app = _make_app(config)
+        app = _make_app(config, items=items)
 
         with TestClient(app) as tc:
             tc.post("/runs", json={"profile": "ai-robotics"})
             _wait_for_idle(app.state.coordinator, "ai-robotics")
 
-        first_write_calls = [
-            c for c in fake_lithos.calls if c[0] == "lithos_write"
-        ]
+        first_write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         assert len(first_write_calls) == 1
 
         # Clear state for second run.
@@ -494,26 +411,18 @@ class TestDedupSkip:
         )
 
         # --- Second run: item is cached (cache hit → skip). ---
-        fake_run_2, state_2 = _make_fake_run_profile(
-            fake_lithos_url, config, items
-        )
-        monkeypatch.setattr("influx.http_api.run_profile", fake_run_2)
-        app2 = _make_app(config)
+        app2 = _make_app(config, items=items)
 
         with TestClient(app2) as tc:
             tc.post("/runs", json={"profile": "ai-robotics"})
             _wait_for_idle(app2.state.coordinator, "ai-robotics")
 
         # cache_lookup was called.
-        lookup_calls = [
-            c for c in fake_lithos.calls if c[0] == "lithos_cache_lookup"
-        ]
+        lookup_calls = [c for c in fake_lithos.calls if c[0] == "lithos_cache_lookup"]
         assert len(lookup_calls) >= 1
 
         # No lithos_write — item was skipped.
-        second_write_calls = [
-            c for c in fake_lithos.calls if c[0] == "lithos_write"
-        ]
+        second_write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         assert len(second_write_calls) == 0
 
         # Webhook digest shows zero ingested.
@@ -532,7 +441,6 @@ class TestNegativeExamples:
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
         fake_webhook: FakeWebhookServer,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """AC-05-H: filter prompt has titles from lithos_list rejections."""
         config = _make_config(
@@ -542,39 +450,34 @@ class TestNegativeExamples:
 
         # Queue lithos_list to return 3 rejection items.
         fake_lithos.list_responses.append(
-            json.dumps({
-                "items": [
-                    {"id": "r1", "title": "Rejected Paper A"},
-                    {"id": "r2", "title": "Rejected Paper B"},
-                    {"id": "r3", "title": "Rejected Paper C"},
-                ]
-            })
+            json.dumps(
+                {
+                    "items": [
+                        {"id": "r1", "title": "Rejected Paper A"},
+                        {"id": "r2", "title": "Rejected Paper B"},
+                        {"id": "r3", "title": "Rejected Paper C"},
+                    ]
+                }
+            )
         )
 
-        fake_run, state = _make_fake_run_profile(
-            fake_lithos_url, config, _SAMPLE_ITEMS[:1]
-        )
-        monkeypatch.setattr("influx.http_api.run_profile", fake_run)
-        app = _make_app(config)
+        captured: dict[str, Any] = {}
+        app = _make_app(config, items=_SAMPLE_ITEMS[:1], captured=captured)
 
         with TestClient(app) as tc:
             tc.post("/runs", json={"profile": "ai-robotics"})
             _wait_for_idle(app.state.coordinator, "ai-robotics")
 
         # AC-05-H: filter prompt contains the rejection titles.
-        prompt = state["filter_prompt"]
+        prompt = captured["filter_prompt"]
         assert "Rejected Paper A" in prompt
         assert "Rejected Paper B" in prompt
         assert "Rejected Paper C" in prompt
 
         # lithos_list was called with the right tag.
-        list_calls = [
-            c for c in fake_lithos.calls if c[0] == "lithos_list"
-        ]
+        list_calls = [c for c in fake_lithos.calls if c[0] == "lithos_list"]
         assert len(list_calls) == 1
-        assert list_calls[0][1]["tags"] == [
-            "influx:rejected:ai-robotics"
-        ]
+        assert list_calls[0][1]["tags"] == ["influx:rejected:ai-robotics"]
 
 
 # ── AC-05-I: webhook fires for non-backfill, skips backfill ──────
@@ -588,18 +491,13 @@ class TestWebhookAutoFire:
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
         fake_webhook: FakeWebhookServer,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """AC-05-I: POST /runs (manual) → webhook POST auto-fires."""
         config = _make_config(
             lithos_url=fake_lithos_url,
             webhook_url=fake_webhook.url,
         )
-        fake_run, _ = _make_fake_run_profile(
-            fake_lithos_url, config, _SAMPLE_ITEMS[:1]
-        )
-        monkeypatch.setattr("influx.http_api.run_profile", fake_run)
-        app = _make_app(config)
+        app = _make_app(config, items=_SAMPLE_ITEMS[:1])
 
         with TestClient(app) as tc:
             tc.post("/runs", json={"profile": "ai-robotics"})
@@ -674,7 +572,6 @@ class TestLithosUnreachable:
     def test_run_aborts_when_lithos_unreachable(
         self,
         fake_webhook: FakeWebhookServer,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """AC-M1-11: POST /runs aborts when Lithos is unreachable."""
         port = self._find_unreachable_port()
@@ -683,26 +580,8 @@ class TestLithosUnreachable:
             lithos_url=unreachable_url,
             webhook_url=fake_webhook.url,
         )
-
-        # Monkeypatch run_profile to attempt a real LithosClient
-        # connection against the unreachable URL.
-        async def failing_run_profile(
-            profile: str,
-            kind: RunKind,
-            run_range: dict[str, str | int] | None = None,
-        ) -> None:
-            client = LithosClient(url=unreachable_url)
-            try:
-                await client.cache_lookup(
-                    query="test", source_url="https://test.com"
-                )
-            finally:
-                await client.close()
-
-        monkeypatch.setattr(
-            "influx.http_api.run_profile", failing_run_profile
-        )
-        app = _make_app(config)
+        # Provide one item so run_profile attempts a real Lithos call.
+        app = _make_app(config, items=_SAMPLE_ITEMS[:1])
 
         with TestClient(app) as tc:
             resp = tc.post("/runs", json={"profile": "ai-robotics"})
@@ -734,7 +613,6 @@ class TestLithosUnreachable:
     def test_service_alive_after_degraded_run(
         self,
         fake_webhook: FakeWebhookServer,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """AC-M1-11: service stays alive after an aborted run."""
         port = self._find_unreachable_port()
@@ -743,20 +621,7 @@ class TestLithosUnreachable:
             lithos_url=unreachable_url,
             webhook_url=fake_webhook.url,
         )
-
-        async def failing_run(
-            profile: str,
-            kind: RunKind,
-            run_range: dict[str, str | int] | None = None,
-        ) -> None:
-            client = LithosClient(url=unreachable_url)
-            try:
-                await client.call_tool("lithos_ping")
-            finally:
-                await client.close()
-
-        monkeypatch.setattr("influx.http_api.run_profile", failing_run)
-        app = _make_app(config)
+        app = _make_app(config, items=_SAMPLE_ITEMS[:1])
 
         with TestClient(app) as tc:
             # First run aborts.

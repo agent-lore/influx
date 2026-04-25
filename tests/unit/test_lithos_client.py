@@ -65,9 +65,7 @@ class TestLCMAStubs:
             stub()
 
     @pytest.mark.parametrize("stub", _LCMA_STUBS, ids=lambda f: f.__name__)
-    def test_lcma_error_is_distinct_from_lithos_error(
-        self, stub: object
-    ) -> None:
+    def test_lcma_error_is_distinct_from_lithos_error(self, stub: object) -> None:
         assert callable(stub)
         with pytest.raises(LCMAError) as exc_info:
             stub()
@@ -100,6 +98,5 @@ class TestLCMAStubs:
                             f":{node.lineno} calls {name}()"
                         )
         assert violations == [], (
-            "Production code must not invoke LCMA stubs:\n"
-            + "\n".join(violations)
+            "Production code must not invoke LCMA stubs:\n" + "\n".join(violations)
         )

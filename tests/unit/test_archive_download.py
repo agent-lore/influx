@@ -96,9 +96,7 @@ class TestSuccessfulDownload:
         assert result.rel_posix_path == "arxiv/2026/01/2601.12345.pdf"
         assert result.error == ""
 
-        fs_path = (
-            tmp_path / "arxiv" / "2026" / "01" / "2601.12345.pdf"
-        )
+        fs_path = tmp_path / "arxiv" / "2026" / "01" / "2601.12345.pdf"
         assert fs_path.exists()
         assert fs_path.read_bytes() == b"%PDF-1.4 sample"
 
@@ -154,9 +152,7 @@ class TestOversizeAbort:
         mock_fetch.side_effect = _oversize_error()  # type: ignore[union-attr]
         _dl(tmp_path, max_download_bytes=1000)
 
-        fs_path = (
-            tmp_path / "arxiv" / "2026" / "01" / "2601.12345.pdf"
-        )
+        fs_path = tmp_path / "arxiv" / "2026" / "01" / "2601.12345.pdf"
         assert not fs_path.exists()
 
 
@@ -242,10 +238,12 @@ class TestFailurePathTagSignal:
         # Caller logic: on failure, archive_path=None and add tags
         failure_tags: list[str] = []
         if not result.ok:
-            failure_tags.extend([
-                "influx:repair-needed",
-                "influx:archive-missing",
-            ])
+            failure_tags.extend(
+                [
+                    "influx:repair-needed",
+                    "influx:archive-missing",
+                ]
+            )
         assert "influx:repair-needed" in failure_tags
         assert "influx:archive-missing" in failure_tags
 
@@ -253,9 +251,7 @@ class TestFailurePathTagSignal:
 class TestPathSafetyBeforeDownload:
     """Path-safety errors propagate as ArchivePathError, not caught."""
 
-    def test_traversal_raises_before_download(
-        self, tmp_path: Path
-    ) -> None:
+    def test_traversal_raises_before_download(self, tmp_path: Path) -> None:
         """Unsafe IDs are rejected before any network call."""
         with pytest.raises(ArchivePathError):
             _dl(tmp_path, item_id="../../etc/passwd")

@@ -125,7 +125,7 @@ class TestSchedulerLockIntegration:
         lock_held_during_run = False
 
         async def spy_run_profile(
-            profile: str, kind: Any, run_range: Any = None
+            profile: str, kind: Any, run_range: Any = None, **_: Any
         ) -> None:
             nonlocal lock_held_during_run
             lock_held_during_run = coord.is_busy(profile)
@@ -159,7 +159,9 @@ class TestSchedulerLockIntegration:
         coord = Coordinator()
         sched = InfluxScheduler(config, coord)
 
-        async def failing_run(profile: str, kind: Any, run_range: Any = None) -> None:
+        async def failing_run(
+            profile: str, kind: Any, run_range: Any = None, **_: Any
+        ) -> None:
             raise RuntimeError("boom")
 
         with (
@@ -184,7 +186,7 @@ class TestCrossProfileParallelism:
         fired: list[str] = []
 
         async def spy_run_profile(
-            profile: str, kind: Any, run_range: Any = None
+            profile: str, kind: Any, run_range: Any = None, **_: Any
         ) -> None:
             fired.append(profile)
 
@@ -207,7 +209,7 @@ class TestCrossProfileParallelism:
         fired_count = 0
 
         async def spy_run_profile(
-            profile: str, kind: Any, run_range: Any = None
+            profile: str, kind: Any, run_range: Any = None, **_: Any
         ) -> None:
             nonlocal fired_count
             fired_count += 1

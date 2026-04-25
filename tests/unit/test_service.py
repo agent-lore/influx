@@ -233,7 +233,7 @@ class TestInfluxService:
         cancel_observed = asyncio.Event()
 
         async def slow_run_profile(
-            profile: str, kind: Any, run_range: Any = None
+            profile: str, kind: Any, run_range: Any = None, **_: Any
         ) -> None:
             try:
                 await asyncio.sleep(0.1)  # well inside the grace window
@@ -286,7 +286,7 @@ class TestInfluxService:
         cancel_observed = asyncio.Event()
 
         async def long_run_profile(
-            profile: str, kind: Any, run_range: Any = None
+            profile: str, kind: Any, run_range: Any = None, **_: Any
         ) -> None:
             fired.set()
             try:

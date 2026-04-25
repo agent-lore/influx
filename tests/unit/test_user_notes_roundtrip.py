@@ -57,8 +57,7 @@ class TestGoldenFileRoundTrip:
             confidence=0.8,
             archive_path="arxiv/2026/01/2601.12345.pdf",
             summary=(
-                "This paper revisits the transformer architecture"
-                " with novel insights."
+                "This paper revisits the transformer architecture with novel insights."
             ),
             keywords=["transformer", "attention", "neural networks"],
             profile_entries=[
@@ -105,8 +104,7 @@ class TestGoldenFileRoundTrip:
             confidence=0.8,
             archive_path="arxiv/2026/01/2601.12345.pdf",
             summary=(
-                "This paper revisits the transformer architecture"
-                " with novel insights."
+                "This paper revisits the transformer architecture with novel insights."
             ),
             keywords=["transformer", "attention", "neural networks"],
             profile_entries=profile_entries,
@@ -163,8 +161,7 @@ class TestUserNotesRoundTrip:
         "### research\n"
         "Score: 7/10\n"
         "Old relevance text.\n"
-        "\n"
-        + USER_NOTES_CONTENT
+        "\n" + USER_NOTES_CONTENT
     )
 
     def test_user_notes_survive_rewrite(self) -> None:
@@ -630,8 +627,7 @@ class TestFrontmatterFields:
         rendered = render_note(
             title="FM Test",
             source_url=(
-                "https://ArXiv.org:443/abs/2601.12345"
-                "?utm_source=twitter&utm_id=42"
+                "https://ArXiv.org:443/abs/2601.12345?utm_source=twitter&utm_id=42"
             ),
             tags=["source:arxiv", "ingested-by:influx"],
             confidence=0.7,
@@ -641,10 +637,7 @@ class TestFrontmatterFields:
             profile_entries=[],
             user_notes=None,
         )
-        assert (
-            "source_url: https://arxiv.org/abs/2601.12345"
-            in rendered
-        )
+        assert "source_url: https://arxiv.org/abs/2601.12345" in rendered
         assert "ArXiv.org" not in rendered
         assert "utm_source" not in rendered
         assert "utm_id" not in rendered
@@ -706,15 +699,7 @@ class TestParseProfileRelevance:
         assert entries[1].reason == "Engineering reason."
 
     def test_no_profile_relevance_section(self) -> None:
-        note = (
-            "---\n"
-            "note_type: summary\n"
-            "---\n"
-            "# Test\n"
-            "\n"
-            "## Summary\n"
-            "Summary.\n"
-        )
+        note = "---\nnote_type: summary\n---\n# Test\n\n## Summary\nSummary.\n"
         parsed = parse_note(note)
         entries = parse_profile_relevance(parsed)
         assert entries == []

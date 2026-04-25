@@ -168,8 +168,7 @@ class TestUserNotesBytePreservation:
         "\n"
         "## Summary\n"
         "A summary.\n"
-        "\n"
-        + USER_NOTES_CONTENT
+        "\n" + USER_NOTES_CONTENT
     )
 
     def test_user_notes_exact_bytes(self) -> None:
@@ -303,15 +302,7 @@ class TestParseArchivePathEmpty:
 class TestParseArchivePathOmitted:
     """Archive section entirely absent is legal."""
 
-    NOTE = (
-        "---\n"
-        "note_type: summary\n"
-        "---\n"
-        "# Paper Title\n"
-        "\n"
-        "## Summary\n"
-        "Content.\n"
-    )
+    NOTE = "---\nnote_type: summary\n---\n# Paper Title\n\n## Summary\nContent.\n"
 
     def test_returns_none(self) -> None:
         parsed = parse_note(self.NOTE)
@@ -389,8 +380,7 @@ class TestCRLFHandling:
         "\r\n"
         "## Summary\r\n"
         "CRLF summary content.\r\n"
-        "\r\n"
-        + USER_NOTES_CRLF
+        "\r\n" + USER_NOTES_CRLF
     )
 
     def test_title_parsed_without_cr(self) -> None:
@@ -408,10 +398,7 @@ class TestCRLFHandling:
 
     def test_archive_path_parse_crlf(self) -> None:
         result = parse_note(self.NOTE_CRLF)
-        assert (
-            parse_archive_path(result)
-            == "arxiv/2026/01/2601.12345.pdf"
-        )
+        assert parse_archive_path(result) == "arxiv/2026/01/2601.12345.pdf"
 
 
 class TestProfileRelevanceCRLF:

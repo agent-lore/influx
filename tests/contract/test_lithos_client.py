@@ -78,9 +78,7 @@ class FakeLithosServer:
             return '{"registered": true}'
 
         @self._mcp.tool(name="lithos_cache_lookup")
-        async def lithos_cache_lookup(
-            query: str = "", source_url: str = ""
-        ) -> str:
+        async def lithos_cache_lookup(query: str = "", source_url: str = "") -> str:
             calls.append(
                 ("lithos_cache_lookup", {"query": query, "source_url": source_url})
             )
@@ -138,9 +136,7 @@ class FakeLithosServer:
             tags: list[str] | None = None,
             limit: int | None = None,
         ) -> str:
-            calls.append(
-                ("lithos_list", {"tags": tags or [], "limit": limit})
-            )
+            calls.append(("lithos_list", {"tags": tags or [], "limit": limit}))
             import json
 
             if list_responses:
@@ -169,9 +165,7 @@ class FakeLithosServer:
             log_level="warning",
         )
         self._uvicorn_server = uvicorn.Server(config)
-        self._thread = threading.Thread(
-            target=self._uvicorn_server.run, daemon=True
-        )
+        self._thread = threading.Thread(target=self._uvicorn_server.run, daemon=True)
         self._thread.start()
         # Wait until the server is accepting connections.
         self._wait_for_ready()
@@ -180,15 +174,11 @@ class FakeLithosServer:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                with socket.create_connection(
-                    ("127.0.0.1", self.port), timeout=0.5
-                ):
+                with socket.create_connection(("127.0.0.1", self.port), timeout=0.5):
                     return
             except OSError:
                 time.sleep(0.05)
-        raise RuntimeError(
-            f"Fake Lithos server did not start within {timeout}s"
-        )
+        raise RuntimeError(f"Fake Lithos server did not start within {timeout}s")
 
     def stop(self) -> None:
         if self._uvicorn_server is not None:
@@ -246,9 +236,7 @@ class TestConstructionValidation:
 class TestConnectionLifecycle:
     """Lazy-connect + reuse semantics (FR-MCP-2)."""
 
-    async def test_not_connected_at_construction(
-        self, fake_lithos_url: str
-    ) -> None:
+    async def test_not_connected_at_construction(self, fake_lithos_url: str) -> None:
         client = LithosClient(url=fake_lithos_url)
         assert not client.connected
         await client.close()
@@ -515,9 +503,7 @@ class TestListNotes:
                 tags=["arxiv-id:2601.12345"],
             )
             # Verify the fake server received the call.
-            list_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_list"
-            ]
+            list_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_list"]
             assert len(list_calls) == 1
             assert list_calls[0][1]["tags"] == ["arxiv-id:2601.12345"]
 
@@ -547,9 +533,7 @@ class TestListNotes:
                 tags=["nonexistent-tag:xyz"],
             )
             # Verify server received the call.
-            list_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_list"
-            ]
+            list_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_list"]
             assert len(list_calls) == 1
 
             # Response should be an empty items list, not None.
@@ -573,12 +557,8 @@ class TestListNotes:
         """Limit parameter is forwarded to the server."""
         client = LithosClient(url=fake_lithos_url)
         try:
-            await client.list_notes(
-                tags=["arxiv-id:2601.12345"], limit=5
-            )
-            list_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_list"
-            ]
+            await client.list_notes(tags=["arxiv-id:2601.12345"], limit=5)
+            list_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_list"]
             assert len(list_calls) == 1
             assert list_calls[0][1]["limit"] == 5
         finally:
@@ -618,21 +598,15 @@ class TestWriteNote:
 
             # Verify the fake server received the call.
             write_calls = [
-                c
-                for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 1
             payload = write_calls[0][1]
             assert payload["title"] == "Attention Is All You Need"
-            assert payload["content"] == (
-                "# Summary\nTransformer architecture paper."
-            )
+            assert payload["content"] == ("# Summary\nTransformer architecture paper.")
             assert payload["agent"] == "influx"
             assert payload["path"] == "papers/arxiv/2026/03"
-            assert payload["source_url"] == (
-                "https://arxiv.org/abs/1706.03762"
-            )
+            assert payload["source_url"] == ("https://arxiv.org/abs/1706.03762")
             assert payload["tags"] == [
                 "profile:ml-research",
                 "arxiv-id:1706.03762",
@@ -645,9 +619,7 @@ class TestWriteNote:
 
             # WriteResult surfaces the status for caller counters.
             assert result.status == "created"
-            assert result.source_url == (
-                "https://arxiv.org/abs/1706.03762"
-            )
+            assert result.source_url == ("https://arxiv.org/abs/1706.03762")
         finally:
             await client.close()
 
@@ -671,14 +643,10 @@ class TestWriteNote:
             )
 
             write_calls = [
-                c
-                for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 1
-            assert write_calls[0][1]["expires_at"] == (
-                "2026-04-30T00:00:00Z"
-            )
+            assert write_calls[0][1]["expires_at"] == ("2026-04-30T00:00:00Z")
         finally:
             await client.close()
 
@@ -701,9 +669,7 @@ class TestWriteNote:
             )
 
             write_calls = [
-                c
-                for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 1
             # expires_at is None in the recorded payload because
@@ -726,9 +692,7 @@ class TestWriteEnvelopeDuplicate:
         clear_fake_calls: None,
     ) -> None:
         """duplicate: no error, status surfaces for dedup_skipped."""
-        fake_lithos_server.write_responses.append(
-            '{"status": "duplicate"}'
-        )
+        fake_lithos_server.write_responses.append('{"status": "duplicate"}')
         client = LithosClient(url=fake_lithos_url)
         try:
             result = await client.write_note(
@@ -740,9 +704,7 @@ class TestWriteEnvelopeDuplicate:
                 confidence=0.8,
             )
             assert result.status == "duplicate"
-            assert result.source_url == (
-                "https://arxiv.org/abs/2601.00001"
-            )
+            assert result.source_url == ("https://arxiv.org/abs/2601.00001")
         finally:
             await client.close()
 
@@ -753,9 +715,7 @@ class TestWriteEnvelopeDuplicate:
         clear_fake_calls: None,
     ) -> None:
         """duplicate: exactly one lithos_write call, no retry."""
-        fake_lithos_server.write_responses.append(
-            '{"status": "duplicate"}'
-        )
+        fake_lithos_server.write_responses.append('{"status": "duplicate"}')
         client = LithosClient(url=fake_lithos_url)
         try:
             await client.write_note(
@@ -767,9 +727,7 @@ class TestWriteEnvelopeDuplicate:
                 confidence=0.8,
             )
             write_calls = [
-                c
-                for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 1
         finally:
@@ -782,9 +740,7 @@ class TestWriteEnvelopeDuplicate:
         clear_fake_calls: None,
     ) -> None:
         """Caller can count dedup_skipped via result.status."""
-        fake_lithos_server.write_responses.append(
-            '{"status": "duplicate"}'
-        )
+        fake_lithos_server.write_responses.append('{"status": "duplicate"}')
         client = LithosClient(url=fake_lithos_url)
         try:
             result = await client.write_note(
@@ -829,9 +785,7 @@ class TestWriteEnvelopeInvalidInput:
             )
             assert result.status == "invalid_input"
             assert result.detail == "bad payload"
-            assert result.source_url == (
-                "https://arxiv.org/abs/2601.00004"
-            )
+            assert result.source_url == ("https://arxiv.org/abs/2601.00004")
         finally:
             await client.close()
 
@@ -913,10 +867,12 @@ class TestWriteEnvelopeSlugCollision:
         clear_fake_calls: None,
     ) -> None:
         """arXiv URL: retry with ` [arXiv <id>]` suffix → succeeds."""
-        fake_lithos_server.write_responses.extend([
-            '{"status": "slug_collision"}',
-            '{"status": "created"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "slug_collision"}',
+                '{"status": "created"}',
+            ]
+        )
         client = LithosClient(url=fake_lithos_url)
         try:
             result = await client.write_note(
@@ -930,13 +886,10 @@ class TestWriteEnvelopeSlugCollision:
             assert result.status == "created"
 
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 2
-            assert write_calls[0][1]["title"] == (
-                "Attention Is All You Need"
-            )
+            assert write_calls[0][1]["title"] == ("Attention Is All You Need")
             assert write_calls[1][1]["title"] == (
                 "Attention Is All You Need [arXiv 1706.03762]"
             )
@@ -950,10 +903,12 @@ class TestWriteEnvelopeSlugCollision:
         clear_fake_calls: None,
     ) -> None:
         """Web/RSS URL: retry with ` [<host>]` suffix → succeeds."""
-        fake_lithos_server.write_responses.extend([
-            '{"status": "slug_collision"}',
-            '{"status": "created"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "slug_collision"}',
+                '{"status": "created"}',
+            ]
+        )
         client = LithosClient(url=fake_lithos_url)
         try:
             result = await client.write_note(
@@ -967,14 +922,11 @@ class TestWriteEnvelopeSlugCollision:
             assert result.status == "created"
 
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 2
             assert write_calls[0][1]["title"] == "Great Blog Post"
-            assert write_calls[1][1]["title"] == (
-                "Great Blog Post [example.com]"
-            )
+            assert write_calls[1][1]["title"] == ("Great Blog Post [example.com]")
         finally:
             await client.close()
 
@@ -985,10 +937,12 @@ class TestWriteEnvelopeSlugCollision:
         clear_fake_calls: None,
     ) -> None:
         """Second slug_collision: skip item, no further retry."""
-        fake_lithos_server.write_responses.extend([
-            '{"status": "slug_collision"}',
-            '{"status": "slug_collision"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "slug_collision"}',
+                '{"status": "slug_collision"}',
+            ]
+        )
         client = LithosClient(url=fake_lithos_url)
         try:
             result = await client.write_note(
@@ -1002,8 +956,7 @@ class TestWriteEnvelopeSlugCollision:
             assert result.status == "slug_collision"
 
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 2  # No third attempt
         finally:
@@ -1019,10 +972,12 @@ class TestWriteEnvelopeSlugCollision:
         """Second slug_collision: warning logged with source_url."""
         import logging
 
-        fake_lithos_server.write_responses.extend([
-            '{"status": "slug_collision"}',
-            '{"status": "slug_collision"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "slug_collision"}',
+                '{"status": "slug_collision"}',
+            ]
+        )
         client = LithosClient(url=fake_lithos_url)
         try:
             with caplog.at_level(logging.WARNING):
@@ -1055,24 +1010,28 @@ class TestWriteEnvelopeVersionConflict:
         """First conflict: re-read, merge tags + user notes, retry succeeds."""
         import json as _json
 
-        fake_lithos_server.write_responses.extend([
-            '{"status": "version_conflict", "note_id": "note-042"}',
-            '{"status": "updated"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "version_conflict", "note_id": "note-042"}',
+                '{"status": "updated"}',
+            ]
+        )
         fake_lithos_server.read_responses.append(
-            _json.dumps({
-                "id": "note-042",
-                "content": (
-                    "# Summary\nOld content.\n\n"
-                    "## User Notes\nMy custom annotations."
-                ),
-                "tags": [
-                    "profile:ml-research",
-                    "user-custom-tag",
-                    "influx:rejected:other-profile",
-                ],
-                "version": 3,
-            })
+            _json.dumps(
+                {
+                    "id": "note-042",
+                    "content": (
+                        "# Summary\nOld content.\n\n"
+                        "## User Notes\nMy custom annotations."
+                    ),
+                    "tags": [
+                        "profile:ml-research",
+                        "user-custom-tag",
+                        "influx:rejected:other-profile",
+                    ],
+                    "version": 3,
+                }
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1087,17 +1046,13 @@ class TestWriteEnvelopeVersionConflict:
             assert result.status == "updated"
 
             # Verify lithos_read was called with note_id.
-            read_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_read"
-            ]
+            read_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_read"]
             assert len(read_calls) == 1
             assert read_calls[0][1]["id"] == "note-042"
 
             # Verify the retry write has merged tags.
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 2
             retry_payload = write_calls[1][1]
@@ -1129,22 +1084,26 @@ class TestWriteEnvelopeVersionConflict:
         """User Notes block from existing note replaces any in new content."""
         import json as _json
 
-        fake_lithos_server.write_responses.extend([
-            '{"status": "version_conflict", "note_id": "note-043"}',
-            '{"status": "updated"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "version_conflict", "note_id": "note-043"}',
+                '{"status": "updated"}',
+            ]
+        )
         existing_user_notes = (
             "## User Notes\n"
             "Important: this paper is referenced in our Q3 review.\n"
             "Follow up with team lead."
         )
         fake_lithos_server.read_responses.append(
-            _json.dumps({
-                "id": "note-043",
-                "content": f"# Summary\nOld.\n\n{existing_user_notes}",
-                "tags": ["profile:ml-research"],
-                "version": 5,
-            })
+            _json.dumps(
+                {
+                    "id": "note-043",
+                    "content": f"# Summary\nOld.\n\n{existing_user_notes}",
+                    "tags": ["profile:ml-research"],
+                    "version": 5,
+                }
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1158,8 +1117,7 @@ class TestWriteEnvelopeVersionConflict:
                 confidence=0.8,
             )
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             retry_content = write_calls[1][1]["content"]
             assert "Refreshed" in retry_content
@@ -1177,17 +1135,21 @@ class TestWriteEnvelopeVersionConflict:
         """Second version_conflict: skip item, no further retry."""
         import json as _json
 
-        fake_lithos_server.write_responses.extend([
-            '{"status": "version_conflict", "note_id": "note-044"}',
-            '{"status": "version_conflict", "note_id": "note-044"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "version_conflict", "note_id": "note-044"}',
+                '{"status": "version_conflict", "note_id": "note-044"}',
+            ]
+        )
         fake_lithos_server.read_responses.append(
-            _json.dumps({
-                "id": "note-044",
-                "content": "# Summary\nContent.",
-                "tags": ["profile:ml-research"],
-                "version": 7,
-            })
+            _json.dumps(
+                {
+                    "id": "note-044",
+                    "content": "# Summary\nContent.",
+                    "tags": ["profile:ml-research"],
+                    "version": 7,
+                }
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1202,8 +1164,7 @@ class TestWriteEnvelopeVersionConflict:
             assert result.status == "version_conflict"
 
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 2  # No third attempt
         finally:
@@ -1220,17 +1181,21 @@ class TestWriteEnvelopeVersionConflict:
         import json as _json
         import logging
 
-        fake_lithos_server.write_responses.extend([
-            '{"status": "version_conflict", "note_id": "note-045"}',
-            '{"status": "version_conflict", "note_id": "note-045"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "version_conflict", "note_id": "note-045"}',
+                '{"status": "version_conflict", "note_id": "note-045"}',
+            ]
+        )
         fake_lithos_server.read_responses.append(
-            _json.dumps({
-                "id": "note-045",
-                "content": "# Summary\nContent.",
-                "tags": [],
-                "version": 1,
-            })
+            _json.dumps(
+                {
+                    "id": "note-045",
+                    "content": "# Summary\nContent.",
+                    "tags": [],
+                    "version": 1,
+                }
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1272,10 +1237,12 @@ class TestWriteEnvelopeContentTooLarge:
         clear_fake_calls: None,
     ) -> None:
         """First content_too_large → drop Tier 2, retry → succeeds."""
-        fake_lithos_server.write_responses.extend([
-            '{"status": "content_too_large"}',
-            '{"status": "created"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "content_too_large"}',
+                '{"status": "created"}',
+            ]
+        )
         client = LithosClient(url=fake_lithos_url)
         try:
             result = await client.write_note(
@@ -1289,8 +1256,7 @@ class TestWriteEnvelopeContentTooLarge:
             assert result.status == "created"
 
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 2
 
@@ -1315,10 +1281,12 @@ class TestWriteEnvelopeContentTooLarge:
         """Second content_too_large + no existing note → skip + count + log."""
         import logging
 
-        fake_lithos_server.write_responses.extend([
-            '{"status": "content_too_large"}',
-            '{"status": "content_too_large"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "content_too_large"}',
+                '{"status": "content_too_large"}',
+            ]
+        )
         # No existing note: cache_lookup returns miss (default).
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1335,21 +1303,17 @@ class TestWriteEnvelopeContentTooLarge:
             # Status indicates skipped for counter.
             assert result.status == "content_too_large_skipped"
             assert result.detail == "create_path"
-            assert result.source_url == (
-                "https://arxiv.org/abs/2601.50002"
-            )
+            assert result.source_url == ("https://arxiv.org/abs/2601.50002")
 
             # Exactly 2 write attempts (original + Tier-2-trimmed retry).
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 2
 
             # cache_lookup was called to check for existing note.
             lookup_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_cache_lookup"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
             ]
             assert len(lookup_calls) == 1
 
@@ -1366,10 +1330,12 @@ class TestWriteEnvelopeContentTooLarge:
         clear_fake_calls: None,
     ) -> None:
         """Create path: no degraded placeholder note is invented."""
-        fake_lithos_server.write_responses.extend([
-            '{"status": "content_too_large"}',
-            '{"status": "content_too_large"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "content_too_large"}',
+                '{"status": "content_too_large"}',
+            ]
+        )
         client = LithosClient(url=fake_lithos_url)
         try:
             result = await client.write_note(
@@ -1384,8 +1350,7 @@ class TestWriteEnvelopeContentTooLarge:
 
             # Only 2 lithos_write calls — no third "placeholder" write.
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 2
         finally:
@@ -1415,22 +1380,28 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         # 1st write → content_too_large
         # 2nd write (Tier 2 dropped) → content_too_large
         # 3rd write (Tier 1 only, repair) → updated
-        fake_lithos_server.write_responses.extend([
-            '{"status": "content_too_large"}',
-            '{"status": "content_too_large"}',
-            '{"status": "updated"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "content_too_large"}',
+                '{"status": "content_too_large"}',
+                '{"status": "updated"}',
+            ]
+        )
         # cache_lookup returns hit → existing note found (repair path).
+        # Existing rejection guards a *different* profile so the canonical
+        # merge contract (FR-NOTE-6) preserves profile:ml-research.
         fake_lithos_server.cache_lookup_responses.append(
-            _json.dumps({
-                "hit": True,
-                "id": "note-repair-001",
-                "tags": [
-                    "profile:ml-research",
-                    "user-custom-tag",
-                    "influx:rejected:ml-research",
-                ],
-            })
+            _json.dumps(
+                {
+                    "hit": True,
+                    "id": "note-repair-001",
+                    "tags": [
+                        "profile:ml-research",
+                        "user-custom-tag",
+                        "influx:rejected:robotics",
+                    ],
+                }
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1445,8 +1416,7 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
             assert result.status == "updated"
 
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             # 3 writes: original, Tier-2-dropped retry, Tier-1-only repair.
             assert len(write_calls) == 3
@@ -1471,11 +1441,11 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
             # influx:repair-needed tag present.
             repair_tags = repair_payload["tags"]
             assert "influx:repair-needed" in repair_tags
-            # Existing tags preserved via merge.
+            # Existing tags preserved via canonical merge (FR-NOTE-5/6/7/8).
             assert "profile:ml-research" in repair_tags
             assert "source:arxiv" in repair_tags
             assert "user-custom-tag" in repair_tags
-            assert "influx:rejected:ml-research" in repair_tags
+            assert "influx:rejected:robotics" in repair_tags
         finally:
             await client.close()
 
@@ -1497,18 +1467,22 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         # 1st write → content_too_large
         # 2nd write (Tier 2 dropped) → content_too_large
         # 3rd write (Tier 1 only, repair) → content_too_large
-        fake_lithos_server.write_responses.extend([
-            '{"status": "content_too_large"}',
-            '{"status": "content_too_large"}',
-            '{"status": "content_too_large"}',
-        ])
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "content_too_large"}',
+                '{"status": "content_too_large"}',
+                '{"status": "content_too_large"}',
+            ]
+        )
         # cache_lookup returns hit → existing note found (repair path).
         fake_lithos_server.cache_lookup_responses.append(
-            _json.dumps({
-                "hit": True,
-                "id": "note-repair-002",
-                "tags": ["profile:ml-research"],
-            })
+            _json.dumps(
+                {
+                    "hit": True,
+                    "id": "note-repair-002",
+                    "tags": ["profile:ml-research"],
+                }
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1525,14 +1499,11 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
             # Status indicates skipped with repair-path detail.
             assert result.status == "content_too_large_skipped"
             assert result.detail == "repair_path_tier1_failed"
-            assert result.source_url == (
-                "https://arxiv.org/abs/2601.60002"
-            )
+            assert result.source_url == ("https://arxiv.org/abs/2601.60002")
 
             # Exactly 3 write attempts (original + Tier-2 retry + Tier-1 repair).
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 3
 
@@ -1563,31 +1534,32 @@ class TestFeedbackFetch:
         import json as _json
 
         fake_lithos_server.list_responses.append(
-            _json.dumps({
-                "items": [
-                    {"id": "r1", "title": "Bad Paper A"},
-                    {"id": "r2", "title": "Bad Paper B"},
-                    {"id": "r3", "title": "Bad Paper C"},
-                ]
-            })
+            _json.dumps(
+                {
+                    "items": [
+                        {"id": "r1", "title": "Bad Paper A"},
+                        {"id": "r2", "title": "Bad Paper B"},
+                        {"id": "r3", "title": "Bad Paper C"},
+                    ]
+                }
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
             titles = await fetch_rejection_titles(
-                client, profile="ml-research", limit=20,
+                client,
+                profile="ml-research",
+                limit=20,
             )
             assert titles == [
-                "Bad Paper A", "Bad Paper B", "Bad Paper C",
+                "Bad Paper A",
+                "Bad Paper B",
+                "Bad Paper C",
             ]
             # Verify correct lithos_list call was made.
-            list_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_list"
-            ]
+            list_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_list"]
             assert len(list_calls) == 1
-            assert list_calls[0][1]["tags"] == [
-                "influx:rejected:ml-research"
-            ]
+            assert list_calls[0][1]["tags"] == ["influx:rejected:ml-research"]
             assert list_calls[0][1]["limit"] == 20
         finally:
             await client.close()
@@ -1602,33 +1574,36 @@ class TestFeedbackFetch:
         import json as _json
 
         fake_lithos_server.list_responses.append(
-            _json.dumps({
-                "items": [
-                    {"id": "r1", "title": "Has Title"},
-                    {"id": "r2"},  # no title
-                ]
-            })
+            _json.dumps(
+                {
+                    "items": [
+                        {"id": "r1", "title": "Has Title"},
+                        {"id": "r2"},  # no title
+                    ]
+                }
+            )
         )
         fake_lithos_server.read_responses.append(
-            _json.dumps({
-                "id": "r2",
-                "title": "Fetched Via Read",
-                "content": "",
-                "tags": [],
-                "version": 1,
-            })
+            _json.dumps(
+                {
+                    "id": "r2",
+                    "title": "Fetched Via Read",
+                    "content": "",
+                    "tags": [],
+                    "version": 1,
+                }
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
             titles = await fetch_rejection_titles(
-                client, profile="ai", limit=10,
+                client,
+                profile="ai",
+                limit=10,
             )
             assert titles == ["Has Title", "Fetched Via Read"]
             # Verify lithos_read was called for the missing-title item.
-            read_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_read"
-            ]
+            read_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_read"]
             assert len(read_calls) == 1
             assert read_calls[0][1]["id"] == "r2"
         finally:
@@ -1643,13 +1618,13 @@ class TestFeedbackFetch:
         """Empty lithos_list response → empty titles list."""
         import json as _json
 
-        fake_lithos_server.list_responses.append(
-            _json.dumps({"items": []})
-        )
+        fake_lithos_server.list_responses.append(_json.dumps({"items": []}))
         client = LithosClient(url=fake_lithos_url)
         try:
             titles = await fetch_rejection_titles(
-                client, profile="ai", limit=20,
+                client,
+                profile="ai",
+                limit=20,
             )
             assert titles == []
         finally:
@@ -1665,13 +1640,15 @@ class TestFeedbackFetch:
         import json as _json
 
         fake_lithos_server.list_responses.append(
-            _json.dumps({
-                "items": [
-                    {"id": "r1", "title": "Bad Paper A"},
-                    {"id": "r2", "title": "Bad Paper B"},
-                    {"id": "r3", "title": "Bad Paper C"},
-                ]
-            })
+            _json.dumps(
+                {
+                    "items": [
+                        {"id": "r1", "title": "Bad Paper A"},
+                        {"id": "r2", "title": "Bad Paper B"},
+                        {"id": "r3", "title": "Bad Paper C"},
+                    ]
+                }
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1721,16 +1698,12 @@ class TestFeedbackTagIntegrity:
                 confidence=0.85,
             )
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             assert len(write_calls) == 1
             written_tags = write_calls[0][1]["tags"]
             # No influx:rejected:* tag synthesized by Influx.
-            assert not any(
-                t.startswith("influx:rejected:")
-                for t in written_tags
-            )
+            assert not any(t.startswith("influx:rejected:") for t in written_tags)
         finally:
             await client.close()
 
@@ -1745,29 +1718,31 @@ class TestFeedbackTagIntegrity:
 
         # First write returns version_conflict.
         fake_lithos_server.write_responses.append(
-            _json.dumps({
-                "status": "version_conflict",
-                "note_id": "note-rejected-001",
-            })
+            _json.dumps(
+                {
+                    "status": "version_conflict",
+                    "note_id": "note-rejected-001",
+                }
+            )
         )
         # Read returns a note with an existing rejected tag.
         fake_lithos_server.read_responses.append(
-            _json.dumps({
-                "id": "note-rejected-001",
-                "title": "Existing Paper",
-                "content": "# Summary\nOld content.",
-                "tags": [
-                    "profile:ml-research",
-                    "influx:rejected:robotics",
-                    "source:arxiv",
-                ],
-                "version": 2,
-            })
+            _json.dumps(
+                {
+                    "id": "note-rejected-001",
+                    "title": "Existing Paper",
+                    "content": "# Summary\nOld content.",
+                    "tags": [
+                        "profile:ml-research",
+                        "influx:rejected:robotics",
+                        "source:arxiv",
+                    ],
+                    "version": 2,
+                }
+            )
         )
         # Retry write succeeds.
-        fake_lithos_server.write_responses.append(
-            '{"status": "updated"}'
-        )
+        fake_lithos_server.write_responses.append('{"status": "updated"}')
 
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1786,13 +1761,138 @@ class TestFeedbackTagIntegrity:
             assert result.status == "updated"
             # The retry write should contain the merged tags.
             write_calls = [
-                c for c in fake_lithos_server.calls
-                if c[0] == "lithos_write"
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
             # 2 writes: original + retry after version_conflict.
             assert len(write_calls) == 2
             retry_tags = write_calls[1][1]["tags"]
             # Existing influx:rejected:robotics is preserved via merge.
             assert "influx:rejected:robotics" in retry_tags
+        finally:
+            await client.close()
+
+    async def test_version_conflict_replaces_stale_influx_owned_tags(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Stale Influx-owned tags (e.g. source:rss) are fully replaced.
+
+        FR-NOTE-5: Influx-owned prefix tags from the existing note must
+        not survive when the new write supplies a fresh value.  The
+        canonical :func:`influx.notes.merge_tags` contract is enforced
+        at the version_conflict retry chokepoint.
+        """
+        import json as _json
+
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "version_conflict", "note_id": "note-stale-001"}',
+                '{"status": "updated"}',
+            ]
+        )
+        fake_lithos_server.read_responses.append(
+            _json.dumps(
+                {
+                    "id": "note-stale-001",
+                    "content": "# Summary\nOld content.",
+                    "tags": [
+                        "source:rss",
+                        "arxiv-id:old.0001",
+                        "profile:ml-research",
+                        "user-custom-tag",
+                    ],
+                    "version": 4,
+                }
+            )
+        )
+
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Updated Paper",
+                content="# Summary\nNew content.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2601.77777",
+                tags=[
+                    "profile:ml-research",
+                    "source:arxiv",
+                    "arxiv-id:2601.77777",
+                ],
+                confidence=0.9,
+            )
+            assert result.status == "updated"
+
+            write_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 2
+            retry_tags = write_calls[1][1]["tags"]
+
+            # New Influx-owned tags present.
+            assert "source:arxiv" in retry_tags
+            assert "arxiv-id:2601.77777" in retry_tags
+            # Stale Influx-owned tags fully replaced.
+            assert "source:rss" not in retry_tags
+            assert "arxiv-id:old.0001" not in retry_tags
+            # External + profile + rejection tags preserved.
+            assert "user-custom-tag" in retry_tags
+            assert "profile:ml-research" in retry_tags
+        finally:
+            await client.close()
+
+    async def test_version_conflict_rejection_guard_blocks_profile(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Rejection guard: ``influx:rejected:<p>`` blocks ``profile:<p>``.
+
+        FR-NOTE-6: a rejected profile tag on the existing note prevents
+        the matching ``profile:<p>`` tag from being re-added on rewrite.
+        """
+        import json as _json
+
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "version_conflict", "note_id": "note-reject-002"}',
+                '{"status": "updated"}',
+            ]
+        )
+        fake_lithos_server.read_responses.append(
+            _json.dumps(
+                {
+                    "id": "note-reject-002",
+                    "content": "# Summary\nOld.",
+                    "tags": [
+                        "profile:robotics",
+                        "influx:rejected:robotics",
+                    ],
+                    "version": 1,
+                }
+            )
+        )
+
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.write_note(
+                title="Rejected Paper",
+                content="# Summary\nNew.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2601.66666",
+                tags=["profile:robotics", "source:arxiv"],
+                confidence=0.7,
+            )
+            write_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 2
+            retry_tags = write_calls[1][1]["tags"]
+            # Rejection guard blocks profile:robotics.
+            assert "profile:robotics" not in retry_tags
+            assert "influx:rejected:robotics" in retry_tags
+            assert "source:arxiv" in retry_tags
         finally:
             await client.close()

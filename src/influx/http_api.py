@@ -170,7 +170,13 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
         # Launch the run in the background so the response returns immediately.
         _spawn_tracked_task(
             request.app,
-            _run_and_release(coordinator, body.profile, RunKind.MANUAL),
+            _run_and_release(
+                coordinator,
+                body.profile,
+                RunKind.MANUAL,
+                config=config,
+                item_provider=getattr(request.app.state, "item_provider", None),
+            ),
         )
 
         return JSONResponse(
@@ -202,10 +208,33 @@ async def _run_and_release(
     profile: str,
     kind: RunKind,
     run_range: dict[str, str | int] | None = None,
+    *,
+    config: Any = None,
+    item_provider: Any = None,
 ) -> None:
-    """Run ``run_profile`` and release the coordinator lock afterward."""
+    """Run ``run_profile`` and release the coordinator lock afterward.
+
+    Failures in ``run_profile`` (e.g. Lithos unreachable per AC-M1-11)
+    are logged and swallowed so that the manual-run lock is released
+    cleanly and the service stays alive (FR-HTTP-4 + AC-M1-11).
+    """
     try:
-        await run_profile(profile, kind, run_range=run_range)
+        try:
+            await run_profile(
+                profile,
+                kind,
+                run_range=run_range,
+                config=config,
+                item_provider=item_provider,
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "run_profile %r aborted",
+                profile,
+                exc_info=True,
+            )
     finally:
         coordinator.release(profile)
 
@@ -375,7 +404,14 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
         # Launch the backfill in the background.
         _spawn_tracked_task(
             request.app,
-            _run_and_release(coordinator, body.profile, RunKind.BACKFILL, run_range),
+            _run_and_release(
+                coordinator,
+                body.profile,
+                RunKind.BACKFILL,
+                run_range,
+                config=config,
+                item_provider=getattr(request.app.state, "item_provider", None),
+            ),
         )
 
         return JSONResponse(

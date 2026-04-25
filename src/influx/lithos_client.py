@@ -24,7 +24,9 @@ from mcp import types as mcp_types
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 
+from influx.dedup import compose_dedup_query
 from influx.errors import ConfigError, LCMAError, LithosError
+from influx.notes import merge_tags as _canonical_merge_tags
 
 __all__ = ["LithosClient", "WriteResult"]
 
@@ -93,25 +95,20 @@ def _extract_slug_suffix(source_url: str) -> str:
     return f" [{host}]"
 
 
-def _merge_tags(
-    existing_tags: list[str], new_tags: list[str]
-) -> list[str]:
-    """Merge tags: new tags first, then existing tags not already present."""
-    seen = set(new_tags)
-    merged = list(new_tags)
-    for tag in existing_tags:
-        if tag not in seen:
-            merged.append(tag)
-            seen.add(tag)
-    return merged
+def _merge_tags(existing_tags: list[str], new_tags: list[str]) -> list[str]:
+    """Merge tags using the canonical PRD 04 contract (FR-NOTE-5/6/7/8).
+
+    Delegates to :func:`influx.notes.merge_tags` so that Influx-owned
+    tags are fully replaced, ``profile:*`` tags are union-merged with
+    the rejection guard, and external tags are preserved verbatim.
+    """
+    return _canonical_merge_tags(existing_tags=existing_tags, new_tags=new_tags)
 
 
 _USER_NOTES_MARKER = "## User Notes"
 
 
-def _preserve_user_notes(
-    existing_content: str, new_content: str
-) -> str:
+def _preserve_user_notes(existing_content: str, new_content: str) -> str:
     """Merge content, preserving ``## User Notes`` from the existing note.
 
     The ``## User Notes`` section and everything beneath it in
@@ -126,6 +123,7 @@ def _preserve_user_notes(
     new_idx = new_content.find(_USER_NOTES_MARKER)
     base = new_content[:new_idx].rstrip() if new_idx != -1 else new_content.rstrip()
     return base + "\n\n" + user_notes_block
+
 
 _TIER2_MARKER = "## Full Text"
 
@@ -300,6 +298,30 @@ class LithosClient:
             {"query": query, "source_url": source_url},
         )
 
+    async def cache_lookup_for_item(
+        self,
+        *,
+        title: str,
+        source_url: str | None,
+        abstract_or_summary: str | None = None,
+    ) -> mcp_types.CallToolResult:
+        """Compose dedup query + cache lookup for an arXiv/RSS item.
+
+        Single source-agnostic chokepoint that ensures the
+        ``title + first_sentence(abstract_or_summary)`` rule from
+        FR-MCP-3 / AC-05-B is always applied identically across arXiv
+        and RSS callers.  Raises ``LithosError("missing_lookup_arg")``
+        before any RPC when *title* or *source_url* is missing.
+        """
+        if not title:
+            raise LithosError(
+                "missing_lookup_arg",
+                operation="cache_lookup",
+                detail="title is required",
+            )
+        query = compose_dedup_query(title, abstract_or_summary)
+        return await self.cache_lookup(query=query, source_url=source_url)
+
     async def read_note(self, *, note_id: str) -> dict[str, Any]:
         """Read a note by ID (used for version_conflict re-reads)."""
         result = await self.call_tool("lithos_read", {"id": note_id})
@@ -347,9 +369,7 @@ class LithosClient:
         parsed = self._parse_write_response(result, source_url=source_url)
 
         if parsed.status == "slug_collision":
-            return await self._retry_slug_collision(
-                args, source_url=source_url
-            )
+            return await self._retry_slug_collision(args, source_url=source_url)
 
         if parsed.status == "version_conflict":
             return await self._retry_version_conflict(
@@ -403,9 +423,7 @@ class LithosClient:
         existing_tags: list[str] = existing.get("tags", [])
         merged_tags = _merge_tags(existing_tags, original_tags)
         existing_content: str = existing.get("content", "")
-        merged_content = _preserve_user_notes(
-            existing_content, args["content"]
-        )
+        merged_content = _preserve_user_notes(existing_content, args["content"])
         retry_args = {
             **args,
             "tags": merged_tags,
@@ -428,9 +446,7 @@ class LithosClient:
 
     # ── Content-too-large retry (§9.7) ──────────────────────────────
 
-    async def _check_existing_note(
-        self, source_url: str
-    ) -> dict[str, Any] | None:
+    async def _check_existing_note(self, source_url: str) -> dict[str, Any] | None:
         """Check whether an Influx-authored note exists for *source_url*.
 
         Uses ``lithos_cache_lookup`` with the source URL.  Returns the
@@ -468,9 +484,7 @@ class LithosClient:
         trimmed = _drop_tier2(args["content"])
         retry_args = {**args, "content": trimmed}
         result = await self.call_tool("lithos_write", retry_args)
-        parsed = self._parse_write_response(
-            result, source_url=source_url
-        )
+        parsed = self._parse_write_response(result, source_url=source_url)
         if parsed.status != "content_too_large":
             return parsed
 
@@ -479,8 +493,7 @@ class LithosClient:
         if existing is None:
             # Create path: skip, no degraded placeholder (AC-05-F).
             logger.warning(
-                "lithos_write content_too_large (create path) "
-                "for %s — skipping item",
+                "lithos_write content_too_large (create path) for %s — skipping item",
                 source_url,
             )
             return WriteResult(
@@ -522,9 +535,7 @@ class LithosClient:
             "tags": merged_tags,
         }
         result = await self.call_tool("lithos_write", repair_args)
-        parsed = self._parse_write_response(
-            result, source_url=source_url
-        )
+        parsed = self._parse_write_response(result, source_url=source_url)
         if parsed.status == "content_too_large":
             # Tier 1 alone too large — leave existing note untouched.
             logger.warning(
@@ -554,9 +565,7 @@ class LithosClient:
         status = body.get("status", "")
 
         if status == "duplicate":
-            return WriteResult(
-                status="duplicate", source_url=source_url
-            )
+            return WriteResult(status="duplicate", source_url=source_url)
 
         if status == "invalid_input":
             reason = body.get("reason", "unknown")
@@ -572,9 +581,7 @@ class LithosClient:
             )
 
         if status == "slug_collision":
-            return WriteResult(
-                status="slug_collision", source_url=source_url
-            )
+            return WriteResult(status="slug_collision", source_url=source_url)
 
         if status == "version_conflict":
             note_id = body.get("note_id", "")

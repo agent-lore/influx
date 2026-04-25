@@ -131,9 +131,7 @@ def _build_full_digest(
 ) -> dict[str, Any]:
     """§11.1 full digest with highlights and all_ingested."""
     highlights = [
-        item
-        for item in result.items
-        if item.score >= notify_immediate_threshold
+        item for item in result.items if item.score >= notify_immediate_threshold
     ]
     all_ingested = [
         IngestedItem(

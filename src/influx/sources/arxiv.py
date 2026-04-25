@@ -136,14 +136,10 @@ def _parse_atom(body: bytes) -> list[ArxivItem]:
         abstract = summary_el.text.strip()
 
         pub_text = published_el.text.strip()
-        published = datetime.fromisoformat(
-            pub_text.replace("Z", "+00:00")
-        )
+        published = datetime.fromisoformat(pub_text.replace("Z", "+00:00"))
 
         categories: list[str] = []
-        for cat_el in entry.findall(
-            f"{{{_ATOM_NS}}}category"
-        ):
+        for cat_el in entry.findall(f"{{{_ATOM_NS}}}category"):
             term = cat_el.get("term")
             if term:
                 categories.append(term)
@@ -245,8 +241,7 @@ def _fetch_with_retry(
             if attempt < max_retries:
                 delay = backoff_base * (2**attempt)
                 _log.warning(
-                    "arXiv fetch attempt %d/%d failed (%s), "
-                    "retrying in %.1fs",
+                    "arXiv fetch attempt %d/%d failed (%s), retrying in %.1fs",
                     attempt + 1,
                     max_retries + 1,
                     exc.kind,
@@ -264,8 +259,7 @@ def _fetch_with_retry(
             )
             if attempt < max_retries:
                 _log.warning(
-                    "arXiv 429 on attempt %d/%d, "
-                    "backing off %ds (FR-RES-2)",
+                    "arXiv 429 on attempt %d/%d, backing off %ds (FR-RES-2)",
                     attempt + 1,
                     max_retries + 1,
                     backoff_429,
@@ -284,8 +278,7 @@ def _fetch_with_retry(
             if attempt < max_retries:
                 delay = backoff_base * (2**attempt)
                 _log.warning(
-                    "arXiv HTTP %d on attempt %d/%d, "
-                    "retrying in %.1fs (FR-RES-1)",
+                    "arXiv HTTP %d on attempt %d/%d, retrying in %.1fs (FR-RES-1)",
                     result.status_code,
                     attempt + 1,
                     max_retries + 1,
@@ -307,10 +300,7 @@ def _fetch_with_retry(
         mime = result.content_type.split(";")[0].strip().lower()
         if mime not in _XML_CONTENT_TYPES:
             raise NetworkError(
-                (
-                    f"Content-type {mime!r} does not match expected "
-                    f"XML family"
-                ),
+                (f"Content-type {mime!r} does not match expected XML family"),
                 url=result.final_url,
                 kind="content_type_mismatch",
                 reason=(

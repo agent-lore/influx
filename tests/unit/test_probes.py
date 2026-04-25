@@ -42,9 +42,7 @@ def _make_config(
 class TestLithosProbe:
     """Lithos probe connects to SSE endpoint (US-013)."""
 
-    def test_lithos_ok_with_reachable_server(
-        self, fake_lithos_sse_url: str
-    ) -> None:
+    def test_lithos_ok_with_reachable_server(self, fake_lithos_sse_url: str) -> None:
         """Reachable Lithos SSE server → probe returns ``ok``."""
         cfg = _make_config(lithos_url=fake_lithos_sse_url)
         loop = ProbeLoop(cfg, interval=30.0)

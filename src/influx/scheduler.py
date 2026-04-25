@@ -1,22 +1,26 @@
-"""APScheduler setup with per-job limits and ``run_profile`` stub hook.
+"""APScheduler setup with per-job limits and the ``run_profile`` hook.
 
 Configures an in-process APScheduler that registers one cron job per
 profile from the loaded config, with ``max_instances=1``,
 ``coalesce=True``, and ``misfire_grace_time=schedule.misfire_grace_seconds``
 (FR-SCHED-2).
 
-Each fire routes through :func:`run_profile`, a documented **no-op
-stub** in this PRD.  The following PRDs replace the body:
-
-- **PRD 04** — scheduled-run ingestion pipeline
-- **PRD 06** — backfill-specific logic
-- **PRD 09** — multi-profile fan-out
+Each fire routes through :func:`run_profile`, which executes one
+ingestion cycle: feedback ingestion → per-item dedup lookup →
+``lithos_write`` → post-run webhook hook.  Source acquisition (arXiv /
+RSS) is supplied by an injectable ``item_provider`` callback on
+``app.state`` — PRD 04 replaces the default no-op provider with the
+real arXiv + RSS pipeline; PRD 06 layers backfill-specific date-range
+logic on top; PRD 09 adds multi-profile fan-out.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from collections.abc import Awaitable, Callable, Iterable
+from datetime import UTC, datetime
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -24,28 +28,69 @@ from apscheduler.triggers.cron import CronTrigger
 
 from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
+from influx.feedback import build_negative_examples_block
+from influx.lithos_client import LithosClient
+from influx.notifications import HighlightItem, ProfileRunResult, RunStats
 
 __all__ = [
     "InfluxScheduler",
+    "ProfileItem",
+    "default_item_provider",
     "run_profile",
 ]
 
 logger = logging.getLogger(__name__)
 
 
+# An item provider yields the iterable of dicts that ``run_profile``
+# turns into ``lithos_write`` calls.  Each dict must include ``title``,
+# ``source_url``, ``content``, ``tags``, and ``confidence``; ``score``,
+# ``path``, and ``abstract_or_summary`` are optional.  PRD 04 replaces
+# the default no-op provider with the real arXiv + RSS pipeline.
+ProfileItem = dict[str, Any]
+ItemProvider = Callable[
+    [str, RunKind, dict[str, str | int] | None, str],
+    Awaitable[Iterable[ProfileItem]],
+]
+
+
+async def default_item_provider(
+    profile: str,
+    kind: RunKind,
+    run_range: dict[str, str | int] | None,
+    filter_prompt: str,
+) -> Iterable[ProfileItem]:
+    """No-op item provider — PRD 04 replaces this with arXiv + RSS fetch.
+
+    Returns an empty iterable so that PRD 03 / PRD 05 production runs
+    still complete cleanly (feedback ingestion + post-run webhook hook
+    fire) until source ingestion is wired by the next PRD.
+    """
+    del profile, kind, run_range, filter_prompt
+    return ()
+
+
 async def run_profile(
     profile: str,
     kind: RunKind,
     run_range: dict[str, str | int] | None = None,
-) -> None:
+    *,
+    config: AppConfig | None = None,
+    item_provider: ItemProvider | None = None,
+) -> ProfileRunResult | None:
     """Execute a single ingestion cycle for the given profile.
 
-    This is a **documented stub** in PRD 03.  The following downstream
-    PRDs replace the body:
+    The body is implemented in PRD 05: connects to Lithos via
+    :class:`~influx.lithos_client.LithosClient`, fetches the rejection
+    feedback block (FR-FB-1..3), composes the filter prompt, walks the
+    *item_provider* once and for each candidate item performs a
+    source-agnostic ``lithos_cache_lookup`` (FR-MCP-3) followed by
+    ``lithos_write`` (FR-MCP-6/7) when no cache hit is found.  After
+    the loop completes, :func:`influx.service.post_run_webhook_hook`
+    fires for non-backfill runs (FR-NOT-4).
 
-    - **PRD 04** — implements the scheduled-run ingestion pipeline
-    - **PRD 06** — implements backfill-specific date-range logic
-    - **PRD 09** — implements multi-profile fan-out
+    Source acquisition is delegated to *item_provider* so PRD 04 can
+    plug in the real arXiv + RSS fetcher without touching this module.
 
     Parameters
     ----------
@@ -57,7 +102,106 @@ async def run_profile(
         Optional date-range parameters for backfills (e.g.
         ``{"days": 7}`` or ``{"from": "...", "to": "..."}``).
         ``None`` for scheduled and manual runs.
+    config:
+        Loaded :class:`AppConfig`.  When ``None`` the function is a
+        no-op — used by tests that exercise the scheduler wiring
+        without bootstrapping a Lithos connection.
+    item_provider:
+        Async callable that yields the candidate items for this run.
+        When ``None``, :func:`default_item_provider` is used (PRD 04
+        replaces this default with the real arXiv + RSS pipeline).
     """
+    if config is None:
+        return None
+
+    # When no ``item_provider`` is configured, source acquisition has
+    # not been wired by a downstream PRD yet — skip the Lithos round
+    # trip entirely so PRD 03 / pre-PRD-04 deployments do not establish
+    # SSE connections for empty runs (matches the "no-op" stub
+    # contract documented in :func:`default_item_provider`).
+    if item_provider is None:
+        return None
+
+    provider = item_provider
+    profile_cfg = next((p for p in config.profiles if p.name == profile), None)
+
+    client = LithosClient(url=config.lithos.url, transport=config.lithos.transport)
+    try:
+        # 1. Feedback ingestion → negative examples block (FR-FB-1..3, AC-05-H).
+        neg_block = await build_negative_examples_block(
+            client,
+            profile=profile,
+            limit=config.feedback.negative_examples_per_profile,
+        )
+
+        # 2. Compose filter prompt for this run (consumed by PRD 04 LLM filter).
+        prompt_text = config.prompts.filter.text or ""
+        try:
+            filter_prompt = prompt_text.format(
+                profile_description=(
+                    profile_cfg.description if profile_cfg else profile
+                ),
+                negative_examples=neg_block,
+                min_score_in_results=config.filter.min_score_in_results,
+            )
+        except (KeyError, IndexError):
+            filter_prompt = prompt_text
+
+        # 3. Source acquisition (PRD 04 plugs in arXiv + RSS).
+        items = await provider(profile, kind, run_range, filter_prompt)
+
+        # 4. Per-item: cache_lookup → write_note.
+        ingested: list[HighlightItem] = []
+        sources_checked = 0
+        for item in items:
+            sources_checked += 1
+            title = item["title"]
+            source_url = item["source_url"]
+            cache_result = await client.cache_lookup_for_item(
+                title=title,
+                source_url=source_url,
+                abstract_or_summary=item.get("abstract_or_summary"),
+            )
+            cache_body = json.loads(
+                cache_result.content[0].text  # type: ignore[union-attr]
+            )
+            if cache_body.get("hit"):
+                continue
+
+            write_result = await client.write_note(
+                title=title,
+                content=item.get("content", ""),
+                path=item.get("path", ""),
+                source_url=source_url,
+                tags=list(item.get("tags", [])),
+                confidence=float(item.get("confidence", 0.0)),
+            )
+            if write_result.status in ("created", "updated"):
+                ingested.append(
+                    HighlightItem(
+                        id=item.get("id", f"note-{len(ingested) + 1}"),
+                        title=title,
+                        score=int(item.get("score", 0)),
+                        tags=list(item.get("tags", [])),
+                        reason=item.get("reason", ""),
+                        url=source_url,
+                    )
+                )
+
+        # 5. Build result + fire post-run webhook hook (FR-NOT-1..6, AC-05-I).
+        result = ProfileRunResult(
+            run_date=datetime.now(UTC).date().isoformat(),
+            profile=profile,
+            stats=RunStats(sources_checked=sources_checked, ingested=len(ingested)),
+            items=ingested,
+        )
+        # Lazy import to avoid the service ↔ scheduler import cycle.
+        from influx.service import post_run_webhook_hook
+
+        post_run_webhook_hook(result, config, kind=kind)
+        return result
+    finally:
+        await client.close()
 
 
 class InfluxScheduler:
@@ -151,7 +295,11 @@ class InfluxScheduler:
                 current.add_done_callback(self._active_tasks.discard)
         try:
             async with self._coordinator.hold(profile_name):
-                await run_profile(profile_name, RunKind.SCHEDULED)
+                await run_profile(
+                    profile_name,
+                    RunKind.SCHEDULED,
+                    config=self._config,
+                )
         except ProfileBusyError:
             logger.info(
                 "Scheduled fire for %r skipped — profile already busy",

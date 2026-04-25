@@ -169,12 +169,13 @@ def _make_config(
 class TestWebhookSendDigest:
     """AC-05-I: webhook sender POSTs digest to receiver."""
 
-    def test_digest_post_reaches_receiver(
-        self, fake_webhook_url: str
-    ) -> None:
+    def test_digest_post_reaches_receiver(self, fake_webhook_url: str) -> None:
         """Digest POST reaches the fake receiver with FR-NOT-2 body keys."""
         result = _make_result(
-            items=[_make_item(score=10), _make_item(id="low", score=5, url="https://l")],
+            items=[
+                _make_item(score=10),
+                _make_item(id="low", score=5, url="https://l"),
+            ],
         )
         digest = build_digest(result, notify_immediate_threshold=8)
         send_digest(
@@ -249,9 +250,7 @@ class TestWebhookEmptyUrl:
 class TestWebhookBackfillNoop:
     """FR-NOT-4: post_run_webhook_hook is no-op for backfills."""
 
-    def test_backfill_sends_no_request(
-        self, fake_webhook_url: str
-    ) -> None:
+    def test_backfill_sends_no_request(self, fake_webhook_url: str) -> None:
         """kind == backfill → zero requests recorded."""
         config = _make_config(
             webhook_url=fake_webhook_url,
@@ -261,9 +260,7 @@ class TestWebhookBackfillNoop:
         post_run_webhook_hook(result, config, kind=RunKind.BACKFILL)
         assert _RecordingHandler.request_count == 0
 
-    def test_manual_run_sends_request(
-        self, fake_webhook_url: str
-    ) -> None:
+    def test_manual_run_sends_request(self, fake_webhook_url: str) -> None:
         """kind == manual → request sent (positive control)."""
         config = _make_config(
             webhook_url=fake_webhook_url,
@@ -273,9 +270,7 @@ class TestWebhookBackfillNoop:
         post_run_webhook_hook(result, config, kind=RunKind.MANUAL)
         assert _RecordingHandler.request_count == 1
 
-    def test_scheduled_run_sends_request(
-        self, fake_webhook_url: str
-    ) -> None:
+    def test_scheduled_run_sends_request(self, fake_webhook_url: str) -> None:
         """kind == scheduled → request sent (positive control)."""
         config = _make_config(
             webhook_url=fake_webhook_url,
@@ -312,9 +307,7 @@ class TestWebhookTimeout:
         # Warning was logged
         assert any("failed" in r.message.lower() for r in caplog.records)
 
-    def test_timeout_does_not_raise(
-        self, hanging_webhook_url: str
-    ) -> None:
+    def test_timeout_does_not_raise(self, hanging_webhook_url: str) -> None:
         """Sender catches timeout — does not propagate."""
         digest = build_digest(_make_result(), notify_immediate_threshold=8)
         # Should not raise

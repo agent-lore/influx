@@ -568,9 +568,7 @@ class TestValidateConfigJsonMode:
         monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
         monkeypatch.setenv("FAKE_PROVIDER_KEY", "test-key")
 
-        route = respx.post(
-            "https://fake.api.example.com/v1/chat/completions"
-        )
+        route = respx.post("https://fake.api.example.com/v1/chat/completions")
         route.mock(
             return_value=httpx.Response(
                 200,
@@ -717,9 +715,7 @@ class TestValidateConfigLithosDryConnect:
             assert captured.out.strip().startswith("{")
 
             # The fake server must have received agent_register.
-            register_calls = [
-                c for c in calls if c[0] == "lithos_agent_register"
-            ]
+            register_calls = [c for c in calls if c[0] == "lithos_agent_register"]
             assert len(register_calls) >= 1
             payload = register_calls[0][1]
             assert payload["id"] == "influx"
