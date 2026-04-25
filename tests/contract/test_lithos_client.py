@@ -68,6 +68,38 @@ class FakeLithosServer:
             )
             return '{"hit": false, "stale_exists": false}'
 
+        @self._mcp.tool(name="lithos_write")
+        async def lithos_write(
+            title: str = "",
+            content: str = "",
+            agent: str = "",
+            path: str = "",
+            source_url: str = "",
+            tags: list[str] | None = None,
+            confidence: float = 0.0,
+            note_type: str = "",
+            namespace: str = "",
+            expires_at: str | None = None,
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_write",
+                    {
+                        "title": title,
+                        "content": content,
+                        "agent": agent,
+                        "path": path,
+                        "source_url": source_url,
+                        "tags": tags or [],
+                        "confidence": confidence,
+                        "note_type": note_type,
+                        "namespace": namespace,
+                        "expires_at": expires_at,
+                    },
+                )
+            )
+            return '{"status": "created"}'
+
         @self._mcp.tool(name="lithos_list")
         async def lithos_list(
             tags: list[str] | None = None,
@@ -510,5 +542,137 @@ class TestListNotes:
             ]
             assert len(list_calls) == 1
             assert list_calls[0][1]["limit"] == 5
+        finally:
+            await client.close()
+
+
+# ── Write wrapper (FR-MCP-6) ──────────────────────────────────────
+
+
+class TestWriteNote:
+    """``write_note`` invokes ``lithos_write`` with FR-MCP-6 fields."""
+
+    async def test_happy_path_arxiv_item(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Sample arXiv write reaches server with documented field set."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Attention Is All You Need",
+                content="# Summary\nTransformer architecture paper.",
+                agent="influx",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/1706.03762",
+                tags=[
+                    "profile:ml-research",
+                    "arxiv-id:1706.03762",
+                    "source:arxiv",
+                ],
+                confidence=0.9,
+                note_type="summary",
+                namespace="influx",
+            )
+
+            # Verify the fake server received the call.
+            write_calls = [
+                c
+                for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 1
+            payload = write_calls[0][1]
+            assert payload["title"] == "Attention Is All You Need"
+            assert payload["content"] == (
+                "# Summary\nTransformer architecture paper."
+            )
+            assert payload["agent"] == "influx"
+            assert payload["path"] == "papers/arxiv/2026/03"
+            assert payload["source_url"] == (
+                "https://arxiv.org/abs/1706.03762"
+            )
+            assert payload["tags"] == [
+                "profile:ml-research",
+                "arxiv-id:1706.03762",
+                "source:arxiv",
+            ]
+            assert payload["confidence"] == 0.9
+            assert payload["note_type"] == "summary"
+            assert payload["namespace"] == "influx"
+            assert payload["expires_at"] is None
+
+            # Response forwarded unchanged.
+            assert result is not None
+            assert len(result.content) > 0
+            text = result.content[0]
+            assert text.type == "text"
+            import json
+
+            body = json.loads(text.text)  # type: ignore[union-attr]
+            assert body["status"] == "created"
+        finally:
+            await client.close()
+
+    async def test_expires_at_forwarded(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Optional expires_at is forwarded when provided."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.write_note(
+                title="Repair note",
+                content="# Summary\nNeeds repair.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.99999",
+                tags=["influx:repair-needed"],
+                confidence=0.5,
+                expires_at="2026-04-30T00:00:00Z",
+            )
+
+            write_calls = [
+                c
+                for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 1
+            assert write_calls[0][1]["expires_at"] == (
+                "2026-04-30T00:00:00Z"
+            )
+        finally:
+            await client.close()
+
+    async def test_expires_at_omitted_when_none(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """expires_at is not sent when None (normal writes)."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.write_note(
+                title="Normal note",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.00001",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+
+            write_calls = [
+                c
+                for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 1
+            # expires_at is None in the recorded payload because
+            # the wrapper did not include it in the tool call args.
+            assert write_calls[0][1]["expires_at"] is None
         finally:
             await client.close()

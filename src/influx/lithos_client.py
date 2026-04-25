@@ -141,6 +141,41 @@ class LithosClient:
             {"query": query, "source_url": source_url},
         )
 
+    async def write_note(
+        self,
+        *,
+        title: str,
+        content: str,
+        agent: str = "influx",
+        path: str,
+        source_url: str,
+        tags: list[str],
+        confidence: float,
+        note_type: str = "summary",
+        namespace: str = "influx",
+        expires_at: str | None = None,
+    ) -> mcp_types.CallToolResult:
+        """Write a note to Lithos (FR-MCP-6).
+
+        Forwards the PRD-owned field set to the underlying MCP
+        ``lithos_write`` tool.  The *expires_at* field is only included
+        when it is non-``None`` (used on repair-needed writes).
+        """
+        args: dict[str, Any] = {
+            "title": title,
+            "content": content,
+            "agent": agent,
+            "path": path,
+            "source_url": source_url,
+            "tags": tags,
+            "confidence": confidence,
+            "note_type": note_type,
+            "namespace": namespace,
+        }
+        if expires_at is not None:
+            args["expires_at"] = expires_at
+        return await self.call_tool("lithos_write", args)
+
     async def list_notes(
         self,
         *,
