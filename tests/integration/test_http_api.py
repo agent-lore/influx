@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from influx.config import (
     AppConfig,
+    LithosConfig,
     ProfileConfig,
     PromptEntryConfig,
     PromptsConfig,
@@ -31,11 +32,13 @@ from influx.scheduler import InfluxScheduler
 def _make_config(
     profiles: list[str] | None = None,
     providers: dict[str, Any] | None = None,
+    lithos_url: str = "",
 ) -> AppConfig:
     """Build a minimal AppConfig for HTTP API tests."""
     profile_names = profiles if profiles is not None else ["ai-robotics"]
     profile_list = [ProfileConfig(name=name) for name in profile_names]
     return AppConfig(
+        lithos=LithosConfig(url=lithos_url),
         schedule=ScheduleConfig(cron="0 6 * * *", timezone="UTC"),
         profiles=profile_list,
         providers=providers or {},
@@ -48,9 +51,12 @@ def _make_config(
 
 
 @pytest.fixture
-def app_with_state() -> FastAPI:
+def app_with_state(fake_lithos_sse_url: str) -> FastAPI:
     """Create a FastAPI app with router, coordinator, scheduler, and probe loop."""
-    config = _make_config(profiles=["ai-robotics", "web-tech"])
+    config = _make_config(
+        profiles=["ai-robotics", "web-tech"],
+        lithos_url=fake_lithos_sse_url,
+    )
     app = FastAPI()
     app.include_router(router)
 
@@ -106,11 +112,17 @@ class TestReady:
     def test_ready_503_when_probes_fail(
         self,
         app_with_state: FastAPI,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Degraded probes → 503 + ready=false."""
-        # Force lithos probe to degraded.
-        monkeypatch.setenv("INFLUX_TEST_LITHOS_DOWN", "1")
+        """Degraded probes ��� 503 + ready=false."""
+        import socket
+
+        # Switch to unreachable Lithos URL to force probe degradation.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        app_with_state.state.config.lithos.url = (
+            f"http://127.0.0.1:{port}/sse"
+        )
         probe_loop: ProbeLoop = app_with_state.state.probe_loop
         probe_loop.run_once()
 
@@ -210,37 +222,47 @@ class TestStatus:
             coordinator.release("ai-robotics")
 
 
-# ── AC-03-C: Degraded state via INFLUX_TEST_LITHOS_DOWN ──────────────
+# ── AC-M1-11 (probe + /status): Lithos unreachable → degraded ────────
 
 
-class TestDegradedStateAC03C:
-    """AC-03-C: INFLUX_TEST_LITHOS_DOWN=1 → /ready 503, /status degraded."""
+class TestDegradedStateLithosUnreachable:
+    """Lithos unreachable → /ready 503, /status degraded (AC-M1-11 probe side)."""
 
-    def test_lithos_down_ready_503(
-        self,
-        app_with_state: FastAPI,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Within one probe cycle, /ready returns 503."""
-        monkeypatch.setenv("INFLUX_TEST_LITHOS_DOWN", "1")
-        probe_loop: ProbeLoop = app_with_state.state.probe_loop
+    @pytest.fixture
+    def app_lithos_down(self) -> FastAPI:
+        """App configured with an unreachable Lithos URL."""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        config = _make_config(
+            profiles=["ai-robotics", "web-tech"],
+            lithos_url=f"http://127.0.0.1:{port}/sse",
+        )
+        app = FastAPI()
+        app.include_router(router)
+        coordinator = Coordinator()
+        scheduler = InfluxScheduler(config, coordinator)
+        probe_loop = ProbeLoop(config, interval=30.0)
         probe_loop.run_once()
+        app.state.config = config
+        app.state.coordinator = coordinator
+        app.state.scheduler = scheduler
+        app.state.probe_loop = probe_loop
+        return app
 
-        with TestClient(app_with_state) as tc:
+    def test_lithos_down_ready_503(self, app_lithos_down: FastAPI) -> None:
+        """Lithos unreachable → /ready returns 503."""
+        with TestClient(app_lithos_down) as tc:
             resp = tc.get("/ready")
         assert resp.status_code == 503
 
     def test_lithos_down_status_degraded(
-        self,
-        app_with_state: FastAPI,
-        monkeypatch: pytest.MonkeyPatch,
+        self, app_lithos_down: FastAPI
     ) -> None:
-        """Within one probe cycle, /status.status == 'degraded'."""
-        monkeypatch.setenv("INFLUX_TEST_LITHOS_DOWN", "1")
-        probe_loop: ProbeLoop = app_with_state.state.probe_loop
-        probe_loop.run_once()
-
-        with TestClient(app_with_state) as tc:
+        """/status reports degraded with lithos dependency not ok (AC-M1-11)."""
+        with TestClient(app_lithos_down) as tc:
             body = tc.get("/status").json()
         assert body["status"] == "degraded"
         assert body["dependencies"]["lithos"]["status"] == "degraded"

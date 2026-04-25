@@ -4,10 +4,9 @@ Provides a background probe loop (≥30s cadence) that caches reachability
 and credential state in memory with timestamps, so that ``/ready`` and
 ``/status`` never issue fresh probes per request (FR-HTTP-7, §5.3).
 
-The Lithos probe is a **stub** in this PRD — it returns ``ok`` by
-default, and returns ``degraded`` when ``INFLUX_TEST_LITHOS_DOWN=1``
-is set.  PRD 05 replaces the stub body with a real MCP reachability
-check.
+The Lithos probe opens an SSE connection to the configured Lithos
+endpoint and verifies HTTP 200 (PRD 05, US-013).  The probe is
+side-effect-free — it does NOT call ``lithos_agent_register``.
 
 The LLM-credentials probe reports on the presence of each configured
 provider's ``api_key_env`` environment variable.  Providers whose
@@ -23,6 +22,8 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Literal
+
+import httpx
 
 from influx.config import AppConfig, ProviderConfig
 
@@ -109,22 +110,49 @@ class ProbeState:
         return "degraded"
 
 
-def _probe_lithos() -> ProbeResult:
-    """Stub Lithos reachability probe (PRD 05 replaces body).
+def _probe_lithos(lithos_url: str) -> ProbeResult:
+    """Probe Lithos by opening an SSE connection (PRD 05, US-013).
 
-    Returns ``ok`` by default.  Returns ``degraded`` when the
-    environment variable ``INFLUX_TEST_LITHOS_DOWN=1`` is set, so that
-    integration tests can drive the service into a degraded state
-    (AC-03-C).
+    Connects to the configured Lithos SSE endpoint and verifies
+    HTTP 200.  Immediately closes the streaming connection after
+    checking the status code.  Does NOT call ``lithos_agent_register``
+    — the connection-establishment-only check is side-effect-free.
     """
     now = time.monotonic()
-    if os.environ.get("INFLUX_TEST_LITHOS_DOWN") == "1":
+    if not lithos_url:
         return ProbeResult(
             status="degraded",
-            detail="Lithos unreachable (test stub)",
+            detail="Lithos URL not configured",
             timestamp=now,
         )
-    return ProbeResult(status="ok", detail="stub ok", timestamp=now)
+    try:
+        with (
+            httpx.Client(timeout=httpx.Timeout(3.0)) as client,
+            client.stream("GET", lithos_url) as resp,
+        ):
+            if resp.status_code == 200:
+                return ProbeResult(
+                    status="ok",
+                    detail="SSE connection ok",
+                    timestamp=now,
+                )
+            return ProbeResult(
+                status="degraded",
+                detail=f"HTTP {resp.status_code}",
+                timestamp=now,
+            )
+    except httpx.TimeoutException:
+        return ProbeResult(
+            status="degraded",
+            detail=f"Lithos timeout ({lithos_url})",
+            timestamp=now,
+        )
+    except Exception as exc:
+        return ProbeResult(
+            status="degraded",
+            detail=f"Lithos unreachable ({lithos_url}): {exc}",
+            timestamp=now,
+        )
 
 
 def _probe_llm_credentials(
@@ -193,7 +221,7 @@ class ProbeLoop:
         background loop starts.
         """
         self._state = ProbeState(
-            lithos=_probe_lithos(),
+            lithos=_probe_lithos(self._config.lithos.url),
             llm_credentials=_probe_llm_credentials(self._config.providers),
             max_age=self._max_age,
         )

@@ -40,6 +40,10 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - FakeLithosServer has `cache_lookup_responses: list[str]` queue (FIFO) for configurable cache_lookup responses
 - 561 tests passing after US-010
 - LCMA stubs (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`) are module-level functions in `lithos_client.py` that raise `LCMAError("not implemented")` — PRD 08 seam
+- `_probe_lithos(lithos_url)` in `probes.py` uses `httpx.Client.stream("GET", url)` for side-effect-free SSE connection check; does NOT call `lithos_agent_register`
+- `fake_lithos_sse_url` session-scoped fixture in `tests/conftest.py` starts a minimal HTTP server responding 200; used by probe and integration tests
+- To test degraded Lithos state: use `socket.socket().bind(("127.0.0.1", 0))` to get a free port, then use it as unreachable URL (port unbound after socket close)
+- `_make_config()` in test files accepts `lithos_url` param to configure `LithosConfig(url=...)` for probe tests
 
 ---
 
@@ -206,4 +210,23 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - LCMA stubs use `**kwargs: Any` with `# noqa: ARG001` to accept arbitrary args without ruff complaints
   - AST-based grep test walks `ast.Call` nodes checking `ast.Name.id` and `ast.Attribute.attr` — covers both direct and attribute-style calls
   - 572 tests pass (9 new unit tests added)
+---
+
+## 2026-04-25 - US-013
+- Replaced stub `_probe_lithos()` in `probes.py` with real SSE connection probe using `httpx.Client.stream("GET", lithos_url)`
+- Probe opens an SSE connection to configured Lithos endpoint, verifies HTTP 200, immediately closes; does NOT call `lithos_agent_register` (side-effect-free)
+- Returns `ProbeResult(status="degraded", detail=...)` with specific reasons: "not configured" (empty URL), "timeout", "unreachable", or "HTTP <code>"
+- Removed `INFLUX_TEST_LITHOS_DOWN` env-flag stub branch entirely
+- Added `fake_lithos_sse_url` session-scoped fixture to `tests/conftest.py` (minimal HTTP server responding 200)
+- Updated `_make_config()` in both `tests/unit/test_probes.py` and `tests/integration/test_http_api.py` to accept `lithos_url` parameter
+- Updated `app_with_state` fixture in `test_http_api.py` to use `fake_lithos_sse_url` for real probe path
+- Replaced `TestDegradedStateAC03C` (env-var driven) with `TestDegradedStateLithosUnreachable` (real probe against unreachable URL)
+- Files changed: `src/influx/probes.py`, `tests/conftest.py`, `tests/unit/test_probes.py`, `tests/integration/test_http_api.py`
+- **Learnings for future iterations:**
+  - `httpx.Client.stream("GET", url)` reads response headers then returns control; exiting the `with` block closes the stream — perfect for connection-only checks
+  - Ruff enforces SIM117 (single `with` for multiple contexts) — use `with (ctx1, ctx2):` syntax
+  - `http.server.HTTPServer(("127.0.0.1", 0), Handler)` binds to any available port; read `srv.server_address[1]` for the assigned port
+  - For unreachable URL tests: `socket.socket().bind(("127.0.0.1", 0))` finds a free port; after socket close, port is unbound → connection refused
+  - Session-scoped conftest fixture `fake_lithos_sse_url` is shared across both unit and integration test modules
+  - 572 tests pass (no new tests added — replaced 3 env-var tests with 3 real probe tests, 2 degraded-state tests with 2 unreachable-URL tests)
 ---

@@ -150,3 +150,34 @@ def influx_config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # Provide the test-only API key required by the fixture's provider.
     monkeypatch.setenv("TEST_PROVIDER_API_KEY", "test-key-value")
     return config_path
+
+
+@pytest.fixture(scope="session")
+def fake_lithos_sse_url():
+    """Minimal HTTP server responding 200, mimicking a Lithos SSE endpoint.
+
+    Used by probe tests and integration tests that need a reachable Lithos
+    endpoint without spinning up a full MCP server (US-013).
+    """
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+
+        def log_message(  # noqa: PLR6301
+            self,
+            format: str,  # noqa: A002
+            *args: object,
+        ) -> None:
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{port}/sse"
+    srv.shutdown()

@@ -9,6 +9,7 @@ import pytest
 
 from influx.config import (
     AppConfig,
+    LithosConfig,
     PromptEntryConfig,
     PromptsConfig,
     ProviderConfig,
@@ -21,9 +22,11 @@ from influx.probes import ProbeLoop, ProbeResult, ProbeState
 
 def _make_config(
     providers: dict[str, ProviderConfig] | None = None,
+    lithos_url: str = "",
 ) -> AppConfig:
     """Return a minimal ``AppConfig`` with the given providers."""
     return AppConfig(
+        lithos=LithosConfig(url=lithos_url),
         providers=providers or {},
         prompts=PromptsConfig(
             filter=PromptEntryConfig(text="f"),
@@ -37,34 +40,45 @@ def _make_config(
 
 
 class TestLithosProbe:
-    """Lithos probe is a stub: ok by default, degraded under env var."""
+    """Lithos probe connects to SSE endpoint (US-013)."""
 
-    def test_lithos_ok_by_default(self) -> None:
-        """Default Lithos probe returns ``ok`` (AC: stub returns ok)."""
-        cfg = _make_config()
+    def test_lithos_ok_with_reachable_server(
+        self, fake_lithos_sse_url: str
+    ) -> None:
+        """Reachable Lithos SSE server → probe returns ``ok``."""
+        cfg = _make_config(lithos_url=fake_lithos_sse_url)
         loop = ProbeLoop(cfg, interval=30.0)
         loop.run_once()
         assert loop.state.lithos.status == "ok"
         assert loop.state.lithos.timestamp > 0
 
-    def test_lithos_degraded_under_env_var(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """INFLUX_TEST_LITHOS_DOWN=1 → Lithos probe returns degraded (AC-03-C)."""
-        monkeypatch.setenv("INFLUX_TEST_LITHOS_DOWN", "1")
-        cfg = _make_config()
+    def test_lithos_degraded_when_unreachable(self) -> None:
+        """Unreachable Lithos → probe returns ``degraded`` with reason."""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        # Port is now unbound — connection will be refused.
+        cfg = _make_config(lithos_url=f"http://127.0.0.1:{port}/sse")
         loop = ProbeLoop(cfg, interval=30.0)
         loop.run_once()
         assert loop.state.lithos.status == "degraded"
         assert loop.state.lithos.timestamp > 0
+        assert lithos_url_in_detail(loop.state.lithos.detail, port)
 
-    def test_lithos_ok_when_env_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Lithos probe returns ok when INFLUX_TEST_LITHOS_DOWN is unset."""
-        monkeypatch.delenv("INFLUX_TEST_LITHOS_DOWN", raising=False)
-        cfg = _make_config()
+    def test_lithos_degraded_when_url_empty(self) -> None:
+        """Empty Lithos URL → probe returns ``degraded``."""
+        cfg = _make_config(lithos_url="")
         loop = ProbeLoop(cfg, interval=30.0)
         loop.run_once()
-        assert loop.state.lithos.status == "ok"
+        assert loop.state.lithos.status == "degraded"
+        assert "not configured" in loop.state.lithos.detail.lower()
+
+
+def lithos_url_in_detail(detail: str, port: int) -> bool:
+    """Helper: verify detail contains the URL (unreachable reason)."""
+    return f"127.0.0.1:{port}" in detail or "unreachable" in detail.lower()
 
 
 # ── LLM-credentials probe ────────────────────────────────────────────
@@ -351,17 +365,21 @@ class TestProbeLoopLifecycle:
 class TestDegradedState:
     """The probe can be driven into a degraded state by either probe."""
 
-    def test_degraded_via_lithos(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """INFLUX_TEST_LITHOS_DOWN=1 drives overall state to degraded."""
-        monkeypatch.setenv("INFLUX_TEST_LITHOS_DOWN", "1")
-        cfg = _make_config()
+    def test_degraded_via_lithos_unreachable(self) -> None:
+        """Unreachable Lithos SSE endpoint drives overall state to degraded."""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        cfg = _make_config(lithos_url=f"http://127.0.0.1:{port}/sse")
         loop = ProbeLoop(cfg, interval=30.0)
         loop.run_once()
         assert loop.state.overall_status == "degraded"
         assert loop.state.is_ready is False
 
     def test_degraded_via_missing_credential(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, fake_lithos_sse_url: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Missing provider credential drives overall state to degraded."""
         monkeypatch.delenv("NONEXISTENT_KEY", raising=False)
@@ -370,7 +388,7 @@ class TestDegradedState:
                 base_url="https://api.example.com", api_key_env="NONEXISTENT_KEY"
             ),
         }
-        cfg = _make_config(providers)
+        cfg = _make_config(providers, lithos_url=fake_lithos_sse_url)
         loop = ProbeLoop(cfg, interval=30.0)
         loop.run_once()
         assert loop.state.overall_status == "degraded"

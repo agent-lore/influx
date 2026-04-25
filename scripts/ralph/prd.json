@@ -190,7 +190,7 @@
         "AC-M1-11 (probe + /status side): with the fake Lithos SSE server unreachable, the probe returns a non-`ok` status and `/status` reports `status=\"degraded\"` and `dependencies.lithos.status != \"ok\"` while the service stays alive. The full `POST /runs` run-abort half of AC-M1-11 is covered by the end-to-end story (US-019)"
       ],
       "priority": 13,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
