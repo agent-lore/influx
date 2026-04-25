@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass, field
 
 from influx.errors import InfluxError
-from influx.schemas import Tier3Extraction
+from influx.schemas import Tier1Enrichment, Tier3Extraction
 from influx.urls import normalise_url
 
 __all__ = [
@@ -523,6 +523,7 @@ def render_note(
     summary: str,
     keywords: list[str],
     profile_entries: list[ProfileRelevanceEntry],
+    tier1_enrichment: Tier1Enrichment | None = None,
     full_text: str | None = None,
     tier3_extraction: Tier3Extraction | None = None,
     user_notes: str | None = None,
@@ -549,6 +550,11 @@ def render_note(
         Profile relevance entries to render. For rewrites, use
         :func:`build_profile_relevance_for_rewrite` to resolve
         entries that honour the rejection guard.
+    tier1_enrichment:
+        Tier-1 structured enrichment result. When provided, emits ``## Summary``
+        containing ``### Contributions``, ``### Method``, ``### Result``,
+        ``### Relevance`` sub-blocks. When ``None`` falls back to the plain
+        *summary* string; when both are absent the section is omitted (FR-ENR-6).
     full_text:
         Tier-2 extracted plain text for the ``## Full Text`` section.
         When ``None`` or empty the section is omitted entirely (FR-ENR-6).
@@ -588,16 +594,25 @@ def render_note(
     )
     archive_section = render_archive_section(archive_path)
 
-    # Summary body
-    summary_body = summary
-    if keywords:
-        summary_body += f"\n\nKeywords: {', '.join(keywords)}"
-
     # Compose note
     output = f"---\n{frontmatter}\n---\n"
     output += f"# {title}\n\n"
     output += archive_section + "\n"
-    output += f"## Summary\n{summary_body}\n"
+
+    # Summary section: structured Tier1Enrichment → plain summary → omit
+    if tier1_enrichment is not None:
+        output += "## Summary\n"
+        output += "### Contributions\n"
+        for contrib in tier1_enrichment.contributions:
+            output += f"- {contrib}\n"
+        output += f"\n### Method\n{tier1_enrichment.method}\n"
+        output += f"\n### Result\n{tier1_enrichment.result}\n"
+        output += f"\n### Relevance\n{tier1_enrichment.relevance}\n"
+    elif summary:
+        summary_body = summary
+        if keywords:
+            summary_body += f"\n\nKeywords: {', '.join(keywords)}"
+        output += f"## Summary\n{summary_body}\n"
 
     # Full Text section (Tier 2) — omitted when absent/empty (FR-ENR-6, US-011)
     if full_text:
