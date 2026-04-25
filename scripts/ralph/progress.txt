@@ -23,6 +23,8 @@ Started: Sat Apr 25 14:42:15 UTC 2026
 - `SweepWriteError(LithosError)` signals terminal write failure — unresolved version_conflict or transport failure aborts the sweep
 - `ContentTooLargeSkipped(Exception)` signals non-fatal content_too_large on repair path — sweep catches and continues; NOT a LithosError subclass
 - Config mock in sweep tests needs `config.profiles = []`; client mock needs `client.call_tool` returning `_make_write_result()`
+- `run_profile()` in `scheduler.py` is the central run entry point for scheduled, manual, and backfill paths — all pre-run hooks (sweep, etc.) wire here
+- FakeLithosServer FIFO queue: when adding new `lithos_list` callers, prepend empty responses for earlier callers so downstream queued responses arrive correctly
 
 ---
 
@@ -204,4 +206,32 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - `_rewrite_sweep_note` returns normally for success but raises for both fatal (`SweepWriteError`) and non-fatal (`ContentTooLargeSkipped`) write outcomes
   - The `content_too_large` status check must come BEFORE the `version_conflict` check in `_rewrite_sweep_note` — a content_too_large is not a version conflict
   - All tests pass: 760 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-013
+- Wired `repair.sweep(profile)` into `run_profile()` in `src/influx/scheduler.py`
+- Added `from influx.repair import sweep as repair_sweep` import
+- Sweep call placed right after `LithosClient` creation, before feedback ingestion step
+- Gated on `kind != RunKind.BACKFILL` per FR-REP-2
+- `SweepWriteError` propagates through existing `_run_and_release` exception handler in `http_api.py`
+- Updated `tests/integration/test_arxiv_to_lithos.py` AC-05-H test to queue an empty list response for the repair sweep's `lithos_list` call
+- Updated AC-05-H assertion from 1 to 2 `lithos_list` calls (sweep + feedback)
+- Files changed: `src/influx/scheduler.py`, `tests/integration/test_arxiv_to_lithos.py`
+- **Learnings for future iterations:**
+  - `run_profile()` in `scheduler.py` is the central entry point for both scheduled (`_fire_profile`) and manual (`_run_and_release`) runs — wiring the sweep here covers both paths
+  - Backfill exclusion is naturally achieved by gating on `kind != RunKind.BACKFILL` in `run_profile`
+  - FakeLithosServer uses a FIFO queue for `list_responses` — adding a new `lithos_list` caller (sweep) can consume responses intended for other callers (feedback); prepend empty responses as needed
+  - All tests pass: 760 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-014
+- Created `tests/integration/test_backfill_exclusion.py` with 2 tests
+- Positive test: POST /runs invokes `repair.sweep` exactly once — asserted via `patch("influx.scheduler.repair_sweep")` spy
+- Negative test (AC-06-D): POST /backfills does NOT invoke `repair.sweep` — asserted via spy confirming zero calls
+- Backfill exclusion logic already in place at `scheduler.py:133` (`kind != RunKind.BACKFILL`) from US-013
+- Files changed: `tests/integration/test_backfill_exclusion.py` (created), `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - Patching `influx.scheduler.repair_sweep` as AsyncMock is the cleanest way to spy on sweep invocation without needing extra FakeLithosServer queue setup
+  - When repair_sweep is mocked out, no need to prepend empty list_responses for the sweep's lithos_list call
+  - All tests pass: 762 passed, pyright 0 errors, ruff clean
 ---

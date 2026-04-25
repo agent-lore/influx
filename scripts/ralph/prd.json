@@ -190,7 +190,7 @@
         "Fatal sweep/write failures (failure mode 1 in §5.4 — generic write transport failure or unresolved `version_conflict` after the FR-MCP-7 re-read + re-merge + retry, after the existing retry budget is exhausted) abort the current repair/run attempt and flow through the existing scheduled and manual run wrappers per §5.4; transient per-stage failures (e.g. abstract-only Transient outcome from `re_extract_archive`) and chronic `content_too_large` on the repair path (failure mode 2 in §5.4) do NOT abort — the sweep continues to the next candidate per §5.2 / §5.4"
       ],
       "priority": 13,
-      "passes": false,
+      "passes": true,
       "notes": "The sweep-before-fetch ordering for both scheduled and manual paths is exercised by the broader integration tests in US-016..US-020; a dedicated ordering-only test is optional."
     },
     {
@@ -203,7 +203,7 @@
         "Negative test (AC-06-D): a `POST /backfills` request for the same profile does NOT invoke the sweep — asserted by spying on `repair.sweep` and confirming zero calls during the backfill request"
       ],
       "priority": 14,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
