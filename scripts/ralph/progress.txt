@@ -314,3 +314,19 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - Two-run tests: clear fake_lithos.calls between runs, simulate Lithos ordering by queueing unvisited notes first
   - All tests pass: 786 passed, pyright 0 errors, ruff clean
 ---
+
+## 2026-04-25 - US-020
+- Created `tests/integration/test_repair_sweep_chronic_oversize.py` with 5 tests in `TestChronicOversizeExemption`
+- `test_run_does_not_abort`: seeds 1 chronic + 3 normal notes; sweep visits all 4 without aborting
+- `test_chronic_note_untouched_others_written`: chronic note gets content_too_large write, normal notes get successful writes with repair-needed cleared
+- `test_chronic_note_stays_at_head_across_runs`: 2-run test; run 1 skips chronic + clears normals, run 2 chronic note still at head (updated_at didn't advance)
+- `test_content_too_large_logged_and_counted`: caplog assertion verifying content_too_large_skipped warning with note ID
+- `test_multiple_chronic_notes_all_skipped`: 2 chronic + 1 normal; both chronic skipped, normal still makes progress
+- Files changed: `tests/integration/test_repair_sweep_chronic_oversize.py` (created), `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - For chronic-oversize tests, queue `{"status": "content_too_large"}` as write response for the target note; FakeLithosServer FIFO handles per-note response ordering
+  - Low-score (5) notes with text:html + archive path = simplest "normal" note that clears repair-needed (all conditions met without Tier 2/3)
+  - `caplog.at_level(logging.WARNING, logger="influx.repair")` captures the content_too_large_skipped warnings from sweep()
+  - Multi-run chronic tests: chronic note is re-queued as sole candidate in run 2 since its updated_at didn't advance
+  - All tests pass: 791 passed, pyright 0 errors, ruff clean
+---

@@ -293,7 +293,7 @@
         "Test passes via `pytest`"
       ],
       "priority": 20,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
