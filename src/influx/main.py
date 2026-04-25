@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from influx.config import load_config
+from influx.config import AppConfig, load_config
 from influx.errors import InfluxError
 
 # FR-CLI-7 exit-code policy
@@ -96,13 +96,87 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _cmd_validate_config() -> None:
-    """Load config, print the effective config, dry-connect to Lithos, and exit 0.
+def _validate_json_mode_slots(config: AppConfig) -> None:
+    """Check JSON-mode compatibility for [models.*] slots with json_mode=true.
 
-    After config validation, opens an SSE connection to the configured
-    Lithos endpoint and calls ``lithos_agent_register`` to verify
-    connectivity (FR-CLI-5, AC-05-K).  On connection failure, exits
-    non-zero with an error naming the SSE endpoint.
+    For each slot, constructs an HTTP client using the provider's
+    ``base_url`` and API key, sends a minimal chat-completions dry-call
+    with ``response_format={"type": "json_object"}``, and verifies the
+    provider/model accepts it.  Exits non-zero on any failure.
+
+    The ``json_mode`` flag and slot configuration come from config
+    (AC-X-1 — no hardcoded constants).  (FR-CLI-5, §16.4)
+    """
+    import os
+
+    import httpx
+
+    for slot_name, slot in config.models.items():
+        if not slot.json_mode:
+            continue
+
+        provider = config.providers.get(slot.provider)
+        if provider is None:
+            print(
+                f"influx: model slot {slot_name!r}: provider "
+                f"{slot.provider!r} not defined in [providers]",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_FAILURE)
+
+        api_key = ""
+        if provider.api_key_env:
+            api_key = os.environ.get(provider.api_key_env, "")
+
+        headers: dict[str, str] = {**provider.extra_headers}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        body = {
+            "model": slot.model,
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1,
+            "response_format": {"type": "json_object"},
+        }
+
+        url = f"{provider.base_url.rstrip('/')}/chat/completions"
+
+        try:
+            resp = httpx.post(
+                url,
+                json=body,
+                headers=headers,
+                timeout=float(slot.request_timeout),
+            )
+        except Exception as exc:
+            print(
+                f"influx: model slot {slot_name!r}: JSON-mode "
+                f"dry-call to {url} failed: {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_FAILURE)
+
+        if resp.status_code >= 400:
+            try:
+                error_body = resp.json()
+                msg = error_body.get("error", {}).get("message", resp.text)
+            except Exception:
+                msg = resp.text
+            print(
+                f"influx: model slot {slot_name!r}: JSON-mode "
+                f"check failed ({resp.status_code}): {msg}",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_FAILURE)
+
+
+def _cmd_validate_config() -> None:
+    """Load config, print it, check JSON-mode slots, dry-connect to Lithos.
+
+    After config validation, checks JSON-mode compatibility for each
+    ``[models.*]`` slot (FR-CLI-5, §16.4), then opens an SSE connection
+    to the configured Lithos endpoint and calls ``lithos_agent_register``
+    to verify connectivity (AC-05-K).  Exits non-zero on any failure.
     """
     import asyncio
 
@@ -110,6 +184,9 @@ def _cmd_validate_config() -> None:
 
     config = load_config()
     print(config.model_dump_json(indent=2))
+
+    # JSON-mode compatibility check for [models.*] slots (FR-CLI-5, §16.4).
+    _validate_json_mode_slots(config)
 
     # Skip Lithos dry-connect if no URL is configured.
     if not config.lithos.url:

@@ -60,6 +60,9 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - 605 tests passing after US-016
 - `_cmd_validate_config()` in `main.py` does Lithos SSE dry-connect after config validation; skipped when `lithos.url` is empty
 - 607 tests passing after US-017
+- `_validate_json_mode_slots(config)` in `main.py` sends minimal chat-completions dry-call with `response_format={"type":"json_object"}` to verify JSON-mode support per slot
+- Tests using `influx_config_env` fixture (which has `json_mode=true` slots) need `@respx.mock` + mock route on `https://api.test.example.com/v1/chat/completions`
+- 611 tests passing after US-018
 
 ---
 
@@ -316,4 +319,25 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - For fake MCP servers in non-contract tests: inline `FastMCP` + `uvicorn.Server` in a daemon thread works; remember to wait for socket readiness
   - Existing validate-config tests with `influx_config_env` fixture are unaffected because config has empty `lithos.url` → dry-connect skipped
   - 607 tests pass (2 new unit tests added)
+---
+
+## 2026-04-25 - US-018
+- Added `_validate_json_mode_slots(config)` to `main.py` — checks JSON-mode compatibility for each `[models.*]` slot with `json_mode=true`
+- Sends a minimal chat-completions dry-call with `response_format={"type":"json_object"}` to `{provider.base_url}/chat/completions` (FR-CLI-5, §16.4)
+- On failure (provider rejects json_object, connection error), exits non-zero with descriptive error naming the slot
+- Validation runs after config printing, before Lithos SSE dry-connect (US-017)
+- Slots with `json_mode=false` are skipped entirely (no HTTP call)
+- Updated existing tests (`test_main.py`, `test_cli_dispatch.py`) that use `influx_config_env` fixture to mock provider endpoint with `@respx.mock`
+- Added 4 new tests in `tests/unit/test_cli_dispatch.py`:
+  - Positive: json_mode=true + capable provider → exit 0
+  - Negative: json_mode=true + incapable provider (returns 400) → exit 2
+  - Skip: json_mode=false → no dry-call issued
+  - AC-X-1: only json_mode=true slots trigger dry-calls; model name from config, not hardcoded
+- Files changed: `src/influx/main.py`, `tests/unit/test_cli_dispatch.py`, `tests/unit/test_main.py`
+- **Learnings for future iterations:**
+  - Tests using `influx_config_env` fixture need `@respx.mock` + mock on `https://api.test.example.com/v1/chat/completions` because all 3 model slots in the fixture have `json_mode=true`
+  - `respx.mock` intercepts httpx calls at transport level; perfect for mocking OpenAI-compatible API endpoints
+  - `_write_config_with_model_slot()` test helper creates a minimal config with one provider + model slot for isolated JSON-mode testing
+  - The dry-call uses `max_tokens=1` to minimize cost; most providers validate `response_format` before processing tokens
+  - 611 tests pass (4 new unit tests added)
 ---

@@ -268,7 +268,7 @@
         "AC-X-1 is honoured: no hardcoded constants — the `json_mode` flag and the slot configuration come from config"
       ],
       "priority": 18,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

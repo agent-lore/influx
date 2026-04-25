@@ -377,15 +377,224 @@ class TestBackfillSubcommand:
 class TestValidateConfigUnchanged:
     """validate-config continues to route to the existing validator."""
 
+    @respx.mock
     def test_validate_config_still_works(
         self,
         influx_config_env: object,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
+        # Mock the provider endpoint for JSON-mode dry-call.
+        respx.post("https://api.test.example.com/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {"content": "{}"},
+                            "finish_reason": "stop",
+                            "index": 0,
+                        }
+                    ]
+                },
+            )
+        )
         main(["validate-config"])
 
         captured = capsys.readouterr()
         assert captured.out.strip().startswith("{")
+
+
+def _write_config_with_model_slot(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_url: str,
+    *,
+    json_mode: bool = True,
+) -> None:
+    """Write a minimal config with one model slot pointing at *provider_url*."""
+    from pathlib import Path
+    from textwrap import dedent
+
+    jm = "true" if json_mode else "false"
+    config_path = Path(str(tmp_path)) / "influx.toml"
+    config_path.write_text(
+        dedent(f"""\
+            [providers.fake-provider]
+            base_url = "{provider_url}"
+            api_key_env = "FAKE_PROVIDER_KEY"
+
+            [models.filter]
+            provider = "fake-provider"
+            model = "fake-model"
+            json_mode = {jm}
+
+            [prompts.filter]
+            text = "f"
+            [prompts.tier1_enrich]
+            text = "e"
+            [prompts.tier3_extract]
+            text = "x"
+        """)
+    )
+    monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+    monkeypatch.setenv("FAKE_PROVIDER_KEY", "test-key")
+
+
+class TestValidateConfigJsonMode:
+    """validate-config checks JSON-mode compatibility for [models.*] slots."""
+
+    @respx.mock
+    def test_json_mode_capable_exits_zero(
+        self,
+        tmp_path: object,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Slot with json_mode=true and capable provider exits 0."""
+        _write_config_with_model_slot(
+            tmp_path, monkeypatch, "https://fake.api.example.com/v1"
+        )
+        respx.post("https://fake.api.example.com/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {"content": "{}"},
+                            "finish_reason": "stop",
+                            "index": 0,
+                        }
+                    ]
+                },
+            )
+        )
+
+        # Should NOT raise SystemExit — exit 0.
+        main(["validate-config"])
+
+        captured = capsys.readouterr()
+        assert captured.out.strip().startswith("{")
+
+    @respx.mock
+    def test_json_mode_incapable_exits_nonzero(
+        self,
+        tmp_path: object,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Slot with json_mode=true and incapable provider exits non-zero."""
+        _write_config_with_model_slot(
+            tmp_path, monkeypatch, "https://fake.api.example.com/v1"
+        )
+        respx.post("https://fake.api.example.com/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": (
+                            "response_format json_object is not "
+                            "supported for this model"
+                        )
+                    }
+                },
+            )
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate-config"])
+
+        assert exc_info.value.code == EXIT_FAILURE
+        captured = capsys.readouterr()
+        assert "json-mode" in captured.err.lower()
+
+    @respx.mock
+    def test_json_mode_false_skips_check(
+        self,
+        tmp_path: object,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Slot with json_mode=false does not trigger a dry-call."""
+        _write_config_with_model_slot(
+            tmp_path,
+            monkeypatch,
+            "https://fake.api.example.com/v1",
+            json_mode=False,
+        )
+        # No respx route registered — any request would raise.
+
+        main(["validate-config"])
+
+        captured = capsys.readouterr()
+        assert captured.out.strip().startswith("{")
+
+    @respx.mock
+    def test_json_mode_config_driven_not_hardcoded(
+        self,
+        tmp_path: object,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """AC-X-1: json_mode flag comes from config, not hardcoded."""
+        from pathlib import Path
+        from textwrap import dedent
+
+        # Config with json_mode=true on filter but false on enrich.
+        config_path = Path(str(tmp_path)) / "influx.toml"
+        config_path.write_text(
+            dedent("""\
+                [providers.fake-provider]
+                base_url = "https://fake.api.example.com/v1"
+                api_key_env = "FAKE_PROVIDER_KEY"
+
+                [models.filter]
+                provider = "fake-provider"
+                model = "fake-model-a"
+                json_mode = true
+
+                [models.enrich]
+                provider = "fake-provider"
+                model = "fake-model-b"
+                json_mode = false
+
+                [prompts.filter]
+                text = "f"
+                [prompts.tier1_enrich]
+                text = "e"
+                [prompts.tier3_extract]
+                text = "x"
+            """)
+        )
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.setenv("FAKE_PROVIDER_KEY", "test-key")
+
+        route = respx.post(
+            "https://fake.api.example.com/v1/chat/completions"
+        )
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {"content": "{}"},
+                            "finish_reason": "stop",
+                            "index": 0,
+                        }
+                    ]
+                },
+            )
+        )
+
+        main(["validate-config"])
+
+        # Only the json_mode=true slot (filter) should trigger a dry-call;
+        # enrich (json_mode=false) should NOT.
+        assert route.call_count == 1
+        import json as json_mod
+
+        sent_body = json_mod.loads(route.calls[0].request.content)
+        assert sent_body["model"] == "fake-model-a"
 
 
 def _write_config_with_lithos(
