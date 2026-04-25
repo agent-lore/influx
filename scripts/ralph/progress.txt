@@ -103,6 +103,20 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - All tests pass: 686 passed, pyright 0 errors, ruff clean
 ---
 
+## 2026-04-25 - US-008
+- Created `tests/unit/test_repair_clearing_rules.py` with 35 tests across 10 test classes
+- Covers: archive-missing only; text:abstract-only only; archive-missing + text:abstract-only; high-score deep-extract eligible; influx:text-terminal present
+- AC-06-B: archive download + abstract-only Upgrade in one pass clears BOTH influx:archive-missing and influx:repair-needed
+- AC-06-C negative: text:abstract-only WITHOUT influx:text-terminal is NOT cleared even when archive + Tier 2 + Tier 3 all succeed
+- AC-X-7 high-score-terminal positive: terminal-abstract-only with score >= deep_extract_threshold, archive path stored, no other outstanding tag -> cleared from influx:repair-needed
+- Partial repair tests: verify unsatisfied stage-specific tags remain
+- Files changed: `tests/unit/test_repair_clearing_rules.py` (created)
+- **Learnings for future iterations:**
+  - `compute_clearing()` is pure logic (no async, no I/O) — same testability as `select_stages()`
+  - Use `_clear()` helper wrapper to reduce boilerplate, same pattern as `_select()` in stage selection tests
+  - All tests pass: 721 passed, pyright 0 errors, ruff clean
+---
+
 ## 2026-04-25 - US-007
 - Added `ClearingDecision` frozen dataclass and `compute_clearing()` function to `src/influx/repair.py`
 - `ClearingDecision` has two booleans: `clear_archive_missing` and `clear_repair_needed`
@@ -117,4 +131,20 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - Terminal exemption is cleanly expressed: `if is_text_terminal: tier2_ok = True` (same for tier3)
   - Text quality check (b) naturally handles AC-06-C without special-casing
   - All tests pass: 686 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-009
+- Added `apply_abstract_only_reextraction()` function to `src/influx/repair.py`
+- Calls `re_extract_archive` hook and switches on `ExtractionOutcome` discriminator
+- UPGRADE: removes `text:abstract-only`, adds the upgraded tag (e.g. `text:html`)
+- TERMINAL: keeps `text:abstract-only`, adds `influx:text-terminal`
+- TRANSIENT (or ExtractionError): keeps tags unchanged — no `influx:text-terminal`
+- `influx:text-terminal` is NEVER set except through Terminal outcome (AC-M2-3)
+- Added to `__all__` exports; imported `ExtractionError` at module level
+- Files changed: `src/influx/repair.py`
+- **Learnings for future iterations:**
+  - `apply_abstract_only_reextraction()` is synchronous — hook protocol is sync `__call__`
+  - Returns a new tag list (immutable pattern) — caller uses the returned list for further stages
+  - ExtractionError catch treats exception as Transient (keeps tags unchanged)
+  - All tests pass: 721 passed, pyright 0 errors, ruff clean
 ---

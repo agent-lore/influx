@@ -19,6 +19,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
+from influx.errors import ExtractionError
+
 if TYPE_CHECKING:
     from influx.config import AppConfig
     from influx.lithos_client import LithosClient
@@ -31,6 +33,7 @@ __all__ = [
     "StageSelection",
     "Tier2EnrichHook",
     "Tier3ExtractHook",
+    "apply_abstract_only_reextraction",
     "compute_clearing",
     "select_stages",
     "sweep",
@@ -284,6 +287,77 @@ def select_stages(
         tier2_retry=tier2_retry,
         tier3_retry=tier3_retry,
     )
+
+
+# ── Abstract-only re-extraction stage (§5.2) ──────────────────────
+
+
+def apply_abstract_only_reextraction(
+    *,
+    tags: list[str],
+    note: dict[str, object],
+    archive_path: str,
+    hook: ReExtractArchiveHook,
+) -> list[str]:
+    """Execute the abstract-only re-extraction stage (PRD 06 §5.2).
+
+    Calls the ``re_extract_archive`` hook and applies tag mutations
+    based on the three-outcome discriminator:
+
+    * **Upgrade** — replace ``text:abstract-only`` with the upgraded
+      tag (e.g. ``text:html``); ``influx:text-terminal`` is NOT added.
+    * **Terminal** — keep ``text:abstract-only``; ADD
+      ``influx:text-terminal``.
+    * **Transient** (or ``ExtractionError``) — keep
+      ``text:abstract-only`` and ``influx:repair-needed``;
+      ``influx:text-terminal`` is NOT added.
+
+    ``influx:text-terminal`` is NEVER set on the initial write — only
+    through this stage's Terminal outcome (AC-M2-3).
+
+    Parameters
+    ----------
+    tags:
+        The note's current tag list (will not be mutated).
+    note:
+        The current note state dict (from ``lithos_read``).
+    archive_path:
+        The archive path for re-extraction.
+    hook:
+        The ``re_extract_archive`` callable (PRD 06 §4).
+
+    Returns
+    -------
+    list[str]
+        A new tag list with the appropriate mutations applied.
+    """
+    try:
+        result = hook(note, archive_path)
+    except ExtractionError:
+        # Transient failure — keep tags unchanged.
+        logger.info(
+            "abstract-only re-extraction raised ExtractionError "
+            "(transient); tags unchanged"
+        )
+        return list(tags)
+
+    if result.outcome is ExtractionOutcome.UPGRADE:
+        # Replace text:abstract-only with the upgraded tag.
+        new_tags = [t for t in tags if t != "text:abstract-only"]
+        if result.upgraded_text_tag:
+            new_tags.append(result.upgraded_text_tag)
+        return new_tags
+
+    if result.outcome is ExtractionOutcome.TERMINAL:
+        # Keep text:abstract-only, ADD influx:text-terminal.
+        new_tags = list(tags)
+        if "influx:text-terminal" not in new_tags:
+            new_tags.append("influx:text-terminal")
+        return new_tags
+
+    # TRANSIENT — keep tags unchanged.
+    logger.info("abstract-only re-extraction returned TRANSIENT; tags unchanged")
+    return list(tags)
 
 
 # ── Post-stage tag clearing (§5.3) ─────────────────────────────────

@@ -115,7 +115,7 @@
         "All new tests pass via `pytest`"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -131,7 +131,7 @@
         "Hook integration: this stage calls the `re_extract_archive` callable from US-003 and switches on its discriminator"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
