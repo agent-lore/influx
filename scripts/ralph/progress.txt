@@ -283,3 +283,17 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - Multi-run tests: clear `fake_lithos.calls`, rebuild note with run 1's written tags, re-queue
   - All tests pass: 777 passed, pyright 0 errors, ruff clean
 ---
+
+## 2026-04-25 - US-018
+- Created `tests/integration/test_repair_sweep_high_score_terminal.py` with 4 tests in `TestHighScoreTerminalClearing`
+- `test_terminal_abstract_only_high_score_clears_repair_needed`: seeds score=9, terminal abstract-only with archive path; asserts influx:repair-needed cleared despite no full-text or influx:deep-extracted
+- `test_terminal_note_not_reselected_on_next_sweep`: two-run test; run 1 clears repair-needed, run 2 returns empty candidate list (note no longer matches filter)
+- `test_terminal_no_reextraction_despite_hooks`: verifies influx:text-terminal suppresses abstract-only re-extraction even when re_extract_archive hook is provided
+- `test_terminal_no_tier2_tier3_despite_high_score`: verifies terminal exemption suppresses Tier 2 and Tier 3 stage execution at high score, while still clearing repair-needed
+- Files changed: `tests/integration/test_repair_sweep_high_score_terminal.py` (created), `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - High-score terminal clearing test needs score=9 (≥ deep_extract threshold of 9) to exercise the exemption
+  - Terminal notes trigger NO hooks at all (re-extraction, Tier 2, Tier 3 all suppressed by influx:text-terminal in stage selection)
+  - Two-run re-selection test: queue empty list response for run 2 and assert visited == []
+  - All tests pass: 781 passed, pyright 0 errors, ruff clean
+---
