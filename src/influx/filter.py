@@ -61,6 +61,7 @@ class FilterScorerError(RuntimeError):
     silently dropping the run (PRD 07 §5.6 graceful degradation).
     """
 
+
 _log = logging.getLogger(__name__)
 
 
@@ -177,6 +178,7 @@ def make_default_arxiv_filter_scorer(
             json.JSONDecodeError,
             KeyError,
             IndexError,
+            TypeError,
             ValidationError,
             ValueError,
         ) as exc:

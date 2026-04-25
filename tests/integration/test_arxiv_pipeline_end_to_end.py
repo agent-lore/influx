@@ -800,3 +800,67 @@ class TestDefaultFilterScorerEndToEnd:
         assert "text:abstract-only" in payload["tags"]
         assert "text:html" not in payload["tags"]
         assert "full-text" not in payload["tags"]
+
+    def test_default_scorer_malformed_response_yields_abstract_only(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Structurally malformed filter response → abstract-only note.
+
+        Regression test for the finding: response shapes such as
+        ``{"choices": [{"message": {"content": None}}]}`` raise
+        ``TypeError`` (not ``JSONDecodeError`` / ``KeyError``) when the
+        scorer indexes the response.  The parse wrapper must normalise
+        these into ``FilterScorerError`` so the provider falls every
+        item back to abstract-only ingestion (PRD 07 §5.6 graceful
+        degradation) rather than letting the batch crash.
+        """
+        config = _make_config_with_filter(fake_lithos_url)
+
+        app = create_app(config)
+        assert app.state.item_provider is not None
+
+        with (
+            patch(
+                "influx.sources.arxiv.guarded_fetch",
+                return_value=_atom_fetch_result(),
+            ),
+            patch(
+                "influx.extraction.html.guarded_fetch",
+            ) as mock_html,
+            patch(
+                "influx.filter.httpx.post",
+                return_value=_FakeFilterResponse(
+                    {"choices": [{"message": {"content": None}}]},
+                ),
+            ) as mock_filter_post,
+        ):
+            import asyncio
+
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=app.state.item_provider,
+                )
+            )
+
+            # Default scorer was attempted exactly once and parse-failed.
+            assert mock_filter_post.call_count == 1
+            # Abstract-only fallback must NOT trigger HTML extraction.
+            assert mock_html.call_count == 0
+
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1, (
+            "structurally malformed filter response must fall back to "
+            "abstract-only, not silently drop the batch"
+        )
+        payload = write_calls[0][1]
+
+        assert "text:abstract-only" in payload["tags"]
+        assert "text:html" not in payload["tags"]
+        assert "full-text" not in payload["tags"]
+        assert "## Full Text" not in payload["content"]
+        assert "influx:deep-extracted" not in payload["tags"]
