@@ -709,6 +709,150 @@ class TestRepairConfigKnob:
         assert repair_val != feedback_val
 
 
+# ── Extraction config defaults and overrides (US-003, PRD 07 §5.1) ──
+
+
+class TestExtractionConfigDefaults:
+    """ExtractionConfig defaults match PRD 07 §5.1 (FR-ENR-2, FR-ENR-3, FR-RES-5)."""
+
+    def test_min_html_chars_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """extraction.min_html_chars defaults to 1000."""
+        _write_config(tmp_path)
+        monkeypatch.setenv("INFLUX_CONFIG", str(tmp_path / "influx.toml"))
+
+        cfg = load_config()
+
+        assert cfg.extraction.min_html_chars == 1000
+
+    def test_min_web_chars_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """extraction.min_web_chars defaults to 500."""
+        _write_config(tmp_path)
+        monkeypatch.setenv("INFLUX_CONFIG", str(tmp_path / "influx.toml"))
+
+        cfg = load_config()
+
+        assert cfg.extraction.min_web_chars == 500
+
+    def test_strip_tags_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """extraction.strip_tags defaults to [script, iframe, object, embed]."""
+        _write_config(tmp_path)
+        monkeypatch.setenv("INFLUX_CONFIG", str(tmp_path / "influx.toml"))
+
+        cfg = load_config()
+
+        assert cfg.extraction.strip_tags == ["script", "iframe", "object", "embed"]
+
+
+class TestExtractionConfigOverrides:
+    """User-supplied extraction overrides flow through to the parsed config."""
+
+    def test_override_min_html_chars(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Custom extraction.min_html_chars is reflected on the parsed config."""
+        toml = dedent("""\
+            [extraction]
+            min_html_chars = 2000
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        assert cfg.extraction.min_html_chars == 2000
+
+    def test_override_min_web_chars(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Custom extraction.min_web_chars is reflected on the parsed config."""
+        toml = dedent("""\
+            [extraction]
+            min_web_chars = 800
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        assert cfg.extraction.min_web_chars == 800
+
+    def test_override_strip_tags(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Custom extraction.strip_tags is reflected on the parsed config."""
+        toml = dedent("""\
+            [extraction]
+            strip_tags = ["script", "style", "noscript"]
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        assert cfg.extraction.strip_tags == ["script", "style", "noscript"]
+
+    def test_override_all_extraction_knobs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """All three knobs overridden simultaneously are reflected."""
+        toml = dedent("""\
+            [extraction]
+            min_html_chars = 3000
+            min_web_chars = 1500
+            strip_tags = ["form", "input"]
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        assert cfg.extraction.min_html_chars == 3000
+        assert cfg.extraction.min_web_chars == 1500
+        assert cfg.extraction.strip_tags == ["form", "input"]
+
+
 class TestConftestFixture:
     """The conftest influx_config_env fixture yields a loadable config."""
 
