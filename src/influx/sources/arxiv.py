@@ -31,10 +31,12 @@ from influx.config import (
     ProfileThresholds,
     ResilienceConfig,
 )
-from influx.errors import ExtractionError, NetworkError
+from influx.enrich import tier1_enrich, tier3_extract
+from influx.errors import ExtractionError, LCMAError, NetworkError
 from influx.extraction.pipeline import extract_arxiv_text
 from influx.http_client import guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
+from influx.schemas import Tier1Enrichment, Tier3Extraction
 
 __all__ = [
     "ArxivItem",
@@ -373,8 +375,8 @@ def build_arxiv_note_item(
         Ready-to-yield ``ProfileItem`` dict (title, source_url,
         content, tags, score, confidence, path, abstract_or_summary).
     """
+    profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
     if thresholds is None:
-        profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
         thresholds = profile_cfg.thresholds if profile_cfg else ProfileThresholds()
 
     source_url = f"https://arxiv.org/abs/{item.arxiv_id}"
@@ -414,7 +416,50 @@ def build_arxiv_note_item(
     if repair_needed:
         tags.append("influx:repair-needed")
 
+    # ── Tier 1 enrichment (FR-ENR-4) ─────────────────────────────
+    tier1_result: Tier1Enrichment | None = None
+    tier1_attempted = score >= thresholds.relevance
+    if tier1_attempted:
+        profile_summary = profile_cfg.description if profile_cfg else ""
+        try:
+            tier1_result = tier1_enrich(
+                title=item.title,
+                abstract=item.abstract,
+                profile_summary=profile_summary,
+                config=config,
+            )
+        except LCMAError:
+            _log.warning("Tier 1 enrichment failed for %s", item.arxiv_id)
+            repair_needed = True
+
+    # ── Tier 3 deep extraction (FR-ENR-5) ─────────────────────────
+    tier3_result: Tier3Extraction | None = None
+    if score >= thresholds.deep_extract and extracted_text is not None:
+        try:
+            tier3_result = tier3_extract(
+                title=item.title,
+                full_text=extracted_text,
+                config=config,
+            )
+        except LCMAError:
+            _log.warning("Tier 3 extraction failed for %s", item.arxiv_id)
+            repair_needed = True
+
+    # influx:deep-extracted iff all four Tier 3 sections exist.
+    if tier3_result is not None:
+        tags.append("influx:deep-extracted")
+
+    # Ensure repair-needed is set exactly once.
+    if repair_needed and "influx:repair-needed" not in tags:
+        tags.append("influx:repair-needed")
+
     # ── Render note ───────────────────────────────────────────────
+    # When Tier 1 was attempted but failed, suppress the plain-text
+    # summary so ## Summary is omitted entirely (AC-07-A / FR-ENR-6).
+    summary_text = item.abstract
+    if tier1_attempted and tier1_result is None:
+        summary_text = ""
+
     profile_entries = [
         ProfileRelevanceEntry(
             profile_name=profile_name,
@@ -429,10 +474,12 @@ def build_arxiv_note_item(
         tags=tags,
         confidence=confidence,
         archive_path=None,
-        summary=item.abstract,
+        summary=summary_text,
         keywords=[],
         profile_entries=profile_entries,
         full_text=full_text_for_note,
+        tier1_enrichment=tier1_result,
+        tier3_extraction=tier3_result,
     )
 
     pub = item.published
