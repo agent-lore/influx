@@ -70,7 +70,7 @@
         "A happy-path contract test in tests/contract/test_lithos_client.py confirms a well-formed `cache_lookup` call reaches the fake server and the wrapper forwards the underlying Lithos `lithos_cache_lookup` response contract unchanged (per `docs/REQUIREMENTS.md`, e.g. the `hit` / `stale_exists` semantics — the wrapper does not invent a `cached`/`not cached` envelope)"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -84,7 +84,7 @@
         "An empty-result contract test confirms an empty list response is propagated correctly (not turned into None or an error)"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

@@ -11,12 +11,15 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - Fake Lithos SSE server fixture pattern: `FakeLithosServer` class in `tests/contract/test_lithos_client.py` with uvicorn on random port
 - `.venv` python symlink is broken (points to missing pyenv); system python3 at `/usr/local/bin/python3` works; need `pip install --target .venv/lib/python3.12/site-packages` for new pyright-visible packages
 - `LithosConfig` added to `config.py` with `url` and `transport` fields, env overrides `LITHOS_URL` and `LITHOS_MCP_TRANSPORT`
-- 533 tests passing after US-004
+- 538 tests passing after US-005
+- `LithosClient.cache_lookup()` is the chokepoint for dedup lookups; requires both `query` and `source_url` keyword args
 - `src/influx/dedup.py` has `first_sentence()` and `compose_dedup_query()` for cache_lookup query composition
 - First-sentence regex `(?<=[a-z]{2})[.!?](?:\s|$)` skips abbreviations like "Mr." and "e.g." by requiring 2 lowercase letters before the terminator
 - `LithosClient._ensure_connected()` auto-calls `lithos_agent_register` on every new connection (including reconnects)
 - `LithosClient.reconnect()` method exists for SSE drop + re-register
 - Agent register payload: `{"id": "influx", "name": "Influx Pipeline", "type": "ingestion-pipeline"}`
+- `LithosClient.list_notes()` wraps `lithos_list` MCP tool; takes `tags: list[str]` and optional `limit: int`
+- 541 tests passing after US-006
 
 ---
 
@@ -66,4 +69,27 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - First-sentence regex `(?<=[a-z]{2})[.!?](?:\s|$)` uses 2-lowercase-letter lookbehind to skip abbreviations (Mr., e.g., Dr.) while catching real sentence ends
   - Ruff enforces SIM108 (ternary operator) — use `x if cond else y` instead of if/else blocks for simple assignments
   - 533 tests pass (21 new unit tests added)
+---
+
+## 2026-04-25 - US-005
+- Added `cache_lookup` method to `LithosClient` with chokepoint enforcement (both `query` and `source_url` required)
+- Raises `LithosError("missing_lookup_arg")` before any RPC when either arg is None or empty
+- Added 5 contract tests: 4 negative (empty/None query/source_url) + 1 happy-path
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - MCP `CallToolResult.content` items are a union type; use `type: ignore[union-attr]` after runtime type-narrowing assertion for pyright
+  - Ruff line length is 88 chars; keep docstrings concise
+  - 538 tests pass (5 new contract tests added)
+---
+
+## 2026-04-25 - US-006
+- Added `list_notes` method to `LithosClient` wrapping `lithos_list` MCP tool
+- Added `lithos_list` tool to `FakeLithosServer` in contract tests
+- Added 3 contract tests: happy-path with tags, empty-result propagation, limit forwarding
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - Named the method `list_notes` to avoid clash with Python's `list` builtin
+  - The `lithos_list` tool returns `{"items": [...]}` envelope — callers parse the JSON from `CallToolResult.content[0].text`
+  - FakeLithosServer can use conditional logic (tag prefix matching) to return different fixtures
+  - 541 tests pass (3 new contract tests added)
 ---

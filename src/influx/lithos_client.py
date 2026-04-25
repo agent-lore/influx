@@ -141,6 +141,23 @@ class LithosClient:
             {"query": query, "source_url": source_url},
         )
 
+    async def list_notes(
+        self,
+        *,
+        tags: list[str],
+        limit: int | None = None,
+    ) -> mcp_types.CallToolResult:
+        """List notes by tag filter (FR-MCP-5).
+
+        Invokes the underlying MCP ``lithos_list`` tool with the provided
+        *tags* and optional *limit*.  The server response is returned
+        unchanged so callers can inspect titles/IDs directly.
+        """
+        args: dict[str, Any] = {"tags": tags}
+        if limit is not None:
+            args["limit"] = limit
+        return await self.call_tool("lithos_list", args)
+
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> mcp_types.CallToolResult:

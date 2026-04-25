@@ -68,6 +68,31 @@ class FakeLithosServer:
             )
             return '{"hit": false, "stale_exists": false}'
 
+        @self._mcp.tool(name="lithos_list")
+        async def lithos_list(
+            tags: list[str] | None = None,
+            limit: int | None = None,
+        ) -> str:
+            calls.append(
+                ("lithos_list", {"tags": tags or [], "limit": limit})
+            )
+            import json
+
+            # Return items matching tags for test purposes.
+            if tags and any(t.startswith("arxiv-id:") for t in tags):
+                return json.dumps(
+                    {
+                        "items": [
+                            {
+                                "id": "note-001",
+                                "title": "Attention Is All You Need",
+                                "tags": tags,
+                            }
+                        ]
+                    }
+                )
+            return json.dumps({"items": []})
+
     def start(self) -> None:
         app = self._mcp.sse_app()
         config = uvicorn.Config(
@@ -396,5 +421,94 @@ class TestCacheLookupChokepoint:
             text_content = result.content[0]
             assert text_content.type == "text"
             assert "hit" in text_content.text  # type: ignore[union-attr]
+        finally:
+            await client.close()
+
+
+# ── List wrapper (FR-MCP-5) ────────────────────────────────────────
+
+
+class TestListNotes:
+    """``list_notes`` invokes ``lithos_list`` and forwards response."""
+
+    async def test_happy_path_with_tags(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """List call with tags reaches server; items envelope returned."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.list_notes(
+                tags=["arxiv-id:2601.12345"],
+            )
+            # Verify the fake server received the call.
+            list_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_list"
+            ]
+            assert len(list_calls) == 1
+            assert list_calls[0][1]["tags"] == ["arxiv-id:2601.12345"]
+
+            # Response content should contain the items envelope.
+            assert len(result.content) > 0
+            text = result.content[0]
+            assert text.type == "text"
+            import json
+
+            body = json.loads(text.text)  # type: ignore[union-attr]
+            assert "items" in body
+            assert len(body["items"]) == 1
+            assert body["items"][0]["title"] == "Attention Is All You Need"
+        finally:
+            await client.close()
+
+    async def test_empty_result_propagated(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Empty list response is propagated (not None or error)."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.list_notes(
+                tags=["nonexistent-tag:xyz"],
+            )
+            # Verify server received the call.
+            list_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_list"
+            ]
+            assert len(list_calls) == 1
+
+            # Response should be an empty items list, not None.
+            assert result is not None
+            assert len(result.content) > 0
+            text = result.content[0]
+            assert text.type == "text"
+            import json
+
+            body = json.loads(text.text)  # type: ignore[union-attr]
+            assert body == {"items": []}
+        finally:
+            await client.close()
+
+    async def test_limit_forwarded(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Limit parameter is forwarded to the server."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.list_notes(
+                tags=["arxiv-id:2601.12345"], limit=5
+            )
+            list_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_list"
+            ]
+            assert len(list_calls) == 1
+            assert list_calls[0][1]["limit"] == 5
         finally:
             await client.close()
