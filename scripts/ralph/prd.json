@@ -147,7 +147,7 @@
         "All new tests pass via `pytest`"
       ],
       "priority": 10,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
