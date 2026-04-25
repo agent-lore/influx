@@ -24,9 +24,37 @@ from mcp import types as mcp_types
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 
-from influx.errors import ConfigError, LithosError
+from influx.errors import ConfigError, LCMAError, LithosError
 
 __all__ = ["LithosClient", "WriteResult"]
+
+
+# ── LCMA tool stubs (PRD 08 seam) ──────────────────────────────────
+#
+# These functions expose the frozen ``lithos_*`` LCMA tool names as
+# stubs that raise ``LCMAError("not implemented")`` until PRD 08
+# fills them in (§4 internal seams permitted, Definition of Done
+# item 3).
+
+
+def lithos_retrieve(**kwargs: Any) -> None:  # noqa: ARG001
+    """LCMA stub — raises ``LCMAError`` until PRD 08."""
+    raise LCMAError("not implemented")
+
+
+def lithos_edge_upsert(**kwargs: Any) -> None:  # noqa: ARG001
+    """LCMA stub — raises ``LCMAError`` until PRD 08."""
+    raise LCMAError("not implemented")
+
+
+def lithos_task_create(**kwargs: Any) -> None:  # noqa: ARG001
+    """LCMA stub — raises ``LCMAError`` until PRD 08."""
+    raise LCMAError("not implemented")
+
+
+def lithos_task_complete(**kwargs: Any) -> None:  # noqa: ARG001
+    """LCMA stub — raises ``LCMAError`` until PRD 08."""
+    raise LCMAError("not implemented")
 
 
 @dataclasses.dataclass(frozen=True)

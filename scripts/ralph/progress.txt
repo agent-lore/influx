@@ -39,6 +39,7 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - `content_too_large_skipped` WriteResult status with `detail` of `create_path` or `repair_path_tier1_failed`
 - FakeLithosServer has `cache_lookup_responses: list[str]` queue (FIFO) for configurable cache_lookup responses
 - 561 tests passing after US-010
+- LCMA stubs (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`) are module-level functions in `lithos_client.py` that raise `LCMAError("not implemented")` — PRD 08 seam
 
 ---
 
@@ -193,4 +194,16 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - `_retry_content_too_large_repair()` uses original `args["content"]` (not the already-trimmed content from step 1) for `_drop_tier2_and_tier3()`, which is correct
   - Together with US-010's tests, all FOUR AC-05-F sub-paths are now covered: first-retry-succeeds, create-path skip, repair-path success, repair-path Tier-1-fails
   - 563 tests pass (2 new contract tests added)
+---
+
+## 2026-04-25 - US-012
+- Added 4 LCMA tool stubs to `lithos_client.py`: `lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete` — each raises `LCMAError("not implemented")`
+- Imported `LCMAError` from `influx.errors` (already existed)
+- Added 9 unit tests in `tests/unit/test_lithos_client.py`: 4 raise-check tests (one per stub), 4 type-distinction tests, 1 AST-based grep assertion that no production module under `src/influx/` invokes any LCMA stub
+- Files changed: `src/influx/lithos_client.py`, `tests/unit/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `LCMAError` is distinct from `LithosError` — both inherit from `InfluxError` but via separate branches
+  - LCMA stubs use `**kwargs: Any` with `# noqa: ARG001` to accept arbitrary args without ruff complaints
+  - AST-based grep test walks `ast.Call` nodes checking `ast.Name.id` and `ast.Attribute.attr` — covers both direct and attribute-style calls
+  - 572 tests pass (9 new unit tests added)
 ---

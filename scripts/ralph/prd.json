@@ -174,7 +174,7 @@
         "A unit test confirms calling each LCMA stub raises `LCMAError(\"not implemented\")` with that exact message"
       ],
       "priority": 12,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
