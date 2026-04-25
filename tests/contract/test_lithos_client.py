@@ -135,8 +135,20 @@ class FakeLithosServer:
         async def lithos_list(
             tags: list[str] | None = None,
             limit: int | None = None,
+            order_by: str | None = None,
+            order: str | None = None,
         ) -> str:
-            calls.append(("lithos_list", {"tags": tags or [], "limit": limit}))
+            calls.append(
+                (
+                    "lithos_list",
+                    {
+                        "tags": tags or [],
+                        "limit": limit,
+                        "order_by": order_by,
+                        "order": order,
+                    },
+                )
+            )
             import json
 
             if list_responses:
@@ -561,6 +573,50 @@ class TestListNotes:
             list_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_list"]
             assert len(list_calls) == 1
             assert list_calls[0][1]["limit"] == 5
+        finally:
+            await client.close()
+
+    async def test_order_by_and_order_forwarded(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """order_by and order parameters are forwarded to the MCP call (FR-REP-1)."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.list_notes(
+                tags=["influx:repair-needed", "profile:ai-robotics"],
+                limit=100,
+                order_by="updated_at",
+                order="asc",
+            )
+            list_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_list"]
+            assert len(list_calls) == 1
+            assert list_calls[0][1]["tags"] == [
+                "influx:repair-needed",
+                "profile:ai-robotics",
+            ]
+            assert list_calls[0][1]["limit"] == 100
+            assert list_calls[0][1]["order_by"] == "updated_at"
+            assert list_calls[0][1]["order"] == "asc"
+        finally:
+            await client.close()
+
+    async def test_order_by_omitted_when_none(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """order_by and order are not sent when None (backward compat)."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.list_notes(tags=["some-tag"])
+            list_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_list"]
+            assert len(list_calls) == 1
+            assert list_calls[0][1]["order_by"] is None
+            assert list_calls[0][1]["order"] is None
         finally:
             await client.close()
 

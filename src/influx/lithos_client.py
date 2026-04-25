@@ -604,16 +604,32 @@ class LithosClient:
         *,
         tags: list[str],
         limit: int | None = None,
+        order_by: str | None = None,
+        order: str | None = None,
     ) -> mcp_types.CallToolResult:
-        """List notes by tag filter (FR-MCP-5).
+        """List notes by tag filter (FR-MCP-5, FR-REP-1).
 
         Invokes the underlying MCP ``lithos_list`` tool with the provided
-        *tags* and optional *limit*.  The server response is returned
-        unchanged so callers can inspect titles/IDs directly.
+        *tags* and optional *limit*, *order_by*, and *order*.  The server
+        response is returned unchanged so callers can inspect titles/IDs
+        directly.
+
+        Parameters
+        ----------
+        order_by:
+            Field to sort by (e.g. ``"updated_at"``).  Forwarded to the
+            MCP call when non-None.
+        order:
+            Sort direction (``"asc"`` or ``"desc"``).  Forwarded to the
+            MCP call when non-None.
         """
         args: dict[str, Any] = {"tags": tags}
         if limit is not None:
             args["limit"] = limit
+        if order_by is not None:
+            args["order_by"] = order_by
+        if order is not None:
+            args["order"] = order
         return await self.call_tool("lithos_list", args)
 
     async def call_tool(
