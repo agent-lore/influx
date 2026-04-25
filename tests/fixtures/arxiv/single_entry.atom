@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <link href="http://arxiv.org/api/query?search_query=cat:cs.NE&amp;sortBy=submittedDate&amp;sortOrder=descending&amp;max_results=200" rel="self" type="application/atom+xml"/>
+  <title type="html">ArXiv Query: cat:cs.NE</title>
+  <id>http://arxiv.org/api/query?search_query=cat:cs.NE</id>
+  <updated>2026-04-24T00:00:00-04:00</updated>
+  <opensearch:totalResults xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">1</opensearch:totalResults>
+  <opensearch:startIndex xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">0</opensearch:startIndex>
+  <opensearch:itemsPerPage xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">200</opensearch:itemsPerPage>
+  <entry>
+    <id>http://arxiv.org/abs/2604.77777v1</id>
+    <updated>2026-04-24T14:00:00Z</updated>
+    <published>2026-04-24T14:00:00Z</published>
+    <title>Neural Architecture Search via Evolutionary Strategies</title>
+    <summary>  We propose an evolutionary approach to neural architecture search
+that leverages population-based training and novelty search to
+discover architectures with superior performance on standard
+benchmarks while maintaining computational efficiency.
+</summary>
+    <author><name>Hiro Tanaka</name></author>
+    <author><name>Ines Morales</name></author>
+    <category term="cs.NE" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+    <link href="http://arxiv.org/abs/2604.77777v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2604.77777v1" rel="related" type="application/pdf"/>
+  </entry>
+</feed>

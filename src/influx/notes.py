@@ -25,10 +25,12 @@ import re
 from dataclasses import dataclass, field
 
 from influx.errors import InfluxError
+from influx.urls import normalise_url
 
 __all__ = [
     "ArchiveInvariantError",
     "ArchiveParseError",
+    "MissingIngestedByTagError",
     "NoteParseError",
     "ParsedNote",
     "ParsedSection",
@@ -59,11 +61,18 @@ class ArchiveInvariantError(InfluxError):
     """Raised when a path: line and influx:archive-missing co-exist."""
 
 
+class MissingIngestedByTagError(InfluxError):
+    """Raised when an Influx-authored note lacks ``ingested-by:influx`` (FR-RES-6)."""
+
+
 # ── Data structures ──────────────────────────────────────────────────
 
 _FRONTMATTER_FENCE = "---"
 _USER_NOTES_HEADING = "## User Notes"
-_H2_RE = re.compile(r"^## (.+)$", re.MULTILINE)
+# Heading captures stop at CR or LF so CRLF notes don't capture a trailing \r.
+# A lookahead (not $) terminates the match so CRLF endings are tolerated;
+# re.MULTILINE's $ only matches before \n, not before \r.
+_H2_RE = re.compile(r"^## ([^\r\n]+)(?=\r?\n|$)", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -137,23 +146,43 @@ def parse_note(text: str) -> ParsedNote:
 # ── Internal helpers ─────────────────────────────────────────────────
 
 
+_CLOSING_FENCE_RE = re.compile(r"\r?\n---(?:[ \t]*)(?=\r?\n|$)")
+
+
 def _split_frontmatter(text: str) -> tuple[str, str]:
     """Return ``(frontmatter_raw, rest)`` by splitting on ``---`` fences.
+
+    Tolerates both LF and CRLF line endings without normalising them; the
+    returned *rest* is sliced from the original text so downstream
+    byte-exact preservation of the ``## User Notes`` region is retained
+    regardless of newline style.
 
     Raises ``NoteParseError`` if fences are missing.
     """
     if not text.startswith(_FRONTMATTER_FENCE):
         raise NoteParseError("Note does not start with frontmatter fence '---'")
 
-    # Find closing fence (skip the opening one)
-    after_open = text.index("\n") + 1
-    close_idx = text.find(f"\n{_FRONTMATTER_FENCE}", after_open)
-    if close_idx == -1:
+    # Find end of opening fence line (either \n or \r\n).
+    nl_idx = text.find("\n")
+    if nl_idx == -1:
+        raise NoteParseError("No closing frontmatter fence '---' found")
+    after_open = nl_idx + 1
+
+    close_match = _CLOSING_FENCE_RE.search(text, after_open - 1)
+    if close_match is None:
         raise NoteParseError("No closing frontmatter fence '---' found")
 
-    frontmatter_raw = text[after_open:close_idx]
-    # Skip past the closing fence line
-    rest_start = close_idx + 1 + len(_FRONTMATTER_FENCE)
+    # frontmatter_raw is the YAML between the fences. Exclude the leading
+    # CR if present so callers see clean YAML content.
+    fm_end = close_match.start()
+    frontmatter_raw = text[after_open:fm_end]
+
+    # Skip past the closing fence line, including any trailing newline.
+    rest_start = close_match.end()
+    if rest_start < len(text) and text[rest_start] == "\r":
+        rest_start += 1
+    if rest_start < len(text) and text[rest_start] == "\n":
+        rest_start += 1
     rest = text[rest_start:]
     return frontmatter_raw, rest
 
@@ -191,8 +220,9 @@ def _split_sections(body: str) -> tuple[list[ParsedSection], str | None]:
     user_notes: str | None = None
     influx_body = body
 
-    # Search for ## User Notes — we need byte-exact preservation
-    un_pattern = re.compile(r"^## User Notes[ \t]*$", re.MULTILINE)
+    # Search for ## User Notes — we need byte-exact preservation.
+    # Tolerate trailing CR (CRLF line endings) without consuming it.
+    un_pattern = re.compile(r"^## User Notes[ \t]*(?=\r?\n|$)", re.MULTILINE)
     un_match = un_pattern.search(body)
     if un_match is not None:
         user_notes = body[un_match.start() :]
@@ -210,11 +240,13 @@ def _split_sections(body: str) -> tuple[list[ParsedSection], str | None]:
         else:
             body_end = len(influx_body)
         section_body = influx_body[body_start:body_end]
-        # Strip single leading newline after heading, preserve rest
-        if section_body.startswith("\n"):
+        # Strip single leading newline (LF or CRLF) after heading.
+        if section_body.startswith("\r\n"):
+            section_body = section_body[2:]
+        elif section_body.startswith("\n"):
             section_body = section_body[1:]
-        # Strip trailing whitespace between sections
-        section_body = section_body.rstrip("\n")
+        # Strip trailing whitespace/newlines between sections
+        section_body = section_body.rstrip("\r\n")
         sections.append(ParsedSection(heading=heading, body=section_body))
 
     return sections, user_notes
@@ -460,11 +492,15 @@ def _render_frontmatter(
     tags: list[str],
     confidence: float,
 ) -> str:
-    """Render the YAML frontmatter content (between ``---`` fences)."""
+    """Render the YAML frontmatter content (between ``---`` fences).
+
+    ``source_url`` is normalised via :func:`influx.urls.normalise_url`
+    so that frontmatter always carries the canonical form (FR-MCP-4).
+    """
     lines = [
         "note_type: summary",
         "namespace: influx",
-        f"source_url: {source_url}",
+        f"source_url: {normalise_url(source_url)}",
     ]
     if tags:
         lines.append("tags:")
@@ -538,7 +574,14 @@ def render_note(
     ArchiveInvariantError
         When *archive_path* is not ``None`` and *tags* contains
         ``influx:archive-missing``.
+    MissingIngestedByTagError
+        When *tags* does not contain ``ingested-by:influx`` (FR-RES-6).
     """
+    if "ingested-by:influx" not in tags:
+        raise MissingIngestedByTagError(
+            "Influx-authored notes must carry the 'ingested-by:influx' tag "
+            "(FR-RES-6)"
+        )
     validate_archive_tag_invariant(archive_path=archive_path, tags=tags)
 
     frontmatter = _render_frontmatter(
@@ -559,11 +602,14 @@ def render_note(
     output += archive_section + "\n"
     output += f"## Summary\n{summary_body}\n"
 
-    # Profile Relevance section
-    if profile_entries:
-        output += "\n"
-        pr_body = _render_profile_relevance_body(profile_entries)
+    # Profile Relevance section — always emitted to keep the canonical
+    # note shape stable (US-007); body is empty when no entries are given.
+    output += "\n"
+    pr_body = _render_profile_relevance_body(profile_entries)
+    if pr_body:
         output += f"## Profile Relevance\n{pr_body}\n"
+    else:
+        output += "## Profile Relevance\n"
 
     # User Notes — preserved byte-exactly or empty heading appended
     output += "\n"
@@ -577,8 +623,12 @@ def render_note(
 
 # ── Profile relevance parse / rewrite helpers ────────────────────────
 
-_H3_RE = re.compile(r"^### (.+)$", re.MULTILINE)
-_SCORE_RE = re.compile(r"^Score:\s*(\d+)/10$", re.MULTILINE)
+# Heading and score regexes are CRLF-tolerant: H3 captures stop before
+# CR/LF (lookahead, not $) and score matches accept ``\r?\n`` after the
+# trailing digit so CRLF notes parse identically to LF notes.
+_H3_RE = re.compile(r"^### ([^\r\n]+)(?=\r?\n|$)", re.MULTILINE)
+_SCORE_RE = re.compile(r"^Score:\s*(\d+)/10[ \t]*(?=\r?\n|$)", re.MULTILINE)
+_LINE_SPLIT_RE = re.compile(r"\r?\n")
 
 
 def parse_profile_relevance(
@@ -620,10 +670,12 @@ def parse_profile_relevance(
         if score_match:
             score = int(score_match.group(1))
 
-        # Reason is everything after the Score: line
+        # Reason is everything after the Score: line. Split on either
+        # ``\n`` or ``\r\n`` so CRLF entry bodies don't leave a trailing
+        # ``\r`` on each line.
         reason_lines: list[str] = []
         past_score = False
-        for line in entry_body.split("\n"):
+        for line in _LINE_SPLIT_RE.split(entry_body):
             if _SCORE_RE.match(line):
                 past_score = True
                 continue

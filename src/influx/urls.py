@@ -7,16 +7,12 @@ shape.
 
 from __future__ import annotations
 
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
-# Query parameters stripped during normalisation.
+# Non-``utm_*`` tracking query parameters stripped during normalisation.
+# Any key starting with ``utm_`` is also stripped (FR-MCP-4).
 _TRACKING_PARAMS: frozenset[str] = frozenset(
     {
-        "utm_source",
-        "utm_medium",
-        "utm_campaign",
-        "utm_term",
-        "utm_content",
         "fbclid",
         "gclid",
         "mc_cid",
@@ -24,6 +20,11 @@ _TRACKING_PARAMS: frozenset[str] = frozenset(
         "ref",
     }
 )
+
+
+def _is_tracking_param(key: str) -> bool:
+    """Return True if *key* is a tracking query parameter (FR-MCP-4)."""
+    return key.startswith("utm_") or key in _TRACKING_PARAMS
 
 # Default ports that are stripped when they match the scheme.
 _DEFAULT_PORTS: dict[str, int] = {
@@ -62,14 +63,32 @@ def normalise_url(raw: str) -> str:
     # Strip trailing slash on path
     path = parsed.path.rstrip("/") if parsed.path != "/" else ""
 
-    # Filter tracking params, preserve ordering of remaining params
-    query_params = parse_qs(parsed.query, keep_blank_values=True)
-    filtered = {
-        k: v for k, v in query_params.items() if k not in _TRACKING_PARAMS
-    }
-    query = urlencode(filtered, doseq=True) if filtered else ""
+    # Filter tracking params from the raw query string while preserving the
+    # original encoding, segment order, and any repeated keys for unrelated
+    # parameters (FR-MCP-4: "leaves unrelated query parameters untouched").
+    query = _filter_tracking_params(parsed.query)
 
     return urlunparse((scheme, netloc, path, "", query, parsed.fragment))
+
+
+def _filter_tracking_params(raw_query: str) -> str:
+    """Strip tracking keys from *raw_query* without touching other params.
+
+    Splits on ``&`` and inspects each segment's key only.  Non-tracking
+    segments are kept verbatim, preserving percent-encoding, ordering,
+    and repeated keys.
+    """
+    if not raw_query:
+        return ""
+    kept: list[str] = []
+    for segment in raw_query.split("&"):
+        if not segment:
+            continue
+        key = segment.split("=", 1)[0]
+        if _is_tracking_param(key):
+            continue
+        kept.append(segment)
+    return "&".join(kept)
 
 
 def arxiv_canonical_url(arxiv_id: str) -> str:

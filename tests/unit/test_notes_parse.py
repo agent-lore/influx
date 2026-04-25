@@ -18,6 +18,7 @@ from influx.notes import (
     NoteParseError,
     parse_archive_path,
     parse_note,
+    parse_profile_relevance,
 )
 
 
@@ -356,6 +357,116 @@ class TestParseArchivePathMalformed:
         parsed = parse_note(self.MULTIPLE_LINES)
         with pytest.raises(ArchiveParseError, match="Malformed"):
             parse_archive_path(parsed)
+
+
+class TestCRLFHandling:
+    """Parser is tolerant of CRLF line endings (US-004).
+
+    The ``## User Notes`` region is preserved byte-exactly regardless of
+    line ending style, and section headings never capture a trailing
+    ``\\r``.
+    """
+
+    USER_NOTES_CRLF = (
+        "## User Notes\r\n"
+        "Line 1\r\n"
+        "\r\n"
+        "Line 3 with unicode: é\U0001f600\r\n"
+        "\r\n"
+        "### Nested heading\r\n"
+        "Content.\r\n"
+    )
+
+    NOTE_CRLF = (
+        "---\r\n"
+        "note_type: summary\r\n"
+        "namespace: influx\r\n"
+        "---\r\n"
+        "# CRLF Title\r\n"
+        "\r\n"
+        "## Archive\r\n"
+        "path: arxiv/2026/01/2601.12345.pdf\r\n"
+        "\r\n"
+        "## Summary\r\n"
+        "CRLF summary content.\r\n"
+        "\r\n"
+        + USER_NOTES_CRLF
+    )
+
+    def test_title_parsed_without_cr(self) -> None:
+        result = parse_note(self.NOTE_CRLF)
+        assert result.title == "CRLF Title"
+
+    def test_section_headings_strip_cr(self) -> None:
+        result = parse_note(self.NOTE_CRLF)
+        headings = [s.heading for s in result.sections]
+        assert headings == ["Archive", "Summary"]
+
+    def test_user_notes_byte_exact_preservation_crlf(self) -> None:
+        result = parse_note(self.NOTE_CRLF)
+        assert result.user_notes == self.USER_NOTES_CRLF
+
+    def test_archive_path_parse_crlf(self) -> None:
+        result = parse_note(self.NOTE_CRLF)
+        assert (
+            parse_archive_path(result)
+            == "arxiv/2026/01/2601.12345.pdf"
+        )
+
+
+class TestProfileRelevanceCRLF:
+    """parse_profile_relevance is CRLF-tolerant (US-005/US-007).
+
+    H3 profile names and Score: lines must not capture a trailing ``\\r``,
+    and reason text must not retain ``\\r`` characters from CRLF
+    line-endings — otherwise the rewrite path drops rejected-profile
+    entries.
+    """
+
+    NOTE_CRLF = (
+        "---\r\n"
+        "note_type: summary\r\n"
+        "namespace: influx\r\n"
+        "---\r\n"
+        "# CRLF Profiles\r\n"
+        "\r\n"
+        "## Summary\r\n"
+        "Summary.\r\n"
+        "\r\n"
+        "## Profile Relevance\r\n"
+        "### research\r\n"
+        "Score: 8/10\r\n"
+        "Old reason.\r\n"
+        "\r\n"
+        "### engineering\r\n"
+        "Score: 7/10\r\n"
+        "Engineering reason.\r\n"
+        "\r\n"
+        "## User Notes\r\n"
+        "Notes.\r\n"
+    )
+
+    def test_profile_names_have_no_cr(self) -> None:
+        parsed = parse_note(self.NOTE_CRLF)
+        entries = parse_profile_relevance(parsed)
+        names = [e.profile_name for e in entries]
+        assert names == ["research", "engineering"]
+        for name in names:
+            assert "\r" not in name
+
+    def test_scores_parsed_on_crlf(self) -> None:
+        parsed = parse_note(self.NOTE_CRLF)
+        entries = parse_profile_relevance(parsed)
+        assert entries[0].score == 8
+        assert entries[1].score == 7
+
+    def test_reasons_have_no_cr(self) -> None:
+        parsed = parse_note(self.NOTE_CRLF)
+        entries = parse_profile_relevance(parsed)
+        assert entries[0].reason == "Old reason."
+        assert entries[1].reason == "Engineering reason."
+        for e in entries:
+            assert "\r" not in e.reason
 
 
 class TestArchiveOnlyInSection:

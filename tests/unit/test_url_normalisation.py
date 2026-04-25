@@ -70,6 +70,53 @@ class TestNormaliseUrl:
         result = normalise_url("https://example.com/")
         assert result == "https://example.com"
 
+    def test_non_enumerated_utm_prefix_stripped(self) -> None:
+        """Any utm_* key is stripped, not just the enumerated five."""
+        raw = "https://example.com/path?utm_id=123&keep=1"
+        result = normalise_url(raw)
+        assert result == "https://example.com/path?keep=1"
+
+    def test_multiple_non_enumerated_utm_params_stripped(self) -> None:
+        raw = (
+            "https://example.com/path"
+            "?utm_id=1&utm_brand=foo&utm_creative=bar&keep=yes"
+        )
+        result = normalise_url(raw)
+        assert result == "https://example.com/path?keep=yes"
+
+    def test_percent_encoded_value_preserved_verbatim(self) -> None:
+        """Percent-encoded values for unrelated params are not re-encoded."""
+        raw = "https://example.com/search?q=hello%20world"
+        assert normalise_url(raw) == "https://example.com/search?q=hello%20world"
+
+    def test_plus_in_value_preserved_verbatim(self) -> None:
+        """``+`` in unrelated params is not rewritten to ``%20`` or vice versa."""
+        raw = "https://example.com/search?q=hello+world"
+        assert normalise_url(raw) == "https://example.com/search?q=hello+world"
+
+    def test_repeated_key_order_preserved(self) -> None:
+        """Repeated query keys keep their original interleaved order."""
+        raw = "https://example.com/search?a=1&b=2&a=3"
+        assert normalise_url(raw) == "https://example.com/search?a=1&b=2&a=3"
+
+    def test_param_order_preserved_when_tracking_in_middle(self) -> None:
+        raw = "https://example.com/path?a=1&utm_source=x&b=2"
+        assert normalise_url(raw) == "https://example.com/path?a=1&b=2"
+
+    def test_value_with_special_chars_preserved(self) -> None:
+        """Reserved characters within values are not normalised away."""
+        raw = "https://example.com/path?q=a%26b%3Dc&keep=1"
+        assert normalise_url(raw) == "https://example.com/path?q=a%26b%3Dc&keep=1"
+
+    def test_blank_value_preserved(self) -> None:
+        raw = "https://example.com/path?keep=&utm_source=x"
+        assert normalise_url(raw) == "https://example.com/path?keep="
+
+    def test_keyless_segment_preserved(self) -> None:
+        """A bare key with no ``=`` is treated as a non-tracking param."""
+        raw = "https://example.com/path?flag&utm_source=x"
+        assert normalise_url(raw) == "https://example.com/path?flag"
+
 
 class TestArxivCanonicalUrl:
     """arXiv canonical URL construction per FR-MCP-5."""

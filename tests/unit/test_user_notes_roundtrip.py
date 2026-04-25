@@ -16,6 +16,7 @@ import pytest
 
 from influx.notes import (
     ArchiveInvariantError,
+    MissingIngestedByTagError,
     ProfileRelevanceEntry,
     build_profile_relevance_for_rewrite,
     parse_note,
@@ -454,6 +455,26 @@ class TestConfidenceInRenderer:
 class TestSectionOrdering:
     """Section ordering: title → Archive → Summary → Profile Relevance → User Notes."""
 
+    def test_profile_relevance_section_present_when_entries_empty(self) -> None:
+        """US-007: canonical renderer always emits ``## Profile Relevance``."""
+        rendered = render_note(
+            title="Empty Profiles",
+            source_url="https://arxiv.org/abs/2601.00001",
+            tags=["source:arxiv", "ingested-by:influx", "schema:1"],
+            confidence=0.7,
+            archive_path=None,
+            summary="Summary.",
+            keywords=[],
+            profile_entries=[],
+            user_notes=None,
+        )
+        assert "## Profile Relevance\n" in rendered
+        # And the section appears between Summary and User Notes.
+        summary_pos = rendered.index("## Summary")
+        profile_pos = rendered.index("## Profile Relevance")
+        user_notes_pos = rendered.index("## User Notes")
+        assert summary_pos < profile_pos < user_notes_pos
+
     def test_archive_before_summary(self) -> None:
         rendered = render_note(
             title="Order Test",
@@ -511,7 +532,11 @@ class TestRendererArchiveInvariant:
             render_note(
                 title="Invariant Test",
                 source_url="https://arxiv.org/abs/2601.00001",
-                tags=["source:arxiv", "influx:archive-missing"],
+                tags=[
+                    "source:arxiv",
+                    "ingested-by:influx",
+                    "influx:archive-missing",
+                ],
                 confidence=0.7,
                 archive_path="arxiv/2026/01/2601.00001.pdf",
                 summary="Summary.",
@@ -531,7 +556,7 @@ class TestFrontmatterFields:
         rendered = render_note(
             title="FM Test",
             source_url="https://arxiv.org/abs/2601.00001",
-            tags=["source:arxiv"],
+            tags=["source:arxiv", "ingested-by:influx"],
             confidence=0.7,
             archive_path=None,
             summary="Summary.",
@@ -545,7 +570,7 @@ class TestFrontmatterFields:
         rendered = render_note(
             title="FM Test",
             source_url="https://arxiv.org/abs/2601.00001",
-            tags=["source:arxiv"],
+            tags=["source:arxiv", "ingested-by:influx"],
             confidence=0.7,
             archive_path=None,
             summary="Summary.",
@@ -559,7 +584,7 @@ class TestFrontmatterFields:
         rendered = render_note(
             title="FM Test",
             source_url="https://arxiv.org/abs/2601.00001",
-            tags=["source:arxiv"],
+            tags=["source:arxiv", "ingested-by:influx"],
             confidence=0.7,
             archive_path=None,
             summary="Summary.",
@@ -569,11 +594,46 @@ class TestFrontmatterFields:
         )
         assert "source_url: https://arxiv.org/abs/2601.00001" in rendered
 
-    def test_empty_tags_renders_empty_list(self) -> None:
+    def test_missing_ingested_by_raises(self) -> None:
+        """FR-RES-6: render_note rejects tags lacking ingested-by:influx."""
+        with pytest.raises(MissingIngestedByTagError):
+            render_note(
+                title="FM Test",
+                source_url="https://arxiv.org/abs/2601.00001",
+                tags=["source:arxiv"],
+                confidence=0.7,
+                archive_path=None,
+                summary="Summary.",
+                keywords=[],
+                profile_entries=[],
+                user_notes=None,
+            )
+
+    def test_empty_tags_raises(self) -> None:
+        """Empty tag list lacks ingested-by:influx and is rejected."""
+        with pytest.raises(MissingIngestedByTagError):
+            render_note(
+                title="FM Test",
+                source_url="https://arxiv.org/abs/2601.00001",
+                tags=[],
+                confidence=0.7,
+                archive_path=None,
+                summary="Summary.",
+                keywords=[],
+                profile_entries=[],
+                user_notes=None,
+            )
+
+    def test_source_url_is_normalised_by_renderer(self) -> None:
+        """Renderer writes canonical source_url even if caller passes
+        mixed-case host, default port, and tracking params (FR-MCP-4)."""
         rendered = render_note(
             title="FM Test",
-            source_url="https://arxiv.org/abs/2601.00001",
-            tags=[],
+            source_url=(
+                "https://ArXiv.org:443/abs/2601.12345"
+                "?utm_source=twitter&utm_id=42"
+            ),
+            tags=["source:arxiv", "ingested-by:influx"],
             confidence=0.7,
             archive_path=None,
             summary="Summary.",
@@ -581,7 +641,14 @@ class TestFrontmatterFields:
             profile_entries=[],
             user_notes=None,
         )
-        assert "tags: []" in rendered
+        assert (
+            "source_url: https://arxiv.org/abs/2601.12345"
+            in rendered
+        )
+        assert "ArXiv.org" not in rendered
+        assert "utm_source" not in rendered
+        assert "utm_id" not in rendered
+        assert ":443" not in rendered
 
 
 # ── parse_profile_relevance ──────────────────────────────────────────
@@ -651,3 +718,111 @@ class TestParseProfileRelevance:
         parsed = parse_note(note)
         entries = parse_profile_relevance(parsed)
         assert entries == []
+
+
+class TestRejectedProfilePreservedOnCRLF:
+    """CRLF-encoded notes preserve rejected-profile entries on rewrite.
+
+    Regression: a CRLF note's ``## Profile Relevance`` block previously
+    parsed profile names with a trailing ``\\r`` and produced score=0
+    entries, which caused ``build_profile_relevance_for_rewrite`` to drop
+    the rejected profile's old entry instead of preserving it (FR-NOTE-6).
+    """
+
+    NOTE_CRLF = (
+        "---\r\n"
+        "note_type: summary\r\n"
+        "namespace: influx\r\n"
+        "source_url: https://arxiv.org/abs/2601.55555\r\n"
+        "tags:\r\n"
+        "  - source:arxiv\r\n"
+        "  - arxiv-id:2601.55555\r\n"
+        "  - ingested-by:influx\r\n"
+        "  - schema:1\r\n"
+        "  - influx:rejected:research\r\n"
+        "confidence: 0.7\r\n"
+        "---\r\n"
+        "# CRLF Rejected Profile\r\n"
+        "\r\n"
+        "## Archive\r\n"
+        "path: arxiv/2026/01/2601.55555.pdf\r\n"
+        "\r\n"
+        "## Summary\r\n"
+        "Summary.\r\n"
+        "\r\n"
+        "## Profile Relevance\r\n"
+        "### research\r\n"
+        "Score: 8/10\r\n"
+        "Old reason.\r\n"
+        "\r\n"
+        "## User Notes\r\n"
+        "Notes.\r\n"
+    )
+
+    def test_rejected_profile_old_entry_preserved_on_crlf(self) -> None:
+        parsed = parse_note(self.NOTE_CRLF)
+        old_entries = parse_profile_relevance(parsed)
+        # Sanity: parser yields a clean entry, not name='research\r' with score=0
+        assert len(old_entries) == 1
+        assert old_entries[0].profile_name == "research"
+        assert old_entries[0].score == 8
+        assert old_entries[0].reason == "Old reason."
+
+        new_entries = [
+            ProfileRelevanceEntry(
+                profile_name="research",
+                score=9,
+                reason="Updated reason.",
+            ),
+        ]
+        tags = [
+            "source:arxiv",
+            "ingested-by:influx",
+            "influx:rejected:research",
+        ]
+        resolved = build_profile_relevance_for_rewrite(
+            old_entries=old_entries,
+            new_entries=new_entries,
+            tags=tags,
+        )
+        assert len(resolved) == 1
+        # Rejected profile keeps its OLD entry unchanged
+        assert resolved[0].profile_name == "research"
+        assert resolved[0].score == 8
+        assert resolved[0].reason == "Old reason."
+
+    def test_rejected_profile_in_rendered_note_crlf(self) -> None:
+        parsed = parse_note(self.NOTE_CRLF)
+        old_entries = parse_profile_relevance(parsed)
+        new_entries = [
+            ProfileRelevanceEntry(
+                profile_name="research",
+                score=9,
+                reason="Updated reason.",
+            ),
+        ]
+        tags = [
+            "source:arxiv",
+            "ingested-by:influx",
+            "schema:1",
+            "influx:rejected:research",
+        ]
+        resolved = build_profile_relevance_for_rewrite(
+            old_entries=old_entries,
+            new_entries=new_entries,
+            tags=tags,
+        )
+        rendered = render_note(
+            title=parsed.title,
+            source_url="https://arxiv.org/abs/2601.55555",
+            tags=tags,
+            confidence=0.7,
+            archive_path="arxiv/2026/01/2601.55555.pdf",
+            summary="Summary.",
+            keywords=[],
+            profile_entries=resolved,
+            user_notes=parsed.user_notes,
+        )
+        assert "Old reason." in rendered
+        assert "Updated reason." not in rendered
+        assert "Score: 8/10" in rendered
