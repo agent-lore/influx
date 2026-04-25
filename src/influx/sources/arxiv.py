@@ -10,6 +10,10 @@ Retry behaviour:
   (FR-RES-2)
 - Other transient failures → exponential backoff from
   ``resilience.backoff_base_seconds`` (FR-RES-1)
+
+``build_arxiv_note_item`` (PRD 07 US-014) constructs a complete
+``ProfileItem`` dict for the scheduler, running the HTML → PDF →
+abstract-only extraction cascade and rendering the canonical note.
 """
 
 from __future__ import annotations
@@ -19,13 +23,22 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from influx.config import ArxivSourceConfig, ResilienceConfig
-from influx.errors import NetworkError
+from influx.config import (
+    AppConfig,
+    ArxivSourceConfig,
+    ProfileThresholds,
+    ResilienceConfig,
+)
+from influx.errors import ExtractionError, NetworkError
+from influx.extraction.pipeline import extract_arxiv_text
 from influx.http_client import guarded_fetch
+from influx.notes import ProfileRelevanceEntry, render_note
 
 __all__ = [
     "ArxivItem",
+    "build_arxiv_note_item",
     "build_query_url",
     "fetch_arxiv",
 ]
@@ -314,3 +327,126 @@ def _fetch_with_retry(
     # Should not reach here, but satisfy type checker
     assert last_error is not None  # noqa: S101
     raise last_error
+
+
+# ── Item builder (PRD 07 US-014) ─────────────────────────────────
+
+
+def build_arxiv_note_item(
+    *,
+    item: ArxivItem,
+    score: int,
+    confidence: float,
+    reason: str,
+    profile_name: str,
+    config: AppConfig,
+    thresholds: ProfileThresholds | None = None,
+) -> dict[str, Any]:
+    """Build a complete ``ProfileItem`` dict for the scheduler.
+
+    Runs the HTML → PDF → abstract-only extraction cascade when the
+    candidate's *score* crosses the ``full_text`` threshold, sets the
+    appropriate ``text:*`` tier tag, and renders the canonical note via
+    :func:`~influx.notes.render_note`.
+
+    Parameters
+    ----------
+    item:
+        Parsed arXiv entry.
+    score:
+        LLM-filter score (1–10).
+    confidence:
+        Filter confidence (0.0–1.0).
+    reason:
+        Human-readable filter reason.
+    profile_name:
+        Profile name for the ``profile:*`` tag.
+    config:
+        Loaded :class:`~influx.config.AppConfig`.
+    thresholds:
+        Optional explicit thresholds; when ``None`` the first matching
+        profile's thresholds are used from *config*.
+
+    Returns
+    -------
+    dict[str, Any]
+        Ready-to-yield ``ProfileItem`` dict (title, source_url,
+        content, tags, score, confidence, path, abstract_or_summary).
+    """
+    if thresholds is None:
+        profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
+        thresholds = profile_cfg.thresholds if profile_cfg else ProfileThresholds()
+
+    source_url = f"https://arxiv.org/abs/{item.arxiv_id}"
+    cat_tags = [f"cat:{c}" for c in item.categories]
+
+    tags: list[str] = [
+        f"profile:{profile_name}",
+        f"arxiv-id:{item.arxiv_id}",
+        "source:arxiv",
+        "ingested-by:influx",
+        "schema:v1",
+        *cat_tags,
+    ]
+
+    # ── Extraction cascade ────────────────────────────────────────
+    extracted_text: str | None = None
+    text_tag = "text:abstract-only"
+    repair_needed = False
+
+    if score >= thresholds.full_text:
+        try:
+            result = extract_arxiv_text(item.arxiv_id, config)
+            extracted_text = result.text
+            text_tag = result.source_tag
+        except ExtractionError:
+            # Both HTML and PDF failed — abstract-only + repair-needed.
+            repair_needed = True
+
+    tags.append(text_tag)
+
+    # full-text tag iff extraction succeeded AND above threshold.
+    full_text_for_note: str | None = None
+    if extracted_text is not None and score >= thresholds.full_text:
+        full_text_for_note = extracted_text
+        tags.append("full-text")
+
+    if repair_needed:
+        tags.append("influx:repair-needed")
+
+    # ── Render note ───────────────────────────────────────────────
+    profile_entries = [
+        ProfileRelevanceEntry(
+            profile_name=profile_name,
+            score=score,
+            reason=reason,
+        ),
+    ]
+
+    content = render_note(
+        title=item.title,
+        source_url=source_url,
+        tags=tags,
+        confidence=confidence,
+        archive_path=None,
+        summary=item.abstract,
+        keywords=[],
+        profile_entries=profile_entries,
+        full_text=full_text_for_note,
+    )
+
+    pub = item.published
+    path = f"papers/arxiv/{pub.year}/{pub.month:02d}"
+
+    return {
+        "id": f"arxiv-{item.arxiv_id}",
+        "title": item.title,
+        "source_url": source_url,
+        "content": content,
+        "tags": tags,
+        "score": score,
+        "confidence": confidence,
+        "reason": reason,
+        "path": path,
+        "abstract_or_summary": item.abstract,
+    }

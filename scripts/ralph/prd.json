@@ -124,7 +124,7 @@
         "Typecheck passes (`uv run pyright`)"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -140,7 +140,7 @@
         "Typecheck passes (`uv run pyright`)"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -155,7 +155,7 @@
         "Typecheck passes (`uv run pyright`)"
       ],
       "priority": 10,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -170,7 +170,7 @@
         "Typecheck passes (`uv run pyright`)"
       ],
       "priority": 11,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -186,7 +186,7 @@
         "Typecheck passes (`uv run pyright`)"
       ],
       "priority": 12,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -201,7 +201,7 @@
         "Typecheck passes (`uv run pyright`)"
       ],
       "priority": 13,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -219,7 +219,7 @@
         "Typecheck passes (`uv run pyright`)"
       ],
       "priority": 14,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

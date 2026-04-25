@@ -15,6 +15,19 @@ Started: Sat Apr 25 19:50:21 UTC 2026
 - trafilatura.extract(html, favor_recall=True) for article extraction; returns None on failure
 - `extract_pdf(pdf_bytes, source_url=...)` takes raw bytes, not URLs — caller owns the fetch; uses `pypdf.PdfReader(io.BytesIO(...))`
 - PDF test fixtures: `sample.pdf` (valid, ~312 chars), `blank.pdf` (no extractable text)
+- `extract_article()` in `extraction/article.py` reuses `_strip_tags` and `_clean_html_fragments` from `extraction/html.py` — same tag-stripping + fragment cleanup, different min-length gate (`min_web_chars` default 500)
+- Article test fixtures: `web_article.html` (good), `short_web_article.html` (below 500 chars), `web_with_script.html` (has all 4 dangerous tags)
+- `_call_json_model(config, slot_name, prompt)` in `enrich.py` is the reusable JSON-mode inference helper — resolves provider/model from config, returns parsed dict; patch it in tests
+- `LCMAError` with `stage="validate"` signals schema validation failure; `stage="http"` for transport; `stage="parse"` for JSON parse failures
+- Model slots are accessed via `config.models["enrich"]` / `config.models["extract"]`; providers via `config.providers[slot.provider]`
+- Conftest fixture `influx_config_env` provides `models.enrich` and `models.extract` slots pointing to `test-provider`
+- `render_note` canonical section order: Archive → Summary → Full Text → (Tier 3 sections) → Profile Relevance → User Notes
+- `tier1_enrichment: Tier1Enrichment | None = None` parameter on `render_note` — when provided, renders structured `## Summary` with `### Contributions`, `### Method`, `### Result`, `### Relevance`; when absent + no plain summary, section omitted; when absent + plain summary, backward-compat plain rendering
+- `extract_arxiv_text(arxiv_id, config)` in `extraction/pipeline.py` — HTML→PDF cascade; returns `ArxivExtractionResult(text, source_tag)` or raises `ExtractionError`
+- `build_arxiv_note_item(item, score, confidence, reason, profile_name, config)` in `sources/arxiv.py` — builds complete `ProfileItem` dict with extraction, tags, and rendered note
+- arXiv HTML URL format: `https://arxiv.org/html/{arxiv_id}`, PDF: `https://arxiv.org/pdf/{arxiv_id}.pdf`
+- `ProfileThresholds` has `relevance=7, full_text=8, deep_extract=9` defaults; score >= full_text triggers extraction
+- Tags set on initial write: `profile:X`, `arxiv-id:X`, `source:arxiv`, `ingested-by:influx`, `schema:v1`, `cat:X`, `text:X`, optionally `full-text`, `influx:repair-needed`
 ---
 
 ## 2026-04-25 - US-001
@@ -103,4 +116,103 @@ Started: Sat Apr 25 19:50:21 UTC 2026
   - Design choice: pdf.py takes bytes, not URLs, so it works for both HTTP-fetched PDFs and locally-stored archive files
   - Minimal valid PDFs can be created with raw PDF syntax for fixtures (hand-crafted, no reportlab needed)
   - Full test suite is 901 tests after US-001…US-007, all passing
+---
+
+## 2026-04-25 - US-008
+- Created `src/influx/extraction/article.py` with `extract_article()` function for generic web article extraction
+- `extract_article()` reuses `_strip_tags` and `_clean_html_fragments` from `extraction/html.py`, uses `min_web_chars` (default 500) instead of `min_html_chars`
+- Created 3 HTML test fixtures in `tests/fixtures/extraction/`: web_article, short_web_article, web_with_script
+- Created `tests/unit/test_article_extraction.py` with 12 tests covering success path, min-length rejection, tag-stripping for all 4 default tags, no-HTML-fragments, and failure propagation
+- Files changed: `src/influx/extraction/article.py`, `tests/fixtures/extraction/*.html` (3 files), `tests/unit/test_article_extraction.py`
+- **Learnings for future iterations:**
+  - `article.py` shares tag-stripping and fragment cleanup with `html.py` via imports — DRY across extraction modules
+  - The only difference from `html.py` is: different result type (`ArticleExtractionResult` with `source="article"`), different min-length parameter name (`min_web_chars` vs `min_html_chars`), and lower default threshold (500 vs 1000)
+  - Full test suite is 913 tests after US-001…US-008, all passing
+---
+
+## 2026-04-25 - US-009
+- Replaced PRD 04 stub in `src/influx/enrich.py` with real LLM-backed `tier1_enrich` implementation
+- `tier1_enrich(title, abstract, profile_summary, config)` renders `prompts.tier1_enrich`, calls `models.enrich` via `_call_json_model`, validates against `Tier1Enrichment`
+- Added `_call_json_model(config, slot_name, prompt)` — reusable JSON-mode inference helper resolving provider/model from runtime config via OpenAI-compatible `/chat/completions` endpoint
+- Validation/transport failures surface as `LCMAError` with appropriate `stage` and `model` fields (FR-ENR-6)
+- Removed `Tier1Result` dataclass and stub implementation
+- Replaced 7 stub tests with 12 tests: success (3), validation failure (4 including AC-07-A `contributions: []`), prompt rendering (2), model slot verification (2), transport failure (1)
+- Files changed: `src/influx/enrich.py`, `tests/unit/test_enrich.py`
+- **Learnings for future iterations:**
+  - `_call_json_model` is a generic helper reusable for US-010 (tier3_extract) — same pattern, different slot name and schema
+  - Patch `influx.enrich._call_json_model` in tests to inject fake responses; verify slot name and config via side_effect capture
+  - The conftest `influx_config_env` fixture provides all three model slots (filter, enrich, extract) and all three prompt entries
+  - `LCMAError(message, model=..., stage=..., detail=...)` is the standard error shape for enrichment/extraction failures
+  - Full test suite is 918 tests after US-001…US-009, all passing
+---
+
+## 2026-04-25 - US-010
+- Added `tier3_extract(title, full_text, config)` to `src/influx/enrich.py` — renders `prompts.tier3_extract`, calls `models.extract` via `_call_json_model`, validates against `Tier3Extraction`
+- Validation failure (e.g. `claims: []`) surfaces as `LCMAError(stage="validate", model="extract")` per FR-ENR-6
+- Oversize strings (> 500 chars) are truncated by the `Tier3Extraction` schema's `field_validator`, not by `tier3_extract` itself
+- Added 13 tests to `tests/unit/test_enrich.py`: success (3), truncation (2), validation failure (3), prompt rendering (2), model slot (2), transport failure (1)
+- Files changed: `src/influx/enrich.py`, `tests/unit/test_enrich.py`
+- **Learnings for future iterations:**
+  - `tier3_extract` follows the exact same pattern as `tier1_enrich` — different slot name (`"extract"` vs `"enrich"`), different schema, different prompt variables
+  - The `_call_json_model` helper is fully reusable across both callers — no changes needed
+  - `Tier3Extraction` schema handles truncation transparently via `field_validator(mode="before")`, so `tier3_extract` just passes raw model output to `model_validate`
+  - Full test suite is 931 tests after US-001…US-010, all passing
+---
+
+## 2026-04-25 - US-011
+- Added optional `full_text: str | None = None` parameter to `render_note()` in `src/influx/notes.py`
+- When provided, emits `## Full Text` section between `## Summary` and `## Profile Relevance`; omitted entirely when `None` or empty (FR-ENR-6)
+- Created `tests/unit/test_full_text_render.py` with 10 tests: 3 rendered, 4 omitted, 3 ordering
+- Files changed: `src/influx/notes.py`, `tests/unit/test_full_text_render.py`
+- **Learnings for future iterations:**
+  - `render_note` uses keyword-only arguments — new optional params can be added without breaking callers
+  - The canonical section order is: Archive → Summary → Full Text → (Tier 3 sections) → Profile Relevance → User Notes
+  - `if full_text:` handles both `None` and `""` — falsy check is the simplest gate for optional sections
+  - Full test suite is 941 tests after US-001…US-011, all passing
+---
+
+## 2026-04-25 - US-012
+- Added optional `tier3_extraction: Tier3Extraction | None = None` parameter to `render_note()` in `src/influx/notes.py`
+- When provided, emits `## Claims`, `## Datasets & Benchmarks`, `## Builds On`, `## Open Questions` sections (one bullet per item) between `## Full Text` and `## Profile Relevance`
+- `potential_connections` is NOT rendered (consumed by PRD 08 LCMA only)
+- When `None`, all four sections are omitted entirely (FR-ENR-6)
+- Created `tests/unit/test_tier3_render.py` with 18 tests: 9 rendered, 3 omitted, 4 ordering, 2 potential_connections not rendered
+- Files changed: `src/influx/notes.py`, `tests/unit/test_tier3_render.py`
+- **Learnings for future iterations:**
+  - `Tier3Extraction` imported from `influx.schemas` — notes.py now depends on schemas.py
+  - Tier 3 sections render even with empty optional lists (e.g. `datasets=[]`) — headings without bullets
+  - Ruff catches f-strings without placeholders (F541) — use plain strings for static text
+  - Full test suite is 959 tests after US-001…US-012, all passing
+---
+
+## 2026-04-25 - US-013
+- Added optional `tier1_enrichment: Tier1Enrichment | None = None` parameter to `render_note()` in `src/influx/notes.py`
+- When provided, renders structured `## Summary` with `### Contributions` (bullet list), `### Method`, `### Result`, `### Relevance` sub-blocks
+- When absent and no plain `summary` text, omits `## Summary` entirely (FR-ENR-6, AC-07-A)
+- Backward compatible: existing callers passing `summary=...` still get plain-text `## Summary`
+- When `tier1_enrichment` is provided, it overrides the plain `summary` parameter
+- Created `tests/unit/test_summary_render.py` with 18 tests: 8 rendered, 3 omitted, 4 ordering, 3 backward compat
+- Files changed: `src/influx/notes.py`, `tests/unit/test_summary_render.py`
+- **Learnings for future iterations:**
+  - `tier1_enrichment` takes priority over `summary` param — structured rendering overrides plain text
+  - For "section omitted" tests, pass `summary=""` (empty) + `tier1_enrichment=None`
+  - Existing golden-file and roundtrip tests pass unchanged since they use the `summary=...` param path
+  - Full test suite is 977 tests after US-001…US-013, all passing
+---
+
+## 2026-04-25 - US-014
+- Created `src/influx/extraction/pipeline.py` with `extract_arxiv_text()` — HTML→PDF→abstract-only cascade for arXiv papers
+- Added `build_arxiv_note_item()` to `src/influx/sources/arxiv.py` — builds complete ProfileItem with extraction, tier tags, full-text section, and repair-needed logic
+- Extraction cascade: tries HTML (`arxiv.org/html/{id}`) first, falls back to PDF (`arxiv.org/pdf/{id}.pdf`), raises ExtractionError when both fail
+- Tag logic: `text:html`/`text:pdf`/`text:abstract-only` based on extraction outcome; `full-text` iff extraction succeeded AND score >= full_text threshold; `influx:repair-needed` when extraction fails above threshold; NO `influx:text-terminal` on initial write (AC-M2-3)
+- Below full_text threshold: extraction not attempted, `text:abstract-only` set, no `full-text` tag, no `## Full Text` section
+- Created `tests/unit/test_extraction_pipeline.py` with 9 tests (3 HTML success, 3 PDF fallback, 3 both-fail)
+- Created `tests/unit/test_build_arxiv_note_item.py` with 18 tests (4 HTML success, 1 PDF fallback, 4 both-fail, 2 below-threshold, 7 item shape/metadata)
+- Files changed: `src/influx/extraction/pipeline.py` (new), `src/influx/sources/arxiv.py`, `tests/unit/test_extraction_pipeline.py` (new), `tests/unit/test_build_arxiv_note_item.py` (new)
+- **Learnings for future iterations:**
+  - `extract_arxiv_text` catches both `ExtractionError` and `NetworkError` from each tier, allowing clean fallthrough
+  - `build_arxiv_note_item` uses `ProfileThresholds` from config; explicit `thresholds` param overrides for testing
+  - `render_note` requires `ingested-by:influx` in tags — must be included when building items
+  - Mock extraction in build_arxiv_note_item tests via `@patch("influx.sources.arxiv.extract_arxiv_text")` — patch at the import site, not the definition site
+  - Full test suite is 1004 tests after US-001…US-014, all passing
 ---
