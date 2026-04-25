@@ -43,12 +43,15 @@ class FakeLithosServer:
         self.write_responses: list[str] = []
         # Queue of override responses for lithos_read (FIFO).
         self.read_responses: list[str] = []
+        # Queue of override responses for lithos_cache_lookup (FIFO).
+        self.cache_lookup_responses: list[str] = []
         self._register_tools()
 
     def _register_tools(self) -> None:
         calls = self.calls
         write_responses = self.write_responses
         read_responses = self.read_responses
+        cache_lookup_responses = self.cache_lookup_responses
 
         @self._mcp.tool(name="lithos_ping")
         async def lithos_ping() -> str:
@@ -74,6 +77,8 @@ class FakeLithosServer:
             calls.append(
                 ("lithos_cache_lookup", {"query": query, "source_url": source_url})
             )
+            if cache_lookup_responses:
+                return cache_lookup_responses.pop(0)
             return '{"hit": false, "stale_exists": false}'
 
         @self._mcp.tool(name="lithos_write")
@@ -203,6 +208,7 @@ def clear_fake_calls(fake_lithos_server: FakeLithosServer) -> None:
     fake_lithos_server.calls.clear()
     fake_lithos_server.write_responses.clear()
     fake_lithos_server.read_responses.clear()
+    fake_lithos_server.cache_lookup_responses.clear()
 
 
 # ── Construction validation ─────────────────────────────────────────
@@ -1229,5 +1235,148 @@ class TestWriteEnvelopeVersionConflict:
                 )
             assert "version_conflict" in caplog.text
             assert "2601.44444" in caplog.text
+        finally:
+            await client.close()
+
+
+# ── Write envelopes — content_too_large (§9.7, AC-05-F) ───────────
+
+
+_CONTENT_WITH_TIERS = (
+    "# Summary\nTransformer paper.\n\n"
+    "## Full Text\n\n"
+    "### Introduction\nIntro text.\n\n"
+    "### Methods\nMethods text.\n\n"
+    "## Claims\n- Claim 1\n\n"
+    "## User Notes\nKeep this."
+)
+
+
+class TestWriteEnvelopeContentTooLarge:
+    """``content_too_large``: trim Tier 2 retry + create-path skip."""
+
+    async def test_first_retry_drops_tier2_and_succeeds(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """First content_too_large → drop Tier 2, retry → succeeds."""
+        fake_lithos_server.write_responses.extend([
+            '{"status": "content_too_large"}',
+            '{"status": "created"}',
+        ])
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Big Paper",
+                content=_CONTENT_WITH_TIERS,
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.50001",
+                tags=["profile:ml-research"],
+                confidence=0.9,
+            )
+            assert result.status == "created"
+
+            write_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 2
+
+            # First call has full content.
+            assert "## Full Text" in write_calls[0][1]["content"]
+            # Retry has Tier 2 removed but Tier 1 + Tier 3 kept.
+            retry_content = write_calls[1][1]["content"]
+            assert "## Full Text" not in retry_content
+            assert "Transformer paper" in retry_content
+            assert "## Claims" in retry_content
+            assert "## User Notes" in retry_content
+        finally:
+            await client.close()
+
+    async def test_create_path_skip_on_second_content_too_large(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Second content_too_large + no existing note → skip + count + log."""
+        import logging
+
+        fake_lithos_server.write_responses.extend([
+            '{"status": "content_too_large"}',
+            '{"status": "content_too_large"}',
+        ])
+        # No existing note: cache_lookup returns miss (default).
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with caplog.at_level(logging.WARNING):
+                result = await client.write_note(
+                    title="Huge Paper",
+                    content=_CONTENT_WITH_TIERS,
+                    path="papers/arxiv/2026/03",
+                    source_url="https://arxiv.org/abs/2601.50002",
+                    tags=["profile:ml-research"],
+                    confidence=0.9,
+                )
+
+            # Status indicates skipped for counter.
+            assert result.status == "content_too_large_skipped"
+            assert result.detail == "create_path"
+            assert result.source_url == (
+                "https://arxiv.org/abs/2601.50002"
+            )
+
+            # Exactly 2 write attempts (original + Tier-2-trimmed retry).
+            write_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 2
+
+            # cache_lookup was called to check for existing note.
+            lookup_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_cache_lookup"
+            ]
+            assert len(lookup_calls) == 1
+
+            # Warning logged with source_url.
+            assert "content_too_large" in caplog.text
+            assert "2601.50002" in caplog.text
+        finally:
+            await client.close()
+
+    async def test_create_path_no_note_persisted(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Create path: no degraded placeholder note is invented."""
+        fake_lithos_server.write_responses.extend([
+            '{"status": "content_too_large"}',
+            '{"status": "content_too_large"}',
+        ])
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Giant Paper",
+                content=_CONTENT_WITH_TIERS,
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.50003",
+                tags=["profile:ml-research"],
+                confidence=0.9,
+            )
+            assert result.status == "content_too_large_skipped"
+
+            # Only 2 lithos_write calls — no third "placeholder" write.
+            write_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 2
         finally:
             await client.close()

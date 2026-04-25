@@ -37,7 +37,9 @@ class WriteResult:
     for an already-ingested item (caller increments ``dedup_skipped``),
     ``"invalid_input"`` for a malformed payload (logged + skipped),
     ``"slug_collision"`` when both retries exhausted (logged + skipped),
-    ``"version_conflict"`` when both retries exhausted (logged + skipped).
+    ``"version_conflict"`` when both retries exhausted (logged + skipped),
+    ``"content_too_large_skipped"`` when content_too_large exhausted
+    all trimming retries (logged + counted + skipped).
     """
 
     status: str
@@ -96,6 +98,62 @@ def _preserve_user_notes(
     new_idx = new_content.find(_USER_NOTES_MARKER)
     base = new_content[:new_idx].rstrip() if new_idx != -1 else new_content.rstrip()
     return base + "\n\n" + user_notes_block
+
+_TIER2_MARKER = "## Full Text"
+
+# Tier 3 section headings (master PRD §7.3).
+_TIER3_MARKERS = (
+    "## Claims",
+    "## Datasets & Benchmarks",
+    "## Builds On",
+    "## Open Questions",
+)
+
+
+def _drop_tier2(content: str) -> str:
+    """Remove the ``## Full Text`` (Tier 2) section from *content*.
+
+    Keeps Tier 1 and Tier 3 sections intact (master PRD §9.7 step 1).
+    The Tier 2 section spans from ``## Full Text`` to the next ``##``
+    heading (exclusive) or the ``## User Notes`` marker or end-of-string.
+    """
+    idx = content.find(_TIER2_MARKER)
+    if idx == -1:
+        return content
+    before = content[:idx].rstrip()
+    # Find the next ## heading after Tier 2.
+    rest = content[idx + len(_TIER2_MARKER) :]
+    next_heading = re.search(r"^## ", rest, re.MULTILINE)
+    if next_heading is not None:
+        after = rest[next_heading.start() :]
+        return (before + "\n\n" + after).rstrip()
+    return before
+
+
+def _drop_tier2_and_tier3(content: str) -> str:
+    """Remove Tier 2 (``## Full Text``) AND Tier 3 sections from *content*.
+
+    Keeps only Tier 1 sections + ``## User Notes`` (master PRD §9.7
+    repair path).  Tier 3 headings: ``## Claims``,
+    ``## Datasets & Benchmarks``, ``## Builds On``, ``## Open Questions``.
+    """
+    # First drop Tier 2.
+    result = _drop_tier2(content)
+    # Then drop each Tier 3 section.
+    for marker in _TIER3_MARKERS:
+        idx = result.find(marker)
+        if idx == -1:
+            continue
+        before = result[:idx].rstrip()
+        rest = result[idx + len(marker) :]
+        next_heading = re.search(r"^## ", rest, re.MULTILINE)
+        if next_heading is not None:
+            after = rest[next_heading.start() :]
+            result = (before + "\n\n" + after).rstrip()
+        else:
+            result = before
+    return result
+
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +331,13 @@ class LithosClient:
                 original_tags=tags,
             )
 
+        if parsed.status == "content_too_large":
+            return await self._retry_content_too_large(
+                args,
+                source_url=source_url,
+                original_tags=tags,
+            )
+
         return parsed
 
     # ── Slug-collision retry (AC-05-D) ──────────────────────────────
@@ -333,6 +398,120 @@ class LithosClient:
             )
         return parsed
 
+    # ── Content-too-large retry (§9.7) ──────────────────────────────
+
+    async def _check_existing_note(
+        self, source_url: str
+    ) -> dict[str, Any] | None:
+        """Check whether an Influx-authored note exists for *source_url*.
+
+        Uses ``lithos_cache_lookup`` with the source URL.  Returns the
+        existing note dict if found, ``None`` otherwise.  The detection
+        mechanism is a cache lookup by ``source_url`` — implementation-
+        defined per AC of US-010.
+        """
+        result = await self.call_tool(
+            "lithos_cache_lookup",
+            {"query": source_url, "source_url": source_url},
+        )
+        text = result.content[0].text  # type: ignore[union-attr]
+        body = json.loads(text)
+        if body.get("hit"):
+            return body
+        return None
+
+    async def _retry_content_too_large(
+        self,
+        args: dict[str, Any],
+        *,
+        source_url: str,
+        original_tags: list[str],
+    ) -> WriteResult:
+        """Handle ``content_too_large`` per master PRD §9.7.
+
+        Step 1: drop Tier 2 (``## Full Text``), keep Tier 1 + Tier 3,
+        retry once.
+
+        Step 2 (on second ``content_too_large``):
+        - **Create path** (no existing note): skip + log + count.
+        - **Repair path** (existing note): handled by US-011.
+        """
+        # Step 1: drop Tier 2 and retry.
+        trimmed = _drop_tier2(args["content"])
+        retry_args = {**args, "content": trimmed}
+        result = await self.call_tool("lithos_write", retry_args)
+        parsed = self._parse_write_response(
+            result, source_url=source_url
+        )
+        if parsed.status != "content_too_large":
+            return parsed
+
+        # Step 2: second content_too_large — branch on create vs repair.
+        existing = await self._check_existing_note(source_url)
+        if existing is None:
+            # Create path: skip, no degraded placeholder (AC-05-F).
+            logger.warning(
+                "lithos_write content_too_large (create path) "
+                "for %s — skipping item",
+                source_url,
+            )
+            return WriteResult(
+                status="content_too_large_skipped",
+                source_url=source_url,
+                detail="create_path",
+            )
+
+        # Repair path: Tier-1-only retry (US-011).
+        return await self._retry_content_too_large_repair(
+            args,
+            source_url=source_url,
+            existing=existing,
+            original_tags=original_tags,
+        )
+
+    async def _retry_content_too_large_repair(
+        self,
+        args: dict[str, Any],
+        *,
+        source_url: str,
+        existing: dict[str, Any],
+        original_tags: list[str],
+    ) -> WriteResult:
+        """Repair-path Tier-1-only retry (US-011, master PRD §9.7).
+
+        Drops Tier 2 AND Tier 3, tags ``influx:repair-needed``, retries
+        once.  If that also fails: leave existing note untouched, count +
+        log, no abort, no ``updated_at`` advance.
+        """
+        tier1_content = _drop_tier2_and_tier3(args["content"])
+        existing_tags: list[str] = existing.get("tags", [])
+        merged_tags = _merge_tags(
+            existing_tags, [*original_tags, "influx:repair-needed"]
+        )
+        repair_args = {
+            **args,
+            "content": tier1_content,
+            "tags": merged_tags,
+        }
+        result = await self.call_tool("lithos_write", repair_args)
+        parsed = self._parse_write_response(
+            result, source_url=source_url
+        )
+        if parsed.status == "content_too_large":
+            # Tier 1 alone too large — leave existing note untouched.
+            logger.warning(
+                "lithos_write content_too_large (repair path, "
+                "Tier-1-only) for %s — leaving existing note "
+                "untouched",
+                source_url,
+            )
+            return WriteResult(
+                status="content_too_large_skipped",
+                source_url=source_url,
+                detail="repair_path_tier1_failed",
+            )
+        return parsed
+
     # ── Response parsing ────────────────────────────────────────────
 
     def _parse_write_response(
@@ -375,6 +554,12 @@ class LithosClient:
                 status="version_conflict",
                 source_url=source_url,
                 detail=note_id,
+            )
+
+        if status == "content_too_large":
+            return WriteResult(
+                status="content_too_large",
+                source_url=source_url,
             )
 
         return WriteResult(status=status, source_url=source_url)

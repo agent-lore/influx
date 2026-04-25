@@ -144,7 +144,7 @@
         "tests/contract/test_lithos_client.py covers AC-05-F create path: second `content_too_large` with no pre-existing note → skip + count + log + no note persisted"
       ],
       "priority": 10,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

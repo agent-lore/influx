@@ -33,6 +33,12 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - `write_note()` handles slug_collision via `_retry_slug_collision()` and version_conflict via `_retry_version_conflict()`; each retries exactly once
 - version_conflict response includes `note_id` in body: `{"status": "version_conflict", "note_id": "..."}`
 - 558 tests passing after US-009
+- `_drop_tier2(content)` strips `## Full Text` section; `_drop_tier2_and_tier3(content)` strips Tier 2 + Tier 3 (Claims, Datasets, Builds On, Open Questions)
+- `_retry_content_too_large()` handles §9.7: first retry drops Tier 2, second failure branches create vs repair path
+- `_check_existing_note(source_url)` uses `lithos_cache_lookup` to check for existing Influx-authored note
+- `content_too_large_skipped` WriteResult status with `detail` of `create_path` or `repair_path_tier1_failed`
+- FakeLithosServer has `cache_lookup_responses: list[str]` queue (FIFO) for configurable cache_lookup responses
+- 561 tests passing after US-010
 
 ---
 
@@ -153,4 +159,25 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - `_preserve_user_notes()` finds `## User Notes` marker in existing content and replaces/appends it to new content
   - `clear_fake_calls` fixture also clears `read_responses` to prevent test leakage
   - 558 tests pass (8 new contract tests added)
+---
+
+## 2026-04-25 - US-010
+- Implemented `content_too_large` first retry: drops Tier 2 (`## Full Text`), keeps Tier 1 + Tier 3, retries write once
+- Implemented create-path skip: on second `content_too_large` with no existing note, skips item with `content_too_large_skipped` status
+- Added `_drop_tier2()` and `_drop_tier2_and_tier3()` pure helpers for content trimming
+- Added `_check_existing_note(source_url)` method using `lithos_cache_lookup` to detect existing notes
+- Added `_retry_content_too_large()` and `_retry_content_too_large_repair()` methods (repair path scaffolded for US-011)
+- Extended `_parse_write_response()` to handle `content_too_large` status
+- Added `cache_lookup_responses` queue to `FakeLithosServer` for configurable lookup responses
+- Updated `clear_fake_calls` fixture to also clear `cache_lookup_responses`
+- Added 3 contract tests: first-retry-succeeds (Tier 2 dropped), create-path skip + log, create-path no placeholder
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - Tier 2 section (`## Full Text`) spans from the heading to the next `##` heading; regex `^## ` with `re.MULTILINE` finds the boundary
+  - `_drop_tier2_and_tier3()` chains: first drops Tier 2, then iterates each Tier 3 marker (`## Claims`, `## Datasets & Benchmarks`, `## Builds On`, `## Open Questions`)
+  - `_check_existing_note()` reuses `lithos_cache_lookup` (same tool as dedup) — checks `body.get("hit")` to distinguish create vs repair path
+  - US-011 repair path scaffolding is already in place via `_retry_content_too_large_repair()` — just needs tests
+  - `content_too_large_skipped` WriteResult status with `detail` of `create_path` vs `repair_path_tier1_failed` lets callers increment the right counter
+  - FakeLithosServer `cache_lookup_responses` list is FIFO (same pattern as `write_responses` and `read_responses`)
+  - 561 tests pass (3 new contract tests added)
 ---
