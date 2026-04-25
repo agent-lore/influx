@@ -27,7 +27,9 @@ Started: Sat Apr 25 19:50:21 UTC 2026
 - `build_arxiv_note_item(item, score, confidence, reason, profile_name, config)` in `sources/arxiv.py` — builds complete `ProfileItem` dict with extraction, tags, and rendered note
 - arXiv HTML URL format: `https://arxiv.org/html/{arxiv_id}`, PDF: `https://arxiv.org/pdf/{arxiv_id}.pdf`
 - `ProfileThresholds` has `relevance=7, full_text=8, deep_extract=9` defaults; score >= full_text triggers extraction
-- Tags set on initial write: `profile:X`, `arxiv-id:X`, `source:arxiv`, `ingested-by:influx`, `schema:v1`, `cat:X`, `text:X`, optionally `full-text`, `influx:repair-needed`
+- Tags set on initial write: `profile:X`, `arxiv-id:X`, `source:arxiv`, `ingested-by:influx`, `schema:v1`, `cat:X`, `text:X`, optionally `full-text`, `influx:deep-extracted`, `influx:repair-needed`
+- Enrichment wiring in `build_arxiv_note_item`: `tier1_enrich` when score >= relevance, `tier3_extract` when score >= deep_extract AND extracted_text available; failures caught as `LCMAError`
+- When tier1 attempted but failed, must pass `summary=""` to suppress plain-text `## Summary` rendering (AC-07-A)
 ---
 
 ## 2026-04-25 - US-001
@@ -215,4 +217,39 @@ Started: Sat Apr 25 19:50:21 UTC 2026
   - `render_note` requires `ingested-by:influx` in tags — must be included when building items
   - Mock extraction in build_arxiv_note_item tests via `@patch("influx.sources.arxiv.extract_arxiv_text")` — patch at the import site, not the definition site
   - Full test suite is 1004 tests after US-001…US-014, all passing
+---
+
+## 2026-04-25 - US-015
+- Wired `tier1_enrich` and `tier3_extract` into `build_arxiv_note_item` in `src/influx/sources/arxiv.py`
+- Tier 1: called when score >= relevance threshold; uses `profile.description` as `profile_summary`; on `LCMAError`, suppresses `## Summary` and sets `influx:repair-needed`
+- Tier 3: called when score >= deep_extract AND extracted_text is available; on `LCMAError`, no Tier 3 sections and `influx:repair-needed`
+- Per-tier failure independence: each enrichment try/except is independent; extraction/Tier1/Tier3 can each fail without affecting others
+- Tag derivation: `influx:deep-extracted` iff tier3_result is not None; `influx:repair-needed` set exactly once even with multiple failures
+- Summary suppression: when Tier 1 attempted but failed, `summary_text=""` suppresses plain-text `## Summary` (AC-07-A)
+- Updated 2 existing US-014 tests to set enrichment thresholds high (isolation from enrichment behavior)
+- Added 23 new unit tests: 5 Tier1 success, 3 Tier1 failure, 5 Tier3 success, 3 Tier3 failure, 3 per-tier independence, 4 tag derivation invariants
+- Files changed: `src/influx/sources/arxiv.py`, `tests/unit/test_build_arxiv_note_item.py`
+- **Learnings for future iterations:**
+  - Existing tests with scores >= relevance need enrichment mocks OR high enrichment thresholds to isolate extraction-only behavior
+  - `LCMAError` is raised by `_call_json_model` when model slot is not configured — tests without model config will trigger this
+  - `profile_cfg.description` serves as `profile_summary` for tier1_enrich — already available from config lookup
+  - When tier1 is attempted but fails, must suppress plain summary too (`summary_text=""`) or `## Summary` renders from abstract
+  - `tier3_extract` requires `extracted_text` — not called when extraction itself failed (no full text available)
+  - Full test suite is 1027 tests after US-001…US-015, all passing
+---
+
+## US-016 — Wire production-default repair hooks (re_extract_archive, tier2_enrich, tier3_extract)
+- Created `src/influx/repair_hooks.py` with `make_default_sweep_hooks(config)` factory
+- Three hook factories using closure pattern: `_make_re_extract_archive_hook`, `_make_tier2_enrich_hook`, `_make_tier3_extract_hook`
+- Content manipulation helpers: `_insert_full_text_section`, `_insert_tier3_sections`, `_render_tier3_sections`, `_extract_full_text_body`, `_extract_title`
+- Archive file reading: `_read_archive_file` + `_extract_from_archive` (PDF via `extract_pdf`, HTML via `trafilatura` + `_strip_tags`/`_clean_html_fragments`)
+- Modified `src/influx/repair.py` sweep() to use production defaults when `hooks=None` (lazy import to avoid circular deps)
+- Updated `tests/unit/test_repair_sweep.py` to pass `SweepHooks()` explicitly (preserves PRD 06 test isolation)
+- Created `tests/unit/test_repair_hooks_production.py` with 31 tests: factory, re_extract (PDF/HTML/outcomes), tier2 (success/failure), tier3 (success/failure), content helpers, injection seam
+- Files changed: `src/influx/repair_hooks.py` (new), `src/influx/repair.py`, `tests/unit/test_repair_hooks_production.py` (new), `tests/unit/test_repair_sweep.py`
+- **Learnings for future iterations:**
+  - Factory return types must match Protocol types (e.g., `-> ReExtractArchiveHook`), not the result type
+  - `note.get("tags", [])` returns `object` when `note: dict[str, object]` — need `isinstance` guard for pyright
+  - `SweepHooks()` with no args gives all-None hooks — useful for test isolation from production defaults
+  - Full test suite is 1058 tests after US-001…US-016, all passing
 ---

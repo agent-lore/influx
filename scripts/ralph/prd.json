@@ -235,7 +235,7 @@
         "Typecheck passes (`uv run pyright`)"
       ],
       "priority": 15,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -252,7 +252,7 @@
         "Typecheck passes (`uv run pyright`)"
       ],
       "priority": 16,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

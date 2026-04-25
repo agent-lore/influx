@@ -988,7 +988,12 @@ async def sweep(
         On terminal write failure — the caller (service.py) treats
         this as a run abort per FR-RES-3.
     """
-    effective_hooks = hooks or SweepHooks()
+    if hooks is not None:
+        effective_hooks = hooks
+    else:
+        from influx.repair_hooks import make_default_sweep_hooks
+
+        effective_hooks = make_default_sweep_hooks(config)
 
     limit = config.repair.max_items_per_run
     list_result = await client.list_notes(

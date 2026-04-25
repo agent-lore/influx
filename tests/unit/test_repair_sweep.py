@@ -18,7 +18,7 @@ import pytest
 
 from influx.config import AppConfig, RepairConfig
 from influx.errors import LithosError
-from influx.repair import ContentTooLargeSkipped, SweepWriteError, sweep
+from influx.repair import ContentTooLargeSkipped, SweepHooks, SweepWriteError, sweep
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -78,7 +78,7 @@ class TestSweepListCall:
         config = _make_config(max_items=50)
         client = _make_client(list_items=[])
 
-        await sweep("ai-robotics", client=client, config=config)
+        await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         client.list_notes.assert_awaited_once_with(
             tags=["influx:repair-needed", "profile:ai-robotics"],
@@ -91,7 +91,7 @@ class TestSweepListCall:
         config = _make_config(max_items=100)
         client = _make_client(list_items=[])
 
-        await sweep("web-tech", client=client, config=config)
+        await sweep("web-tech", client=client, config=config, hooks=SweepHooks())
 
         call_kwargs = client.list_notes.call_args.kwargs
         assert call_kwargs["limit"] == 100
@@ -100,7 +100,7 @@ class TestSweepListCall:
         config = _make_config()
         client = _make_client(list_items=[])
 
-        await sweep("ml-research", client=client, config=config)
+        await sweep("ml-research", client=client, config=config, hooks=SweepHooks())
 
         call_kwargs = client.list_notes.call_args.kwargs
         assert call_kwargs["tags"] == [
@@ -119,7 +119,9 @@ class TestSweepZeroCandidates:
         config = _make_config()
         client = _make_client(list_items=[])
 
-        result = await sweep("ai-robotics", client=client, config=config)
+        result = await sweep(
+            "ai-robotics", client=client, config=config, hooks=SweepHooks()
+        )
 
         assert result == []
 
@@ -127,7 +129,7 @@ class TestSweepZeroCandidates:
         config = _make_config()
         client = _make_client(list_items=[])
 
-        await sweep("ai-robotics", client=client, config=config)
+        await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         client.read_note.assert_not_awaited()
 
@@ -152,7 +154,7 @@ class TestSweepIteration:
         config = _make_config()
         client = _make_client(list_items=items, read_responses=read_notes)
 
-        await sweep("ai-robotics", client=client, config=config)
+        await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         assert client.read_note.await_count == 3
         # Verify IDs passed in order.
@@ -181,7 +183,9 @@ class TestSweepIteration:
         config = _make_config()
         client = _make_client(list_items=items, read_responses=read_notes)
 
-        result = await sweep("ai-robotics", client=client, config=config)
+        result = await sweep(
+            "ai-robotics", client=client, config=config, hooks=SweepHooks()
+        )
 
         assert len(result) == 2
         assert result[0]["id"] == "note-A"
@@ -193,7 +197,9 @@ class TestSweepIteration:
         config = _make_config()
         client = _make_client(list_items=items, read_responses=read_notes)
 
-        result = await sweep("ai-robotics", client=client, config=config)
+        result = await sweep(
+            "ai-robotics", client=client, config=config, hooks=SweepHooks()
+        )
 
         assert len(result) == 1
         client.read_note.assert_awaited_once_with(note_id="note-solo")
@@ -209,7 +215,9 @@ class TestSweepIteration:
         config = _make_config()
         client = _make_client(list_items=items, read_responses=read_notes)
 
-        result = await sweep("ai-robotics", client=client, config=config)
+        result = await sweep(
+            "ai-robotics", client=client, config=config, hooks=SweepHooks()
+        )
 
         assert len(result) == 1
         assert result[0]["id"] == "note-good"
@@ -235,7 +243,7 @@ class TestSweepRewriteInvariant:
         config = _make_config()
         client = _make_client(list_items=items, read_responses=read_notes)
 
-        await sweep("ai-robotics", client=client, config=config)
+        await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         # call_tool is used for lithos_write
         write_calls = [
@@ -252,7 +260,7 @@ class TestSweepRewriteInvariant:
         config = _make_config()
         client = _make_client(list_items=items, read_responses=read_notes)
 
-        await sweep("ai-robotics", client=client, config=config)
+        await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         write_calls = [
             c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
@@ -279,7 +287,7 @@ class TestSweepRewriteInvariant:
         config = _make_config()
         client = _make_client(list_items=items, read_responses=read_notes)
 
-        await sweep("ai-robotics", client=client, config=config)
+        await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         write_calls = [
             c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
@@ -330,7 +338,7 @@ class TestSweepVersionConflict:
             ]
         )
 
-        await sweep("ai-robotics", client=client, config=config)
+        await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         # Two lithos_write calls: initial + retry.
         write_calls = [
@@ -375,7 +383,7 @@ class TestSweepVersionConflict:
         )
 
         with pytest.raises(SweepWriteError, match="version_conflict"):
-            await sweep("ai-robotics", client=client, config=config)
+            await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         # Only one note was attempted (abort after n1 failed).
         assert client.read_note.await_count == 2  # initial + re-read
@@ -410,7 +418,7 @@ class TestSweepVersionConflict:
         )
 
         with pytest.raises(SweepWriteError):
-            await sweep("ai-robotics", client=client, config=config)
+            await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         # n2 was never read — the sweep aborted on n1.
         read_ids = [c.kwargs["note_id"] for c in client.read_note.call_args_list]
@@ -437,7 +445,7 @@ class TestSweepTransportFailure:
         client.call_tool = AsyncMock(side_effect=LithosError("connection lost"))
 
         with pytest.raises(SweepWriteError, match="transport failure"):
-            await sweep("ai-robotics", client=client, config=config)
+            await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
     async def test_transport_failure_no_later_candidate(self) -> None:
         items = [
@@ -456,7 +464,7 @@ class TestSweepTransportFailure:
         client.call_tool = AsyncMock(side_effect=LithosError("connection lost"))
 
         with pytest.raises(SweepWriteError):
-            await sweep("ai-robotics", client=client, config=config)
+            await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         # Only n1 was read — n2 never reached.
         assert client.read_note.await_count == 1
@@ -504,7 +512,9 @@ class TestSweepContentTooLargeSkipped:
             ]
         )
 
-        result = await sweep("ai-robotics", client=client, config=config)
+        result = await sweep(
+            "ai-robotics", client=client, config=config, hooks=SweepHooks()
+        )
 
         # Both notes were visited (read).
         assert len(result) == 2
@@ -540,7 +550,7 @@ class TestSweepContentTooLargeSkipped:
             return_value=_make_write_result("content_too_large"),
         )
 
-        await sweep("ai-robotics", client=client, config=config)
+        await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
         # Three write calls — original + Tier-2-dropped + Tier-1-only.
         write_calls = [
@@ -593,7 +603,9 @@ class TestSweepContentTooLargeSkipped:
             ]
         )
 
-        result = await sweep("ai-robotics", client=client, config=config)
+        result = await sweep(
+            "ai-robotics", client=client, config=config, hooks=SweepHooks()
+        )
 
         assert len(result) == 3
         # All three were read.
@@ -632,7 +644,9 @@ class TestSweepContentTooLargeSkipped:
         )
 
         # Does NOT raise — both skipped, sweep completes.
-        result = await sweep("ai-robotics", client=client, config=config)
+        result = await sweep(
+            "ai-robotics", client=client, config=config, hooks=SweepHooks()
+        )
 
         assert len(result) == 2
         # 6 writes total: 3 trim attempts × 2 chronic notes.
