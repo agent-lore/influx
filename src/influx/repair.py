@@ -24,12 +24,14 @@ if TYPE_CHECKING:
     from influx.lithos_client import LithosClient
 
 __all__ = [
+    "ClearingDecision",
     "ExtractionOutcome",
     "ReExtractionResult",
     "ReExtractArchiveHook",
     "StageSelection",
     "Tier2EnrichHook",
     "Tier3ExtractHook",
+    "compute_clearing",
     "select_stages",
     "sweep",
 ]
@@ -281,6 +283,102 @@ def select_stages(
         abstract_only_reextraction=abstract_only_reextraction,
         tier2_retry=tier2_retry,
         tier3_retry=tier3_retry,
+    )
+
+
+# ── Post-stage tag clearing (§5.3) ─────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ClearingDecision:
+    """Post-stage tag-clearing decision (PRD 06 §5.3).
+
+    Each boolean indicates whether the corresponding tag should be
+    removed from the note's tag set during the rewrite step.
+    """
+
+    clear_archive_missing: bool = False
+    clear_repair_needed: bool = False
+
+
+def compute_clearing(
+    *,
+    tags: list[str],
+    archive_path: str | None,
+    max_profile_score: int,
+    full_text_threshold: int,
+    deep_extract_threshold: int,
+) -> ClearingDecision:
+    """Decide which tags to clear after stage execution (PRD 06 §5.3).
+
+    Called after all selected stages have run for a single note.
+    The *tags* parameter represents the note's tag set after stage
+    execution has potentially modified it (e.g. upgraded
+    ``text:abstract-only`` → ``text:html``).
+
+    Parameters
+    ----------
+    tags:
+        The note's tag set after all stages have run this pass.
+    archive_path:
+        The archive path after potential archive retry, or ``None``
+        when no ``path:`` line is stored in ``## Archive``.
+    max_profile_score:
+        Maximum profile score across profile entries on the note.
+    full_text_threshold:
+        ``thresholds.full_text`` from the profile config.
+    deep_extract_threshold:
+        ``thresholds.deep_extract`` from the profile config.
+
+    Returns
+    -------
+    ClearingDecision
+        Which tags to remove.  The caller should strip the indicated
+        tags from the Influx-owned tag set before the ``lithos_write``
+        rewrite.
+    """
+    tag_set = set(tags)
+    is_text_terminal = "influx:text-terminal" in tag_set
+
+    # FR-NOTE-9: clear influx:archive-missing iff archive path stored.
+    clear_archive_missing = archive_path is not None
+
+    # §5.3: clear influx:repair-needed iff ALL four conditions hold.
+
+    # (a) Non-empty path: line in ## Archive.
+    archive_ok = archive_path is not None
+
+    # (b) Text quality: text:html or text:pdf, OR (text:abstract-only
+    #     accompanied by influx:text-terminal).
+    #     AC-06-C: text:abstract-only WITHOUT influx:text-terminal
+    #     → NEVER clear influx:repair-needed.
+    text_ok = (
+        "text:html" in tag_set
+        or "text:pdf" in tag_set
+        or ("text:abstract-only" in tag_set and is_text_terminal)
+    )
+
+    # (c) Tier 2 satisfied: only required when score ≥ full_text
+    #     threshold AND influx:text-terminal absent.
+    #     AC-X-7: terminal exemption waives Tier 2.
+    if is_text_terminal or max_profile_score < full_text_threshold:
+        tier2_ok = True
+    else:
+        tier2_ok = "full-text" in tag_set
+
+    # (d) Tier 3 satisfied: only required when score ≥ deep_extract
+    #     threshold AND influx:text-terminal absent.
+    #     AC-X-7: terminal exemption waives Tier 3.
+    if is_text_terminal or max_profile_score < deep_extract_threshold:
+        tier3_ok = True
+    else:
+        tier3_ok = "influx:deep-extracted" in tag_set
+
+    clear_repair_needed = archive_ok and text_ok and tier2_ok and tier3_ok
+
+    return ClearingDecision(
+        clear_archive_missing=clear_archive_missing,
+        clear_repair_needed=clear_repair_needed,
     )
 
 

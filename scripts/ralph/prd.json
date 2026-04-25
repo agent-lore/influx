@@ -40,7 +40,7 @@
         "Hook implementations can be substituted by tests (e.g. via dependency injection, fixture override, or equivalent), without mandating any specific registry pattern"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -54,7 +54,7 @@
         "When `lithos_list` returns zero candidates the sweep returns cleanly without raising and without calling `lithos_read`"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -69,7 +69,7 @@
         "Tier 3 retry is selected iff `influx:deep-extracted` is missing AND current max profile score ≥ `thresholds.deep_extract` AND `influx:text-terminal` is absent"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -85,7 +85,7 @@
         "All new tests pass via `pytest`"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -100,7 +100,7 @@
         "Partially-completed repair keeps `influx:repair-needed` and every unsatisfied stage-specific tag in place"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

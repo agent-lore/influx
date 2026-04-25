@@ -9,6 +9,15 @@ Started: Sat Apr 25 14:42:15 UTC 2026
 - Test fixtures in `tests/conftest.py` provide `influx_config_env` (realistic v0.7 TOML) and `fake_lithos_sse_url`
 - Use `uv run ruff check`, `uv run ruff format`, `uv run pyright`, `uv run pytest` for quality gates
 - Git identity needs explicit config in worktrees: `git config user.email/user.name`
+- Repair hook protocols live in `src/influx/repair.py`: `ReExtractArchiveHook`, `Tier2EnrichHook`, `Tier3ExtractHook` — all use `typing.Protocol`
+- `ExtractionOutcome` enum (UPGRADE/TERMINAL/TRANSIENT) + `ReExtractionResult` dataclass drive abstract-only re-extraction tag logic
+- `sweep(profile, *, client, config)` is the async repair entry point; accepts LithosClient + AppConfig via kwargs
+- `list_notes` returns `CallToolResult` whose `.content[0].text` is JSON `{"items": [...]}`; each item has `id`, `title`, etc.
+- Unit tests for sweep use `AsyncMock` + `MagicMock` to mock LithosClient (no SSE server needed)
+- `select_stages()` accepts extracted `archive_path` and `max_profile_score` as params; caller must parse note content via `parse_note` + `parse_archive_path` + `parse_profile_relevance`
+- `StageSelection` frozen dataclass with 5 booleans: `archive_retry`, `text_extraction_retry`, `abstract_only_reextraction`, `tier2_retry`, `tier3_retry`
+- `ClearingDecision` frozen dataclass + `compute_clearing()` pure function determine post-stage tag removal for `influx:archive-missing` and `influx:repair-needed`
+- Clearing logic: archive-missing iff archive_path stored; repair-needed iff archive_ok AND text_ok AND tier2_ok AND tier3_ok (with terminal exemption waiving Tier 2/3)
 
 ---
 
@@ -34,4 +43,78 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - RepairConfig with max_items_per_run=100 was already in place from earlier PRD work
   - Ruff enforces 88-char line limit; docstrings and long assert chains need wrapping
   - All tests pass: 628 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-003
+- Created `src/influx/repair.py` with hook protocol definitions
+- `ExtractionOutcome` enum: UPGRADE, TERMINAL, TRANSIENT — the three abstract-only re-extraction outcomes
+- `ReExtractionResult` frozen dataclass with `outcome` discriminator and optional `upgraded_text_tag`
+- `ReExtractArchiveHook` Protocol: `(note, archive_path) -> ReExtractionResult`
+- `Tier2EnrichHook` Protocol: `(note) -> None`
+- `Tier3ExtractHook` Protocol: `(note) -> None`
+- All hooks may raise `ExtractionError` or `LithosError` (documented in Protocol docstrings)
+- Created `tests/unit/test_repair_hooks.py` with 15 tests covering: outcome variants, result dataclass, hook substitution for all three hooks, error raising
+- Files changed: `src/influx/repair.py` (created), `tests/unit/test_repair_hooks.py` (created)
+- **Learnings for future iterations:**
+  - Codebase uses `typing.Protocol` for hook interfaces — keeps them decoupled from implementations
+  - `ExtractionError` and `LithosError` are in `influx.errors` module; don't import them in repair.py unless used at runtime (ruff F401)
+  - Ruff enforces import sorting (I001); use `--fix` to auto-sort
+  - All tests pass: 643 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-004
+- Added `sweep(profile, *, client, config)` async function to `src/influx/repair.py`
+- Calls `lithos_list` with `tags=['influx:repair-needed', f'profile:{profile}']`, `limit=config.repair.max_items_per_run`, `order_by='updated_at'`, `order='asc'`
+- Parses JSON response to get items list, iterates in order, re-reads each via `lithos_read`
+- Returns empty list cleanly when no candidates (no `lithos_read` calls)
+- Created `tests/unit/test_repair_sweep.py` with 9 tests covering: correct list params, zero candidates, iteration order, re-read per candidate, items without id skipped
+- Files changed: `src/influx/repair.py`, `tests/unit/test_repair_sweep.py` (created)
+- **Learnings for future iterations:**
+  - Use `TYPE_CHECKING` guard for `AppConfig`/`LithosClient` imports to avoid circular imports
+  - `AsyncMock` + `MagicMock` are the right test pattern for unit-testing sweep (no SSE server)
+  - `list_notes` response: `.content[0].text` is JSON with `{"items": [...]}` envelope
+  - All tests pass: 652 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-005
+- Added `StageSelection` frozen dataclass and `select_stages()` function to `src/influx/repair.py`
+- Five stages independently selected: archive_retry, text_extraction_retry, abstract_only_reextraction, tier2_retry, tier3_retry
+- `select_stages` takes extracted values (tags, archive_path, max_profile_score, thresholds) — caller parses note content
+- `archive_succeeded_this_pass` defaults to False; caller updates after running archive stage
+- Files changed: `src/influx/repair.py`
+- **Learnings for future iterations:**
+  - Stage selection is pure logic — no async, no note parsing, no I/O; easy to unit test
+  - `archive_path is not None` is sufficient for "non-empty path: line" check (parse_archive_path never returns empty string)
+  - `text:*` tags checked via `any(t.startswith("text:") for t in tags)` — covers text:html, text:pdf, text:abstract-only
+  - All tests pass: 652 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-006
+- Created `tests/unit/test_repair_stage_selection.py` with 34 tests across 8 test classes
+- Covers: archive-missing only, text:abstract-only only, archive-missing + text:abstract-only, high-score Tier 2/3 eligible, influx:text-terminal suppression, stored archive path eligibility, AC-06-A regression, edge cases
+- AC-06-A regression: text:html + influx:archive-missing selects archive but NOT text-extraction
+- influx:text-terminal suppresses abstract-only, Tier 2, Tier 3 (but NOT archive retry)
+- Abstract-only reextraction IS selected when archive path already stored even without archive stage this pass
+- Files changed: `tests/unit/test_repair_stage_selection.py` (created)
+- **Learnings for future iterations:**
+  - `select_stages()` is pure logic (no async, no I/O) — trivial to test directly
+  - Use `_select()` helper wrapper to reduce boilerplate across tests
+  - Parametrize over text:* variants (`text:html`, `text:pdf`, `text:abstract-only`) to catch edge cases
+  - All tests pass: 686 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-007
+- Added `ClearingDecision` frozen dataclass and `compute_clearing()` function to `src/influx/repair.py`
+- `ClearingDecision` has two booleans: `clear_archive_missing` and `clear_repair_needed`
+- `compute_clearing()` is pure logic (no async, no I/O) — takes post-stage tags + archive_path + score/thresholds
+- `influx:archive-missing` cleared iff `archive_path is not None` (FR-NOTE-9)
+- `influx:repair-needed` cleared iff ALL: (a) archive_ok, (b) text_ok (html/pdf or abstract-only+terminal), (c) tier2_ok, (d) tier3_ok
+- AC-X-7 high-score terminal exemption: `influx:text-terminal` waives Tier 2 and Tier 3 requirements
+- AC-06-C: `text:abstract-only` without `influx:text-terminal` naturally fails condition (b), preventing clearing
+- Files changed: `src/influx/repair.py`
+- **Learnings for future iterations:**
+  - `compute_clearing()` mirrors `select_stages()` in design — pure function, same threshold params
+  - Terminal exemption is cleanly expressed: `if is_text_terminal: tier2_ok = True` (same for tier3)
+  - Text quality check (b) naturally handles AC-06-C without special-casing
+  - All tests pass: 686 passed, pyright 0 errors, ruff clean
 ---
