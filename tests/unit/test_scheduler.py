@@ -222,3 +222,158 @@ class TestCrossProfileParallelism:
             )
 
         assert fired_count == 1
+
+
+# ── SweepWriteError → readiness latch (US-011, finding #5) ───────────
+
+
+class TestSweepWriteErrorMarksReadinessDegraded:
+    """``SweepWriteError`` from the sweep flips the probe-loop latch."""
+
+    async def test_sweep_write_error_marks_repair_failure(self) -> None:
+        """When repair_sweep raises SweepWriteError, mark the probe latch."""
+        from influx.repair import SweepWriteError
+
+        config = _make_config(profiles=["alpha"])
+
+        class _FakeProbeLoop:
+            def __init__(self) -> None:
+                self.marked = False
+                self.cleared = False
+                self.detail = ""
+
+            def mark_repair_write_failure(
+                self, *, profile: str = "", detail: str = ""
+            ) -> None:
+                self.marked = True
+                self.detail = detail or profile
+
+            def clear_repair_write_failure(self) -> None:
+                self.cleared = True
+
+        probe_loop = _FakeProbeLoop()
+
+        async def _failing_sweep(*args: Any, **kwargs: Any) -> None:
+            raise SweepWriteError(
+                "abort",
+                operation="lithos_write",
+                detail="version_conflict_unresolved",
+            )
+
+        # Patch the LithosClient close so the test doesn't need a real
+        # connection.
+        class _NoopClient:
+            async def close(self) -> None: ...
+
+        with (
+            patch("influx.scheduler.repair_sweep", side_effect=_failing_sweep),
+            patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            pytest.raises(SweepWriteError),
+        ):
+            await run_profile(
+                "alpha",
+                RunKind.SCHEDULED,
+                config=config,
+                item_provider=None,  # default provider used internally
+                probe_loop=probe_loop,
+            )
+
+        assert probe_loop.marked is True
+        assert probe_loop.cleared is False
+
+    async def test_successful_sweep_clears_repair_failure(self) -> None:
+        """Successful sweep clears the latch."""
+        config = _make_config(profiles=["alpha"])
+
+        class _FakeProbeLoop:
+            def __init__(self) -> None:
+                self.cleared = False
+
+            def mark_repair_write_failure(
+                self, *, profile: str = "", detail: str = ""
+            ) -> None:
+                pass
+
+            def clear_repair_write_failure(self) -> None:
+                self.cleared = True
+
+        probe_loop = _FakeProbeLoop()
+
+        async def _ok_sweep(*args: Any, **kwargs: Any) -> list[Any]:
+            return []
+
+        class _NoopClient:
+            async def close(self) -> None: ...
+
+            async def cache_lookup_for_item(self, **kwargs: Any) -> Any:
+                # Should not be called — empty provider.
+                raise AssertionError("unexpected cache lookup")
+
+        # Patch build_negative_examples_block to a no-op so the run can
+        # complete cleanly with the empty default item provider.
+        async def _empty_neg_block(*args: Any, **kwargs: Any) -> str:
+            return ""
+
+        with (
+            patch("influx.scheduler.repair_sweep", side_effect=_ok_sweep),
+            patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch(
+                "influx.scheduler.build_negative_examples_block",
+                side_effect=_empty_neg_block,
+            ),
+            patch("influx.service.post_run_webhook_hook"),
+        ):
+            await run_profile(
+                "alpha",
+                RunKind.SCHEDULED,
+                config=config,
+                item_provider=None,
+                probe_loop=probe_loop,
+            )
+
+        assert probe_loop.cleared is True
+
+    async def test_backfill_does_not_touch_repair_latch(self) -> None:
+        """Backfills skip the sweep entirely; latch is neither marked nor cleared."""
+        config = _make_config(profiles=["alpha"])
+
+        class _FakeProbeLoop:
+            def __init__(self) -> None:
+                self.marked = False
+                self.cleared = False
+
+            def mark_repair_write_failure(
+                self, *, profile: str = "", detail: str = ""
+            ) -> None:
+                self.marked = True
+
+            def clear_repair_write_failure(self) -> None:
+                self.cleared = True
+
+        probe_loop = _FakeProbeLoop()
+
+        class _NoopClient:
+            async def close(self) -> None: ...
+
+        async def _empty_neg_block(*args: Any, **kwargs: Any) -> str:
+            return ""
+
+        with (
+            patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch(
+                "influx.scheduler.build_negative_examples_block",
+                side_effect=_empty_neg_block,
+            ),
+            patch("influx.service.post_run_webhook_hook"),
+        ):
+            await run_profile(
+                "alpha",
+                RunKind.BACKFILL,
+                {"days": 7},
+                config=config,
+                item_provider=None,
+                probe_loop=probe_loop,
+            )
+
+        assert probe_loop.marked is False
+        assert probe_loop.cleared is False

@@ -453,3 +453,66 @@ class TestLoadConfigRelaxedApiKeys:
 
         with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
             load_config(check_api_keys=True)
+
+
+# ── Repair-write-failure readiness latch (US-011, finding #5) ─────────
+
+
+class TestRepairWriteFailureLatch:
+    """Terminal sweep-write failures degrade readiness.
+
+    Per US-011 (PRD 06 §5.4 failure mode 1), an unresolved
+    ``version_conflict`` after the FR-MCP-7 retry — or a generic write
+    transport failure — must flip ``/ready`` to degraded until the
+    next successful repair sweep clears the latch.
+    """
+
+    def test_default_latch_is_clear(self) -> None:
+        """Fresh state has no repair-write-failure latch."""
+        state = ProbeState()
+        assert state.repair_write_failure is False
+
+    def test_latch_makes_state_not_ready(self) -> None:
+        """Setting the latch flips is_ready False even with ok probes."""
+        import time as time_mod
+
+        now = time_mod.monotonic()
+        state = ProbeState(
+            lithos=ProbeResult(status="ok", timestamp=now),
+            llm_credentials=ProbeResult(status="ok", timestamp=now),
+            repair_write_failure=True,
+        )
+        assert state.is_ready is False
+        assert state.overall_status == "degraded"
+
+    def test_clear_latch_returns_ready(self) -> None:
+        """Clearing the latch returns is_ready to True (probes ok)."""
+        import time as time_mod
+
+        now = time_mod.monotonic()
+        state = ProbeState(
+            lithos=ProbeResult(status="ok", timestamp=now),
+            llm_credentials=ProbeResult(status="ok", timestamp=now),
+            repair_write_failure=False,
+        )
+        assert state.is_ready is True
+        assert state.overall_status == "ok"
+
+    def test_probe_loop_mark_and_clear_repair_failure(self) -> None:
+        """ProbeLoop exposes mark/clear methods that update state."""
+        cfg = _make_config()
+        loop = ProbeLoop(cfg, interval=30.0)
+        loop.run_once()
+        # Clean baseline.
+        assert loop.state.repair_write_failure is False
+
+        loop.mark_repair_write_failure(profile="ai-robotics", detail="abort")
+        assert loop.state.repair_write_failure is True
+        assert loop.state.is_ready is False
+
+        # Latch persists across the next probe cycle until cleared.
+        loop.run_once()
+        assert loop.state.repair_write_failure is True
+
+        loop.clear_repair_write_failure()
+        assert loop.state.repair_write_failure is False

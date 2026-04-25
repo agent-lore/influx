@@ -173,6 +173,9 @@ _NORMAL_TAGS = [
 _CHRONIC_TAGS = list(_NORMAL_TAGS)
 
 
+_CHRONIC_TRIM_ATTEMPTS = 3
+
+
 def _queue_mixed_sweep(
     fake_lithos: FakeLithosServer,
     chronic_note: dict[str, Any],
@@ -181,8 +184,11 @@ def _queue_mixed_sweep(
     """Queue list + read + write responses for a mixed sweep.
 
     The chronic note is first (oldest updated_at), followed by normal
-    notes.  The chronic note's write returns ``content_too_large``;
-    normal notes' writes return ``updated``.
+    notes.  Per master PRD §9.7 / finding #2, the sweep retries each
+    chronic note ``_CHRONIC_TRIM_ATTEMPTS`` times (original + Tier 2
+    dropped + Tier 1 only) before treating it as chronic-oversize, so
+    we queue ``_CHRONIC_TRIM_ATTEMPTS`` ``content_too_large`` responses
+    for the chronic note.  Normal notes' writes return ``updated``.
     """
     all_notes = [chronic_note, *normal_notes]
     items = [{"id": n["id"], "title": n["title"]} for n in all_notes]
@@ -191,8 +197,8 @@ def _queue_mixed_sweep(
     for note in all_notes:
         fake_lithos.read_responses.append(json.dumps(note))
 
-    # Chronic note: content_too_large; normal notes: updated.
-    fake_lithos.write_responses.append('{"status": "content_too_large"}')
+    for _ in range(_CHRONIC_TRIM_ATTEMPTS):
+        fake_lithos.write_responses.append('{"status": "content_too_large"}')
     for _ in normal_notes:
         fake_lithos.write_responses.append('{"status": "updated"}')
 
@@ -284,15 +290,17 @@ class TestChronicOversizeExemption:
             )
 
             write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-            # 3 writes total: 1 for chronic (content_too_large) +
-            # 2 for normal notes (updated).
-            assert len(write_calls) == 3
+            # 5 writes total: 3 chronic trim attempts (content_too_large
+            # × 3 per finding #2) + 2 normal notes (updated).
+            assert len(write_calls) == _CHRONIC_TRIM_ATTEMPTS + 2
 
-            # Chronic note's write was attempted.
-            assert write_calls[0][1]["id"] == "chronic-001"
+            # All chronic-trim attempts were against the chronic note.
+            for wc in write_calls[:_CHRONIC_TRIM_ATTEMPTS]:
+                assert wc[1]["id"] == "chronic-001"
 
             # Normal notes' writes succeeded — repair-needed cleared.
-            for wc in write_calls[1:]:
+            for wc in write_calls[_CHRONIC_TRIM_ATTEMPTS:]:
+                assert wc[1]["id"] != "chronic-001"
                 assert "influx:repair-needed" not in wc[1]["tags"]
         finally:
             await client.close()
@@ -367,7 +375,8 @@ class TestChronicOversizeExemption:
                 )
             )
             fake_lithos.read_responses.append(json.dumps(chronic))
-            fake_lithos.write_responses.append('{"status": "content_too_large"}')
+            for _ in range(_CHRONIC_TRIM_ATTEMPTS):
+                fake_lithos.write_responses.append('{"status": "content_too_large"}')
 
             visited_r2 = await sweep(
                 "ai-robotics",
@@ -380,10 +389,11 @@ class TestChronicOversizeExemption:
             assert len(visited_r2) == 1
             assert visited_r2[0]["id"] == "chronic-001"
 
-            # Write was attempted again (content_too_large again).
+            # 3 trim attempts on the chronic note, all content_too_large.
             write_calls_r2 = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-            assert len(write_calls_r2) == 1
-            assert write_calls_r2[0][1]["id"] == "chronic-001"
+            assert len(write_calls_r2) == _CHRONIC_TRIM_ATTEMPTS
+            for wc in write_calls_r2:
+                assert wc[1]["id"] == "chronic-001"
         finally:
             await client.close()
 
@@ -467,9 +477,9 @@ class TestChronicOversizeExemption:
         for n in all_notes:
             fake_lithos.read_responses.append(json.dumps(n))
 
-        # Two chronic writes + one normal write.
-        fake_lithos.write_responses.append('{"status": "content_too_large"}')
-        fake_lithos.write_responses.append('{"status": "content_too_large"}')
+        # Two chronic notes × 3 trim attempts each + one normal write.
+        for _ in range(2 * _CHRONIC_TRIM_ATTEMPTS):
+            fake_lithos.write_responses.append('{"status": "content_too_large"}')
         fake_lithos.write_responses.append('{"status": "updated"}')
 
         config = _make_config(lithos_url=fake_lithos_url, max_items=10)
@@ -488,7 +498,7 @@ class TestChronicOversizeExemption:
             assert len(visited) == 3
 
             write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-            assert len(write_calls) == 3
+            assert len(write_calls) == 2 * _CHRONIC_TRIM_ATTEMPTS + 1
 
             # Normal note's repair-needed cleared.
             normal_write = [wc for wc in write_calls if wc[1]["id"] == "normal-001"]

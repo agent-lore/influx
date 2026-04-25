@@ -54,6 +54,11 @@ class ProbeState:
     stale, forcing ``is_ready`` to ``False`` and ``overall_status`` to
     ``degraded`` (US-002 stale-cache requirement).  A ``max_age`` of
     ``0.0`` disables the check.
+
+    ``repair_write_failure`` is a sticky latch raised by terminal
+    sweep-write failures (US-011, §5.4 failure mode 1) — when set,
+    ``is_ready`` returns ``False`` and ``overall_status`` becomes
+    ``degraded`` until the next successful repair sweep clears it.
     """
 
     lithos: ProbeResult = field(
@@ -63,6 +68,8 @@ class ProbeState:
         default_factory=lambda: ProbeResult(status="ok", timestamp=0.0)
     )
     max_age: float = 0.0
+    repair_write_failure: bool = False
+    repair_write_failure_detail: str = ""
 
     def _has_run(self) -> bool:
         """Return ``True`` once at least one probe cycle has completed."""
@@ -91,6 +98,8 @@ class ProbeState:
         """Return ``True`` when all probes report ``ok`` AND are fresh."""
         if self.is_stale():
             return False
+        if self.repair_write_failure:
+            return False
         return self.lithos.status == "ok" and self.llm_credentials.status == "ok"
 
     @property
@@ -99,11 +108,14 @@ class ProbeState:
 
         - ``starting`` before the first probe cycle completes
         - ``degraded`` when any probe fails OR cached results are stale
-        - ``ok`` when all probes pass and are fresh
+          OR a terminal repair-sweep write failure is latched
+        - ``ok`` when all probes pass, are fresh, and no latched failure
         """
         if not self._has_run():
             return "starting"
         if self.is_stale():
+            return "degraded"
+        if self.repair_write_failure:
             return "degraded"
         if self.lithos.status == "ok" and self.llm_credentials.status == "ok":
             return "ok"
@@ -206,6 +218,11 @@ class ProbeLoop:
         # or two shouldn't immediately flip readiness, but an
         # indefinitely stuck loop must.
         self._max_age = max_age if max_age is not None else interval * 3.0
+        # Sweep-write-failure latch (US-011, §5.4 failure mode 1).
+        # Persisted across probe cycles until ``clear_repair_write_failure``
+        # is invoked by a successful sweep.
+        self._repair_write_failure = False
+        self._repair_write_failure_detail = ""
         self._state = ProbeState(max_age=self._max_age)
         self._task: asyncio.Task[None] | None = None
 
@@ -224,7 +241,36 @@ class ProbeLoop:
             lithos=_probe_lithos(self._config.lithos.url),
             llm_credentials=_probe_llm_credentials(self._config.providers),
             max_age=self._max_age,
+            repair_write_failure=self._repair_write_failure,
+            repair_write_failure_detail=self._repair_write_failure_detail,
         )
+
+    def mark_repair_write_failure(
+        self,
+        *,
+        profile: str = "",
+        detail: str = "",
+    ) -> None:
+        """Latch a terminal sweep-write failure (US-011).
+
+        Called by ``run_profile`` when ``SweepWriteError`` propagates
+        out of the repair sweep.  Flips ``ProbeState.repair_write_failure``
+        so ``/ready`` reports degraded until the next successful sweep
+        clears it via :meth:`clear_repair_write_failure`.
+        """
+        self._repair_write_failure = True
+        self._repair_write_failure_detail = detail or f"profile={profile!r}"
+        # Reflect the latch into the cached state so ``/ready`` sees it
+        # before the next probe cycle runs.
+        self._state.repair_write_failure = True
+        self._state.repair_write_failure_detail = self._repair_write_failure_detail
+
+    def clear_repair_write_failure(self) -> None:
+        """Clear the sweep-write-failure latch on next successful sweep."""
+        self._repair_write_failure = False
+        self._repair_write_failure_detail = ""
+        self._state.repair_write_failure = False
+        self._state.repair_write_failure_detail = ""
 
     async def start(self) -> None:
         """Start the background probe loop as an ``asyncio.Task``."""

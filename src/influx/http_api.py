@@ -176,6 +176,7 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
                 RunKind.MANUAL,
                 config=config,
                 item_provider=getattr(request.app.state, "item_provider", None),
+                probe_loop=getattr(request.app.state, "probe_loop", None),
             ),
         )
 
@@ -211,6 +212,7 @@ async def _run_and_release(
     *,
     config: Any = None,
     item_provider: Any = None,
+    probe_loop: Any = None,
 ) -> None:
     """Run ``run_profile`` and release the coordinator lock afterward.
 
@@ -226,6 +228,7 @@ async def _run_and_release(
                 run_range=run_range,
                 config=config,
                 item_provider=item_provider,
+                probe_loop=probe_loop,
             )
         except Exception:
             import logging
@@ -411,6 +414,7 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
                 run_range,
                 config=config,
                 item_provider=getattr(request.app.state, "item_provider", None),
+                probe_loop=getattr(request.app.state, "probe_loop", None),
             ),
         )
 

@@ -337,10 +337,12 @@ class TestSweepVersionConflict:
             c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
         ]
         assert len(write_calls) == 2
-        # Retry uses refreshed version.
+        # Retry uses refreshed version and preserves the SWEEP's pending
+        # content (no user-notes section in either, so merge is the
+        # sweep's content unchanged — never the refreshed body).
         retry_args = write_calls[1].args[1]
         assert retry_args["expected_version"] == 2
-        assert retry_args["content"] == "C-refreshed"
+        assert retry_args["content"] == "C"
 
     async def test_unresolved_conflict_aborts_sweep(self) -> None:
         """Second version_conflict → SweepWriteError → abort."""
@@ -467,7 +469,12 @@ class TestSweepContentTooLargeSkipped:
     """Chronic ``content_too_large`` on repair path: skip, don't abort."""
 
     async def test_content_too_large_does_not_abort_sweep(self) -> None:
-        """Sweep continues to next candidate after content_too_large."""
+        """Sweep continues to next candidate after content_too_large.
+
+        The chronic-oversize repair-path skip per master PRD §9.7 only
+        triggers AFTER the Tier-2 → Tier-1 trim retry sequence (finding
+        #2): three ``content_too_large`` responses → ``ContentTooLargeSkipped``.
+        """
         items = [
             {"id": "n1", "title": "Oversize"},
             {"id": "n2", "title": "Normal"},
@@ -486,9 +493,12 @@ class TestSweepContentTooLargeSkipped:
         client = AsyncMock()
         client.list_notes = AsyncMock(return_value=_make_list_result(items))
         client.read_note = AsyncMock(side_effect=[note1, note2])
-        # n1 write → content_too_large; n2 write → success.
+        # n1 chronic-oversize: 3 content_too_large (orig + Tier-2-dropped
+        # + Tier-1-only) → ContentTooLargeSkipped.  Then n2 → updated.
         client.call_tool = AsyncMock(
             side_effect=[
+                _make_write_result("content_too_large"),
+                _make_write_result("content_too_large"),
                 _make_write_result("content_too_large"),
                 _make_write_result("updated"),
             ]
@@ -500,16 +510,22 @@ class TestSweepContentTooLargeSkipped:
         assert len(result) == 2
         assert result[0]["id"] == "n1"
         assert result[1]["id"] == "n2"
-        # n2 was still written (sweep didn't abort).
+        # 4 write calls total: 3 trim attempts on n1 + 1 success on n2.
         write_calls = [
             c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
         ]
-        assert len(write_calls) == 2
+        assert len(write_calls) == 4
 
-    async def test_oversize_note_untouched_no_second_write(
+    async def test_oversize_note_chronic_skip_after_trim_retries(
         self,
     ) -> None:
-        """content_too_large note gets only one write attempt (no retry)."""
+        """Chronic ``content_too_large`` only after 3 trim attempts.
+
+        Per master PRD §9.7 / finding #2, the sweep first retries with
+        Tier 2 dropped, then with Tier 1-only + ``influx:repair-needed``.
+        Only when *all three* attempts return ``content_too_large`` is
+        the note treated as chronic-oversize.
+        """
         items = [{"id": "n1", "title": "Oversize"}]
         note = {
             "id": "n1",
@@ -526,11 +542,17 @@ class TestSweepContentTooLargeSkipped:
 
         await sweep("ai-robotics", client=client, config=config)
 
-        # Only one write call — no version_conflict retry loop.
+        # Three write calls — original + Tier-2-dropped + Tier-1-only.
         write_calls = [
             c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
         ]
-        assert len(write_calls) == 1
+        assert len(write_calls) == 3
+
+        # The third attempt MUST carry ``influx:repair-needed`` and
+        # MUST drop ``## Full Text`` / Tier-3 sections (master PRD
+        # §9.7 repair-path Tier-1-only retry).
+        third_args = write_calls[2].args[1]
+        assert "influx:repair-needed" in third_args["tags"]
 
     async def test_other_notes_still_make_progress(self) -> None:
         """Notes after the oversize one are rewritten normally."""
@@ -560,9 +582,11 @@ class TestSweepContentTooLargeSkipped:
         client = AsyncMock()
         client.list_notes = AsyncMock(return_value=_make_list_result(items))
         client.read_note = AsyncMock(side_effect=notes)
-        # n1 → oversize, n2 + n3 → success.
+        # n1 → oversize×3 (chronic), n2 + n3 → success.
         client.call_tool = AsyncMock(
             side_effect=[
+                _make_write_result("content_too_large"),
+                _make_write_result("content_too_large"),
                 _make_write_result("content_too_large"),
                 _make_write_result("updated"),
                 _make_write_result("updated"),
@@ -574,11 +598,11 @@ class TestSweepContentTooLargeSkipped:
         assert len(result) == 3
         # All three were read.
         assert client.read_note.await_count == 3
-        # Three write calls total — n1 (failed), n2, n3.
+        # Five write calls total — 3 trim attempts on n1 + n2 + n3.
         write_calls = [
             c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
         ]
-        assert len(write_calls) == 3
+        assert len(write_calls) == 5
 
     async def test_multiple_oversize_notes_all_skipped(self) -> None:
         """Multiple content_too_large notes are all skipped; no abort."""
@@ -602,17 +626,20 @@ class TestSweepContentTooLargeSkipped:
         client = AsyncMock()
         client.list_notes = AsyncMock(return_value=_make_list_result(items))
         client.read_note = AsyncMock(side_effect=notes)
+        # Each note gets 3 content_too_large attempts → chronic skip.
         client.call_tool = AsyncMock(
-            side_effect=[
-                _make_write_result("content_too_large"),
-                _make_write_result("content_too_large"),
-            ]
+            return_value=_make_write_result("content_too_large"),
         )
 
         # Does NOT raise — both skipped, sweep completes.
         result = await sweep("ai-robotics", client=client, config=config)
 
         assert len(result) == 2
+        # 6 writes total: 3 trim attempts × 2 chronic notes.
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert len(write_calls) == 6
 
 
 class TestContentTooLargeSkippedException:

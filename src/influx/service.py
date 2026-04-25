@@ -112,14 +112,24 @@ def create_app(
     # scheduler-fired — so that shutdown can await them within
     # ``schedule.shutdown_grace_seconds`` (US-008).
     active_tasks: set[asyncio.Task[Any]] = set()
-    scheduler = InfluxScheduler(config, coordinator, active_tasks=active_tasks)
     probe_loop = ProbeLoop(config, interval=30.0)
+    scheduler = InfluxScheduler(
+        config,
+        coordinator,
+        active_tasks=active_tasks,
+        probe_loop=probe_loop,
+    )
 
     app.state.config = config
     app.state.coordinator = coordinator
     app.state.scheduler = scheduler
     app.state.probe_loop = probe_loop
     app.state.active_tasks = active_tasks
+    # Default no-op item provider — replaced by PRD 04 with the real
+    # arXiv + RSS pipeline.  Stored on app.state so the HTTP run path
+    # can pass it through to ``run_profile`` (US-013).  ``None`` means
+    # "use ``default_item_provider``" inside ``run_profile``.
+    app.state.item_provider = None
 
     return app
 

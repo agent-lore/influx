@@ -412,11 +412,13 @@ def apply_abstract_only_reextraction(
     """
     try:
         result = hook(note, archive_path)
-    except ExtractionError:
-        # Transient failure — keep tags unchanged.
+    except (ExtractionError, LithosError):
+        # Transient failure — keep tags unchanged.  ``LithosError``
+        # raised by the hook is treated as a per-stage failure (not a
+        # fatal sweep abort) per US-003 / US-013 (finding #4).
         logger.info(
-            "abstract-only re-extraction raised ExtractionError "
-            "(transient); tags unchanged"
+            "abstract-only re-extraction hook raised "
+            "ExtractionError/LithosError (transient); tags unchanged"
         )
         return list(tags)
 
@@ -538,6 +540,98 @@ def compute_clearing(
 # ── Sweep rewrite helper (§5.4, AC-06-F) ─────────────────────────
 
 
+async def _sweep_call_write(
+    client: LithosClient,
+    args: dict[str, Any],
+    note_id: str,
+) -> str:
+    """Single ``lithos_write`` attempt — wraps transport errors.
+
+    Returns the response ``status`` string.  Wraps any
+    :class:`LithosError` raised by the transport as
+    :class:`SweepWriteError` so the sweep aborts cleanly per
+    §5.4 failure mode 1.
+    """
+    try:
+        result = await client.call_tool("lithos_write", args)
+    except LithosError as exc:
+        raise SweepWriteError(
+            f"sweep rewrite transport failure for note {note_id}",
+            operation="lithos_write",
+            detail=str(exc),
+        ) from exc
+    text = result.content[0].text  # type: ignore[union-attr]
+    body = json.loads(text)
+    return body.get("status", "")
+
+
+async def _sweep_resolve_version_conflict(
+    client: LithosClient,
+    args: dict[str, Any],
+    pending_tags: list[str],
+    note_id: str,
+) -> str:
+    """FR-MCP-7: re-read + re-merge tags + retry once on version_conflict.
+
+    Preserves the sweep's pending content edits (e.g. a freshly written
+    archive ``path:`` line) and merges only the ``## User Notes`` region
+    from the refreshed note — parallels
+    :meth:`LithosClient._retry_version_conflict`.
+
+    Returns the retry's response ``status``.  Raises
+    :class:`SweepWriteError` on unresolved conflict or transport failure.
+    """
+    # Late import to avoid circular dependency (lithos_client → repair
+    # is unidirectional, but the sweep needs lithos_client's helpers).
+    from influx.lithos_client import _preserve_user_notes
+
+    logger.info(
+        "sweep rewrite version_conflict for note %s; re-reading and retrying once",
+        note_id,
+    )
+    try:
+        refreshed = await client.read_note(note_id=note_id)
+    except LithosError as exc:
+        raise SweepWriteError(
+            f"sweep re-read failed for note {note_id}",
+            operation="lithos_read",
+            detail=str(exc),
+        ) from exc
+
+    refreshed_tags: list[str] = refreshed.get("tags", [])
+    merged_tags = merge_tags(
+        existing_tags=refreshed_tags,
+        new_tags=list(pending_tags),
+    )
+
+    refreshed_content: str = refreshed.get("content", "")
+    # Use the sweep's pending content (with any sweep edits like a new
+    # archive ``path:`` line) and only graft the user-notes region from
+    # the refreshed note — never overwrite pending edits with refreshed
+    # body content.
+    pending_content: str = args.get("content", "")
+    merged_content = _preserve_user_notes(refreshed_content, pending_content)
+
+    retry_args = {
+        **args,
+        "tags": merged_tags,
+        "content": merged_content,
+    }
+    refresh_version = refreshed.get("version")
+    if refresh_version is not None:
+        retry_args["expected_version"] = refresh_version
+
+    status = await _sweep_call_write(client, retry_args, note_id)
+    if status == "version_conflict":
+        raise SweepWriteError(
+            f"sweep rewrite unresolved version_conflict "
+            f"for note {note_id} after FR-MCP-7 retry",
+            operation="lithos_write",
+            detail="version_conflict_unresolved",
+        )
+    return status
+
+
 async def _rewrite_sweep_note(
     client: LithosClient,
     note: dict[str, Any],
@@ -545,11 +639,21 @@ async def _rewrite_sweep_note(
 ) -> None:
     """Rewrite a single sweep-visited note via ``lithos_write`` (§5.4).
 
-    Builds the write args from the existing note dict with the updated
-    *tags* and calls ``lithos_write``.  On ``version_conflict``, performs
-    one re-read + tag re-merge + retry per FR-MCP-7 (AC-06-F first half).
-    On a second ``version_conflict`` or transport failure, raises
-    :class:`SweepWriteError` to abort the run (AC-06-F second half).
+    Implements the full PRD 05/06 envelope contract:
+
+    * On ``version_conflict``: one re-read + tag re-merge + retry per
+      FR-MCP-7 (AC-06-F first half).  Pending content is preserved and
+      only ``## User Notes`` is grafted from the refreshed note —
+      never overwriting sweep edits like a freshly inserted archive
+      ``path:`` line.
+    * On ``content_too_large``: drop ``## Full Text`` (Tier 2) and
+      retry; if still oversize, drop Tier 2 + Tier 3 and ensure
+      ``influx:repair-needed``, retry; only after that final attempt
+      also returns ``content_too_large`` is the note treated as
+      chronic-oversize (master PRD §9.7, US-012, finding #2).
+    * On a second ``version_conflict`` or generic transport failure:
+      raises :class:`SweepWriteError` to abort the run (AC-06-F
+      second half).
 
     Parameters
     ----------
@@ -565,9 +669,16 @@ async def _rewrite_sweep_note(
     SweepWriteError
         On unresolved ``version_conflict`` (after FR-MCP-7 retry) or
         generic transport failure — the sweep must abort.
+    ContentTooLargeSkipped
+        When all trim attempts (original → Tier 2 dropped → Tier 1
+        only) returned ``content_too_large`` — the chronic-oversize
+        repair-path exemption (§5.4 failure mode 2, AC-X-8).
     """
+    # Late import to avoid circular dependency.
+    from influx.lithos_client import _drop_tier2, _drop_tier2_and_tier3
+
     note_id: str = note.get("id", "")
-    args: dict[str, Any] = {
+    base_args: dict[str, Any] = {
         "id": note_id,
         "title": note.get("title", ""),
         "content": note.get("content", ""),
@@ -581,76 +692,45 @@ async def _rewrite_sweep_note(
     }
     version = note.get("version")
     if version is not None:
-        args["expected_version"] = version
+        base_args["expected_version"] = version
 
-    try:
-        result = await client.call_tool("lithos_write", args)
-    except LithosError as exc:
-        raise SweepWriteError(
-            f"sweep rewrite transport failure for note {note_id}",
-            operation="lithos_write",
-            detail=str(exc),
-        ) from exc
-
-    text = result.content[0].text  # type: ignore[union-attr]
-    body = json.loads(text)
-    status = body.get("status", "")
-
-    if status == "content_too_large":
-        raise ContentTooLargeSkipped(note_id)
-
-    if status != "version_conflict":
+    # ── Attempt 1: original content + tags. ───────────────────────
+    status = await _sweep_call_write(client, base_args, note_id)
+    if status == "version_conflict":
+        status = await _sweep_resolve_version_conflict(
+            client, base_args, list(tags), note_id
+        )
+    if status != "content_too_large":
         return
 
-    # FR-MCP-7: re-read + re-merge tags + retry once.
-    logger.info(
-        "sweep rewrite version_conflict for note %s; re-reading and retrying once",
-        note_id,
-    )
-    try:
-        refreshed = await client.read_note(note_id=note_id)
-    except LithosError as exc:
-        raise SweepWriteError(
-            f"sweep re-read failed for note {note_id}",
-            operation="lithos_read",
-            detail=str(exc),
-        ) from exc
-
-    refreshed_tags: list[str] = refreshed.get("tags", [])
-    # Re-merge via merge_tags to apply the rejection guard (FR-NOTE-6,
-    # AC-M3-6) and preserve the sweep's Influx-owned tag changes.
-    merged = merge_tags(existing_tags=refreshed_tags, new_tags=list(tags))
-
-    retry_args = {
-        **args,
-        "tags": merged,
-        "content": refreshed.get("content", args["content"]),
-    }
-    refresh_version = refreshed.get("version")
-    if refresh_version is not None:
-        retry_args["expected_version"] = refresh_version
-
-    try:
-        retry_result = await client.call_tool("lithos_write", retry_args)
-    except LithosError as exc:
-        raise SweepWriteError(
-            f"sweep rewrite retry transport failure for note {note_id}",
-            operation="lithos_write",
-            detail=str(exc),
-        ) from exc
-
-    retry_text = retry_result.content[0].text  # type: ignore[union-attr]
-    retry_body = json.loads(retry_text)
-    retry_status = retry_body.get("status", "")
-    if retry_status == "content_too_large":
-        raise ContentTooLargeSkipped(note_id)
-    if retry_status == "version_conflict":
-        raise SweepWriteError(
-            f"sweep rewrite unresolved version_conflict "
-            f"for note {note_id} after FR-MCP-7 retry",
-            operation="lithos_write",
-            detail="version_conflict_unresolved",
+    # ── Attempt 2: drop Tier 2 (## Full Text) and retry. ─────────
+    tier2_args = dict(base_args)
+    tier2_args["content"] = _drop_tier2(base_args["content"])
+    status = await _sweep_call_write(client, tier2_args, note_id)
+    if status == "version_conflict":
+        status = await _sweep_resolve_version_conflict(
+            client, tier2_args, list(tags), note_id
         )
+    if status != "content_too_large":
+        return
+
+    # ── Attempt 3: drop Tier 2 + Tier 3, ensure repair-needed. ───
+    tier1_args = dict(base_args)
+    tier1_args["content"] = _drop_tier2_and_tier3(base_args["content"])
+    repair_tags = list(tags)
+    if "influx:repair-needed" not in repair_tags:
+        repair_tags.append("influx:repair-needed")
+    tier1_args["tags"] = repair_tags
+    status = await _sweep_call_write(client, tier1_args, note_id)
+    if status == "version_conflict":
+        status = await _sweep_resolve_version_conflict(
+            client, tier1_args, list(repair_tags), note_id
+        )
+    if status != "content_too_large":
+        return
+
+    # All trim attempts exhausted — chronic-oversize on repair path.
+    raise ContentTooLargeSkipped(note_id)
 
 
 # ── Per-note stage execution ──────────────────────────────────────
@@ -734,7 +814,9 @@ async def _process_sweep_note(
                         + f"path: {downloaded_path}\n"
                         + content[insert_pos:]
                     )
-        except ExtractionError:
+        except (ExtractionError, LithosError):
+            # Hook raises are per-stage failures, not fatal aborts
+            # (finding #4).
             logger.info(
                 "sweep: archive download failed for %s",
                 note.get("id"),
@@ -769,17 +851,28 @@ async def _process_sweep_note(
 
     # Tier 2 retry.
     if stages.tier2_retry and hooks.tier2_enrich:
+        # Expose any tag mutations from earlier stages so the hook sees
+        # the latest tag set on the note dict (finding #3).
+        note["tags"] = list(current_tags)
         try:
             hooks.tier2_enrich(note)
-        except ExtractionError:
+            # Sync any tag/content mutations the hook applied to the
+            # note dict back into the local working set.
+            current_tags = list(note.get("tags", current_tags))
+        except (ExtractionError, LithosError):
+            # Per-stage failure (finding #4).
             logger.info("sweep: tier2 enrichment failed for %s", note.get("id"))
+            current_tags = list(note.get("tags", current_tags))
 
     # Tier 3 retry.
     if stages.tier3_retry and hooks.tier3_extract:
+        note["tags"] = list(current_tags)
         try:
             hooks.tier3_extract(note)
-        except ExtractionError:
+            current_tags = list(note.get("tags", current_tags))
+        except (ExtractionError, LithosError):
             logger.info("sweep: tier3 extraction failed for %s", note.get("id"))
+            current_tags = list(note.get("tags", current_tags))
 
     # ── Compute and apply clearing ──────────────────────────────
     post_archive_path = archive_path

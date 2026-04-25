@@ -31,6 +31,7 @@ from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.feedback import build_negative_examples_block
 from influx.lithos_client import LithosClient
 from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+from influx.repair import SweepWriteError
 from influx.repair import sweep as repair_sweep
 
 __all__ = [
@@ -78,6 +79,7 @@ async def run_profile(
     *,
     config: AppConfig | None = None,
     item_provider: ItemProvider | None = None,
+    probe_loop: Any | None = None,
 ) -> ProfileRunResult | None:
     """Execute a single ingestion cycle for the given profile.
 
@@ -115,15 +117,12 @@ async def run_profile(
     if config is None:
         return None
 
-    # When no ``item_provider`` is configured, source acquisition has
-    # not been wired by a downstream PRD yet — skip the Lithos round
-    # trip entirely so PRD 03 / pre-PRD-04 deployments do not establish
-    # SSE connections for empty runs (matches the "no-op" stub
-    # contract documented in :func:`default_item_provider`).
-    if item_provider is None:
-        return None
-
-    provider = item_provider
+    # When no ``item_provider`` is configured, fall back to the default
+    # no-op provider so the run still goes through its full pipeline
+    # (repair sweep + feedback ingestion + post-run hook).  Source
+    # acquisition becomes a no-op until a downstream PRD wires a real
+    # provider via ``app.state.item_provider``.
+    provider = item_provider if item_provider is not None else default_item_provider
     profile_cfg = next((p for p in config.profiles if p.name == profile), None)
 
     client = LithosClient(url=config.lithos.url, transport=config.lithos.transport)
@@ -131,7 +130,22 @@ async def run_profile(
         # 0. Repair sweep — durable retry for failed enrichment (PRD 06 §5.1).
         #    Runs for scheduled and manual runs only; backfills skip (FR-REP-2).
         if kind != RunKind.BACKFILL:
-            await repair_sweep(profile, client=client, config=config)
+            try:
+                await repair_sweep(profile, client=client, config=config)
+            except SweepWriteError:
+                # §5.4 failure mode 1: terminal write failure aborts the
+                # run AND degrades readiness (US-011).
+                if probe_loop is not None and hasattr(
+                    probe_loop, "mark_repair_write_failure"
+                ):
+                    probe_loop.mark_repair_write_failure(profile=profile)
+                raise
+            else:
+                # Successful sweep clears the readiness latch.
+                if probe_loop is not None and hasattr(
+                    probe_loop, "clear_repair_write_failure"
+                ):
+                    probe_loop.clear_repair_write_failure()
 
         # 1. Feedback ingestion → negative examples block (FR-FB-1..3, AC-05-H).
         neg_block = await build_negative_examples_block(
@@ -225,6 +239,9 @@ class InfluxScheduler:
         config: AppConfig,
         coordinator: Coordinator,
         active_tasks: set[asyncio.Task[Any]] | None = None,
+        *,
+        item_provider: ItemProvider | None = None,
+        probe_loop: Any | None = None,
     ) -> None:
         self._config = config
         self._coordinator = coordinator
@@ -234,6 +251,15 @@ class InfluxScheduler:
         # ``schedule.shutdown_grace_seconds`` during graceful shutdown
         # (US-008).  ``None`` disables tracking.
         self._active_tasks = active_tasks
+        # Optional injected item provider — replaced by PRD 04 with the
+        # real arXiv + RSS pipeline.  Defaults to ``default_item_provider``
+        # at fire time so scheduled runs still execute the repair sweep
+        # and feedback ingestion (US-013).
+        self._item_provider = item_provider
+        # Optional probe loop — when set, terminal repair write failures
+        # (SweepWriteError) flip a readiness latch so ``/ready`` reports
+        # degraded per US-011 (§5.4 failure mode 1).
+        self._probe_loop = probe_loop
 
     @property
     def jobs(self) -> list[Any]:
@@ -305,6 +331,8 @@ class InfluxScheduler:
                     profile_name,
                     RunKind.SCHEDULED,
                     config=self._config,
+                    item_provider=self._item_provider,
+                    probe_loop=self._probe_loop,
                 )
         except ProfileBusyError:
             logger.info(
