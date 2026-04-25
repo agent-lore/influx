@@ -25,6 +25,8 @@ Started: Sat Apr 25 14:42:15 UTC 2026
 - Config mock in sweep tests needs `config.profiles = []`; client mock needs `client.call_tool` returning `_make_write_result()`
 - `run_profile()` in `scheduler.py` is the central run entry point for scheduled, manual, and backfill paths — all pre-run hooks (sweep, etc.) wire here
 - FakeLithosServer FIFO queue: when adding new `lithos_list` callers, prepend empty responses for earlier callers so downstream queued responses arrive correctly
+- `ArchiveDownloadHook` protocol: `(note: dict[str, object]) -> str` — returns archive path on success; raises `ExtractionError` on failure
+- Integration tests for sweep call `sweep()` directly with real `LithosClient` + `FakeLithosServer`; use `_queue_single_note()` pattern to queue list+read+write responses
 
 ---
 
@@ -234,4 +236,34 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - Patching `influx.scheduler.repair_sweep` as AsyncMock is the cleanest way to spy on sweep invocation without needing extra FakeLithosServer queue setup
   - When repair_sweep is mocked out, no need to prepend empty list_responses for the sweep's lithos_list call
   - All tests pass: 762 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-015
+- Created `tests/integration/test_coordinator_slot.py` with 4 tests in `TestCoordinatorSlotIntegration`
+- `test_sweep_runs_inside_coordinator_lock`: patches sweep and item_provider as spies, both observe `coordinator.is_busy(profile) == True` during their execution
+- `test_lock_held_exactly_once_per_profile_run`: wraps `coordinator.try_acquire` with a counter, asserts exactly 1 acquire per run (no double-lock)
+- `test_two_profiles_run_independently`: launches POST /runs for profile-a and profile-b, verifies each sweep observes its own lock held
+- `test_scheduled_fire_holds_lock_for_run_profile`: patches `run_profile` to observe lock state during `_fire_profile` scheduled path, confirms lock held
+- No production code changes needed — coordinator integration was already correct in `scheduler.py` and `http_api.py` from US-013
+- Files changed: `tests/integration/test_coordinator_slot.py` (created), `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - `_fire_profile` doesn't pass `item_provider`, so `run_profile` returns early (before sweep). For scheduled path tests, patch `run_profile` directly instead of `repair_sweep`
+  - Ruff enforces SIM117 (combine nested `with` statements) — use `with (patch(...), TestClient(app) as tc):` syntax
+  - All tests pass: 766 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-016
+- Created `tests/integration/test_repair_sweep_archive_only.py` with 5 tests in `TestArchiveOnlyRepairFlow`
+- Added `ArchiveDownloadHook` protocol to `src/influx/repair.py` — `(note) -> str` returns archive path
+- Added `archive_download` field to `SweepHooks` (first field, None default)
+- Wired archive download hook in `_process_sweep_note()`: on success, updates `archive_path` and inserts `path:` line into note's `## Archive` section content
+- Added abstract-only re-extraction re-evaluation after archive download (handles case where archive success makes abstract-only eligible mid-pass)
+- Tests cover: exact empty initial `## Archive` body, exact post-repair `path:` line, AC-06-A (text:html + archive-missing → archive only), archive failure keeps tags, repair-needed kept when Tier 2/3 outstanding
+- Files changed: `src/influx/repair.py`, `tests/integration/test_repair_sweep_archive_only.py` (created), `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - `ArchiveDownloadHook` uses `Protocol` like other hooks; pyright enforces parameter name matching for Protocol callables (use `note` not `n`)
+  - Content update for `## Archive` uses string `find` + `insert` approach: find `"## Archive\n"` marker, insert `"path: <path>\n"` after it
+  - Integration tests call `sweep()` directly with `LithosClient` + `FakeLithosServer` — queue list, read, write responses via `_queue_single_note()` helper
+  - Low-score notes (score < thresholds) naturally bypass Tier 2/3 clearing requirements, making archive-only repair testable
+  - All tests pass: 771 passed, pyright 0 errors, ruff clean
 ---

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from influx.lithos_client import LithosClient
 
 __all__ = [
+    "ArchiveDownloadHook",
     "ClearingDecision",
     "ContentTooLargeSkipped",
     "ExtractionOutcome",
@@ -226,6 +227,36 @@ class Tier3ExtractHook(Protocol):
     def __call__(self, note: dict[str, object]) -> None: ...
 
 
+class ArchiveDownloadHook(Protocol):
+    """Callable protocol for archive download retry (PRD 04).
+
+    Called by the sweep when ``influx:archive-missing`` is present.
+    The implementation downloads the archive and returns the relative
+    POSIX path for the ``path:`` line in ``## Archive``.
+
+    Parameters
+    ----------
+    note:
+        The current note state (as returned by ``lithos_read``).
+
+    Returns
+    -------
+    str
+        The relative POSIX path to the downloaded archive.
+
+    Raises
+    ------
+    ExtractionError
+        On download failure — treated as "stage failed this pass"
+        by the sweep.
+    LithosError
+        On Lithos API failure — propagated to the sweep's error
+        handling.
+    """
+
+    def __call__(self, note: dict[str, object]) -> str: ...
+
+
 @dataclass(frozen=True, slots=True)
 class SweepHooks:
     """Optional hook callables for stage execution within the sweep.
@@ -235,6 +266,7 @@ class SweepHooks:
     implementations; tests inject fakes.
     """
 
+    archive_download: ArchiveDownloadHook | None = None
     re_extract_archive: ReExtractArchiveHook | None = None
     tier2_enrich: Tier2EnrichHook | None = None
     tier3_extract: Tier3ExtractHook | None = None
@@ -686,16 +718,49 @@ async def _process_sweep_note(
     # ── Execute selected stages ─────────────────────────────────
     current_tags = list(tags)
 
-    # Archive retry (PRD 04 hook — not yet wired).
-    # Placeholder: archive download hook would go here.
+    # Archive retry.
     archive_succeeded = False
+    if stages.archive_retry and hooks.archive_download:
+        try:
+            downloaded_path = hooks.archive_download(note)
+            archive_path = downloaded_path
+            archive_succeeded = True
+            # Update ## Archive in note content with the new path.
+            content = str(note.get("content", ""))
+            marker = "## Archive\n"
+            idx = content.find(marker)
+            if idx >= 0:
+                insert_pos = idx + len(marker)
+                rest = content[insert_pos:]
+                if not rest.startswith("path:"):
+                    note["content"] = (
+                        content[:insert_pos]
+                        + f"path: {downloaded_path}\n"
+                        + content[insert_pos:]
+                    )
+        except ExtractionError:
+            logger.info(
+                "sweep: archive download failed for %s",
+                note.get("id"),
+            )
 
     # Text extraction retry (PRD 07 hook — not yet wired).
     # Placeholder: text extraction hook would go here.
 
     # Abstract-only re-extraction.
+    # Re-evaluate eligibility if archive just succeeded this pass
+    # (initial selection used archive_succeeded_this_pass=False).
+    run_abstract_reextraction = stages.abstract_only_reextraction
     if (
-        stages.abstract_only_reextraction
+        not run_abstract_reextraction
+        and archive_succeeded
+        and "text:abstract-only" in set(tags)
+        and "influx:text-terminal" not in set(tags)
+    ):
+        run_abstract_reextraction = True
+
+    if (
+        run_abstract_reextraction
         and hooks.re_extract_archive
         and archive_path is not None
     ):
@@ -721,11 +786,7 @@ async def _process_sweep_note(
             logger.info("sweep: tier3 extraction failed for %s", note.get("id"))
 
     # ── Compute and apply clearing ──────────────────────────────
-    # Re-parse archive_path from post-stage state if archive
-    # succeeded this pass (currently always False until wired).
     post_archive_path = archive_path
-    if archive_succeeded:
-        post_archive_path = archive_path  # would be updated
 
     clearing = compute_clearing(
         tags=current_tags,

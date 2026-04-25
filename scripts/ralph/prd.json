@@ -231,7 +231,7 @@
         "Test passes via `pytest`"
       ],
       "priority": 16,
-      "passes": false,
+      "passes": true,
       "notes": "Explicit `text:*`-present coverage for the FR-ST-4 / AC-06-A archive-vs-text-extraction stage-selection scenario lives in the stage-selection unit-test story (US-006); this integration test may include such a variant but is not required to."
     },
     {
