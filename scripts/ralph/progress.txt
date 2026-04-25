@@ -330,3 +330,33 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - Multi-run chronic tests: chronic note is re-queued as sole candidate in run 2 since its updated_at didn't advance
   - All tests pass: 791 passed, pyright 0 errors, ruff clean
 ---
+
+## 2026-04-25 - US-021
+- Verified sweep tag-merge honours `influx:rejected:<profile>` rejection authority (AC-M3-6)
+- `_process_sweep_note()` already calls `merge_tags(existing_tags=tags, new_tags=current_tags)` before rewrite — applies rejection guard (FR-NOTE-6)
+- `_rewrite_sweep_note()` version_conflict re-merge already uses `merge_tags()` for FR-MCP-7 path
+- `merge_tags()` in `src/influx/notes.py` implements rejection guard: collects `influx:rejected:<profile>` tags, strips matching `profile:<profile>` from union merge
+- `build_profile_relevance_for_rewrite()` blocks new entries for rejected profiles, preserves old entries
+- Created `tests/unit/test_repair_rejection_authority.py` with 10 tests across 3 test classes:
+  - `TestSweepHonoursRejection`: rejected tag preserved, profile not re-added, full scenario, profile relevance not refreshed/created for rejected
+  - `TestNoRejectionNormalBehaviour`: profile re-added without rejection, profile relevance refreshed, existing profile preserved
+  - `TestRejectionEdgeCases`: multiple rejections all honoured, rejection guard applied on version_conflict re-merge
+- Files changed: `src/influx/repair.py` (merge_tags import + rejection guard calls), `tests/unit/test_repair_rejection_authority.py` (created)
+- **Learnings for future iterations:**
+  - `merge_tags()` handles rejection guard for both normal rewrite and version_conflict re-merge paths
+  - `build_profile_relevance_for_rewrite()` resolves profile relevance entries respecting rejection — new entries for rejected profiles are blocked, old entries preserved
+  - All tests pass: 801 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-022
+- Verified all quality gates pass: ruff check (clean), ruff format (clean), pyright (0 errors), pytest (801 passed)
+- Coverage on `src/influx/repair.py` is 93% (well above 80% minimum)
+- Hook signatures `re_extract_archive`, `tier2_enrich`, `tier3_extract` are documented with Protocol docstrings and stable
+- Backfill exclusion verified by `tests/integration/test_backfill_exclusion.py` (US-014)
+- Coordinator slot verified by `tests/integration/test_coordinator_slot.py` (US-015)
+- All unit and integration tests from US-006, US-008, US-010, US-016–US-021 pass
+- No files changed (quality gate verification only)
+- **Learnings for future iterations:**
+  - pytest-cov is not in the project's dev dependencies; use `uv add --dev pytest-cov` temporarily to check coverage, then revert
+  - 93% coverage on repair.py — uncovered lines are mostly error paths in version_conflict retry and Tier 2/3 hook execution
+---

@@ -306,7 +306,7 @@
         "Negative test: the same merge step on a note WITHOUT `influx:rejected:<profile_B>` is NOT affected by this rule — `profile:<profile_B>` may be (re-)added when the source matches and the corresponding `## Profile Relevance` entry may be (re-)created/refreshed normally"
       ],
       "priority": 21,
-      "passes": false,
+      "passes": true,
       "notes": "Scope clarification: the source-side filter logic itself lives in PRD 09; this PRD's responsibility is only the sweep's merge-time honour of FR-NOTE-6. The acceptance criteria above codify that scope."
     },
     {
@@ -323,7 +323,7 @@
         "Coordinator slot is held exactly once per profile run, including the sweep portion (US-015)"
       ],
       "priority": 22,
-      "passes": false,
+      "passes": true,
       "notes": ""
     }
   ]
