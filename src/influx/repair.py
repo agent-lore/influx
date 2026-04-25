@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from influx.errors import ExtractionError, LithosError
+from influx.notes import merge_tags
 
 if TYPE_CHECKING:
     from influx.config import AppConfig
@@ -616,18 +617,13 @@ async def _rewrite_sweep_note(
         ) from exc
 
     refreshed_tags: list[str] = refreshed.get("tags", [])
-    # Re-merge: union the existing tags with the sweep's intended tags
-    # while preserving the sweep's Influx-owned tag changes.
-    merged_tag_set: dict[str, None] = {}
-    for t in tags:
-        merged_tag_set[t] = None
-    for t in refreshed_tags:
-        if t not in merged_tag_set:
-            merged_tag_set[t] = None
+    # Re-merge via merge_tags to apply the rejection guard (FR-NOTE-6,
+    # AC-M3-6) and preserve the sweep's Influx-owned tag changes.
+    merged = merge_tags(existing_tags=refreshed_tags, new_tags=list(tags))
 
     retry_args = {
         **args,
-        "tags": list(merged_tag_set),
+        "tags": merged,
         "content": refreshed.get("content", args["content"]),
     }
     refresh_version = refreshed.get("version")
@@ -800,6 +796,11 @@ async def _process_sweep_note(
         current_tags = [t for t in current_tags if t != "influx:archive-missing"]
     if clearing.clear_repair_needed:
         current_tags = [t for t in current_tags if t != "influx:repair-needed"]
+
+    # Apply rejection guard (FR-NOTE-6, AC-M3-6): ensure the final
+    # tag set preserves influx:rejected:<profile> tags and does NOT
+    # re-add profile:<name> for rejected profiles.
+    current_tags = merge_tags(existing_tags=tags, new_tags=current_tags)
 
     # ── Rewrite (§5.4 retry-order advancement) ──────────────────
     await _rewrite_sweep_note(client, note, current_tags)
