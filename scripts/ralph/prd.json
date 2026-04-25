@@ -216,7 +216,7 @@
         "Test verifies that across two profiles A and B, sweep+fetch for A runs serialised within A's slot while B's run can proceed independently within B's slot"
       ],
       "priority": 15,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
