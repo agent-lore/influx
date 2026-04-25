@@ -647,6 +647,68 @@ class TestExampleTomlRoundTrip:
         assert cfg.repair.max_items_per_run == 100
 
 
+# ── Repair config knob (US-002, PRD 06 §5.1 FR-REP-1) ───────────────
+
+
+class TestRepairConfigKnob:
+    """repair.max_items_per_run is independently configurable."""
+
+    def test_custom_max_items_per_run_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Setting repair.max_items_per_run = 50 validates and is accessible."""
+        toml = dedent("""\
+            [repair]
+            max_items_per_run = 50
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        assert cfg.repair.max_items_per_run == 50
+
+    def test_repair_and_feedback_independently_configurable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """repair and feedback knobs are independent."""
+        toml = dedent("""\
+            [repair]
+            max_items_per_run = 50
+
+            [feedback]
+            negative_examples_per_profile = 30
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        assert cfg.repair.max_items_per_run == 50
+        assert cfg.feedback.negative_examples_per_profile == 30
+        repair_val = cfg.repair.max_items_per_run
+        feedback_val = cfg.feedback.negative_examples_per_profile
+        assert repair_val != feedback_val
+
+
 class TestConftestFixture:
     """The conftest influx_config_env fixture yields a loadable config."""
 
