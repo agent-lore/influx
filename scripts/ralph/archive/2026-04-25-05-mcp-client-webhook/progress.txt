@@ -1,0 +1,380 @@
+# Ralph Progress Log
+Started: Sat Apr 25 06:30:16 UTC 2026
+
+## Codebase Patterns
+- Dev tools (ruff, pyright, pytest) are installed via `pip install` to `~/.local/bin`; PATH must include `$HOME/.local/bin`
+- Dependency style in pyproject.toml: `"pkg>=X.Y,<Z"` with next-major ceiling
+- `LithosError` and `LCMAError` already exist in `src/influx/errors.py` — reuse, don't recreate
+- `LithosClient` is class-based in `src/influx/lithos_client.py` with lazy SSE connection via `_ensure_connected()`
+- MCP client uses: `from mcp.client.sse import sse_client` + `from mcp.client.session import ClientSession`
+- MCP server for tests uses: `from mcp.server.fastmcp import FastMCP` + `app.sse_app()` for Starlette app
+- Fake Lithos SSE server fixture pattern: `FakeLithosServer` class in `tests/contract/test_lithos_client.py` with uvicorn on random port
+- `.venv` python symlink is broken (points to missing pyenv); system python3 at `/usr/local/bin/python3` works; need `pip install --target .venv/lib/python3.12/site-packages` for new pyright-visible packages
+- `LithosConfig` added to `config.py` with `url` and `transport` fields, env overrides `LITHOS_URL` and `LITHOS_MCP_TRANSPORT`
+- 538 tests passing after US-005
+- `LithosClient.cache_lookup()` is the chokepoint for dedup lookups; requires both `query` and `source_url` keyword args
+- `src/influx/dedup.py` has `first_sentence()` and `compose_dedup_query()` for cache_lookup query composition
+- First-sentence regex `(?<=[a-z]{2})[.!?](?:\s|$)` skips abbreviations like "Mr." and "e.g." by requiring 2 lowercase letters before the terminator
+- `LithosClient._ensure_connected()` auto-calls `lithos_agent_register` on every new connection (including reconnects)
+- `LithosClient.reconnect()` method exists for SSE drop + re-register
+- Agent register payload: `{"id": "influx", "name": "Influx Pipeline", "type": "ingestion-pipeline"}`
+- `LithosClient.list_notes()` wraps `lithos_list` MCP tool; takes `tags: list[str]` and optional `limit: int`
+- `LithosClient.write_note()` wraps `lithos_write` MCP tool; FR-MCP-6 fields: title, content, agent, path, source_url, tags, confidence, note_type, namespace, optional expires_at
+- FakeLithosServer has `lithos_write` tool registered; returns `{"status": "created"}` by default
+- FakeLithosServer has `write_responses: list[str]` queue for configurable write responses (FIFO, pops from front; falls back to default when empty)
+- `write_note()` returns `WriteResult(status, source_url, detail)` dataclass instead of raw `CallToolResult`; callers check `result.status` to determine outcome
+- `_parse_write_response()` private method handles envelope parsing for all write statuses (duplicate, invalid_input, slug_collision, version_conflict, content_too_large)
+- `_extract_slug_suffix(source_url)` module-level helper: arXiv → ` [arXiv <id>]`, web → ` [<host>]`
+- `_merge_tags(existing, new)` module-level helper: new tags first, then existing not already present
+- `_preserve_user_notes(existing_content, new_content)` module-level helper: preserves `## User Notes` section from existing note
+- `LithosClient.read_note(note_id=...)` wraps `lithos_read` MCP tool for version_conflict re-reads
+- FakeLithosServer has `read_responses: list[str]` queue (FIFO) for `lithos_read` tool; also has `lithos_read` tool registered
+- FakeLithosServer `lithos_write` tool accepts optional `id` and `expected_version` params (for retry writes)
+- `write_note()` handles slug_collision via `_retry_slug_collision()` and version_conflict via `_retry_version_conflict()`; each retries exactly once
+- version_conflict response includes `note_id` in body: `{"status": "version_conflict", "note_id": "..."}`
+- 558 tests passing after US-009
+- `_drop_tier2(content)` strips `## Full Text` section; `_drop_tier2_and_tier3(content)` strips Tier 2 + Tier 3 (Claims, Datasets, Builds On, Open Questions)
+- `_retry_content_too_large()` handles §9.7: first retry drops Tier 2, second failure branches create vs repair path
+- `_check_existing_note(source_url)` uses `lithos_cache_lookup` to check for existing Influx-authored note
+- `content_too_large_skipped` WriteResult status with `detail` of `create_path` or `repair_path_tier1_failed`
+- FakeLithosServer has `cache_lookup_responses: list[str]` queue (FIFO) for configurable cache_lookup responses
+- 561 tests passing after US-010
+- LCMA stubs (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`) are module-level functions in `lithos_client.py` that raise `LCMAError("not implemented")` — PRD 08 seam
+- `_probe_lithos(lithos_url)` in `probes.py` uses `httpx.Client.stream("GET", url)` for side-effect-free SSE connection check; does NOT call `lithos_agent_register`
+- `fake_lithos_sse_url` session-scoped fixture in `tests/conftest.py` starts a minimal HTTP server responding 200; used by probe and integration tests
+- To test degraded Lithos state: use `socket.socket().bind(("127.0.0.1", 0))` to get a free port, then use it as unreachable URL (port unbound after socket close)
+- `_make_config()` in test files accepts `lithos_url` param to configure `LithosConfig(url=...)` for probe tests
+- `src/influx/feedback.py` has `fetch_rejection_titles()`, `format_negative_examples()`, and `build_negative_examples_block()` — the seam for filter-prompt `{negative_examples}` injection
+- FakeLithosServer has `list_responses: list[str]` queue (FIFO) for configurable `lithos_list` responses
+- §6.3 negative-example format: `- "{title}" (rejected)` — one line per title, truncated at `filter.negative_example_max_title_chars` (default 200)
+- 584 tests passing after US-014
+- `build_digest()` in `notifications.py` is the pure digest builder; takes `ProfileRunResult` + `notify_immediate_threshold` kwarg, returns JSON-serialisable dict
+- `HighlightItem`, `IngestedItem`, `RunStats`, `ProfileRunResult` are frozen dataclasses in `notifications.py` — all have `.to_dict()` or dict conversion
+- §11.1 full digest: `type`, `run_date`, `profile`, `stats` (with `high_relevance`), `highlights`, `all_ingested`
+- §11.2 quiet digest: `type`, `run_date`, `profile`, `stats` (no `high_relevance`), `message` — NO `highlights`/`all_ingested` keys
+- 594 tests passing after US-015
+- `guarded_post_json(url, payload, *, allow_private_ips, timeout_seconds)` in `http_client.py` does POST with SSRF+scheme guards; returns HTTP status code
+- `send_digest(digest, *, webhook_url, timeout_seconds, allow_private_ips)` in `notifications.py` — silently skips on empty URL, catches/logs all errors
+- `post_run_webhook_hook(result, config, *, kind)` in `service.py` — no-op for `RunKind.BACKFILL`, reads threshold from profile config, delegates to `send_digest`
+- Fake HTTP receiver pattern for tests: `HTTPServer(("127.0.0.1", 0), Handler)` with class-level `received` list and `request_count`; fixture yields URL, shuts down server on teardown
+- 605 tests passing after US-016
+- `_cmd_validate_config()` in `main.py` does Lithos SSE dry-connect after config validation; skipped when `lithos.url` is empty
+- 607 tests passing after US-017
+- `_validate_json_mode_slots(config)` in `main.py` sends minimal chat-completions dry-call with `response_format={"type":"json_object"}` to verify JSON-mode support per slot
+- Tests using `influx_config_env` fixture (which has `json_mode=true` slots) need `@respx.mock` + mock route on `https://api.test.example.com/v1/chat/completions`
+- 611 tests passing after US-018
+
+---
+
+## 2026-04-25 - US-001
+- Added `mcp>=1.8,<2` to project dependencies in pyproject.toml
+- Files changed: pyproject.toml
+- **Learnings for future iterations:**
+  - The `mcp` SDK (v1.27.0) installs `httpx-sse` as a transitive dep — SSE transport works out of the box
+  - `tail`, `head` not available in this container; pipe-less commands only
+  - 505 existing tests all pass; no test breakage from adding the dependency
+---
+
+## 2026-04-25 - US-002
+- Replaced stub `lithos_client.py` with real SSE-backed `LithosClient` class
+- Added `LithosConfig` to `config.py` with `url` and `transport` fields + env overrides
+- Created `tests/contract/test_lithos_client.py` with fake Lithos SSE server and lifecycle tests
+- Updated `tests/unit/test_lithos_client.py` to test construction validation only
+- Files changed: `src/influx/lithos_client.py`, `src/influx/config.py`, `tests/unit/test_lithos_client.py`, `tests/contract/__init__.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `FastMCP("name")` + `.sse_app()` is the cleanest way to create a fake MCP SSE server for tests
+  - `FakeLithosServer` uses uvicorn in a daemon thread + `_wait_for_ready()` socket polling
+  - The `.venv` python symlink is broken; mcp needed `pip install --target` to appear in .venv for pyright
+  - `LithosClient` uses `AsyncExitStack` to manage nested `sse_client` + `ClientSession` context managers
+  - Lazy connection via `_ensure_connected()` with double-checked locking
+  - 509 tests pass (4 new contract + 3 new unit + replaced 5 old stub tests)
+---
+
+## 2026-04-25 - US-003
+- Implemented auto `lithos_agent_register` on every new SSE connection (fired inside `_ensure_connected()`)
+- Added `reconnect()` method to `LithosClient` for SSE drop handling
+- Added `lithos_agent_register` tool to `FakeLithosServer`
+- Updated existing lifecycle tests to account for the extra `agent_register` call
+- Added 3 new contract tests: register on first call, no register before call, register again after reconnect
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - When adding auto-calls in `_ensure_connected()`, existing tests that count `len(calls)` need updating
+  - `_AGENT_REGISTER_ARGS` class-level dict keeps the payload DRY and testable
+  - `reconnect()` simply calls `close()` then `_ensure_connected()` — the auto-register fires as part of new connection
+  - 512 tests pass (3 new contract tests added)
+---
+
+## 2026-04-25 - US-004
+- Created `src/influx/dedup.py` with `first_sentence()` and `compose_dedup_query()` helpers
+- Created `tests/unit/test_dedup_query.py` with 21 tests covering all AC-05-B golden cases
+- Files changed: `src/influx/dedup.py`, `tests/unit/test_dedup_query.py`
+- **Learnings for future iterations:**
+  - First-sentence regex `(?<=[a-z]{2})[.!?](?:\s|$)` uses 2-lowercase-letter lookbehind to skip abbreviations (Mr., e.g., Dr.) while catching real sentence ends
+  - Ruff enforces SIM108 (ternary operator) — use `x if cond else y` instead of if/else blocks for simple assignments
+  - 533 tests pass (21 new unit tests added)
+---
+
+## 2026-04-25 - US-005
+- Added `cache_lookup` method to `LithosClient` with chokepoint enforcement (both `query` and `source_url` required)
+- Raises `LithosError("missing_lookup_arg")` before any RPC when either arg is None or empty
+- Added 5 contract tests: 4 negative (empty/None query/source_url) + 1 happy-path
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - MCP `CallToolResult.content` items are a union type; use `type: ignore[union-attr]` after runtime type-narrowing assertion for pyright
+  - Ruff line length is 88 chars; keep docstrings concise
+  - 538 tests pass (5 new contract tests added)
+---
+
+## 2026-04-25 - US-006
+- Added `list_notes` method to `LithosClient` wrapping `lithos_list` MCP tool
+- Added `lithos_list` tool to `FakeLithosServer` in contract tests
+- Added 3 contract tests: happy-path with tags, empty-result propagation, limit forwarding
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - Named the method `list_notes` to avoid clash with Python's `list` builtin
+  - The `lithos_list` tool returns `{"items": [...]}` envelope — callers parse the JSON from `CallToolResult.content[0].text`
+  - FakeLithosServer can use conditional logic (tag prefix matching) to return different fixtures
+  - 541 tests pass (3 new contract tests added)
+---
+
+## 2026-04-25 - US-007
+- Added `write_note` method to `LithosClient` wrapping `lithos_write` MCP tool with FR-MCP-6 fields
+- Added `lithos_write` tool to `FakeLithosServer` in contract tests
+- Added 3 contract tests: happy-path arXiv item with full field set, expires_at forwarded, expires_at omitted when None
+- PRD 04's recording-stub `write` / `WriteRecord` / `get_write_log` / `clear_write_log` were already removed in US-002
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - Named the method `write_note` to match `list_notes` naming convention
+  - `expires_at` is conditionally included in args dict (only when non-None) to keep the tool call clean
+  - FakeLithosServer `lithos_write` returns `{"status": "created"}` by default — future stories will add conditional responses for error envelopes
+  - 544 tests pass (3 new contract tests added)
+---
+
+## 2026-04-25 - US-008
+- Added `WriteResult` dataclass to `lithos_client.py` (status, source_url, detail)
+- Changed `write_note()` return type from `CallToolResult` to `WriteResult` with envelope handling
+- Added `_parse_write_response()` helper for `duplicate` and `invalid_input` envelope parsing
+- Added `write_responses` queue to `FakeLithosServer` for configurable per-test responses
+- Added 6 contract tests: 3 for duplicate (hit status, no retry, countable), 3 for invalid_input (skip status, logged, no abort)
+- Updated existing `test_happy_path_arxiv_item` to assert `WriteResult.status`
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `WriteResult` is frozen dataclass; future envelope handlers (slug_collision, version_conflict, content_too_large) extend `_parse_write_response()` and add new status values
+  - FakeLithosServer `write_responses` list is FIFO (pop(0)); supports multi-step scenarios (e.g., first call returns error, second returns created)
+  - `clear_fake_calls` fixture now also clears `write_responses` — tests that set overrides don't leak to other tests
+  - `caplog.at_level(logging.WARNING)` in async pytest tests works with `pytest.LogCaptureFixture` type annotation
+  - 550 tests pass (6 new contract tests added)
+---
+
+## 2026-04-25 - US-009
+- Implemented slug_collision retry: `_retry_slug_collision()` with title suffix disambiguation (arXiv → ` [arXiv <id>]`, web → ` [<host>]`)
+- Implemented version_conflict retry: `_retry_version_conflict()` with re-read + tag-merge + `## User Notes` preservation
+- Added `read_note()` method to `LithosClient` wrapping `lithos_read` MCP tool
+- Added 3 module-level pure helpers: `_extract_slug_suffix()`, `_merge_tags()`, `_preserve_user_notes()`
+- Extended `_parse_write_response()` to handle `slug_collision` and `version_conflict` statuses
+- Added `lithos_read` tool + `read_responses` queue to `FakeLithosServer`
+- Updated `lithos_write` fake tool to accept optional `id` and `expected_version` params
+- Added 8 contract tests: 4 for slug_collision (arXiv suffix, web suffix, second collision skip, log), 4 for version_conflict (merge + retry, user-notes preservation, second conflict skip, log)
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `_retry_slug_collision` and `_retry_version_conflict` are private async methods that handle the retry loop; `write_note()` dispatches to them based on `_parse_write_response()` status
+  - For version_conflict, the server response body must include `note_id` so the wrapper can re-read: `{"status": "version_conflict", "note_id": "..."}`
+  - Tag merge is order-preserving: new tags first, then existing tags not already present (simple set-union approach)
+  - `_preserve_user_notes()` finds `## User Notes` marker in existing content and replaces/appends it to new content
+  - `clear_fake_calls` fixture also clears `read_responses` to prevent test leakage
+  - 558 tests pass (8 new contract tests added)
+---
+
+## 2026-04-25 - US-010
+- Implemented `content_too_large` first retry: drops Tier 2 (`## Full Text`), keeps Tier 1 + Tier 3, retries write once
+- Implemented create-path skip: on second `content_too_large` with no existing note, skips item with `content_too_large_skipped` status
+- Added `_drop_tier2()` and `_drop_tier2_and_tier3()` pure helpers for content trimming
+- Added `_check_existing_note(source_url)` method using `lithos_cache_lookup` to detect existing notes
+- Added `_retry_content_too_large()` and `_retry_content_too_large_repair()` methods (repair path scaffolded for US-011)
+- Extended `_parse_write_response()` to handle `content_too_large` status
+- Added `cache_lookup_responses` queue to `FakeLithosServer` for configurable lookup responses
+- Updated `clear_fake_calls` fixture to also clear `cache_lookup_responses`
+- Added 3 contract tests: first-retry-succeeds (Tier 2 dropped), create-path skip + log, create-path no placeholder
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - Tier 2 section (`## Full Text`) spans from the heading to the next `##` heading; regex `^## ` with `re.MULTILINE` finds the boundary
+  - `_drop_tier2_and_tier3()` chains: first drops Tier 2, then iterates each Tier 3 marker (`## Claims`, `## Datasets & Benchmarks`, `## Builds On`, `## Open Questions`)
+  - `_check_existing_note()` reuses `lithos_cache_lookup` (same tool as dedup) — checks `body.get("hit")` to distinguish create vs repair path
+  - US-011 repair path scaffolding is already in place via `_retry_content_too_large_repair()` — just needs tests
+  - `content_too_large_skipped` WriteResult status with `detail` of `create_path` vs `repair_path_tier1_failed` lets callers increment the right counter
+  - FakeLithosServer `cache_lookup_responses` list is FIFO (same pattern as `write_responses` and `read_responses`)
+  - 561 tests pass (3 new contract tests added)
+---
+
+## 2026-04-25 - US-011
+- Added 2 contract tests for content_too_large repair path (AC-05-F repair path)
+- Test 1: repair-path success — second content_too_large with existing note → Tier-1-only retry succeeds, `influx:repair-needed` tag present, existing tags preserved via merge
+- Test 2: repair-path Tier-1-fails — third content_too_large → existing note untouched, counter incremented (`repair_path_tier1_failed`), no abort, warning logged
+- Implementation was already complete (scaffolded in US-010 via `_retry_content_too_large_repair()`)
+- Files changed: `tests/contract/test_lithos_client.py`, `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - The repair path requires 3 write_responses in the queue (original, Tier-2-dropped retry, Tier-1-only repair) plus 1 cache_lookup_response (hit=true for existing note detection)
+  - `_retry_content_too_large_repair()` uses original `args["content"]` (not the already-trimmed content from step 1) for `_drop_tier2_and_tier3()`, which is correct
+  - Together with US-010's tests, all FOUR AC-05-F sub-paths are now covered: first-retry-succeeds, create-path skip, repair-path success, repair-path Tier-1-fails
+  - 563 tests pass (2 new contract tests added)
+---
+
+## 2026-04-25 - US-012
+- Added 4 LCMA tool stubs to `lithos_client.py`: `lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete` — each raises `LCMAError("not implemented")`
+- Imported `LCMAError` from `influx.errors` (already existed)
+- Added 9 unit tests in `tests/unit/test_lithos_client.py`: 4 raise-check tests (one per stub), 4 type-distinction tests, 1 AST-based grep assertion that no production module under `src/influx/` invokes any LCMA stub
+- Files changed: `src/influx/lithos_client.py`, `tests/unit/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `LCMAError` is distinct from `LithosError` — both inherit from `InfluxError` but via separate branches
+  - LCMA stubs use `**kwargs: Any` with `# noqa: ARG001` to accept arbitrary args without ruff complaints
+  - AST-based grep test walks `ast.Call` nodes checking `ast.Name.id` and `ast.Attribute.attr` — covers both direct and attribute-style calls
+  - 572 tests pass (9 new unit tests added)
+---
+
+## 2026-04-25 - US-013
+- Replaced stub `_probe_lithos()` in `probes.py` with real SSE connection probe using `httpx.Client.stream("GET", lithos_url)`
+- Probe opens an SSE connection to configured Lithos endpoint, verifies HTTP 200, immediately closes; does NOT call `lithos_agent_register` (side-effect-free)
+- Returns `ProbeResult(status="degraded", detail=...)` with specific reasons: "not configured" (empty URL), "timeout", "unreachable", or "HTTP <code>"
+- Removed `INFLUX_TEST_LITHOS_DOWN` env-flag stub branch entirely
+- Added `fake_lithos_sse_url` session-scoped fixture to `tests/conftest.py` (minimal HTTP server responding 200)
+- Updated `_make_config()` in both `tests/unit/test_probes.py` and `tests/integration/test_http_api.py` to accept `lithos_url` parameter
+- Updated `app_with_state` fixture in `test_http_api.py` to use `fake_lithos_sse_url` for real probe path
+- Replaced `TestDegradedStateAC03C` (env-var driven) with `TestDegradedStateLithosUnreachable` (real probe against unreachable URL)
+- Files changed: `src/influx/probes.py`, `tests/conftest.py`, `tests/unit/test_probes.py`, `tests/integration/test_http_api.py`
+- **Learnings for future iterations:**
+  - `httpx.Client.stream("GET", url)` reads response headers then returns control; exiting the `with` block closes the stream — perfect for connection-only checks
+  - Ruff enforces SIM117 (single `with` for multiple contexts) — use `with (ctx1, ctx2):` syntax
+  - `http.server.HTTPServer(("127.0.0.1", 0), Handler)` binds to any available port; read `srv.server_address[1]` for the assigned port
+  - For unreachable URL tests: `socket.socket().bind(("127.0.0.1", 0))` finds a free port; after socket close, port is unbound → connection refused
+  - Session-scoped conftest fixture `fake_lithos_sse_url` is shared across both unit and integration test modules
+  - 572 tests pass (no new tests added — replaced 3 env-var tests with 3 real probe tests, 2 degraded-state tests with 2 unreachable-URL tests)
+---
+
+## 2026-04-25 - US-014
+- Created `src/influx/feedback.py` with 3 helpers: `fetch_rejection_titles()` (FR-FB-1/FR-FB-2), `format_negative_examples()` (§6.3), `build_negative_examples_block()` (documented seam)
+- `fetch_rejection_titles()` calls `lithos_list(tags=[f"influx:rejected:{profile}"], limit=...)` and uses titles directly when present; falls back to `lithos_read(id=...)` for items missing titles (FR-FB-2)
+- `format_negative_examples()` renders each title as `- "{title}" (rejected)` with max_title_chars truncation
+- `build_negative_examples_block()` combines fetch + format as the single seam the filter-prompt builder consumes
+- Added `list_responses: list[str]` FIFO queue to `FakeLithosServer` for configurable `lithos_list` responses
+- Updated `clear_fake_calls` fixture to also clear `list_responses`
+- Added 6 unit tests in `tests/unit/test_feedback.py`: format with 3 titles, empty list, truncation at max, exact max, single title, custom max
+- Added 6 contract tests in `tests/contract/test_lithos_client.py`: happy-path fetch, read fallback for missing titles, empty result, seam integration (AC-05-H), write never synthesizes rejected tag (FR-FB-3), tag-merge preserves existing rejected tag
+- Files changed: `src/influx/feedback.py` (new), `tests/unit/test_feedback.py` (new), `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `lithos_list` returns `CallToolResult` (not a custom wrapper like `write_note`); parse `result.content[0].text` as JSON to get `{"items": [...]}`
+  - FakeLithosServer's `lithos_list` tool already had default logic for `arxiv-id:` tags; `list_responses` queue overrides that (FIFO, same pattern as other queues)
+  - `format_negative_examples` is pure (no I/O); `fetch_rejection_titles` is async (needs LithosClient); `build_negative_examples_block` is the async convenience that combines both
+  - Tag integrity test verifies FR-FB-3 behaviorally: exercises write wrappers and asserts no `influx:rejected:*` tag is synthesized by Influx
+  - 584 tests pass (12 new tests added: 6 unit + 6 contract)
+---
+
+## 2026-04-25 - US-015
+- Created `src/influx/notifications.py` with pure `build_digest()` function producing §11.1 (full) and §11.2 (quiet) JSON shapes
+- Defined frozen dataclasses: `HighlightItem`, `IngestedItem`, `RunStats`, `ProfileRunResult`
+- `highlights` selected by `score >= notify_immediate_threshold` (from config, not hardcoded — AC-X-1, AC-05-I)
+- `related_in_lithos` always `[]` until PRD 08 (FR-NOT-6)
+- Zero-ingest runs produce quiet digest with `message` and no `highlights`/`all_ingested` keys (§11.2)
+- Created `tests/unit/test_webhook_digest.py` with 10 tests: 7 non-zero-ingest (shape, threshold selection, threshold-not-hardcoded, highlight entry shape, related_in_lithos empty, all_ingested, no highlights), 3 zero-ingest (quiet shape, sources-checked variant, no high_relevance key)
+- Files changed: `src/influx/notifications.py` (new), `tests/unit/test_webhook_digest.py` (new)
+- **Learnings for future iterations:**
+  - `build_digest()` is pure — no I/O, no async; takes `ProfileRunResult` + threshold kwarg, returns dict
+  - Two internal helpers: `_build_quiet_digest()` and `_build_full_digest()` — branched on `ingested == 0`
+  - US-016 will add the HTTP sender and service.py post-run hook to this same module
+  - `HighlightItem.to_dict()` and `IngestedItem.to_dict()` handle JSON serialisation
+  - 594 tests pass (10 new unit tests added)
+---
+
+## 2026-04-25 - US-016
+- Added `guarded_post_json()` to `http_client.py` — POST with SSRF+scheme guards, configurable timeout, no retry
+- Added `send_digest()` sender to `notifications.py` — POSTs digest JSON via guarded client, silently skips empty URL (FR-NOT-5), catches/logs all errors
+- Added `post_run_webhook_hook()` to `service.py` — callable seam: no-op for backfills (FR-NOT-4), reads `notify_immediate` threshold from profile config, delegates to `send_digest`
+- Created `tests/unit/test_webhook_sender.py` with 11 tests covering all ACs:
+  - AC-05-I: digest POST reaches fake receiver with FR-NOT-2 body keys + threshold-based highlights
+  - AC-05-J: empty webhook URL → zero requests
+  - FR-NOT-4: backfill kind → zero requests; manual/scheduled → request sent
+  - Timeout/no-retry: hanging receiver → exactly 1 request attempt, warning logged, no raise
+  - Hook integration: threshold from config, empty URL skip
+- Files changed: `src/influx/http_client.py`, `src/influx/notifications.py`, `src/influx/service.py`, `tests/unit/test_webhook_sender.py` (new)
+- **Learnings for future iterations:**
+  - `guarded_post_json` reuses `_validate_scheme` and `_ssrf_check` from `guarded_fetch` — keeps all HTTP guards in one module
+  - `send_digest` uses deferred import `from influx.http_client import guarded_post_json` to avoid circular imports
+  - For fake HTTP servers in tests: use `HTTPServer(("127.0.0.1", 0), Handler)` with class-level mutable state (`received`, `request_count`); fixture yields URL string
+  - Hanging handler tests: `time.sleep(30)` in handler + `timeout_seconds=1` in sender creates reliable timeout; test takes ~1s not 30s
+  - Pyright requires `Generator[str]` return type on pytest fixtures that use `yield`; plain `-> str` causes `reportReturnType` error
+  - 605 tests pass (11 new unit tests added)
+---
+
+## 2026-04-25 - US-017
+- Extended `_cmd_validate_config()` in `main.py` to dry-connect to Lithos via SSE + auto-`agent_register` (FR-CLI-5)
+- Uses `LithosClient._ensure_connected()` which lazily opens SSE and auto-calls `lithos_agent_register`
+- Skips dry-connect when `lithos.url` is empty (existing behavior preserved)
+- On failure, exits non-zero with error message naming the configured SSE endpoint URL (AC-05-K)
+- Added 2 tests in `tests/unit/test_cli_dispatch.py`:
+  - AC-05-K: unreachable Lithos → exit 2 with SSE endpoint in error message
+  - Successful dry-connect: fake FastMCP server receives `agent_register` payload, exit 0
+- Files changed: `src/influx/main.py`, `tests/unit/test_cli_dispatch.py`
+- **Learnings for future iterations:**
+  - `LithosClient._ensure_connected()` auto-calls `lithos_agent_register` on every new connection — no need to call it separately
+  - `asyncio.run()` in a synchronous function works cleanly for one-shot async operations in CLI commands
+  - For fake MCP servers in non-contract tests: inline `FastMCP` + `uvicorn.Server` in a daemon thread works; remember to wait for socket readiness
+  - Existing validate-config tests with `influx_config_env` fixture are unaffected because config has empty `lithos.url` → dry-connect skipped
+  - 607 tests pass (2 new unit tests added)
+---
+
+## 2026-04-25 - US-018
+- Added `_validate_json_mode_slots(config)` to `main.py` — checks JSON-mode compatibility for each `[models.*]` slot with `json_mode=true`
+- Sends a minimal chat-completions dry-call with `response_format={"type":"json_object"}` to `{provider.base_url}/chat/completions` (FR-CLI-5, §16.4)
+- On failure (provider rejects json_object, connection error), exits non-zero with descriptive error naming the slot
+- Validation runs after config printing, before Lithos SSE dry-connect (US-017)
+- Slots with `json_mode=false` are skipped entirely (no HTTP call)
+- Updated existing tests (`test_main.py`, `test_cli_dispatch.py`) that use `influx_config_env` fixture to mock provider endpoint with `@respx.mock`
+- Added 4 new tests in `tests/unit/test_cli_dispatch.py`:
+  - Positive: json_mode=true + capable provider → exit 0
+  - Negative: json_mode=true + incapable provider (returns 400) → exit 2
+  - Skip: json_mode=false → no dry-call issued
+  - AC-X-1: only json_mode=true slots trigger dry-calls; model name from config, not hardcoded
+- Files changed: `src/influx/main.py`, `tests/unit/test_cli_dispatch.py`, `tests/unit/test_main.py`
+- **Learnings for future iterations:**
+  - Tests using `influx_config_env` fixture need `@respx.mock` + mock on `https://api.test.example.com/v1/chat/completions` because all 3 model slots in the fixture have `json_mode=true`
+  - `respx.mock` intercepts httpx calls at transport level; perfect for mocking OpenAI-compatible API endpoints
+  - `_write_config_with_model_slot()` test helper creates a minimal config with one provider + model slot for isolated JSON-mode testing
+  - The dry-call uses `max_tokens=1` to minimize cost; most providers validate `response_format` before processing tokens
+  - 611 tests pass (4 new unit tests added)
+---
+
+## US-019 — Integration test for full arXiv → Lithos → webhook path against fakes
+- **Status:** PASS
+- **Acceptance criteria covered:**
+  - AC-M1-7: POST /runs → lithos_write calls recorded on FakeLithosServer + webhook digest received on FakeWebhookServer
+  - AC-M1-9: second run with cache hit → no lithos_write, digest shows 0 ingested
+  - AC-M1-10: lithos_write payloads contain all FR-MCP-6 fields (title, agent, source_url, namespace, note_type, tags, confidence, content)
+  - AC-M1-11: Lithos unreachable → run aborts, /status reports degraded, service stays alive
+  - AC-05-H: filter prompt contains rejection titles from lithos_list (negative examples end-to-end)
+  - AC-05-I: webhook auto-fires for manual run; skips backfill (FR-NOT-4); silent skip on empty URL (AC-05-J)
+- **Key implementation details:**
+  - `FakeWebhookServer` — simple http.server recording POST requests; reusable for future webhook tests
+  - `_make_fake_run_profile()` factory creates a fake `run_profile` that exercises real MCP tool calls (cache_lookup, write_note, lithos_list) against `FakeLithosServer`, then fires `post_run_webhook_hook`
+  - Monkeypatch target: `influx.http_api.run_profile` (NOT `influx.scheduler.run_profile`) because `http_api.py` imports `run_profile` at module level with `from influx.scheduler import run_profile`, creating a local reference
+  - `_wait_for_idle()` polls coordinator lock to synchronize with background tasks spawned by TestClient
+  - `allow_private_ips=True` in test config for SSRF guard with localhost URLs
+- Files changed: `tests/integration/test_arxiv_to_lithos.py` (new)
+- **Learnings for future iterations:**
+  - When monkeypatching, always patch at the import site (`influx.http_api.run_profile`), not the source module (`influx.scheduler.run_profile`)
+  - `FakeLithosServer` from `tests/contract/test_lithos_client.py` is reusable for integration tests — import directly
+  - `probe_loop.run_once()` is needed in test app setup to initialize probe state before status endpoint checks
+  - 622 tests pass (11 new integration tests added)
+---
+
+## 2026-04-25 - US-020
+- Confirmed PRD 04 stub-recorder artifacts (fixtures, code, test references) were already fully removed in earlier stories (US-002/US-007)
+- No `tests/fixtures/lithos/stub_recorder.json` exists; no `WriteRecord`/`get_write_log`/`clear_write_log` imports remain in tests
+- Added v1 surface-freeze footer to `tasks/prd-05-mcp-client-webhook.md` — explicit freeze note per master PRD §14 listing frozen contracts (HTTP responses, Lithos tool call shapes, note structure, config schema)
+- Checked the Definition of Done checkbox for freeze note in the PRD doc
+- Verified all quality checks pass: ruff (0 errors), pyright (0 errors), pytest (622 passed)
+- Verified coverage: `lithos_client.py` 98%, `notifications.py` 98% — both well above 80% threshold
+- Files changed: `tasks/prd-05-mcp-client-webhook.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - PRD 04 stub artifacts were cleaned up incrementally during US-002 and US-007 — by US-020 nothing remained to delete
+  - `pytest-cov` is not installed by default in this env; `pip install pytest-cov` needed for coverage reports
+  - All 20 user stories complete — PRD 05 is DONE
+---
