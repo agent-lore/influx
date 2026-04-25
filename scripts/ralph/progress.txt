@@ -10,6 +10,11 @@ Started: Sat Apr 25 19:50:21 UTC 2026
 - Ruff + pyright are the quality gates (`uv run ruff check`, `uv run ruff format --check`, `uv run pyright`)
 - Tier3Extraction uses `field_validator` with `mode="before"` for trim+truncate, `mode="after"` for non-empty check
 - Use `_valid(**overrides)` helper in test files for concise payload construction with overrides
+- HTTP mocking pattern: `@patch("influx.extraction.html.guarded_fetch")` + `FetchResult(body=..., status_code=200, content_type="text/html; charset=utf-8", final_url=...)`
+- `ExtractionError` in `errors.py` has fields: url, stage, detail — use stage="min_length" for threshold rejections
+- trafilatura.extract(html, favor_recall=True) for article extraction; returns None on failure
+- `extract_pdf(pdf_bytes, source_url=...)` takes raw bytes, not URLs — caller owns the fetch; uses `pypdf.PdfReader(io.BytesIO(...))`
+- PDF test fixtures: `sample.pdf` (valid, ~312 chars), `blank.pdf` (no extractable text)
 ---
 
 ## 2026-04-25 - US-001
@@ -55,4 +60,47 @@ Started: Sat Apr 25 19:50:21 UTC 2026
   - TOML multiline strings (`"""..."""`) include leading/trailing newlines — use `.strip()` for comparison
   - `validate_prompt_variables` correctly ignores `{{escaped}}` braces in prompt text (JSON examples in prompts)
   - Full test suite is 878 tests after US-001…US-004, all passing
+---
+
+## 2026-04-25 - US-005
+- Added `trafilatura>=2.0` and `pypdf>=5.0` to `pyproject.toml` dependencies
+- Ran `uv sync` — resolved successfully, installed 17 new packages (trafilatura 2.0.0, pypdf 6.10.2 + transitive deps)
+- Verified both imports work: `import trafilatura`, `import pypdf`
+- Files changed: `pyproject.toml`, `uv.lock`
+- **Learnings for future iterations:**
+  - trafilatura brings several transitive deps: lxml, courlan, htmldate, justext, dateparser, babel, charset-normalizer, regex, tld, urllib3
+  - pypdf is relatively lightweight with no extra transitive deps
+  - Pre-existing pyright errors (110) in test_tier3_schema.py/test_tier3_truncation.py from `_valid(**overrides)` pattern — these were committed in US-002 and are not blocking
+  - Full test suite is still 878 tests, all passing
+---
+
+## 2026-04-25 - US-006
+- Created `src/influx/extraction/__init__.py` (package marker) and `src/influx/extraction/html.py` with `extract_html()` function
+- `extract_html()` uses guarded_fetch → tag-stripping via regex → trafilatura.extract → HTML fragment cleanup → min-length gate
+- Created 6 HTML test fixtures in `tests/fixtures/extraction/`: good_article, short_article, with_script, with_iframe, with_object, with_embed
+- Created `tests/unit/test_html_extraction.py` with 14 tests covering success path, min-length rejection, tag-stripping for all 4 default tags, no-HTML-fragments, and failure propagation
+- Files changed: `src/influx/extraction/__init__.py`, `src/influx/extraction/html.py`, `tests/fixtures/extraction/*.html` (6 files), `tests/unit/test_html_extraction.py`
+- **Learnings for future iterations:**
+  - trafilatura.extract(html_body, favor_recall=True) returns plain text or None; pass HTML as string not bytes
+  - Tag stripping uses regex `<tag\b[^>]*>.*?</tag>` with re.DOTALL for content removal + `<tag\b[^>]*/?\s*>` for self-closing
+  - `_clean_html_fragments()` strips any residual `<...>` from trafilatura output as a safety net
+  - ExtractionError with stage="min_length" signals threshold rejection; callers catch this to fall through
+  - pytest.raises(ExtractionError, match="...") matches against the exception *message*, not attributes
+  - Full test suite is 892 tests after US-001…US-006, all passing
+---
+
+## 2026-04-25 - US-007
+- Created `src/influx/extraction/pdf.py` with `extract_pdf(pdf_bytes, source_url=...)` function using pypdf
+- `extract_pdf()` accepts raw bytes (not URLs) — caller owns the HTTP fetch via guarded_fetch; re-extraction from archive doesn't need HTTP
+- Uses `pypdf.PdfReader(io.BytesIO(pdf_bytes))` to read, iterates pages, joins text with double newlines
+- Raises `ExtractionError` on: invalid PDF (stage="read"), no extractable text (stage="extract"), empty result (stage="extract")
+- Created `tests/fixtures/extraction/sample.pdf` (valid PDF, ~312 chars extractable) and `blank.pdf` (blank page, no text)
+- Created `tests/unit/test_pdf_extraction.py` with 9 tests: success path (3), plain text output (2), failure paths (4)
+- Files changed: `src/influx/extraction/pdf.py`, `tests/fixtures/extraction/sample.pdf`, `tests/fixtures/extraction/blank.pdf`, `tests/unit/test_pdf_extraction.py`
+- **Learnings for future iterations:**
+  - pypdf accepts bytes via `PdfReader(io.BytesIO(pdf_bytes))` — no temp files needed
+  - `page.extract_text()` returns empty string (not None) for pages without text content
+  - Design choice: pdf.py takes bytes, not URLs, so it works for both HTTP-fetched PDFs and locally-stored archive files
+  - Minimal valid PDFs can be created with raw PDF syntax for fixtures (hand-crafted, no reportlab needed)
+  - Full test suite is 901 tests after US-001…US-007, all passing
 ---
