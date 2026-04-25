@@ -27,8 +27,10 @@ __all__ = [
     "ExtractionOutcome",
     "ReExtractionResult",
     "ReExtractArchiveHook",
+    "StageSelection",
     "Tier2EnrichHook",
     "Tier3ExtractHook",
+    "select_stages",
     "sweep",
 ]
 
@@ -185,6 +187,101 @@ class Tier3ExtractHook(Protocol):
     """
 
     def __call__(self, note: dict[str, object]) -> None: ...
+
+
+# ── Per-note stage selection (§5.2) ────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class StageSelection:
+    """Per-note stage selection result (PRD 06 §5.2).
+
+    Each boolean indicates whether the corresponding retry stage
+    should be exercised for this note in the current sweep pass.
+    """
+
+    archive_retry: bool = False
+    text_extraction_retry: bool = False
+    abstract_only_reextraction: bool = False
+    tier2_retry: bool = False
+    tier3_retry: bool = False
+
+
+def select_stages(
+    *,
+    tags: list[str],
+    archive_path: str | None,
+    archive_succeeded_this_pass: bool = False,
+    max_profile_score: int,
+    full_text_threshold: int,
+    deep_extract_threshold: int,
+) -> StageSelection:
+    """Select retry stages for a single note (PRD 06 §5.2).
+
+    Each stage is independently selected based on the note's
+    current tag set and profile score thresholds.
+
+    Parameters
+    ----------
+    tags:
+        Current tags on the note (from ``lithos_read``).
+    archive_path:
+        The archive path from the note's ``## Archive`` section,
+        or ``None`` if no ``path:`` line is stored.
+    archive_succeeded_this_pass:
+        Whether the archive download stage succeeded during this
+        sweep pass.  Used for abstract-only re-extraction
+        eligibility.
+    max_profile_score:
+        The maximum profile score across profile entries on this
+        note.
+    full_text_threshold:
+        ``thresholds.full_text`` from the profile config.
+    deep_extract_threshold:
+        ``thresholds.deep_extract`` from the profile config.
+    """
+    tag_set = set(tags)
+    is_text_terminal = "influx:text-terminal" in tag_set
+
+    # 1. Archive retry: influx:archive-missing present (AC-06-A).
+    archive_retry = "influx:archive-missing" in tag_set
+
+    # 2. Text-extraction retry: no text:* tag present.
+    has_text_tag = any(t.startswith("text:") for t in tag_set)
+    text_extraction_retry = not has_text_tag
+
+    # 3. Abstract-only re-extraction: text:abstract-only AND NOT
+    #    influx:text-terminal AND (archive succeeded this pass OR
+    #    archive path already stored).
+    abstract_only_reextraction = (
+        "text:abstract-only" in tag_set
+        and not is_text_terminal
+        and (archive_succeeded_this_pass or archive_path is not None)
+    )
+
+    # 4. Tier 2 retry: full-text missing AND score >= threshold AND
+    #    NOT terminal.
+    tier2_retry = (
+        "full-text" not in tag_set
+        and max_profile_score >= full_text_threshold
+        and not is_text_terminal
+    )
+
+    # 5. Tier 3 retry: influx:deep-extracted missing AND score >=
+    #    threshold AND NOT terminal.
+    tier3_retry = (
+        "influx:deep-extracted" not in tag_set
+        and max_profile_score >= deep_extract_threshold
+        and not is_text_terminal
+    )
+
+    return StageSelection(
+        archive_retry=archive_retry,
+        text_extraction_retry=text_extraction_retry,
+        abstract_only_reextraction=abstract_only_reextraction,
+        tier2_retry=tier2_retry,
+        tier3_retry=tier3_retry,
+    )
 
 
 # ── Sweep entry point ──────────────────────────────────────────────
