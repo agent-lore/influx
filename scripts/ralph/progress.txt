@@ -19,7 +19,12 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - `LithosClient.reconnect()` method exists for SSE drop + re-register
 - Agent register payload: `{"id": "influx", "name": "Influx Pipeline", "type": "ingestion-pipeline"}`
 - `LithosClient.list_notes()` wraps `lithos_list` MCP tool; takes `tags: list[str]` and optional `limit: int`
-- 541 tests passing after US-006
+- `LithosClient.write_note()` wraps `lithos_write` MCP tool; FR-MCP-6 fields: title, content, agent, path, source_url, tags, confidence, note_type, namespace, optional expires_at
+- FakeLithosServer has `lithos_write` tool registered; returns `{"status": "created"}` by default
+- FakeLithosServer has `write_responses: list[str]` queue for configurable write responses (FIFO, pops from front; falls back to default when empty)
+- `write_note()` returns `WriteResult(status, source_url, detail)` dataclass instead of raw `CallToolResult`; callers check `result.status` to determine outcome
+- `_parse_write_response()` private method handles envelope parsing; future stories extend it for slug_collision, version_conflict, content_too_large
+- 550 tests passing after US-008
 
 ---
 
@@ -92,4 +97,33 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - The `lithos_list` tool returns `{"items": [...]}` envelope — callers parse the JSON from `CallToolResult.content[0].text`
   - FakeLithosServer can use conditional logic (tag prefix matching) to return different fixtures
   - 541 tests pass (3 new contract tests added)
+---
+
+## 2026-04-25 - US-007
+- Added `write_note` method to `LithosClient` wrapping `lithos_write` MCP tool with FR-MCP-6 fields
+- Added `lithos_write` tool to `FakeLithosServer` in contract tests
+- Added 3 contract tests: happy-path arXiv item with full field set, expires_at forwarded, expires_at omitted when None
+- PRD 04's recording-stub `write` / `WriteRecord` / `get_write_log` / `clear_write_log` were already removed in US-002
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - Named the method `write_note` to match `list_notes` naming convention
+  - `expires_at` is conditionally included in args dict (only when non-None) to keep the tool call clean
+  - FakeLithosServer `lithos_write` returns `{"status": "created"}` by default — future stories will add conditional responses for error envelopes
+  - 544 tests pass (3 new contract tests added)
+---
+
+## 2026-04-25 - US-008
+- Added `WriteResult` dataclass to `lithos_client.py` (status, source_url, detail)
+- Changed `write_note()` return type from `CallToolResult` to `WriteResult` with envelope handling
+- Added `_parse_write_response()` helper for `duplicate` and `invalid_input` envelope parsing
+- Added `write_responses` queue to `FakeLithosServer` for configurable per-test responses
+- Added 6 contract tests: 3 for duplicate (hit status, no retry, countable), 3 for invalid_input (skip status, logged, no abort)
+- Updated existing `test_happy_path_arxiv_item` to assert `WriteResult.status`
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `WriteResult` is frozen dataclass; future envelope handlers (slug_collision, version_conflict, content_too_large) extend `_parse_write_response()` and add new status values
+  - FakeLithosServer `write_responses` list is FIFO (pop(0)); supports multi-step scenarios (e.g., first call returns error, second returns created)
+  - `clear_fake_calls` fixture now also clears `write_responses` — tests that set overrides don't leak to other tests
+  - `caplog.at_level(logging.WARNING)` in async pytest tests works with `pytest.LogCaptureFixture` type annotation
+  - 550 tests pass (6 new contract tests added)
 ---

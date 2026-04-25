@@ -12,6 +12,8 @@ attempted (FR-MCP-1).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import logging
 from contextlib import AsyncExitStack
 from typing import Any
@@ -22,7 +24,21 @@ from mcp.client.sse import sse_client
 
 from influx.errors import ConfigError, LithosError
 
-__all__ = ["LithosClient"]
+__all__ = ["LithosClient", "WriteResult"]
+
+
+@dataclasses.dataclass(frozen=True)
+class WriteResult:
+    """Result of a ``write_note`` call after envelope handling (FR-MCP-7).
+
+    *status*: ``"created"`` for a successful write, ``"duplicate"``
+    for an already-ingested item (caller increments ``dedup_skipped``),
+    ``"invalid_input"`` for a malformed payload (logged + skipped).
+    """
+
+    status: str
+    source_url: str
+    detail: str = ""
 
 logger = logging.getLogger(__name__)
 
@@ -154,12 +170,13 @@ class LithosClient:
         note_type: str = "summary",
         namespace: str = "influx",
         expires_at: str | None = None,
-    ) -> mcp_types.CallToolResult:
-        """Write a note to Lithos (FR-MCP-6).
+    ) -> WriteResult:
+        """Write a note to Lithos with envelope handling (FR-MCP-6/7).
 
-        Forwards the PRD-owned field set to the underlying MCP
-        ``lithos_write`` tool.  The *expires_at* field is only included
-        when it is non-``None`` (used on repair-needed writes).
+        Handles ``duplicate`` (treated as hit, no retry) and
+        ``invalid_input`` (logged + skipped, no exception) envelopes.
+        Returns a :class:`WriteResult` so callers can inspect the
+        outcome and increment counters (e.g. ``dedup_skipped``).
         """
         args: dict[str, Any] = {
             "title": title,
@@ -174,7 +191,39 @@ class LithosClient:
         }
         if expires_at is not None:
             args["expires_at"] = expires_at
-        return await self.call_tool("lithos_write", args)
+        result = await self.call_tool("lithos_write", args)
+        return self._parse_write_response(result, source_url=source_url)
+
+    def _parse_write_response(
+        self,
+        result: mcp_types.CallToolResult,
+        *,
+        source_url: str,
+    ) -> WriteResult:
+        """Parse a ``lithos_write`` response and handle envelopes."""
+        text = result.content[0].text  # type: ignore[union-attr]
+        body = json.loads(text)
+        status = body.get("status", "")
+
+        if status == "duplicate":
+            return WriteResult(
+                status="duplicate", source_url=source_url
+            )
+
+        if status == "invalid_input":
+            reason = body.get("reason", "unknown")
+            logger.warning(
+                "lithos_write invalid_input for %s: %s",
+                source_url,
+                reason,
+            )
+            return WriteResult(
+                status="invalid_input",
+                source_url=source_url,
+                detail=reason,
+            )
+
+        return WriteResult(status=status, source_url=source_url)
 
     async def list_notes(
         self,

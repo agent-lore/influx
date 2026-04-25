@@ -97,7 +97,7 @@
         "A happy-path contract test in tests/contract/test_lithos_client.py asserts the fake Lithos server receives a `lithos_write` call with the exact documented field set for a sample arXiv item (AC-M1-10 is re-asserted at the wrapper/contract level here; full integration-path re-assertion is deferred to whichever story runs against the real PRD 04 ingestion pipeline once it exists)"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -112,7 +112,7 @@
         "tests/contract/test_lithos_client.py covers `invalid_input`: the fake server returns `invalid_input`, the wrapper logs and skips, and a single failed-item record is observable (e.g. via a returned status enum or a logger probe)"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

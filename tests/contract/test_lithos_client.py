@@ -37,10 +37,15 @@ class FakeLithosServer:
         self._mcp = FastMCP("fake-lithos")
         self._uvicorn_server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
+        # Queue of override responses for lithos_write (FIFO).
+        # When non-empty, the next response is popped and returned
+        # instead of the default ``{"status": "created"}``.
+        self.write_responses: list[str] = []
         self._register_tools()
 
     def _register_tools(self) -> None:
         calls = self.calls
+        write_responses = self.write_responses
 
         @self._mcp.tool(name="lithos_ping")
         async def lithos_ping() -> str:
@@ -98,6 +103,8 @@ class FakeLithosServer:
                     },
                 )
             )
+            if write_responses:
+                return write_responses.pop(0)
             return '{"status": "created"}'
 
         @self._mcp.tool(name="lithos_list")
@@ -178,8 +185,9 @@ def fake_lithos_url(fake_lithos_server: FakeLithosServer) -> str:
 
 @pytest.fixture
 def clear_fake_calls(fake_lithos_server: FakeLithosServer) -> None:
-    """Clear recorded calls before each test."""
+    """Clear recorded calls and response overrides before each test."""
     fake_lithos_server.calls.clear()
+    fake_lithos_server.write_responses.clear()
 
 
 # ── Construction validation ─────────────────────────────────────────
@@ -604,15 +612,11 @@ class TestWriteNote:
             assert payload["namespace"] == "influx"
             assert payload["expires_at"] is None
 
-            # Response forwarded unchanged.
-            assert result is not None
-            assert len(result.content) > 0
-            text = result.content[0]
-            assert text.type == "text"
-            import json
-
-            body = json.loads(text.text)  # type: ignore[union-attr]
-            assert body["status"] == "created"
+            # WriteResult surfaces the status for caller counters.
+            assert result.status == "created"
+            assert result.source_url == (
+                "https://arxiv.org/abs/1706.03762"
+            )
         finally:
             await client.close()
 
@@ -674,5 +678,192 @@ class TestWriteNote:
             # expires_at is None in the recorded payload because
             # the wrapper did not include it in the tool call args.
             assert write_calls[0][1]["expires_at"] is None
+        finally:
+            await client.close()
+
+
+# ── Write envelopes — duplicate & invalid_input (FR-MCP-7) ────────
+
+
+class TestWriteEnvelopeDuplicate:
+    """``duplicate`` envelope is treated as hit (AC-05-C)."""
+
+    async def test_duplicate_treated_as_hit(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """duplicate: no error, status surfaces for dedup_skipped."""
+        fake_lithos_server.write_responses.append(
+            '{"status": "duplicate"}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Already exists",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.00001",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+            assert result.status == "duplicate"
+            assert result.source_url == (
+                "https://arxiv.org/abs/2601.00001"
+            )
+        finally:
+            await client.close()
+
+    async def test_duplicate_no_second_write(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """duplicate: exactly one lithos_write call, no retry."""
+        fake_lithos_server.write_responses.append(
+            '{"status": "duplicate"}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.write_note(
+                title="Dup item",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.00002",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+            write_calls = [
+                c
+                for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 1
+        finally:
+            await client.close()
+
+    async def test_duplicate_dedup_skipped_countable(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Caller can count dedup_skipped via result.status."""
+        fake_lithos_server.write_responses.append(
+            '{"status": "duplicate"}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Counted dup",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.00003",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+            # Caller increments dedup_skipped based on status.
+            dedup_skipped = 0
+            if result.status == "duplicate":
+                dedup_skipped += 1
+            assert dedup_skipped == 1
+        finally:
+            await client.close()
+
+
+class TestWriteEnvelopeInvalidInput:
+    """``invalid_input`` envelope: logged + skipped (FR-MCP-7)."""
+
+    async def test_invalid_input_returns_skip_status(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """invalid_input: no exception, status='invalid_input'."""
+        fake_lithos_server.write_responses.append(
+            '{"status": "invalid_input", "reason": "bad payload"}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Bad item",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.00004",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+            assert result.status == "invalid_input"
+            assert result.detail == "bad payload"
+            assert result.source_url == (
+                "https://arxiv.org/abs/2601.00004"
+            )
+        finally:
+            await client.close()
+
+    async def test_invalid_input_logged(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """invalid_input: source_url and reason are logged."""
+        import logging
+
+        fake_lithos_server.write_responses.append(
+            '{"status": "invalid_input", "reason": "missing field"}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with caplog.at_level(logging.WARNING):
+                await client.write_note(
+                    title="Bad item 2",
+                    content="# Summary\nContent.",
+                    path="papers/arxiv/2026/03",
+                    source_url="https://arxiv.org/abs/2601.00005",
+                    tags=["profile:ml-research"],
+                    confidence=0.8,
+                )
+            assert "2601.00005" in caplog.text
+            assert "missing field" in caplog.text
+        finally:
+            await client.close()
+
+    async def test_invalid_input_no_abort(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """invalid_input does not raise — run continues."""
+        fake_lithos_server.write_responses.append(
+            '{"status": "invalid_input", "reason": "bad"}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            # Should NOT raise an exception.
+            result = await client.write_note(
+                title="Skipped item",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.00006",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+            assert result.status == "invalid_input"
+            # Subsequent writes still work.
+            result2 = await client.write_note(
+                title="Good item",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.00007",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+            assert result2.status == "created"
         finally:
             await client.close()
