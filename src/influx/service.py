@@ -23,15 +23,17 @@ from typing import Any
 from fastapi import FastAPI
 
 from influx.config import AppConfig
-from influx.coordinator import Coordinator
+from influx.coordinator import Coordinator, RunKind
 from influx.errors import ConfigError
 from influx.http_api import router
+from influx.notifications import ProfileRunResult, build_digest, send_digest
 from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler
 
 __all__ = [
     "InfluxService",
     "create_app",
+    "post_run_webhook_hook",
     "resolve_bind_address",
     "validate_bind_host",
 ]
@@ -231,3 +233,36 @@ class InfluxService:
             yield
         finally:
             await self.stop()
+
+
+def post_run_webhook_hook(
+    result: ProfileRunResult,
+    config: AppConfig,
+    *,
+    kind: RunKind,
+) -> None:
+    """Post-run webhook hook — POSTs digest for non-backfill runs.
+
+    No-op when ``kind`` is ``RunKind.BACKFILL`` (FR-NOT-4).
+    Failures inside the sender are logged but do NOT propagate.
+    The end-to-end assertion that this hook fires automatically after
+    each completed run is covered by US-019.
+    """
+    if kind == RunKind.BACKFILL:
+        return
+
+    profile_cfg = next(
+        (p for p in config.profiles if p.name == result.profile),
+        None,
+    )
+    threshold = (
+        profile_cfg.thresholds.notify_immediate if profile_cfg else 8
+    )
+
+    digest = build_digest(result, notify_immediate_threshold=threshold)
+    send_digest(
+        digest,
+        webhook_url=config.notifications.webhook_url,
+        timeout_seconds=config.notifications.timeout_seconds,
+        allow_private_ips=config.security.allow_private_ips,
+    )

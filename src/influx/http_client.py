@@ -20,7 +20,7 @@ import httpx
 
 from influx.errors import NetworkError
 
-__all__ = ["ContentTypeFamily", "FetchResult", "guarded_fetch"]
+__all__ = ["ContentTypeFamily", "FetchResult", "guarded_fetch", "guarded_post_json"]
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
@@ -248,3 +248,47 @@ def guarded_fetch(
         content_type=content_type,
         final_url=final_url,
     )
+
+
+def guarded_post_json(
+    url: str,
+    payload: dict[str, object],
+    *,
+    allow_private_ips: bool = False,
+    timeout_seconds: int = 5,
+) -> int:
+    """POST *payload* as JSON to *url* with scheme and SSRF guards.
+
+    Returns the HTTP status code.  Raises
+    :class:`~influx.errors.NetworkError` on guard violations, timeouts,
+    or connection failures.  No retry logic — callers handle retries if
+    needed (FR-NOT-1).
+    """
+    _validate_scheme(url)
+    _ssrf_check(url, allow_private_ips=allow_private_ips)
+
+    timeout = httpx.Timeout(
+        connect=timeout_seconds,
+        read=timeout_seconds,
+        write=timeout_seconds,
+        pool=timeout_seconds,
+    )
+
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(url, json=payload)
+            return response.status_code
+    except httpx.TimeoutException as exc:
+        raise NetworkError(
+            f"Request timed out: {exc}",
+            url=url,
+            kind="timeout",
+            reason=str(exc),
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise NetworkError(
+            f"HTTP error: {exc}",
+            url=url,
+            kind="network",
+            reason=str(exc),
+        ) from exc

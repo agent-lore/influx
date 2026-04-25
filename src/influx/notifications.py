@@ -1,4 +1,4 @@
-"""Webhook notification digest builder (§11, FR-NOT-2..6).
+"""Webhook notification digest builder and sender (§11, FR-NOT-1..6).
 
 Builds the JSON digest body for Agent Zero webhook POSTs.  Two shapes:
 
@@ -8,14 +8,17 @@ Builds the JSON digest body for Agent Zero webhook POSTs.  Two shapes:
   and no ``highlights``/``all_ingested``.
 
 The digest builder is pure — it accepts a run result and config and
-returns a JSON-serialisable ``dict``.  The HTTP sender lives in the
-same module but is wired separately (US-016).
+returns a JSON-serialisable ``dict``.  The HTTP sender POSTs the digest
+via the guarded HTTP client from PRD 02 (SSRF guard applies).
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -154,3 +157,47 @@ def _build_full_digest(
         "highlights": [h.to_dict() for h in highlights],
         "all_ingested": [i.to_dict() for i in all_ingested],
     }
+
+
+def send_digest(
+    digest: dict[str, Any],
+    *,
+    webhook_url: str,
+    timeout_seconds: int = 5,
+    allow_private_ips: bool = False,
+) -> None:
+    """POST *digest* JSON to *webhook_url* via the guarded HTTP client.
+
+    - When *webhook_url* is empty, silently returns (FR-NOT-5, AC-05-J).
+    - Uses the SSRF guard from PRD 02 (FR-NOT-1).
+    - Timeout is read from ``notifications.timeout_seconds`` in config
+      (default 5s per existing schema); no retry on failure (FR-NOT-1).
+    - Failures (timeout, 5xx, network errors) are logged but do NOT
+      raise — the caller is not interrupted.
+    """
+    if not webhook_url:
+        return
+
+    from influx.http_client import guarded_post_json
+
+    try:
+        status = guarded_post_json(
+            webhook_url,
+            digest,
+            allow_private_ips=allow_private_ips,
+            timeout_seconds=timeout_seconds,
+        )
+        if status >= 400:
+            logger.warning(
+                "Webhook POST to %s returned HTTP %d",
+                webhook_url,
+                status,
+            )
+        else:
+            logger.info("Webhook digest sent to %s (HTTP %d)", webhook_url, status)
+    except Exception:
+        logger.warning(
+            "Webhook POST to %s failed",
+            webhook_url,
+            exc_info=True,
+        )
