@@ -1,19 +1,14 @@
 {
-  "project": "Influx v1 — arXiv Fetcher + Filter Pipeline + Canonical Note Render + Archive",
-  "branchName": "ralph/04-arxiv-filter-notes",
-  "description": "Deliver the arXiv side of the Influx v1 pipeline end-to-end: Atom-feed fetcher against `export.arxiv.org` with client-side date filtering and per-category min-interval pacing; LLM relevance scoring in JSON mode with Pydantic validation and per-profile threshold tagging (relevance / full_text / deep_extract / notify_immediate); canonical Lithos note render+parse with exact-byte `## User Notes` preservation, the `## Archive` section contract, Influx-owned tag replacement, `profile:*` union merging, and preservation of external tags; PDF archive download via the guarded HTTP client from PRD 02 with path-safety verification and the failure path that emits `influx:repair-needed` + `influx:archive-missing` tags; and a real `run_profile` wire-up that calls arXiv → filter → (per accepted item) archive + render note → stubbed `lithos_client.write`. Real MCP calls, the repair sweep, HTML/PDF/article extraction, Tier 2/3 enrichment, webhook notifier, and RSS fetcher are out of scope and remain stubs or seams — `lithos_client.write`, `lithos_client.cache_lookup`, and `enrich.tier1_enrich` are documented stubs replaced by PRDs 05 and 07.",
+  "project": "Influx v1 — Real Lithos MCP Client + Write Error Envelopes + Webhook + Feedback",
+  "branchName": "ralph/05-mcp-client-webhook",
+  "description": "Replace PRD 04's `lithos_client.py` stub with the real SSE-transport MCP client built on the official `mcp` Python SDK. Wire all `lithos_*` tool calls Influx uses today: `agent_register` on startup, `cache_lookup` with both `query` and `source_url` enforced at a single chokepoint (R-7 mitigation), `write` with full error-envelope handling — `duplicate`, `invalid_input`, `slug_collision` (retry once with disambiguating suffix), `version_conflict` (re-read + tag-merge + user-notes preservation, retry once), and `content_too_large` with the §9.7 create-vs-repair branching including the Tier-1-only repair-path retry plus `influx:repair-needed` tag — and `list` for feedback. Implement the first-sentence helper that composes `query` source-agnostically. Replace PRD 03's stub Lithos probe with a real ping-style probe in `probes.py`. Extend PRD 01's `validate-config` to dry-connect over SSE and assert JSON-mode compatibility for each `[models.*]` slot. Implement the feedback ingestion path (FR-FB-1..3) that pulls `influx:rejected:<profile>` titles via `lithos_list` and pipes them into `negative_examples`. Implement the webhook notifier (`notifications.py`): JSON digest builder + sender via the guarded HTTP client from PRD 02, 5s timeout, no retry, silent skip when `AGENT_ZERO_WEBHOOK_URL` is empty, no-op for `kind == \"backfill\"`. Add LCMA tool stubs (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`) that raise `LCMAError(\"not implemented\")` until PRD 08. Repair sweep, LCMA tools, and rejection-rate logging cadence are explicitly out of scope. When this PRD lands, the v1 public surface (HTTP responses, Lithos tool call shapes, note structure, config schema) is FROZEN per master PRD §14.",
   "userStories": [
     {
       "id": "US-001",
-      "title": "Create urls.py with canonical URL normalisation helper",
-      "description": "As a developer, I want a pure URL normalisation helper (in `src/influx/urls.py` or `src/influx/notes.py`, per PRD 04 §5.5) that is reused by both the note renderer and the forthcoming MCP layer (PRD 05), so that arXiv and other sources agree on a single canonical `source_url` shape (FR-MCP-4, FR-MCP-5).",
+      "title": "Add `mcp` SDK dependency to pyproject.toml",
+      "description": "As a developer, I want the official `mcp` Python SDK declared as a project dependency so that the real SSE-transport client can be built on top of it (FR-MCP-1, §7 of PRD 05).",
       "acceptanceCriteria": [
-        "A pure URL normalisation function (exact name, signature, and module location — `src/influx/urls.py` or `src/influx/notes.py` — left to the implementation per FR-MCP-4) lowercases scheme and host, drops default ports (80 for http, 443 for https), strips `utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, and `ref` query parameters, removes a trailing slash on the path, and preserves the fragment verbatim (FR-MCP-4)",
-        "An arXiv-specific helper (or documented convention) constructs the canonical arXiv URL `https://arxiv.org/abs/{id}` from a raw arXiv ID (FR-MCP-5)",
-        "tests/unit/test_url_normalisation.py covers AC-04-H: `https://arXiv.org:443/abs/2601.12345?utm_source=twitter` normalises to `https://arxiv.org/abs/2601.12345`, and a URL with a `#foo` fragment preserves the fragment",
-        "tests/unit/test_url_normalisation.py also covers: mixed-case host lowercased, default port 80 on http stripped, non-default ports (e.g. 8443) preserved, multiple tracking params stripped while unrelated params preserved, trailing slash on path removed, and fragment preserved when query is stripped",
-        "The normaliser leaves unrelated query parameters untouched (only the documented tracking-param allowlist is stripped)",
-        "Typecheck passes"
+        "`mcp` is added to project dependencies in `pyproject.toml` (or equivalent dependency manifest used by the repo) per §7 of PRD 05"
       ],
       "priority": 1,
       "passes": true,
@@ -21,182 +16,162 @@
     },
     {
       "id": "US-002",
-      "title": "Create schemas.py with FilterResponse and FilterResult Pydantic models",
-      "description": "As a developer, I want `src/influx/schemas.py` to define the Pydantic models used by the filter pipeline so that LLM JSON-mode responses are strictly validated with bounded score/tag lengths (FR-FLT-3).",
+      "title": "Replace lithos_client.py stub with real SSE connection scaffolding",
+      "description": "As a developer, I want `src/influx/lithos_client.py` to expose a real SSE-backed client wrapper that lazily establishes a connection on first use and reuses it for the run, so that subsequent stories can hang individual tool-call methods off this transport (FR-MCP-1, FR-MCP-2).",
       "acceptanceCriteria": [
-        "src/influx/schemas.py defines `FilterResult` with fields `id: str`, `score: int` constrained to `1..10` inclusive, `tags: list[str]` constrained to length `0..5` inclusive, and `reason: str` (FR-FLT-3)",
-        "src/influx/schemas.py defines `FilterResponse` with field `results: list[FilterResult]` (FR-FLT-3)",
-        "Validation errors are raised (Pydantic ValidationError) when score is out of `[1,10]`, tags list exceeds length 5, or required fields are missing — a unit test in tests/unit/test_filter.py (or a dedicated tests/unit/test_schemas.py) asserts each negative case",
-        "A positive unit test confirms a well-formed JSON payload parses into `FilterResponse` with correct field types",
-        "Typecheck passes"
+        "`src/influx/lithos_client.py` provides a wrapper around the official `mcp` SDK SSE transport; `LITHOS_MCP_TRANSPORT=sse` is the only supported value in v1 — any other value raises a configuration error before any connection is attempted (FR-MCP-1). The wrapper's API shape (module-level functions, class/object, or context manager) is left to the implementation",
+        "The SSE connection is established lazily on first tool-call use (not eagerly at import or wrapper construction) and is reused for the duration of the run (FR-MCP-2)",
+        "PRD 04's recording-stub behaviour is removed from this module; the previous in-process call recorder no longer exists in `lithos_client.py` (recording, if needed by tests, is replaced by a contract-test fake Lithos server in later stories)",
+        "A `LithosError` exception class exists for Lithos wrapper failures (defined in this module or imported from a shared errors module) — used by later stories for envelope and chokepoint errors (e.g. `LithosError(\"missing_lookup_arg\")` per FR-MCP-3). LCMA stubs (US-012) raise `LCMAError(\"not implemented\")`. Implementation note (not part of acceptance): the pre-existing `LCMAError` in `src/influx/errors.py` may be reused rather than duplicated",
+        "tests/contract/test_lithos_client.py is created with a connection-lifecycle test that exercises lazy-connect + reuse against a fake Lithos SSE server fixture"
       ],
       "priority": 2,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-003",
-      "title": "Create lithos_client.py and enrich.py stub modules with documented replacement notes",
-      "description": "As a developer, I want `src/influx/lithos_client.py` and `src/influx/enrich.py` as documented stubs so that the arXiv flow can call `lithos_client.write`, `lithos_client.cache_lookup`, and `enrich.tier1_enrich` during this PRD while PRDs 05 and 07 swap in real implementations (Definition of Done items in §10 of PRD 04, §4 internal seams).",
+      "title": "Implement lithos_agent_register call on startup with reconnect re-register",
+      "description": "As an Influx operator, I want the client to register itself with Lithos exactly once on startup (and re-register on SSE reconnect) so that Lithos knows the agent identity and type for downstream attribution (FR-MCP-8, AC-05-G).",
       "acceptanceCriteria": [
-        "src/influx/lithos_client.py exposes `write(...)` that records every call (arguments retained in-process for test assertions) and `cache_lookup(...)` that always returns a \"not cached\" result (exact API shape and recording mechanism left to the implementation)",
-        "src/influx/lithos_client.py module docstring explicitly says \"replaced by PRD 05\"",
-        "src/influx/enrich.py exposes `tier1_enrich(...)` that returns a canned Tier-1-shape result derived from the provided abstract (exact return shape left to the implementation but must be usable by the note renderer's `## Summary` section)",
-        "src/influx/enrich.py module docstring explicitly says \"replaced by PRD 07\"",
-        "A unit test confirms `lithos_client.write` records its calls in a retrievable way and `lithos_client.cache_lookup` returns a \"not cached\" result, and that `enrich.tier1_enrich` returns a non-empty Tier-1 shape for a sample abstract",
-        "Typecheck passes"
+        "The `lithos_client.py` wrapper exposes an agent-register entry point that calls `lithos_agent_register(id=\"influx\", name=\"Influx Pipeline\", type=\"ingestion-pipeline\")` (FR-MCP-8)",
+        "The agent-register entry point is invoked exactly once per Lithos connection — fired automatically as part of establishing the first lazy SSE connection in a run (per FR-MCP-2's lazy-connection contract), not eagerly at service-process startup; one-shot CLI subcommands like `validate-config` are out of scope for this story and covered by US-017 (AC-05-G)",
+        "After an SSE drop and reconnect, the agent-register entry point is called again automatically as part of re-establishing the connection (AC-05-G)",
+        "A contract test in tests/contract/test_lithos_client.py asserts that on first tool-call use the fake Lithos server receives exactly one `agent_register` call with the documented `id`/`name`/`type` payload, and that no `agent_register` call is sent before any tool-call use (lazy-connection contract preserved)",
+        "A contract test asserts that simulating an SSE drop + reconnect triggers a second `agent_register` call with identical payload"
       ],
       "priority": 3,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-004",
-      "title": "Implement notes.py parser for frontmatter, title, sections, and User Notes region",
-      "description": "As a developer, I want `src/influx/notes.py` to expose a parser that splits an existing canonical note into frontmatter, title, Influx-owned body sections, and the `## User Notes` region (everything below the heading) so that rewrites can preserve user content byte-identically (FR-NOTE-1, FR-NOTE-4).",
+      "title": "Implement first-sentence helper and dedup-query composer",
+      "description": "As a developer, I want a pure helper that composes the source-agnostic `query` string for `lithos_cache_lookup` per FR-MCP-3 (title + first sentence of abstract/summary, falling back to title alone) so that dedup behaviour is identical across arXiv and RSS sources (AC-05-B).",
       "acceptanceCriteria": [
-        "src/influx/notes.py exposes a parser (exact API shape and return representation left to the implementation) that, given a note's text, recovers enough state to support the downstream rewrite pipeline: frontmatter (including tags), title, the Influx-owned body sections encountered above `## User Notes` (generic section capture — the concrete `## Archive` parse contract is owned by US-006), and the `## User Notes` region preserved byte-exactly (FR-NOTE-1, FR-NOTE-4)",
-        "When `## User Notes` is absent, the parser signals that absence (e.g. via a dedicated field or sentinel) so the renderer can append an empty one on rewrite (FR-NOTE-4)",
-        "The parser preserves the `## User Notes` region byte-identically — no whitespace stripping, no line-ending normalisation, no trimming",
-        "The parser is tolerant of notes that contain only frontmatter + title + `## User Notes` (no Influx-owned body sections yet)",
-        "tests/unit/test_notes_parse.py covers: well-formed note with all sections; note missing `## User Notes`; note with only title + `## User Notes`; note whose `## User Notes` region contains blank lines, unicode, and nested markdown headings — all preserved byte-exactly",
-        "Typecheck passes"
+        "A helper function (exact name and module location left to the implementation, but reused by the cache_lookup chokepoint and exposed for unit tests) takes title and an optional abstract-or-summary and returns the composed `query` string",
+        "When abstract/summary is non-empty, returns `title + \" \" + first_sentence(abstract_or_summary)`; \"first sentence\" is the substring up to (but not including) the first `.`, `!`, or `?` followed by whitespace OR end-of-string, trimmed and capped at 200 characters (FR-MCP-3)",
+        "When abstract/summary is missing or empty, returns title alone (FR-MCP-3)",
+        "The returned query is always non-empty (an empty title input raises a clear error or is handled at a higher layer — explicitly documented)",
+        "tests/unit/test_dedup_query.py covers AC-05-B golden cases: no abstract → title only; abstract `\"Mr. Smith went home. He was tired.\"` → first sentence is `\"Mr. Smith went home\"` (because `.` is followed by whitespace at end of `home.`); abstract ending in `?` followed by EOF → that `?` IS a sentence end; abstract with no terminator → entire string capped at 200 chars"
       ],
       "priority": 4,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-005",
-      "title": "Implement notes.py tag-merging rules for rewrite (FR-NOTE-5/6/7/8)",
-      "description": "As a developer, I want `src/influx/notes.py` to expose a tag-merging helper that computes the rewrite's final tag set from existing tags + newly-computed Influx-owned tags, so that rewrites follow the ownership contract in master PRD §8.1 (FR-NOTE-5, FR-NOTE-6, FR-NOTE-7, FR-NOTE-8).",
+      "title": "Implement lithos_cache_lookup wrapper with chokepoint enforcement",
+      "description": "As an Influx operator, I want `lithos_cache_lookup` to enforce at a single chokepoint that BOTH `query` and `source_url` are always passed so that the R-7 risk (one-arg lookups missing matches) cannot recur (FR-MCP-3, AC-05-A).",
       "acceptanceCriteria": [
-        "src/influx/notes.py exposes a tag-merging helper (exact API shape left to the implementation) that accepts the parsed existing tags and the newly-computed Influx-owned tags and returns the final merged tag set for the rewrite",
-        "The helper fully replaces any existing tag matching the Influx-owned prefixes/values: `source:*`, `arxiv-id:*`, `cat:*`, `text:*`, `ingested-by:*`, `schema:*`, `full-text`, `influx:repair-needed`, `influx:archive-missing`, `influx:deep-extracted`, `influx:text-terminal` (FR-NOTE-5)",
-        "`profile:*` tags are merged as a union of existing and new (FR-NOTE-6)",
-        "When a per-profile `influx:rejected:<profile>` tag is present, the helper MUST NOT re-add the corresponding `profile:<profile>` tag (FR-NOTE-6) — a unit test asserts this guard",
-        "Tags authored outside Influx (anything not matching the Influx-owned list above and not `profile:*`) are preserved verbatim (FR-NOTE-7) — a unit test asserts external tags like `favourite` or `reading-queue` survive a rewrite",
-        "A confidence-recompute helper (or documented convention) computes `max(existing_confidence, current_max_score / 10.0)` (FR-NOTE-8) and a unit test covers both branches (existing > new, and new > existing)",
-        "tests/unit/test_notes_render.py or a dedicated tag-merging test file covers all of FR-NOTE-5/6/7/8 with explicit positive and negative cases",
-        "Typecheck passes"
+        "The cache-lookup wrapper in `src/influx/lithos_client.py` requires both `query` and `source_url` arguments — calls that omit `query` or `source_url` (e.g. pass `None` or empty string) raise `LithosError(\"missing_lookup_arg\")` BEFORE any RPC is sent (FR-MCP-3, AC-05-A)",
+        "When both args are provided, the wrapper invokes the underlying MCP `lithos_cache_lookup` tool with both args and returns its response shape unchanged",
+        "tests/unit/test_dedup_query.py (or tests/contract/test_lithos_client.py) asserts: calling `cache_lookup(query=\"\", source_url=\"https://x\")` raises `LithosError(\"missing_lookup_arg\")`; calling with `query=None` raises the same; calling with missing `source_url` raises the same — and in each negative case, the fake Lithos server records ZERO RPCs (BEFORE-RPC enforcement)",
+        "A happy-path contract test in tests/contract/test_lithos_client.py confirms a well-formed `cache_lookup` call reaches the fake server and the wrapper forwards the underlying Lithos `lithos_cache_lookup` response contract unchanged (per `docs/REQUIREMENTS.md`, e.g. the `hit` / `stale_exists` semantics — the wrapper does not invent a `cached`/`not cached` envelope)"
       ],
       "priority": 5,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-006",
-      "title": "Implement notes.py Archive section render and parse (FR-NOTE-9)",
-      "description": "As a developer, I want `src/influx/notes.py` to render and parse the `## Archive` section per the exact contract so that archive paths live in exactly one authoritative location and parsers reject malformed bodies (FR-NOTE-9, AC-04-B).",
+      "title": "Implement lithos_list generic wrapper",
+      "description": "As a developer, I want a generic `lithos_list` wrapper (used in this PRD by feedback ingestion and reused by PRD 06's repair sweep) so that tag-based queries to Lithos have a single typed entry point (FR-MCP-5, supports FR-FB-1).",
       "acceptanceCriteria": [
-        "The renderer places the `## Archive` section immediately after `# {Title}` and before any other Influx-owned section (FR-NOTE-9)",
-        "When an archive path is present, the `## Archive` section contains exactly one line of the form `path: <rel-path>` using POSIX separators, relative to `archive_root` (FR-NOTE-9)",
-        "When an archive path is absent, the renderer emits the `## Archive` section with an empty body (the canonical no-path form used by this PRD's failure path); the parser additionally accepts an omitted `## Archive` section as a legal state (FR-NOTE-9)",
-        "The renderer never writes both a `path:` line AND an `influx:archive-missing` tag on the same note — a unit test asserts this invariant is enforced (FR-NOTE-9)",
-        "The parser accepts both legal `## Archive` body states (non-empty `path: <rel-path>`, or empty body / omitted section) and returns the parsed path or None",
-        "The parser rejects (raises) a note whose `## Archive` section contains stray text that is neither empty nor a single `path:` line (AC-04-B)",
-        "No frontmatter field, alternative tag, or alternative body location carries the archive path — a unit test asserts that only `## Archive` is consulted by the parser and renderer (FR-NOTE-9)",
-        "tests/unit/test_notes_render.py and tests/unit/test_notes_parse.py together cover AC-04-B: non-empty `path:` round-trip, empty body round-trip, and malformed stray-text rejection",
-        "Typecheck passes"
+        "The list wrapper in `src/influx/lithos_client.py` invokes the underlying MCP `lithos_list` tool with the provided tag list and limit; exact name (e.g. `list_`, `list`, or `lithos_list`) is left to the implementation per project conventions",
+        "The wrapper returns the server response unchanged so callers can inspect titles/IDs (titles are used directly when present per FR-FB-2; PRD 06 will use the same wrapper for the repair sweep)",
+        "A happy-path contract test in tests/contract/test_lithos_client.py confirms a list call with `tags=[\"arxiv-id:2601.12345\"]` reaches the fake Lithos server and the wrapper returns the listed-items envelope",
+        "An empty-result contract test confirms an empty list response is propagated correctly (not turned into None or an error)"
       ],
       "priority": 6,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-007",
-      "title": "Implement notes.py full canonical renderer with User Notes round-trip preservation",
-      "description": "As a developer, I want `src/influx/notes.py` to expose a full canonical note renderer that composes frontmatter, title, `## Archive`, `## Summary`, `## Profile Relevance`, and `## User Notes` into a single byte-stable output, with `## User Notes` preserved byte-identically across parse → rewrite cycles (FR-NOTE-1..8, AC-04-A, R-5).",
+      "title": "Implement lithos_write happy path",
+      "description": "As an Influx operator, I want `lithos_write` to be invoked with the documented field set (`agent`, `path`, `source_url`, `tags`, `confidence`, `note_type`, `namespace`, optional `expires_at`) so that notes are written to Lithos using the v1 surface (FR-MCP-6).",
       "acceptanceCriteria": [
-        "src/influx/notes.py exposes a full canonical renderer (exact API shape left to the implementation) that writes a complete note with: frontmatter including `note_type = \"summary\"`, `namespace = \"influx\"`, `source_url` (normalised canonical URL), the merged tag list from US-005, and `confidence` computed as follows — on initial note creation `confidence = max(profile_scores) / 10.0` (FR-NOTE-3); on rewrite `confidence = max(existing_confidence, current_max_score / 10.0)` per FR-NOTE-8 (reusing the US-005 confidence-recompute helper)",
-        "The renderer places `# {Title}` first, then `## Archive` immediately after the title and before any other Influx-owned section (FR-NOTE-9), then the Influx-owned body sections `## Summary` (from the Tier-1 enrich stub) and `## Profile Relevance` (relative order between these two sections is not constrained), and finally `## User Notes` (existing region preserved byte-exactly, or an empty one appended when absent per FR-NOTE-4)",
-        "On rewrite, a per-profile `## Profile Relevance` entry is NOT refreshed when `influx:rejected:<profile>` is set (FR-NOTE-6) — a unit test asserts this",
-        "All Influx-authored notes carry the `ingested-by:influx` tag (FR-RES-6)",
-        "tests/unit/test_user_notes_roundtrip.py covers AC-04-A: a note with a non-trivial `## User Notes` section (including blank lines, unicode, and nested markdown headings) is parsed, re-rendered with updated Influx-owned tags, and the byte-exact user region survives (R-5 mitigation)",
-        "A golden-file test (fixture in tests/fixtures/) backs the round-trip to catch regressions in section ordering or whitespace",
-        "Typecheck passes"
+        "The write wrapper in `src/influx/lithos_client.py` accepts and forwards the FR-MCP-6 PRD-owned fields: `agent=\"influx\"`, `path`, `source_url`, `tags`, `confidence`, `note_type=\"summary\"`, `namespace=\"influx\"`, and an optional `expires_at` (used only on repair-needed writes per FR-MCP-6), plus whatever additional fields the underlying Lithos contract requires. The listed PRD-owned fields are not the full write interface — they are forwarded alongside whatever else the underlying contract mandates",
+        "PRD 04's recording-stub `write` function and its `WriteRecord`/`get_write_log`/`clear_write_log` helpers are fully removed from `lithos_client.py`",
+        "A happy-path contract test in tests/contract/test_lithos_client.py asserts the fake Lithos server receives a `lithos_write` call with the exact documented field set for a sample arXiv item (AC-M1-10 is re-asserted at the wrapper/contract level here; full integration-path re-assertion is deferred to whichever story runs against the real PRD 04 ingestion pipeline once it exists)"
       ],
       "priority": 7,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-008",
-      "title": "Implement storage.py archive path construction and path-safety check",
-      "description": "As a developer, I want `src/influx/storage.py` to construct the archive path for a given source/id and verify it cannot escape `archive_root`, so that a malicious or malformed identifier cannot write outside the archive tree (FR-ST-1, FR-ST-2, FR-ST-3, AC-04-C).",
+      "title": "Implement lithos_write envelopes — duplicate and invalid_input",
+      "description": "As an Influx operator, I want `lithos_write` to handle the `duplicate` envelope as a cache hit (no error, no second write) and the `invalid_input` envelope as a logged skip so that already-ingested items and malformed payloads do not abort the run (FR-MCP-7, AC-05-C).",
       "acceptanceCriteria": [
-        "src/influx/storage.py exposes a path-construction helper (exact API shape left to the implementation) that produces, for a given source, id, and published date, (a) a filesystem path under `archive_root / {source}/{YYYY}/{MM}/{id}.{ext}` (FR-ST-1) and (b) a note-facing relative path `{source}/{YYYY}/{MM}/{id}.{ext}` using POSIX separators, suitable for the `## Archive` section's `path:` line (FR-NOTE-9)",
-        "For arXiv, the path uses `source = \"arxiv\"`, extension `.pdf`, and the arXiv ID as-is — the arXiv ID is globally unique so no `{url-hash}` is appended (FR-ST-1)",
-        "Feed slugs used anywhere in the path satisfy `^[a-z0-9]+(-[a-z0-9]+)*$`, max 40 chars — the helper calls into the existing `slugs.py` from PRD 01 rather than re-implementing the regex (FR-ST-2)",
-        "After building the full filesystem archive path, the helper verifies `path.resolve().is_relative_to(archive_root)` and rejects (raises) otherwise (FR-ST-3)",
-        "tests/unit/test_archive_path.py covers AC-04-C: an arXiv ID containing `..` (e.g. `../../etc/passwd`) and an absolute-path injection are both rejected BEFORE any download is attempted (additional hardening such as trailing-slash or encoded-traversal attempts is optional and may be included at the implementer's discretion, but is not required by AC-04-C)",
-        "A positive test confirms a well-formed arXiv ID produces the expected filesystem path under `archive_root` and the expected POSIX-separator note-facing relative path `{source}/{YYYY}/{MM}/{id}.{ext}`",
-        "Typecheck passes"
+        "When `lithos_write` returns `duplicate`, the wrapper treats the result as a successful hit, does NOT retry or re-write, and surfaces this via the return value so the caller can count it in `dedup_skipped` (FR-MCP-7, AC-05-C)",
+        "When `lithos_write` returns `invalid_input`, the wrapper logs the failure (with `source_url` and the server-provided reason) and returns a result indicating the item was skipped — no exception is raised that would abort the surrounding profile run (FR-MCP-7)",
+        "The caller-side counter for `dedup_skipped` is incremented exactly once per `duplicate` envelope (either inside the wrapper if counters live there, or at the documented call site — wiring left to the implementation)",
+        "tests/contract/test_lithos_client.py covers AC-05-C: `duplicate` envelope is treated as hit (no error, no second write, item counted in `dedup_skipped`)",
+        "tests/contract/test_lithos_client.py covers `invalid_input`: the fake server returns `invalid_input`, the wrapper logs and skips, and a single failed-item record is observable (e.g. via a returned status enum or a logger probe)"
       ],
       "priority": 8,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-009",
-      "title": "Implement storage.py archive download with guarded HTTP client and failure-path tagging",
-      "description": "As a developer, I want `src/influx/storage.py` to download the archive PDF via the guarded HTTP client from PRD 02, and on any download failure emit the canonical failure signal (empty `## Archive` body + `influx:repair-needed` + `influx:archive-missing` tags) so that PRD 06's repair sweep can pick it up (FR-ST-4, AC-X-4 partial).",
+      "title": "Implement lithos_write envelopes — slug_collision and version_conflict",
+      "description": "As an Influx operator, I want `lithos_write` to retry once on `slug_collision` (with the documented title-suffix disambiguator) and once on `version_conflict` (after re-reading the note and re-applying tag-merge + user-notes preservation), so that transient slug clashes and concurrent edits do not lose writes (FR-MCP-7, AC-05-D, AC-05-E).",
       "acceptanceCriteria": [
-        "The download helper uses the guarded HTTP client from PRD 02 (SSRF guard, oversize abort via `storage.max_download_bytes`, timeouts) rather than a direct `httpx`/`urllib` call",
-        "On successful download, the PDF is written to the path produced by the US-008 helper and the returned archive metadata includes the relative POSIX path suitable for the `## Archive` section's `path:` line",
-        "On download failure (SSRF rejection, timeout, oversize abort, HTTP error, or any archive-step failure), the helper returns a signal that the caller uses to render the note with an EMPTY `## Archive` body (no `path:` line), tagged with BOTH `influx:repair-needed` AND `influx:archive-missing` (FR-ST-4)",
-        "A unit test simulates oversize abort (exceeding `storage.max_download_bytes` mid-stream) and asserts the failure signal is returned and drives the empty `## Archive` body plus `influx:repair-needed` and `influx:archive-missing` tags (AC-X-4 partial setup)",
-        "A unit test simulates SSRF rejection and asserts the failure signal is returned",
-        "Archive-step failures (SSRF rejection, timeout, oversize abort, HTTP error, or any other archive-step failure) are surfaced by `storage.py` in a form that callers can detect and handle — the implementation is free to use the existing typed-exception model (e.g. `NetworkError` from `src/influx/errors.py`) or any other mechanism, as long as the observable behaviour is that the caller can render the note with an empty `## Archive` body plus `influx:repair-needed` and `influx:archive-missing` tags and continue processing the next item; the run-level assertion that the whole run continues across per-item failures (FR-RES-1) is owned by US-015 at the `run_profile` wire-up layer",
-        "Typecheck passes"
+        "On `slug_collision`, the wrapper retries the write exactly once with a disambiguating title suffix: ` [arXiv <id>]` for arXiv source URLs, ` [<host>]` for web/RSS source URLs (FR-MCP-7, AC-05-D)",
+        "On a second `slug_collision`, the wrapper logs the failure, skips the item, and does NOT retry further (AC-05-D)",
+        "On `version_conflict`, the wrapper re-reads the existing note (via the appropriate Lithos read mechanism), re-applies tag-merge and preserves the existing `## User Notes` block, and retries the write exactly once (FR-MCP-7, AC-05-E)",
+        "On a second `version_conflict`, the wrapper logs and skips the item (AC-05-E)",
+        "tests/contract/test_lithos_client.py covers AC-05-D: arXiv + web title-suffix variants on first collision, skip + log on second collision",
+        "tests/contract/test_lithos_client.py covers AC-05-E: re-read + tag-merge + user-notes preservation on first conflict (assert the second write payload contains merged tags AND the original `## User Notes` block is preserved), skip + log on second conflict"
       ],
       "priority": 9,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-010",
-      "title": "Implement sources/arxiv.py Atom fetcher with client-side date filtering",
-      "description": "As a developer, I want `src/influx/sources/arxiv.py` to query `https://export.arxiv.org/api/query` for configured categories, parse the Atom response with stdlib `xml.etree`, and apply client-side date filtering against `profile.sources.arxiv.lookback_days`, so that profiles receive only recent items per FR-SRC-1 and FR-SRC-2.",
+      "title": "Implement lithos_write content_too_large — first retry drop Tier 2 + create-path skip",
+      "description": "As an Influx operator, I want the first `content_too_large` envelope to trigger one trimmed retry that drops `## Full Text` (Tier 2) keeping Tier 1 + Tier 3, and on a second failure with no existing note (create path) skip the item with a counted, logged outcome rather than persisting a degraded placeholder (master PRD §9.7, FR-MCP-7, AC-05-F create path).",
       "acceptanceCriteria": [
-        "src/influx/sources/__init__.py is created",
-        "src/influx/sources/arxiv.py exposes a fetcher (exact API shape left to the implementation) that queries `https://export.arxiv.org/api/query` using the FR-SRC-1 parameter contract: `search_query` built as an OR-joined expression (`cat:X+OR+cat:Y+...`) from `profile.sources.arxiv.categories` (the existing `ArxivSourceConfig.categories: list[str]` in `src/influx/config.py`), `sortBy=submittedDate`, `sortOrder=descending`, and `max_results=profile.sources.arxiv.max_results_per_category` (FR-SRC-1)",
-        "The fetcher parses the Atom response using stdlib `xml.etree` (no new parsing dependency)",
-        "Date filtering is client-side on `<published>` parsed as UTC, against `profile.sources.arxiv.lookback_days` — items older than the lookback are dropped (FR-SRC-2)",
-        "On arXiv HTTP 429, the fetcher sleeps `resilience.arxiv_429_backoff_seconds` before retry (FR-RES-2); general retries use exponential backoff from `resilience.backoff_base_seconds` (e.g. `base`, `base*2`, `base*4`, …) with max retries default 3 (FR-RES-1)",
-        "tests/fixtures/arxiv/*.atom contains 3–5 recorded Atom fixtures at different dates",
-        "tests/unit/test_arxiv_fetcher.py drives the fetcher against those fixtures (no live network), asserting: correct query URL construction, Atom parsing extracts arXiv id / title / abstract / published / categories, lookback filtering drops older items, and 429 backoff is honoured",
-        "Typecheck passes"
+        "On the first `content_too_large` envelope, the wrapper drops the `## Full Text` (Tier 2) section, keeps Tier 1 + Tier 3 sections, and retries the write exactly once (master PRD §9.7 step 1)",
+        "If the retry succeeds, normal completion path is taken — the note is persisted with Tier 1 + Tier 3 only",
+        "If the retry also returns `content_too_large` AND no existing Influx-authored note exists for this `source_url` (create path): no degraded placeholder is invented, `source_url` is logged, the `content_too_large_skipped` counter is incremented, and the item is skipped this run (AC-05-F create path; retry is best-effort via source rediscovery per FR-REP-3 owned by PRD 06)",
+        "The detection of \"existing Influx-authored note for this `source_url`\" is implementation-defined and based on source-URL lookup — exact mechanism left to the implementation but documented in the wrapper",
+        "tests/contract/test_lithos_client.py covers the first-retry-succeeds path (Tier 2 dropped, write succeeds, no further retries)",
+        "tests/contract/test_lithos_client.py covers AC-05-F create path: second `content_too_large` with no pre-existing note → skip + count + log + no note persisted"
       ],
       "priority": 10,
-      "passes": true,
-      "notes": "Internal request-grouping strategy (one grouped request or multiple per-category requests) is an implementation choice and not constrained by the acceptance criteria, provided the FR-SRC-1 query-parameter contract is observed on the wire."
+      "passes": false,
+      "notes": ""
     },
     {
       "id": "US-011",
-      "title": "Add arXiv global rate limiter and run-scoped shared-fetch cache",
-      "description": "As a developer, I want a module- or service-level rate limiter that enforces `resilience.arxiv_request_min_interval_seconds` GLOBALLY across a run (not just within one caller) AND a run-scoped shared-fetch cache around the arXiv fetcher so that repeated requests for the same category within one run resolve to a single underlying HTTP call, so that we respect arXiv rate limits, avoid redundant work, and satisfy AC-04-E cross-profile de-duplication within this PRD (FR-SRC-3, AC-04-D, AC-04-E, R-8).",
+      "title": "Implement lithos_write content_too_large — repair-path Tier-1-only retry with influx:repair-needed",
+      "description": "As an Influx operator, I want the second `content_too_large` envelope on the repair path (an Influx-authored note already exists for this `source_url`) to perform one additional Tier-1-only trimmed write tagged `influx:repair-needed`, with the documented exemption that if THAT trimmed write also fails the existing note is left untouched and the sweep proceeds without aborting or advancing `updated_at` (master PRD §9.7 repair path, FR-MCP-7, AC-05-F repair path).",
       "acceptanceCriteria": [
-        "A rate limiter (exact API shape left to the implementation) enforces a minimum interval of `resilience.arxiv_request_min_interval_seconds` (default 3s) between successive requests to `export.arxiv.org`, applied globally across the run rather than per-caller (FR-SRC-3, R-8)",
-        "Within a single run, repeated requests for the same arXiv category resolve to a single underlying HTTP call and all callers receive equivalent parsed results — exact mechanism (cache, context, wrapper, etc.) is left to the implementation (AC-04-E, R-8)",
-        "tests/unit/test_arxiv_fetcher.py covers AC-04-D: three sequential fetches observe an inter-request gap of at least `resilience.arxiv_request_min_interval_seconds` (use a fake clock or sleep-monkeypatch so the test is fast and deterministic)",
-        "A test covers AC-04-E: within a single run, when two profiles share an arXiv category, the run-scoped shared-fetch layer produces exactly one underlying HTTP call for that category and both profiles receive equivalent parsed results",
-        "Typecheck passes"
+        "When the second `content_too_large` envelope arrives AND an Influx-authored note already exists for this `source_url` (repair path), the wrapper performs one additional trimmed write that preserves Tier 1 only (drops Tier 2 AND Tier 3), tags `influx:repair-needed`, and writes (master PRD §9.7 repair path)",
+        "If THAT trimmed write also returns `content_too_large`: the existing note is left untouched (no overwrite, no update), the `content_too_large_skipped` counter is incremented, the run does NOT abort, and the existing note's `updated_at` does NOT advance — this is documented in code as the sole exemption to FR-REP-1's retry-order advancement mechanism (AC-05-F repair path)",
+        "When the Tier-1-only retry succeeds, the note is updated with `influx:repair-needed` in its tag set (merged with any existing tags per PRD 04's tag-merge contract) and `updated_at` advances normally",
+        "tests/contract/test_lithos_client.py covers AC-05-F repair path success: second `content_too_large` with pre-existing note → Tier-1-only retry succeeds, `influx:repair-needed` tag is present, existing tags preserved",
+        "tests/contract/test_lithos_client.py covers AC-05-F repair path Tier-1-fails sub-path: third `content_too_large` (Tier 1 alone too large) → existing note untouched, counter incremented, no abort, `updated_at` unchanged on the existing note",
+        "Together with US-010, all FOUR AC-05-F sub-paths are covered: first-retry-succeeds, create-path skip, repair-path success, repair-path Tier-1-fails"
       ],
       "priority": 11,
       "passes": false,
-      "notes": "Codebase-constrained proxy for AC-04-E: current `/runs` is single-profile (see `src/influx/http_api.py`) and `src/influx/scheduler.py` already operates per profile in-process, so AC-04-E's two-profiles-in-one-run observable is exercised in this PRD by driving the run-scoped shared-fetch API with the two-profile call pattern directly rather than via a multi-profile `/runs` endpoint. Full multi-profile `/runs` fan-out is owned by PRD 09 and will reuse the same shared-fetch API."
+      "notes": ""
     },
     {
       "id": "US-012",
-      "title": "Implement filter.py prompt rendering with negative examples",
-      "description": "As a developer, I want `src/influx/filter.py` to render the filter prompt from `prompts.filter` with the required variables `{profile_description}`, `{negative_examples}`, and `{min_score_in_results}`, so that the LLM sees the correct context before scoring (FR-FLT-1, FR-FLT-5).",
+      "title": "Add LCMA tool stubs that raise LCMAError",
+      "description": "As a developer, I want `lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, and `lithos_task_complete` to exist in `lithos_client.py` as `LCMAError`-raising stubs so that PRD 08 has a clear seam to fill in while the rest of the system is enforced not to call them yet (§4 internal seams permitted, Definition of Done item 3).",
       "acceptanceCriteria": [
-        "src/influx/filter.py exposes a prompt-rendering helper (exact API shape left to the implementation) that substitutes `{profile_description}`, `{negative_examples}`, and `{min_score_in_results}` into the template loaded from `prompts.filter` (FR-FLT-1)",
-        "Negative examples are rendered one per line as `- \"{title}\" (rejected)`, with each title truncated to `filter.negative_example_max_title_chars`, and the total list capped at `feedback.negative_examples_per_profile` (FR-FLT-5)",
-        "When the negative-examples input list is empty (the PRD-04 case — PRD 05 wires `lithos_list` for real feedback), the rendered `{negative_examples}` substitution is empty (no negative-example lines emitted and no invented placeholder text) so prompt semantics are not altered beyond what the PRD authorises",
-        "tests/unit/test_filter.py covers: all three variables substituted; title longer than `filter.negative_example_max_title_chars` is truncated; more-than-cap negative examples are truncated to the cap; empty negative-examples list is handled",
-        "Typecheck passes"
+        "`src/influx/lithos_client.py` exposes the LCMA wrapper surface using the PRD's frozen `lithos_*` tool names exactly: `lithos_retrieve(...)`, `lithos_edge_upsert(...)`, `lithos_task_create(...)`, `lithos_task_complete(...)` (as module-level functions or methods on a wrapper object, per the implementation choice in US-002); each raises `LCMAError(\"not implemented\")` when called",
+        "`LCMAError` is a distinct exception class from `LithosError`",
+        "A grep-style assertion in tests/contract/test_lithos_client.py (or a unit test in tests/unit/) confirms that no production module under `src/influx/` invokes any of `lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete` (e.g. by importing each name and asserting `__module__` is only `lithos_client` itself, or by a static AST/grep check — exact mechanism left to the implementation)",
+        "A unit test confirms calling each LCMA stub raises `LCMAError(\"not implemented\")` with that exact message"
       ],
       "priority": 12,
       "passes": false,
@@ -204,19 +179,15 @@
     },
     {
       "id": "US-013",
-      "title": "Implement filter.py LLM call with JSON-mode validation, retries, and batching",
-      "description": "As a developer, I want `src/influx/filter.py` to call `models.filter` in JSON mode, validate the response against `FilterResponse`, retry on parse failure up to `models.filter.max_retries`, and batch items at `filter.batch_size`, so that scoring is robust under flaky LLM output (FR-FLT-2, FR-FLT-3, FR-FLT-4, FR-FLT-6, AC-04-F, AC-04-G).",
+      "title": "Replace stub Lithos probe in probes.py with real ping-style probe",
+      "description": "As an Influx operator, I want `src/influx/probes.py` to replace the env-flag stub Lithos probe (from PRD 03) with a real ping-style SSE probe so that `/status` reflects actual Lithos reachability and the AC-M1-11 degraded-state assertion works against real connectivity (PRD 05 §2, AC-M1-11).",
       "acceptanceCriteria": [
-        "A JSON-mode-capable LLM client permitted by PRD §7 (`litellm` or a direct provider SDK such as OpenAI or Anthropic) is added as a dependency in pyproject.toml and resolves on install",
-        "The filter caller invokes `models.filter` with `response_format={\"type\": \"json_object\"}` when `json_mode = true` (FR-FLT-2)",
-        "Responses are validated against `FilterResponse` from US-002 (FR-FLT-3)",
-        "Items are batched at `filter.batch_size` (default 25) (FR-FLT-4)",
-        "On JSON-mode parse failure (invalid JSON, schema violation, or any validation error), the filter logs the raw response and retries within `models.filter.max_retries` (FR-FLT-6)",
-        "When retries are exhausted, the filter yields zero validated results for that batch and logs the skip — NO regex salvage is attempted (FR-FLT-6); the end-to-end no-partial-write observable at the filter-to-render boundary (AC-04-G) is owned by US-015",
-        "tests/unit/test_filter.py asserts that the filter produces one validated `FilterResult` per input item when the LLM returns well-formed JSON-mode responses (threshold-based acceptance filtering is owned by US-014; the end-to-end filter-to-render call-count observable for AC-04-F is owned by US-015)",
-        "tests/unit/test_filter.py asserts JSON-mode retry-and-skip behaviour at the filter-internal level (this is NOT AC-04-G coverage — AC-04-G's no-partial-write observable is owned by US-015 at the filter-to-render boundary): a malformed JSON-mode response triggers retry up to `max_retries`, after which the batch is skipped and the filter yields zero validated results for that batch with a log entry",
-        "Pre-recorded filter responses keyed by input hash drive the deterministic filter test (no live LLM calls in CI)",
-        "Typecheck passes"
+        "The Lithos probe path in `src/influx/probes.py` used by `ProbeLoop`/`/status` opens an SSE connection to the configured Lithos endpoint and performs a lightweight, side-effect-free ping; the probe MUST NOT call `lithos_agent_register` because US-003 / AC-05-G require `agent_register` to be invoked exactly once on startup (and again only on SSE reconnect) and using it as the probe ping would conflict with that contract; acceptable mechanisms include a no-op tool call, the SDK's built-in health check, or a connection-establishment-only check; exact function/seam name is left to the implementation but documented in the probe's docstring",
+        "The probe returns a structured result indicating `status=\"ok\"` on success and a non-`ok` status with a reason string on failure (timeout, connection refused, protocol error)",
+        "PRD 03's env-flag stub branch is fully removed from `probes.py`; the env flag (if it existed) is no longer read by the probe",
+        "A unit/integration test against a fake Lithos SSE server confirms `status=\"ok\"` when the server is reachable",
+        "A unit/integration test confirms `status != \"ok\"` (with a reason) when the server is unreachable or times out — wired up so the existing `/status` endpoint test from PRD 03 now exercises the real probe path and `/status` reports `status=\"degraded\"` and `dependencies.lithos.status != \"ok\"` while the service stays alive",
+        "AC-M1-11 (probe + /status side): with the fake Lithos SSE server unreachable, the probe returns a non-`ok` status and `/status` reports `status=\"degraded\"` and `dependencies.lithos.status != \"ok\"` while the service stays alive. The full `POST /runs` run-abort half of AC-M1-11 is covered by the end-to-end story (US-019)"
       ],
       "priority": 13,
       "passes": false,
@@ -224,17 +195,14 @@
     },
     {
       "id": "US-014",
-      "title": "Implement filter.py threshold behaviour and tier tagging (FR-FLT-7)",
-      "description": "As a developer, I want `src/influx/filter.py` to apply per-profile thresholds (`relevance`, `full_text`, `deep_extract`, `notify_immediate`) to each scored item and emit the correct tier tags, so that downstream PRDs (06 repair sweep, 07 Tier 2/3 enrichment) see the intended signal shape (FR-FLT-7).",
+      "title": "Implement feedback ingestion via lithos_list",
+      "description": "As an Influx operator, I want each filter run to read up to `feedback.negative_examples_per_profile` recent rejection items via `lithos_list(tags=[f\"influx:rejected:{profile}\"])` and pipe their titles into the filter prompt's `negative_examples` block, so that LLM filtering improves over time based on Lens's rejections (FR-FB-1, FR-FB-2, FR-FB-3, AC-05-H).",
       "acceptanceCriteria": [
-        "Score < `profile.thresholds.relevance` (default 7) → item is discarded (no note written) (FR-FLT-7)",
-        "Score ≥ `relevance` → item is kept for canonical-note rendering with Tier 1 sections (FR-FLT-7)",
-        "Score ≥ `full_text` → the item carries the `full-text` tag (FR-FLT-7)",
-        "Score ≥ `deep_extract` → the item carries the `influx:deep-extracted` tag (FR-FLT-7)",
-        "Score ≥ `notify_immediate` → the item is flagged for digest highlights (FR-FLT-7) — actual digest wiring is a stub in this PRD (PRD 05), so asserting the flag is sufficient",
-        "For items crossing `full_text` or `deep_extract`, the Tier 2 / Tier 3 BODY SECTIONS are NOT rendered in this PRD — only the corresponding TAG is written, and the item also carries `influx:repair-needed` so PRD 06's sweep picks it up for upgrade (FR-FLT-7 temporary-mismatch seam)",
-        "tests/unit/test_filter.py covers each threshold boundary (score = threshold − 1, = threshold, = threshold + 1) for `relevance`, `full_text`, `deep_extract`, and `notify_immediate`, asserting the correct combination of tags and the `influx:repair-needed` seam",
-        "Typecheck passes"
+        "A feedback-fetch helper (exact name and module location left to the implementation) calls `lithos_list(tags=[f\"influx:rejected:{profile}\"], limit=feedback.negative_examples_per_profile)` for the given profile and returns the rejection items (FR-FB-1)",
+        "The helper uses title metadata directly when `lithos_list` returns it; only items missing titles trigger a `lithos_read(id=...)` fallback (FR-FB-2)",
+        "A negative-example formatting helper renders the retrieved titles into the FR-FLT-5 `negative_examples` block format defined in PRD 04 — verified by a unit test against a sample list of 3 rejection items producing the expected formatted block (covers AC-05-H at the fetch + format level)",
+        "The feedback-fetch + format helpers expose the rendered `negative_examples` block via the documented seam the filter-prompt builder consumes; verified by a unit or contract test that, given `lithos_list` returning 3 rejection items, the seam returns exactly those 3 titles rendered per FR-FLT-5 format (covers AC-05-H at the fetch + format + seam level). The end-to-end assertion that a constructed filter prompt for a real run contains those titles is covered by the end-to-end story (US-019)",
+        "Influx does NOT author `influx:rejected:<profile>` tags itself (Lens is the sole writer per FR-FB-3) — verified behaviorally: a test exercises the Influx write wrappers (e.g. via the fake Lithos server recording every `lithos_write` payload) and asserts that Influx never synthesizes a new `influx:rejected:<profile>` tag on its own (no payload introduces such a tag that wasn't already present on the existing note). Repair/update writes that rewrite an existing note MUST preserve any pre-existing `influx:rejected:<profile>` tags through the tag-merge contract — this preservation is asserted by a separate test against an existing note that carries the tag"
       ],
       "priority": 14,
       "passes": false,
@@ -242,18 +210,15 @@
     },
     {
       "id": "US-015",
-      "title": "Wire run_profile to drive the end-to-end arXiv flow",
-      "description": "As a developer, I want the existing `influx.scheduler.run_profile` hook (the PRD-03 stub called by `http_api.py`) replaced with the real arXiv flow — fetch (US-010/US-011) → filter (US-012/US-013/US-014) → per-accepted-item archive (US-008/US-009) + render note (US-007) → stub `lithos_client.write` (US-003) — with a dedup check via stub `lithos_client.cache_lookup`, so that `POST /runs` produces at least one stub-recorded write with the correct canonical shape (§2 \"Wire a real run_profile\", AC-M1-7, AC-M1-9, AC-M1-10).",
+      "title": "Create notifications.py with webhook digest builder",
+      "description": "As an Influx operator, I want `src/influx/notifications.py` to expose a pure digest-builder function that produces the JSON body shape defined in `docs/REQUIREMENTS.md` §11.1 (with the §11.2 zero-ingest variant), so that the digest is testable independently of the HTTP send path (FR-NOT-2, FR-NOT-3, FR-NOT-6, AC-05-I).",
       "acceptanceCriteria": [
-        "The existing `influx.scheduler.run_profile` hook (the PRD-03 stub called by `http_api.py`) is wired to the real arXiv flow — calling the arXiv fetcher, filter, per-accepted-item archive, and note render in the correct order; the choice of which file owns the implementation is left to the implementer (PRD §6 lists `src/influx/service.py` as the file to modify for the wire-up)",
-        "Before rendering a note, the flow consults `lithos_client.cache_lookup` — when the stub returns \"cached\" the item is skipped (AC-M1-9 via unit test against the dedup call site); when it returns \"not cached\" (the default stub behaviour) the flow proceeds",
-        "After each accepted item is rendered, the flow calls `lithos_client.write` with the canonical note payload (recorded by the stub from US-003) — recorded writes include `source_url = https://arxiv.org/abs/<id>`, tags containing `arxiv-id:<id>`, `profile:<name>`, `source:arxiv`, `ingested-by:influx`, `schema:1`, `confidence = max_score / 10.0`, `namespace = \"influx\"`, `note_type = \"summary\"` (AC-M1-10)",
-        "The digest/webhook hook fires after the run but the actual HTTP POST is NOT required (stubbed here; real webhook is PRD 05) — a unit or integration test asserts the hook fires (AC-M1-7)",
-        "Per-item failures (download failure, filter batch skipped, etc.) do NOT abort the run (FR-RES-1)",
-        "A unit test against the dedup call site asserts that when the stub `cache_lookup` returns a \"cached\" response the item is skipped (AC-M1-9 contract surface)",
-        "A unit test at the filter-to-render boundary covers AC-04-F: when the filter is driven with a batch of 25 items and 3 are above `profile.thresholds.relevance`, the flow makes exactly 3 note-render invocations and exactly 3 stub-recorded `lithos_client.write` calls (no more, no fewer)",
-        "A unit test at the filter-to-render boundary covers AC-04-G: when a malformed JSON-mode filter response causes the batch to be skipped after `models.filter.max_retries` are exhausted, the flow performs ZERO note renders and ZERO stub-recorded `lithos_client.write` calls for that batch (no partial notes written), and the skip is logged",
-        "Typecheck passes"
+        "src/influx/notifications.py is created; exposes a pure digest-builder function (exact name and signature left to the implementation) that takes a profile-run result + config and returns a JSON-serialisable dict",
+        "For non-zero-ingest runs, the dict contains the FR-NOT-2 keys: `type`, `run_date`, `profile`, `stats`, `highlights`, `all_ingested`",
+        "Zero-ingest runs produce the §11.2 quiet digest variant (FR-NOT-3) — the dict shape matches `docs/REQUIREMENTS.md` §11.2 (no `highlights`/`all_ingested` content beyond what §11.2 prescribes); a test covers a profile run with zero accepted items and asserts the digest's quiet shape",
+        "`highlights` (on non-zero-ingest digests) is populated per the FR-NOT-2 body shape with items satisfying `score >= profiles.thresholds.notify_immediate` for the active profile (the score-threshold semantics defined in `src/influx/config.py` and `docs/REQUIREMENTS.md`); the threshold value is read from config, not hardcoded (AC-X-1, AC-05-I)",
+        "Each highlight entry includes a `related_in_lithos` field; in this PRD the field is always an empty list (FR-NOT-6 — PRD 08 will fill it via the same hook when `lithos_retrieve` exists)",
+        "tests/unit/test_webhook_digest.py covers: a non-zero-ingest digest matching the FR-NOT-2 body shape with `highlights` selected by `score >= profiles.thresholds.notify_immediate` (threshold sourced from config, not hardcoded; per AC-05-I), a zero-ingest quiet digest matching §11.2, and `related_in_lithos` is `[]` for every highlight"
       ],
       "priority": 15,
       "passes": false,
@@ -261,17 +226,82 @@
     },
     {
       "id": "US-016",
-      "title": "Add integration test for end-to-end arXiv flow via POST /runs",
-      "description": "As a developer, I want `tests/integration/test_arxiv_flow.py` to drive `POST /runs {\"profile\": \"<arXiv-enabled-profile>\"}` end-to-end using recorded Atom fixtures (US-010) and pre-recorded filter responses (US-013), so that AC-M1-7 + AC-M1-10 + the repair-needed/archive-missing signals are asserted against stub-recorded `lithos_client.write` calls (§10 Definition of Done).",
+      "title": "Implement webhook sender + service.py post-run hook",
+      "description": "As an Influx operator, I want the digest from US-015 to be POSTed to `AGENT_ZERO_WEBHOOK_URL` via the guarded HTTP client from PRD 02 (5s timeout, no retry, silent skip on empty URL, no-op for backfills), wired into `service.py` as a post-run hook, so that Agent Zero receives a per-run summary for live runs only (FR-NOT-1, FR-NOT-4, FR-NOT-5, AC-05-I, AC-05-J).",
       "acceptanceCriteria": [
-        "tests/integration/test_arxiv_flow.py exercises `POST /runs {\"profile\": \"<arXiv-enabled-profile>\"}` end-to-end against a running service (in-process or subprocess is an implementation choice) and waits for the run to complete",
-        "The test asserts the service returned `202` + `request_id` and that after completion at least one stub-recorded `lithos_client.write` call exists with the canonical shape from AC-M1-10",
-        "The test uses the recorded Atom fixtures from US-010 (no live network) and pre-recorded filter responses (no live LLM)",
-        "The test asserts `AC-M2-3` partial: for an item with only an abstract, the recorded note carries `text:abstract-only`, no Tier 2/3 body, both `influx:repair-needed` AND `influx:archive-missing` when applicable, and does NOT carry `influx:text-terminal`",
-        "The test asserts the digest/webhook hook fired without requiring a real HTTP POST (AC-M1-7)",
-        "Typecheck passes"
+        "`src/influx/notifications.py` exposes a sender function that POSTs the digest JSON to `AGENT_ZERO_WEBHOOK_URL` using the guarded HTTP client from PRD 02 (the SSRF guard applies to the webhook URL too); the request timeout is read from `notifications.timeout_seconds` in config (default 5 seconds per the existing schema) and there is no retry on failure (FR-NOT-1, AC-X-1)",
+        "When `AGENT_ZERO_WEBHOOK_URL` is empty (unset or empty string), the sender silently skips and returns without raising (FR-NOT-5, AC-05-J)",
+        "The post-run webhook hook is exposed in `src/influx/service.py` (the file PRD 05 §6 names as the modification point) as a callable seam that, when invoked with a non-backfill profile run result, POSTs the digest; the hook is a no-op when `kind == \"backfill\"` (FR-NOT-4); failures inside the sender (timeout, 5xx) are logged but do NOT propagate. The end-to-end assertion that the hook fires automatically after each completed run is covered by the end-to-end story (US-019)",
+        "An integration/unit test covers AC-05-I against the hook + sender (invoked directly): the digest POST reaches a local fake webhook receiver and contains all FR-NOT-2 body keys, with `highlights` selected by `score >= profiles.thresholds.notify_immediate` per AC-05-I (threshold sourced from config, not hardcoded)",
+        "A test covers AC-05-J: with `AGENT_ZERO_WEBHOOK_URL=\"\"`, the webhook step is silently skipped (the fake receiver records zero requests)",
+        "A test covers FR-NOT-4: invoking the hook with `kind == \"backfill\"` results in zero requests recorded by the fake receiver",
+        "A test covers timeout/no-retry: a fake receiver that hangs longer than the configured `notifications.timeout_seconds` causes the sender to time out, log, and return — and the receiver records exactly ONE request attempt (no retry)"
       ],
       "priority": 16,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-017",
+      "title": "Extend validate-config with SSE dry-connect and agent_register",
+      "description": "As an Influx operator, I want `validate-config` to open an SSE connection to Lithos using the configured endpoint and call `lithos_agent_register`, exiting non-zero on failure with a message naming the SSE endpoint, so that misconfiguration is surfaced before a run is started (FR-CLI-5, AC-05-K).",
+      "acceptanceCriteria": [
+        "The `validate-config` subcommand (currently owned by `src/influx/main.py` in this codebase; module location may be moved per the implementation) is extended to open an SSE connection to Lithos using the configured endpoint and call `lithos_agent_register` (FR-CLI-5)",
+        "On success, the existing `validate-config` exit-zero path is preserved",
+        "On any dry-connect or register failure, `validate-config` exits non-zero with a descriptive error message; for the AC-05-K case specifically (Lithos unreachable — connection refused or timeout), the error message MUST explicitly name the configured SSE endpoint URL. For other failure modes (e.g. register-time errors after a successful connection), naming the endpoint is recommended implementation guidance but not required by this acceptance criterion",
+        "tests/integration/test_cli.py (or the existing validate-config test suite) covers AC-05-K: with Lithos unreachable, `validate-config` exits non-zero with a message naming the SSE endpoint",
+        "A successful-dry-connect test against a fake Lithos SSE server confirms the agent_register payload reaches the server and `validate-config` exits zero"
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-018",
+      "title": "Extend validate-config with JSON-mode compatibility check for [models.*] slots",
+      "description": "As an Influx operator, I want `validate-config` to construct a client for each `[models.*]` slot and assert that with `json_mode = true` the constructed client supports `response_format={\"type\": \"json_object\"}` (or equivalent), so that an incompatible slot fails validation before runtime instead of mid-run (FR-CLI-5).",
+      "acceptanceCriteria": [
+        "For each `[models.*]` slot in the loaded config, `validate-config` constructs the corresponding client and inspects its supported `response_format` (or equivalent JSON-mode capability) — exact inspection mechanism (capability flag, dry-call, or vendor-specific check) left to the implementation but documented in the validator",
+        "When a `[models.*]` slot has `json_mode = true` and the constructed client does NOT support `response_format={\"type\": \"json_object\"}` (or equivalent), `validate-config` exits non-zero. (Naming the offending slot in the error message is recommended implementation guidance for operability but is not required by this acceptance criterion.)",
+        "When all slots pass, validation proceeds to the SSE dry-connect step from US-017",
+        "tests/integration/test_cli.py covers a positive case (a slot with `json_mode = true` and a JSON-mode-capable client) and a negative case (a slot with `json_mode = true` and a JSON-mode-incapable client) — exit codes and error messages asserted",
+        "AC-X-1 is honoured: no hardcoded constants — the `json_mode` flag and the slot configuration come from config"
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-019",
+      "title": "Integration test for full arXiv → Lithos → webhook path against fakes",
+      "description": "As a developer, I want `tests/integration/test_arxiv_to_lithos.py` to exercise the full arXiv → real-MCP-write → webhook-POST path against a local fake Lithos SSE server and a local fake webhook receiver, replacing PRD 04's stub-recorder assertions, so that AC-M1-7 and AC-M1-9 pass against real wiring (PRD 05 §6 Create, AC-M1-7, AC-M1-9).",
+      "acceptanceCriteria": [
+        "tests/integration/test_arxiv_to_lithos.py is created (or rewritten if a stub-version exists) and drives the full arXiv → real-MCP-write → webhook-POST path through `POST /runs` against a local fake Lithos SSE server and a local fake webhook receiver (PRD 05 §6 Create)",
+        "AC-M1-7 (full): after `POST /runs`, the fake Lithos server records real `lithos_write` calls and the fake webhook receiver records a real digest POST",
+        "AC-M1-9 (full): re-running the same profile after completion via `POST /runs` skips already-ingested items via `lithos_cache_lookup`, asserted by the fake Lithos server's recorded calls",
+        "AC-M1-10 is re-asserted against real `lithos_write` calls driven by `POST /runs` in this test",
+        "AC-M1-11 (full): with the fake Lithos SSE server unreachable, `POST /runs` aborts the run, `/status` reports `status=\"degraded\"` and `dependencies.lithos.status != \"ok\"`, and the service stays alive (full coverage deferred from US-013)",
+        "AC-05-H (end-to-end): the filter prompt actually constructed for a real run via `POST /runs` contains the `negative_examples` titles fetched and formatted by US-014's helpers (end-to-end coverage deferred from US-014)",
+        "AC-05-I (end-to-end): the post-run webhook hook fires automatically after each non-backfill `POST /runs` completion (end-to-end auto-fire coverage deferred from US-016)",
+        "PRD 04's stub-recorder fixture references in this integration test are removed",
+        "Coverage on `lithos_client.py` and `notifications.py` is ≥ 80% (project-required threshold)"
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-020",
+      "title": "Delete legacy stub fixtures and add v1 surface-freeze note",
+      "description": "As a maintainer, I want `tests/fixtures/lithos/stub_recorder.json` (or whatever PRD 04 used) to be deleted now that contract tests replace it, and a reviewer-style freeze note to be added to `tasks/prd-influx-v1-index.md` (or this PRD's footer) confirming the v1 public surface is FROZEN, so that the Definition of Done item is satisfied and downstream PRDs cannot adapt the surface (PRD 05 §6 Delete, Definition of Done freeze item, master PRD §14).",
+      "acceptanceCriteria": [
+        "If a PRD 04 stub-recorder fixture artifact exists on disk (e.g. `tests/fixtures/lithos/stub_recorder.json` or any equivalent fixture file PRD 04 introduced), it is deleted from the repo; otherwise the in-process stub recorder code in `src/influx/lithos_client.py` (and any direct test references to it in `tests/unit/test_lithos_client.py`) is removed",
+        "Any references to deleted stub-recorder code or fixture paths in tests or fixtures are removed; the test suite continues to pass with no broken-path fixture errors",
+        "A reviewer-style freeze note is added to `tasks/prd-influx-v1-index.md` (or as a footer to `tasks/prd-05-mcp-client-webhook.md`) explicitly stating the v1 public surface (HTTP responses, Lithos tool call shapes, note structure, config schema) is FROZEN per master PRD §14",
+        "Ruff, pyright, and pytest all run green",
+        "Coverage ≥ 80% on `src/influx/lithos_client.py` and `src/influx/notifications.py`"
+      ],
+      "priority": 20,
       "passes": false,
       "notes": ""
     }
