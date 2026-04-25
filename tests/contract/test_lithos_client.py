@@ -1380,3 +1380,158 @@ class TestWriteEnvelopeContentTooLarge:
             assert len(write_calls) == 2
         finally:
             await client.close()
+
+
+# ── Write envelopes — content_too_large repair path (§9.7, AC-05-F) ─
+
+
+class TestWriteEnvelopeContentTooLargeRepairPath:
+    """``content_too_large`` repair path: Tier-1-only retry + repair-needed tag."""
+
+    async def test_repair_path_tier1_retry_succeeds(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Repair path: Tier-1-only retry succeeds.
+
+        Second content_too_large with existing note triggers
+        repair-path Tier-1-only retry.  Asserts repair-needed
+        tag present and existing tags preserved (AC-05-F).
+        """
+        import json as _json
+
+        # 1st write → content_too_large
+        # 2nd write (Tier 2 dropped) → content_too_large
+        # 3rd write (Tier 1 only, repair) → updated
+        fake_lithos_server.write_responses.extend([
+            '{"status": "content_too_large"}',
+            '{"status": "content_too_large"}',
+            '{"status": "updated"}',
+        ])
+        # cache_lookup returns hit → existing note found (repair path).
+        fake_lithos_server.cache_lookup_responses.append(
+            _json.dumps({
+                "hit": True,
+                "id": "note-repair-001",
+                "tags": [
+                    "profile:ml-research",
+                    "user-custom-tag",
+                    "influx:rejected:ml-research",
+                ],
+            })
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Large Paper",
+                content=_CONTENT_WITH_TIERS,
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.60001",
+                tags=["profile:ml-research", "source:arxiv"],
+                confidence=0.9,
+            )
+            assert result.status == "updated"
+
+            write_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            # 3 writes: original, Tier-2-dropped retry, Tier-1-only repair.
+            assert len(write_calls) == 3
+
+            # First call has full content.
+            assert "## Full Text" in write_calls[0][1]["content"]
+            # Second call has Tier 2 dropped, Tier 3 kept.
+            assert "## Full Text" not in write_calls[1][1]["content"]
+            assert "## Claims" in write_calls[1][1]["content"]
+
+            # Third call (repair): Tier 1 only — no Tier 2 or Tier 3.
+            repair_payload = write_calls[2][1]
+            repair_content = repair_payload["content"]
+            assert "## Full Text" not in repair_content
+            assert "## Claims" not in repair_content
+            assert "## Datasets & Benchmarks" not in repair_content
+            assert "## Builds On" not in repair_content
+            assert "## Open Questions" not in repair_content
+            # Tier 1 content preserved.
+            assert "Transformer paper" in repair_content
+
+            # influx:repair-needed tag present.
+            repair_tags = repair_payload["tags"]
+            assert "influx:repair-needed" in repair_tags
+            # Existing tags preserved via merge.
+            assert "profile:ml-research" in repair_tags
+            assert "source:arxiv" in repair_tags
+            assert "user-custom-tag" in repair_tags
+            assert "influx:rejected:ml-research" in repair_tags
+        finally:
+            await client.close()
+
+    async def test_repair_path_tier1_fails_leaves_existing_untouched(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Repair path Tier-1 also too large.
+
+        Existing note untouched, counter incremented, no abort,
+        updated_at unchanged (AC-05-F repair path).
+        """
+        import json as _json
+        import logging
+
+        # 1st write → content_too_large
+        # 2nd write (Tier 2 dropped) → content_too_large
+        # 3rd write (Tier 1 only, repair) → content_too_large
+        fake_lithos_server.write_responses.extend([
+            '{"status": "content_too_large"}',
+            '{"status": "content_too_large"}',
+            '{"status": "content_too_large"}',
+        ])
+        # cache_lookup returns hit → existing note found (repair path).
+        fake_lithos_server.cache_lookup_responses.append(
+            _json.dumps({
+                "hit": True,
+                "id": "note-repair-002",
+                "tags": ["profile:ml-research"],
+            })
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with caplog.at_level(logging.WARNING):
+                result = await client.write_note(
+                    title="Enormous Paper",
+                    content=_CONTENT_WITH_TIERS,
+                    path="papers/arxiv/2026/03",
+                    source_url="https://arxiv.org/abs/2601.60002",
+                    tags=["profile:ml-research"],
+                    confidence=0.9,
+                )
+
+            # Status indicates skipped with repair-path detail.
+            assert result.status == "content_too_large_skipped"
+            assert result.detail == "repair_path_tier1_failed"
+            assert result.source_url == (
+                "https://arxiv.org/abs/2601.60002"
+            )
+
+            # Exactly 3 write attempts (original + Tier-2 retry + Tier-1 repair).
+            write_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 3
+
+            # No further writes after the third failure — existing note untouched.
+            # (No 4th "overwrite" or "placeholder" call.)
+
+            # Warning logged with source_url.
+            assert "content_too_large" in caplog.text
+            assert "2601.60002" in caplog.text
+            assert "repair path" in caplog.text.lower()
+        finally:
+            await client.close()

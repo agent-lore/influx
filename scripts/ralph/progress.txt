@@ -181,3 +181,16 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - FakeLithosServer `cache_lookup_responses` list is FIFO (same pattern as `write_responses` and `read_responses`)
   - 561 tests pass (3 new contract tests added)
 ---
+
+## 2026-04-25 - US-011
+- Added 2 contract tests for content_too_large repair path (AC-05-F repair path)
+- Test 1: repair-path success — second content_too_large with existing note → Tier-1-only retry succeeds, `influx:repair-needed` tag present, existing tags preserved via merge
+- Test 2: repair-path Tier-1-fails — third content_too_large → existing note untouched, counter incremented (`repair_path_tier1_failed`), no abort, warning logged
+- Implementation was already complete (scaffolded in US-010 via `_retry_content_too_large_repair()`)
+- Files changed: `tests/contract/test_lithos_client.py`, `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - The repair path requires 3 write_responses in the queue (original, Tier-2-dropped retry, Tier-1-only repair) plus 1 cache_lookup_response (hit=true for existing note detection)
+  - `_retry_content_too_large_repair()` uses original `args["content"]` (not the already-trimmed content from step 1) for `_drop_tier2_and_tier3()`, which is correct
+  - Together with US-010's tests, all FOUR AC-05-F sub-paths are now covered: first-retry-succeeds, create-path skip, repair-path success, repair-path Tier-1-fails
+  - 563 tests pass (2 new contract tests added)
+---

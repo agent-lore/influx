@@ -160,7 +160,7 @@
         "Together with US-010, all FOUR AC-05-F sub-paths are covered: first-retry-succeeds, create-path skip, repair-path success, repair-path Tier-1-fails"
       ],
       "priority": 11,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
