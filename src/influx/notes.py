@@ -522,6 +522,7 @@ def render_note(
     summary: str,
     keywords: list[str],
     profile_entries: list[ProfileRelevanceEntry],
+    full_text: str | None = None,
     user_notes: str | None = None,
 ) -> str:
     """Render a full canonical Lithos note (FR-NOTE-1..8).
@@ -546,6 +547,9 @@ def render_note(
         Profile relevance entries to render. For rewrites, use
         :func:`build_profile_relevance_for_rewrite` to resolve
         entries that honour the rejection guard.
+    full_text:
+        Tier-2 extracted plain text for the ``## Full Text`` section.
+        When ``None`` or empty the section is omitted entirely (FR-ENR-6).
     user_notes:
         Byte-exact ``## User Notes`` region from a previous parse,
         or ``None`` to append an empty ``## User Notes`` heading.
@@ -586,6 +590,10 @@ def render_note(
     output += f"# {title}\n\n"
     output += archive_section + "\n"
     output += f"## Summary\n{summary_body}\n"
+
+    # Full Text section (Tier 2) — omitted when absent/empty (FR-ENR-6, US-011)
+    if full_text:
+        output += f"\n## Full Text\n{full_text}\n"
 
     # Profile Relevance section — always emitted to keep the canonical
     # note shape stable (US-007); body is empty when no entries are given.
