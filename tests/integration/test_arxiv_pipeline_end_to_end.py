@@ -679,3 +679,124 @@ class TestDefaultFilterScorerEndToEnd:
         assert "full-text" in payload["tags"]
         assert "influx:deep-extracted" in payload["tags"]
         assert "## Claims" in payload["content"]
+
+    def test_default_scorer_http_failure_yields_abstract_only(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Default LLM filter HTTP failure → note still written abstract-only.
+
+        Regression test for the finding: when the default batch scorer
+        hard-fails (HTTP error, parse error, missing provider) the
+        provider must fall every item back to abstract-only ingestion
+        rather than dropping the entire batch (PRD 07 §5.6 graceful
+        degradation).
+        """
+        import httpx
+
+        config = _make_config_with_filter(fake_lithos_url)
+
+        app = create_app(config)
+        assert app.state.item_provider is not None
+
+        with (
+            patch(
+                "influx.sources.arxiv.guarded_fetch",
+                return_value=_atom_fetch_result(),
+            ),
+            patch(
+                "influx.extraction.html.guarded_fetch",
+            ) as mock_html,
+            patch(
+                "influx.filter.httpx.post",
+                side_effect=httpx.ConnectError("simulated transport failure"),
+            ) as mock_filter_post,
+        ):
+            import asyncio
+
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=app.state.item_provider,
+                )
+            )
+
+            # Default scorer was attempted once and failed.
+            assert mock_filter_post.call_count == 1
+            # Abstract-only fallback must NOT trigger HTML extraction.
+            assert mock_html.call_count == 0
+
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+        # The note is still written even though the filter failed —
+        # that is the bug this regression test pins down.
+        assert len(write_calls) == 1, (
+            "filter scorer hard-failure must fall back to abstract-only "
+            "ingestion, not silently drop the batch"
+        )
+        payload = write_calls[0][1]
+
+        assert "text:abstract-only" in payload["tags"]
+        assert "text:html" not in payload["tags"]
+        assert "full-text" not in payload["tags"]
+        assert "## Full Text" not in payload["content"]
+        assert "influx:deep-extracted" not in payload["tags"]
+
+    def test_default_scorer_missing_provider_yields_abstract_only(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """models.filter slot points at a missing provider → abstract-only note.
+
+        Misconfiguration where ``[models.filter]`` is configured but the
+        referenced provider is not declared in ``[providers]`` must not
+        silently drop the batch — every item should fall back to
+        abstract-only ingestion (PRD 07 §5.6).
+        """
+        config = _make_config_with_filter(fake_lithos_url)
+        # Drop the provider that ``[models.filter]`` references so the
+        # scorer's provider lookup fails at call time.
+        config.providers = {}
+
+        app = create_app(config)
+        assert app.state.item_provider is not None
+
+        with (
+            patch(
+                "influx.sources.arxiv.guarded_fetch",
+                return_value=_atom_fetch_result(),
+            ),
+            patch(
+                "influx.extraction.html.guarded_fetch",
+            ) as mock_html,
+            patch("influx.filter.httpx.post") as mock_filter_post,
+        ):
+            import asyncio
+
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=app.state.item_provider,
+                )
+            )
+
+            # Provider lookup fails before httpx is called.
+            assert mock_filter_post.call_count == 0
+            # No HTML extraction either (score=0 fallback < full_text).
+            assert mock_html.call_count == 0
+
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1, (
+            "missing filter provider must fall back to abstract-only, "
+            "not silently drop the batch"
+        )
+        payload = write_calls[0][1]
+
+        assert "text:abstract-only" in payload["tags"]
+        assert "text:html" not in payload["tags"]
+        assert "full-text" not in payload["tags"]

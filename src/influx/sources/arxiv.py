@@ -36,6 +36,7 @@ from influx.coordinator import RunKind
 from influx.enrich import tier1_enrich, tier3_extract
 from influx.errors import ExtractionError, LCMAError, NetworkError
 from influx.extraction.pipeline import extract_arxiv_text
+from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import Tier1Enrichment, Tier3Extraction
@@ -611,18 +612,30 @@ def make_arxiv_item_provider(
         # Batched LLM filter takes precedence as the production default.
         # The per-item ``scorer`` seam stays available for tests that
         # want deterministic, synchronous scoring without an LLM.
+        #
+        # Distinguish two filter-scorer outcomes:
+        #   - returned a (possibly empty) mapping → the filter ran and
+        #     intentionally omitted any items missing from the mapping
+        #     (typically because they fell below
+        #     ``filter.min_score_in_results``).  Drop those items.
+        #   - raised ``FilterScorerError`` → the filter could not produce
+        #     a scoring decision at all (provider misconfigured, HTTP
+        #     failure, parse failure).  Fall every item back to
+        #     abstract-only ingestion so the run still produces notes
+        #     (PRD 07 §5.6 graceful degradation).
         batch_scores: dict[str, ArxivScoreResult] = {}
+        filter_failed = False
         if scorer is None and filter_scorer is not None:
             try:
                 batch_scores = await filter_scorer(items, profile, filter_prompt)
-            except Exception:  # pragma: no cover — defensive  # noqa: BLE001
+            except FilterScorerError:
                 _log.warning(
-                    "filter_scorer raised for profile %r; "
-                    "falling back to abstract-only ingestion",
+                    "filter_scorer failed for profile %r; "
+                    "falling back to abstract-only ingestion for entire batch",
                     profile,
                     exc_info=True,
                 )
-                batch_scores = {}
+                filter_failed = True
 
         results: list[dict[str, Any]] = []
         for arxiv_item in items:
@@ -631,13 +644,23 @@ def make_arxiv_item_provider(
                 if score_result is None:
                     continue
             elif filter_scorer is not None:
-                # Items absent from the LLM filter response are dropped
-                # entirely — the filter explicitly chose not to score
-                # them (typically because they fell below
-                # ``filter.min_score_in_results``).
-                if arxiv_item.arxiv_id not in batch_scores:
+                if filter_failed:
+                    # The filter call hard-failed for the whole batch —
+                    # write each item abstract-only (score=0) instead of
+                    # dropping the run.
+                    score_result = ArxivScoreResult(
+                        score=0,
+                        confidence=0.0,
+                        reason="filter-scorer-failed",
+                    )
+                elif arxiv_item.arxiv_id not in batch_scores:
+                    # Items absent from the LLM filter response are
+                    # dropped entirely — the filter explicitly chose not
+                    # to score them (typically because they fell below
+                    # ``filter.min_score_in_results``).
                     continue
-                score_result = batch_scores[arxiv_item.arxiv_id]
+                else:
+                    score_result = batch_scores[arxiv_item.arxiv_id]
             else:
                 score_result = ArxivScoreResult(
                     score=0,

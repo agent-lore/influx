@@ -22,9 +22,13 @@ Design notes
   rather than crashing.
 - Scorer failure is non-fatal at the per-item level: items the LLM
   filter omits from its ``results`` array are dropped; transport / parse
-  / validation failures cause the scorer to return an empty mapping so
-  every item falls back to abstract-only ingestion (§5.6 graceful
-  degradation).
+  / validation failures raise :class:`FilterScorerError` so the caller
+  (the arXiv item provider) can fall every item in the batch back to
+  abstract-only ingestion instead of dropping the batch entirely
+  (§5.6 graceful degradation).  An empty returned mapping therefore
+  unambiguously means "the LLM intentionally scored nothing above
+  ``filter.min_score_in_results``" — drop the items, do not emit
+  abstract-only notes for them.
 """
 
 from __future__ import annotations
@@ -41,8 +45,21 @@ from influx.config import AppConfig
 from influx.schemas import FilterResponse
 
 __all__ = [
+    "FilterScorerError",
     "make_default_arxiv_filter_scorer",
 ]
+
+
+class FilterScorerError(RuntimeError):
+    """Hard failure of the production-default LLM filter scorer.
+
+    Raised when the scorer cannot produce a valid scoring decision at
+    all (provider misconfigured, HTTP error, malformed response).  The
+    arXiv item provider catches this and falls every item in the batch
+    back to abstract-only ingestion (score=0) so a misconfigured /
+    transient-LLM-failure deployment still produces notes instead of
+    silently dropping the run (PRD 07 §5.6 graceful degradation).
+    """
 
 _log = logging.getLogger(__name__)
 
@@ -78,11 +95,14 @@ def make_default_arxiv_filter_scorer(
         provider = config.providers.get(slot.provider)
         if provider is None:
             _log.warning(
-                "filter provider %r not configured; skipping LLM filter for %r",
+                "filter provider %r not configured for profile %r; "
+                "falling back to abstract-only ingestion",
                 slot.provider,
                 profile,
             )
-            return {}
+            raise FilterScorerError(
+                f"filter provider {slot.provider!r} not configured",
+            )
 
         item_payload = [
             {
@@ -130,19 +150,23 @@ def make_default_arxiv_filter_scorer(
             )
         except httpx.HTTPError as exc:
             _log.warning(
-                "filter HTTP error for profile %r: %s; falling back to no scores",
+                "filter HTTP error for profile %r: %s; "
+                "falling back to abstract-only ingestion",
                 profile,
                 exc,
             )
-            return {}
+            raise FilterScorerError(f"filter HTTP error: {exc}") from exc
 
         if resp.status_code >= 400:
             _log.warning(
-                "filter slot HTTP %d for profile %r; falling back to no scores",
+                "filter slot HTTP %d for profile %r; "
+                "falling back to abstract-only ingestion",
                 resp.status_code,
                 profile,
             )
-            return {}
+            raise FilterScorerError(
+                f"filter slot HTTP {resp.status_code}",
+            )
 
         try:
             resp_json = resp.json()
@@ -158,11 +182,13 @@ def make_default_arxiv_filter_scorer(
         ) as exc:
             _log.warning(
                 "filter response parse failure for profile %r: %s; "
-                "falling back to no scores",
+                "falling back to abstract-only ingestion",
                 profile,
                 exc,
             )
-            return {}
+            raise FilterScorerError(
+                f"filter response parse failure: {exc}",
+            ) from exc
 
         return {
             r.id: ArxivScoreResult(
