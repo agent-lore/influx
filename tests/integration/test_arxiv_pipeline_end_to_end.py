@@ -16,8 +16,6 @@ extraction stack end-to-end (PRD 07 US-014).
 
 from __future__ import annotations
 
-import json
-import time
 from collections.abc import Generator
 from unittest.mock import patch
 
@@ -42,6 +40,7 @@ from influx.coordinator import RunKind
 from influx.http_client import FetchResult
 from influx.scheduler import run_profile
 from influx.service import create_app
+from influx.sources.arxiv import ArxivItem, ArxivScorer, ArxivScoreResult
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Fixture data ──────────────────────────────────────────────────
@@ -190,6 +189,21 @@ def _html_fetch_result() -> FetchResult:
 # ── Tests ─────────────────────────────────────────────────────────
 
 
+def _scorer_with_score(score: int) -> ArxivScorer:
+    """Build a deterministic scorer that returns the same score for every item.
+
+    Used by the integration tests below to drive the score-gated
+    extraction / enrichment paths from US-014/US-015 without standing
+    up a real LLM filter.
+    """
+
+    def _score(item: ArxivItem, profile: str) -> ArxivScoreResult:
+        del item, profile
+        return ArxivScoreResult(score=score, confidence=1.0, reason="test-scorer")
+
+    return _score
+
+
 class TestProductionArxivProviderWiring:
     """``create_app`` wires the real arXiv provider into ``run_profile``."""
 
@@ -215,7 +229,10 @@ class TestRunProfileDrivesExtraction:
     ) -> None:
         """End-to-end: arXiv fetch → HTML extract → lithos_write payload."""
         config = _make_config(fake_lithos_url)
-        app = create_app(config)
+        # Inject a scorer that returns score=8 (= ``thresholds.full_text``) so
+        # the extraction cascade actually runs; without an injected scorer the
+        # provider now returns score=0 and the note would be abstract-only.
+        app = create_app(config, arxiv_scorer=_scorer_with_score(8))
 
         # Mock both guarded_fetch import sites: the arXiv API fetcher in
         # ``sources.arxiv`` and the HTML extractor in ``extraction.html``.
@@ -252,6 +269,158 @@ class TestRunProfileDrivesExtraction:
         # The full-text body should be substantive — i.e. came from the
         # mocked HTML body, not a placeholder.
         assert "transformer" in payload["content"].lower()
+
+
+class TestRunProfileHonoursScoreGating:
+    """``run_profile`` honours the score-gated extraction/enrichment contract.
+
+    Drives the production-default item provider end-to-end with both a
+    below-``full_text`` score and a ``>= deep_extract`` score so the
+    score-gated behaviour from US-014/US-015 is exercised through
+    ``run_profile`` rather than only through ``build_arxiv_note_item``.
+    Demonstrates that the new injectable ``arxiv_scorer`` seam (the
+    finding's recommended fix) actually drives the gating logic.
+    """
+
+    def test_below_full_text_score_yields_abstract_only(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Score below ``full_text`` → no extraction, no full-text tag."""
+        config = _make_config(fake_lithos_url)
+        # Score 5 < relevance(100) < full_text(8) — no Tier 1, no extraction.
+        app = create_app(config, arxiv_scorer=_scorer_with_score(5))
+
+        with (
+            patch(
+                "influx.sources.arxiv.guarded_fetch",
+                return_value=_atom_fetch_result(),
+            ),
+            patch(
+                "influx.extraction.html.guarded_fetch",
+            ) as mock_html,
+        ):
+            import asyncio
+
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=app.state.item_provider,
+                )
+            )
+
+            # Below-threshold scores must NOT trigger the HTML extractor.
+            assert mock_html.call_count == 0, (
+                "HTML extractor must not be called when score < full_text"
+            )
+
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1
+        payload = write_calls[0][1]
+
+        assert "text:abstract-only" in payload["tags"]
+        assert "text:html" not in payload["tags"]
+        assert "full-text" not in payload["tags"]
+        assert "## Full Text" not in payload["content"]
+        assert "influx:deep-extracted" not in payload["tags"]
+
+    def test_deep_extract_threshold_triggers_tier3(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Score ≥ ``deep_extract`` → Tier 3 enrichment is invoked."""
+        # Use a config with permissive thresholds so deep_extract is reachable.
+        config = AppConfig(
+            lithos=LithosConfig(url=fake_lithos_url),
+            schedule=ScheduleConfig(cron="0 6 * * *", timezone="UTC"),
+            profiles=[
+                ProfileConfig(
+                    name="ai-robotics",
+                    description="Robotics papers",
+                    thresholds=ProfileThresholds(
+                        relevance=100,  # disable Tier 1 so we don't need to
+                        # mock ``enrich.tier1_enrich``
+                        full_text=8,
+                        deep_extract=9,
+                        notify_immediate=8,
+                    ),
+                    sources=ProfileSources(
+                        arxiv=ArxivSourceConfig(
+                            enabled=True,
+                            categories=["cs.RO"],
+                            max_results_per_category=10,
+                            lookback_days=30,
+                        ),
+                    ),
+                ),
+            ],
+            providers={},
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="x"),
+                tier1_enrich=PromptEntryConfig(text="x"),
+                tier3_extract=PromptEntryConfig(text="x"),
+            ),
+            notifications=NotificationsConfig(webhook_url="", timeout_seconds=5),
+            security=SecurityConfig(allow_private_ips=True),
+            extraction=ExtractionConfig(),
+            feedback=FeedbackConfig(),
+        )
+
+        # Score 9 >= deep_extract — Tier 3 must be invoked.
+        app = create_app(config, arxiv_scorer=_scorer_with_score(9))
+
+        from influx.schemas import Tier3Extraction
+
+        tier3_stub = Tier3Extraction(
+            claims=["claim"],
+            datasets=[],
+            builds_on=[],
+            open_questions=[],
+            potential_connections=[],
+        )
+
+        with (
+            patch(
+                "influx.sources.arxiv.guarded_fetch",
+                return_value=_atom_fetch_result(),
+            ),
+            patch(
+                "influx.extraction.html.guarded_fetch",
+                return_value=_html_fetch_result(),
+            ),
+            patch(
+                "influx.sources.arxiv.tier3_extract",
+                return_value=tier3_stub,
+            ) as mock_tier3,
+        ):
+            import asyncio
+
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=app.state.item_provider,
+                )
+            )
+
+            # Score >= deep_extract MUST invoke Tier 3 exactly once.
+            assert mock_tier3.call_count == 1, (
+                "Tier 3 extraction must be called when score >= deep_extract"
+            )
+
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1
+        payload = write_calls[0][1]
+
+        assert "text:html" in payload["tags"]
+        assert "full-text" in payload["tags"]
+        assert "influx:deep-extracted" in payload["tags"]
+        assert "## Claims" in payload["content"]
 
 
 class TestRunProfileSkipsWhenSourceDisabled:

@@ -21,10 +21,10 @@ from __future__ import annotations
 import logging
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from influx.config import (
     AppConfig,
@@ -32,6 +32,7 @@ from influx.config import (
     ProfileThresholds,
     ResilienceConfig,
 )
+from influx.coordinator import RunKind
 from influx.enrich import tier1_enrich, tier3_extract
 from influx.errors import ExtractionError, LCMAError, NetworkError
 from influx.extraction.pipeline import extract_arxiv_text
@@ -39,11 +40,10 @@ from influx.http_client import guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 
-if TYPE_CHECKING:
-    from influx.coordinator import RunKind
-
 __all__ = [
     "ArxivItem",
+    "ArxivScorer",
+    "ArxivScoreResult",
     "build_arxiv_note_item",
     "build_query_url",
     "fetch_arxiv",
@@ -80,6 +80,32 @@ class ArxivItem:
     abstract: str
     published: datetime
     categories: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class ArxivScoreResult:
+    """One scored candidate emitted by an :data:`ArxivScorer`.
+
+    The scorer drives the score-gated extraction / enrichment
+    behaviour required by PRD 07 §5.6 (``build_arxiv_note_item`` gates
+    HTML/PDF extraction on ``score >= thresholds.full_text``, Tier 1
+    enrichment on ``score >= thresholds.relevance``, and Tier 3
+    extraction on ``score >= thresholds.deep_extract``).  Returning
+    ``None`` from the scorer means "drop this item entirely".
+    """
+
+    score: int
+    confidence: float
+    reason: str
+
+
+# A scorer maps each fetched arXiv item + the active profile name to a
+# concrete ``ArxivScoreResult`` (or ``None`` to drop the item from the
+# run).  The seam exists so the production-default item provider does
+# NOT fabricate a synthetic score: the caller must supply real scoring
+# (LLM filter wiring lives outside PRD 07's scope, but the seam keeps
+# the score-gated contract from US-014/US-015 honest).
+ArxivScorer = Callable[[ArxivItem, str], ArxivScoreResult | None]
 
 
 # ── Query URL construction ─────────────────────────────────────────
@@ -509,6 +535,8 @@ def build_arxiv_note_item(
 
 def make_arxiv_item_provider(
     config: AppConfig,
+    *,
+    scorer: ArxivScorer | None = None,
 ) -> Any:
     """Build the production-default ``item_provider`` for arXiv profiles.
 
@@ -520,16 +548,18 @@ def make_arxiv_item_provider(
     abstract-only extraction stack and the Tier 1 / Tier 3 enrichment
     callers end-to-end.
 
-    LLM-filter scoring (PRD 04) is not yet wired into this provider:
-    each fetched item is admitted with the profile's ``full_text``
-    threshold as a placeholder score so the extraction cascade is
-    exercised; downstream PRDs replace this placeholder with real
-    LLM filter output.  RSS sources are likewise out of scope here.
+    *scorer* is the score-gating seam.  PRD 04's LLM filter is the
+    eventual production wiring; until that lands, callers (production
+    bootstrapping and tests) must supply a scorer or items receive a
+    score of ``0`` and are written abstract-only with no extraction or
+    enrichment — the provider does NOT fabricate a score equal to
+    ``thresholds.full_text``.  Returning ``None`` from the scorer drops
+    the item entirely.
     """
 
     async def provider(
         profile: str,
-        kind: "RunKind",
+        kind: RunKind,
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
     ) -> Iterable[dict[str, Any]]:
@@ -554,21 +584,30 @@ def make_arxiv_item_provider(
             )
             return ()
 
-        # Placeholder score until PRD 04's LLM filter is wired: admit
-        # every fetched item at the profile's full_text threshold so the
-        # extraction cascade is exercised end-to-end.
-        score = profile_cfg.thresholds.full_text
+        results: list[dict[str, Any]] = []
+        for arxiv_item in items:
+            if scorer is None:
+                score_result: ArxivScoreResult | None = ArxivScoreResult(
+                    score=0,
+                    confidence=0.0,
+                    reason="no-scorer-configured",
+                )
+            else:
+                score_result = scorer(arxiv_item, profile)
+                if score_result is None:
+                    continue
 
-        return [
-            build_arxiv_note_item(
-                item=arxiv_item,
-                score=score,
-                confidence=1.0,
-                reason="arxiv-source",
-                profile_name=profile,
-                config=config,
+            results.append(
+                build_arxiv_note_item(
+                    item=arxiv_item,
+                    score=score_result.score,
+                    confidence=score_result.confidence,
+                    reason=score_result.reason,
+                    profile_name=profile,
+                    config=config,
+                )
             )
-            for arxiv_item in items
-        ]
+
+        return results
 
     return provider

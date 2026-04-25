@@ -29,7 +29,7 @@ from influx.http_api import router
 from influx.notifications import ProfileRunResult, build_digest, send_digest
 from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler
-from influx.sources.arxiv import make_arxiv_item_provider
+from influx.sources.arxiv import ArxivScorer, make_arxiv_item_provider
 
 __all__ = [
     "InfluxService",
@@ -93,6 +93,8 @@ def validate_bind_host(host: str, *, allow_remote_admin: bool) -> None:
 def create_app(
     config: AppConfig,
     lifespan: Any | None = None,
+    *,
+    arxiv_scorer: ArxivScorer | None = None,
 ) -> FastAPI:
     """Build and return the FastAPI app with all dependencies on ``app.state``.
 
@@ -104,6 +106,14 @@ def create_app(
     lifespan:
         Optional FastAPI lifespan context manager (async generator).
         When provided, wired into the app for startup/shutdown handling.
+    arxiv_scorer:
+        Optional score-gating callback for the arXiv item provider.
+        See :func:`~influx.sources.arxiv.make_arxiv_item_provider` —
+        when ``None``, fetched arXiv items receive a placeholder
+        score of ``0`` (abstract-only, no extraction or enrichment)
+        until PRD 04's LLM filter is wired through this seam.  Tests
+        inject a deterministic scorer to exercise the score-gated
+        extraction / enrichment paths from US-014/US-015.
     """
     app = FastAPI(title="Influx Admin API", lifespan=lifespan)
     app.include_router(router)
@@ -121,7 +131,7 @@ def create_app(
     # the LLM filter remain future-PRD scope.  Tests still override
     # this seam by setting ``app.state.item_provider`` and passing a
     # custom provider into ``InfluxScheduler``.
-    item_provider: Any = make_arxiv_item_provider(config)
+    item_provider: Any = make_arxiv_item_provider(config, scorer=arxiv_scorer)
 
     scheduler = InfluxScheduler(
         config,
