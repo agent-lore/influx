@@ -341,3 +341,26 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - The dry-call uses `max_tokens=1` to minimize cost; most providers validate `response_format` before processing tokens
   - 611 tests pass (4 new unit tests added)
 ---
+
+## US-019 — Integration test for full arXiv → Lithos → webhook path against fakes
+- **Status:** PASS
+- **Acceptance criteria covered:**
+  - AC-M1-7: POST /runs → lithos_write calls recorded on FakeLithosServer + webhook digest received on FakeWebhookServer
+  - AC-M1-9: second run with cache hit → no lithos_write, digest shows 0 ingested
+  - AC-M1-10: lithos_write payloads contain all FR-MCP-6 fields (title, agent, source_url, namespace, note_type, tags, confidence, content)
+  - AC-M1-11: Lithos unreachable → run aborts, /status reports degraded, service stays alive
+  - AC-05-H: filter prompt contains rejection titles from lithos_list (negative examples end-to-end)
+  - AC-05-I: webhook auto-fires for manual run; skips backfill (FR-NOT-4); silent skip on empty URL (AC-05-J)
+- **Key implementation details:**
+  - `FakeWebhookServer` — simple http.server recording POST requests; reusable for future webhook tests
+  - `_make_fake_run_profile()` factory creates a fake `run_profile` that exercises real MCP tool calls (cache_lookup, write_note, lithos_list) against `FakeLithosServer`, then fires `post_run_webhook_hook`
+  - Monkeypatch target: `influx.http_api.run_profile` (NOT `influx.scheduler.run_profile`) because `http_api.py` imports `run_profile` at module level with `from influx.scheduler import run_profile`, creating a local reference
+  - `_wait_for_idle()` polls coordinator lock to synchronize with background tasks spawned by TestClient
+  - `allow_private_ips=True` in test config for SSRF guard with localhost URLs
+- Files changed: `tests/integration/test_arxiv_to_lithos.py` (new)
+- **Learnings for future iterations:**
+  - When monkeypatching, always patch at the import site (`influx.http_api.run_profile`), not the source module (`influx.scheduler.run_profile`)
+  - `FakeLithosServer` from `tests/contract/test_lithos_client.py` is reusable for integration tests — import directly
+  - `probe_loop.run_once()` is needed in test app setup to initialize probe state before status endpoint checks
+  - 622 tests pass (11 new integration tests added)
+---
