@@ -47,6 +47,18 @@ class FakeLithosServer:
             calls.append(("lithos_ping", {}))
             return "pong"
 
+        @self._mcp.tool(name="lithos_agent_register")
+        async def lithos_agent_register(
+            id: str = "", name: str = "", type: str = ""
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_agent_register",
+                    {"id": id, "name": name, "type": type},
+                )
+            )
+            return '{"registered": true}'
+
         @self._mcp.tool(name="lithos_cache_lookup")
         async def lithos_cache_lookup(
             query: str = "", source_url: str = ""
@@ -156,8 +168,10 @@ class TestConnectionLifecycle:
             assert not client.connected
             await client.call_tool("lithos_ping")
             assert client.connected
-            assert len(fake_lithos_server.calls) == 1
-            assert fake_lithos_server.calls[0][0] == "lithos_ping"
+            # agent_register fires on connect, then our ping.
+            assert len(fake_lithos_server.calls) == 2
+            assert fake_lithos_server.calls[0][0] == "lithos_agent_register"
+            assert fake_lithos_server.calls[1][0] == "lithos_ping"
         finally:
             await client.close()
 
@@ -169,7 +183,7 @@ class TestConnectionLifecycle:
     ) -> None:
         client = LithosClient(url=fake_lithos_url)
         try:
-            # First call establishes the connection.
+            # First call establishes connection (agent_register + ping).
             await client.call_tool("lithos_ping")
             assert client.connected
 
@@ -179,7 +193,8 @@ class TestConnectionLifecycle:
             # Second call reuses the same session (no reconnect).
             await client.call_tool("lithos_ping")
             assert client._session is session_after_first  # noqa: SLF001
-            assert len(fake_lithos_server.calls) == 2
+            # agent_register + 2 × ping = 3 total calls.
+            assert len(fake_lithos_server.calls) == 3
         finally:
             await client.close()
 
@@ -191,3 +206,83 @@ class TestConnectionLifecycle:
         assert client.connected
         await client.close()
         assert not client.connected
+
+
+# ── Agent registration (FR-MCP-8, AC-05-G) ────────────────────────
+
+
+_EXPECTED_REGISTER_PAYLOAD = {
+    "id": "influx",
+    "name": "Influx Pipeline",
+    "type": "ingestion-pipeline",
+}
+
+
+class TestAgentRegister:
+    """``lithos_agent_register`` fires on connect and on reconnect."""
+
+    async def test_register_on_first_tool_call(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """First tool-call triggers exactly one agent_register with correct payload."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.call_tool("lithos_ping")
+
+            register_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_agent_register"
+            ]
+            assert len(register_calls) == 1
+            assert register_calls[0][1] == _EXPECTED_REGISTER_PAYLOAD
+        finally:
+            await client.close()
+
+    async def test_no_register_before_tool_call(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """No agent_register call is sent before any tool-call use."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            # Client constructed but no tool call yet.
+            assert not client.connected
+            register_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_agent_register"
+            ]
+            assert len(register_calls) == 0
+        finally:
+            await client.close()
+
+    async def test_register_again_after_reconnect(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """SSE drop + reconnect triggers a second agent_register call."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            # First connection — one register.
+            await client.call_tool("lithos_ping")
+            register_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_agent_register"
+            ]
+            assert len(register_calls) == 1
+
+            # Simulate SSE drop + reconnect.
+            await client.reconnect()
+
+            register_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_agent_register"
+            ]
+            assert len(register_calls) == 2
+            # Both calls carry identical payload.
+            assert register_calls[0][1] == _EXPECTED_REGISTER_PAYLOAD
+            assert register_calls[1][1] == _EXPECTED_REGISTER_PAYLOAD
+        finally:
+            await client.close()

@@ -51,8 +51,20 @@ class LithosClient:
         self._exit_stack: AsyncExitStack | None = None
         self._connect_lock = asyncio.Lock()
 
+    # Agent identity sent on every (re-)connection (FR-MCP-8).
+    _AGENT_REGISTER_ARGS: dict[str, str] = {
+        "id": "influx",
+        "name": "Influx Pipeline",
+        "type": "ingestion-pipeline",
+    }
+
     async def _ensure_connected(self) -> ClientSession:
-        """Lazily establish the SSE connection on first use."""
+        """Lazily establish the SSE connection on first use.
+
+        On every new connection (including reconnects after an SSE drop),
+        ``lithos_agent_register`` is called automatically so Lithos knows
+        the agent identity (FR-MCP-8, AC-05-G).
+        """
         if self._session is not None:
             return self._session
 
@@ -76,6 +88,16 @@ class LithosClient:
                     )
                 )
                 await session.initialize()
+
+                # Register with Lithos on every new connection (FR-MCP-8).
+                await session.call_tool(
+                    "lithos_agent_register", self._AGENT_REGISTER_ARGS
+                )
+                logger.info(
+                    "Registered agent with Lithos (id=%s)",
+                    self._AGENT_REGISTER_ARGS["id"],
+                )
+
                 self._exit_stack = stack
                 self._session = session
                 logger.info("Lithos SSE connection established to %s", self._url)
@@ -83,6 +105,15 @@ class LithosClient:
             except Exception:
                 await stack.aclose()
                 raise
+
+    async def reconnect(self) -> None:
+        """Drop the current SSE connection and re-establish it.
+
+        On the new connection ``lithos_agent_register`` is called again
+        automatically (AC-05-G reconnect re-register).
+        """
+        await self.close()
+        await self._ensure_connected()
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None

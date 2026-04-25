@@ -41,7 +41,7 @@
         "A contract test asserts that simulating an SSE drop + reconnect triggers a second `agent_register` call with identical payload"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
