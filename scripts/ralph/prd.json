@@ -205,7 +205,7 @@
         "Influx does NOT author `influx:rejected:<profile>` tags itself (Lens is the sole writer per FR-FB-3) — verified behaviorally: a test exercises the Influx write wrappers (e.g. via the fake Lithos server recording every `lithos_write` payload) and asserts that Influx never synthesizes a new `influx:rejected:<profile>` tag on its own (no payload introduces such a tag that wasn't already present on the existing note). Repair/update writes that rewrite an existing note MUST preserve any pre-existing `influx:rejected:<profile>` tags through the tag-merge contract — this preservation is asserted by a separate test against an existing note that carries the tag"
       ],
       "priority": 14,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

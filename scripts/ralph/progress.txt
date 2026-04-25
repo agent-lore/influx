@@ -44,6 +44,10 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - `fake_lithos_sse_url` session-scoped fixture in `tests/conftest.py` starts a minimal HTTP server responding 200; used by probe and integration tests
 - To test degraded Lithos state: use `socket.socket().bind(("127.0.0.1", 0))` to get a free port, then use it as unreachable URL (port unbound after socket close)
 - `_make_config()` in test files accepts `lithos_url` param to configure `LithosConfig(url=...)` for probe tests
+- `src/influx/feedback.py` has `fetch_rejection_titles()`, `format_negative_examples()`, and `build_negative_examples_block()` — the seam for filter-prompt `{negative_examples}` injection
+- FakeLithosServer has `list_responses: list[str]` queue (FIFO) for configurable `lithos_list` responses
+- §6.3 negative-example format: `- "{title}" (rejected)` — one line per title, truncated at `filter.negative_example_max_title_chars` (default 200)
+- 584 tests passing after US-014
 
 ---
 
@@ -229,4 +233,22 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - For unreachable URL tests: `socket.socket().bind(("127.0.0.1", 0))` finds a free port; after socket close, port is unbound → connection refused
   - Session-scoped conftest fixture `fake_lithos_sse_url` is shared across both unit and integration test modules
   - 572 tests pass (no new tests added — replaced 3 env-var tests with 3 real probe tests, 2 degraded-state tests with 2 unreachable-URL tests)
+---
+
+## 2026-04-25 - US-014
+- Created `src/influx/feedback.py` with 3 helpers: `fetch_rejection_titles()` (FR-FB-1/FR-FB-2), `format_negative_examples()` (§6.3), `build_negative_examples_block()` (documented seam)
+- `fetch_rejection_titles()` calls `lithos_list(tags=[f"influx:rejected:{profile}"], limit=...)` and uses titles directly when present; falls back to `lithos_read(id=...)` for items missing titles (FR-FB-2)
+- `format_negative_examples()` renders each title as `- "{title}" (rejected)` with max_title_chars truncation
+- `build_negative_examples_block()` combines fetch + format as the single seam the filter-prompt builder consumes
+- Added `list_responses: list[str]` FIFO queue to `FakeLithosServer` for configurable `lithos_list` responses
+- Updated `clear_fake_calls` fixture to also clear `list_responses`
+- Added 6 unit tests in `tests/unit/test_feedback.py`: format with 3 titles, empty list, truncation at max, exact max, single title, custom max
+- Added 6 contract tests in `tests/contract/test_lithos_client.py`: happy-path fetch, read fallback for missing titles, empty result, seam integration (AC-05-H), write never synthesizes rejected tag (FR-FB-3), tag-merge preserves existing rejected tag
+- Files changed: `src/influx/feedback.py` (new), `tests/unit/test_feedback.py` (new), `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - `lithos_list` returns `CallToolResult` (not a custom wrapper like `write_note`); parse `result.content[0].text` as JSON to get `{"items": [...]}`
+  - FakeLithosServer's `lithos_list` tool already had default logic for `arxiv-id:` tags; `list_responses` queue overrides that (FIFO, same pattern as other queues)
+  - `format_negative_examples` is pure (no I/O); `fetch_rejection_titles` is async (needs LithosClient); `build_negative_examples_block` is the async convenience that combines both
+  - Tag integrity test verifies FR-FB-3 behaviorally: exercises write wrappers and asserts no `influx:rejected:*` tag is synthesized by Influx
+  - 584 tests pass (12 new tests added: 6 unit + 6 contract)
 ---

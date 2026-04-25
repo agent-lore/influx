@@ -17,6 +17,10 @@ import uvicorn
 from mcp.server.fastmcp import FastMCP
 
 from influx.errors import ConfigError, LithosError
+from influx.feedback import (
+    build_negative_examples_block,
+    fetch_rejection_titles,
+)
 from influx.lithos_client import LithosClient
 
 # ── Fake Lithos SSE server ──────────────────────────────────────────
@@ -45,6 +49,8 @@ class FakeLithosServer:
         self.read_responses: list[str] = []
         # Queue of override responses for lithos_cache_lookup (FIFO).
         self.cache_lookup_responses: list[str] = []
+        # Queue of override responses for lithos_list (FIFO).
+        self.list_responses: list[str] = []
         self._register_tools()
 
     def _register_tools(self) -> None:
@@ -52,6 +58,7 @@ class FakeLithosServer:
         write_responses = self.write_responses
         read_responses = self.read_responses
         cache_lookup_responses = self.cache_lookup_responses
+        list_responses = self.list_responses
 
         @self._mcp.tool(name="lithos_ping")
         async def lithos_ping() -> str:
@@ -136,7 +143,9 @@ class FakeLithosServer:
             )
             import json
 
-            # Return items matching tags for test purposes.
+            if list_responses:
+                return list_responses.pop(0)
+            # Default: return items matching tags for test purposes.
             if tags and any(t.startswith("arxiv-id:") for t in tags):
                 return json.dumps(
                     {
@@ -209,6 +218,7 @@ def clear_fake_calls(fake_lithos_server: FakeLithosServer) -> None:
     fake_lithos_server.write_responses.clear()
     fake_lithos_server.read_responses.clear()
     fake_lithos_server.cache_lookup_responses.clear()
+    fake_lithos_server.list_responses.clear()
 
 
 # ── Construction validation ─────────────────────────────────────────
@@ -1533,5 +1543,256 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
             assert "content_too_large" in caplog.text
             assert "2601.60002" in caplog.text
             assert "repair path" in caplog.text.lower()
+        finally:
+            await client.close()
+
+
+# ── Feedback ingestion (FR-FB-1..3, AC-05-H) ─────────────────────
+
+
+class TestFeedbackFetch:
+    """Feedback-fetch helper via lithos_list (FR-FB-1, FR-FB-2)."""
+
+    async def test_fetch_rejection_titles_happy_path(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """3 rejection items with titles → 3 titles returned."""
+        import json as _json
+
+        fake_lithos_server.list_responses.append(
+            _json.dumps({
+                "items": [
+                    {"id": "r1", "title": "Bad Paper A"},
+                    {"id": "r2", "title": "Bad Paper B"},
+                    {"id": "r3", "title": "Bad Paper C"},
+                ]
+            })
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            titles = await fetch_rejection_titles(
+                client, profile="ml-research", limit=20,
+            )
+            assert titles == [
+                "Bad Paper A", "Bad Paper B", "Bad Paper C",
+            ]
+            # Verify correct lithos_list call was made.
+            list_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_list"
+            ]
+            assert len(list_calls) == 1
+            assert list_calls[0][1]["tags"] == [
+                "influx:rejected:ml-research"
+            ]
+            assert list_calls[0][1]["limit"] == 20
+        finally:
+            await client.close()
+
+    async def test_fetch_titles_fallback_to_read(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Item without title triggers lithos_read fallback (FR-FB-2)."""
+        import json as _json
+
+        fake_lithos_server.list_responses.append(
+            _json.dumps({
+                "items": [
+                    {"id": "r1", "title": "Has Title"},
+                    {"id": "r2"},  # no title
+                ]
+            })
+        )
+        fake_lithos_server.read_responses.append(
+            _json.dumps({
+                "id": "r2",
+                "title": "Fetched Via Read",
+                "content": "",
+                "tags": [],
+                "version": 1,
+            })
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            titles = await fetch_rejection_titles(
+                client, profile="ai", limit=10,
+            )
+            assert titles == ["Has Title", "Fetched Via Read"]
+            # Verify lithos_read was called for the missing-title item.
+            read_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_read"
+            ]
+            assert len(read_calls) == 1
+            assert read_calls[0][1]["id"] == "r2"
+        finally:
+            await client.close()
+
+    async def test_fetch_titles_empty_result(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Empty lithos_list response → empty titles list."""
+        import json as _json
+
+        fake_lithos_server.list_responses.append(
+            _json.dumps({"items": []})
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            titles = await fetch_rejection_titles(
+                client, profile="ai", limit=20,
+            )
+            assert titles == []
+        finally:
+            await client.close()
+
+    async def test_build_negative_examples_block_seam(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """AC-05-H (seam): 3 rejection items → formatted block via seam."""
+        import json as _json
+
+        fake_lithos_server.list_responses.append(
+            _json.dumps({
+                "items": [
+                    {"id": "r1", "title": "Bad Paper A"},
+                    {"id": "r2", "title": "Bad Paper B"},
+                    {"id": "r3", "title": "Bad Paper C"},
+                ]
+            })
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            block = await build_negative_examples_block(
+                client,
+                profile="ml-research",
+                limit=20,
+                max_title_chars=200,
+            )
+            expected = (
+                '- "Bad Paper A" (rejected)\n'
+                '- "Bad Paper B" (rejected)\n'
+                '- "Bad Paper C" (rejected)'
+            )
+            assert block == expected
+        finally:
+            await client.close()
+
+
+class TestFeedbackTagIntegrity:
+    """Influx never synthesizes ``influx:rejected:<profile>`` (FR-FB-3).
+
+    Verifies behaviorally that Influx's write wrappers do not
+    introduce new ``influx:rejected:<profile>`` tags; they are
+    authored solely by Lens.
+    """
+
+    async def test_write_does_not_synthesize_rejected_tag(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """A normal write never introduces an influx:rejected:* tag."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.write_note(
+                title="Good Paper",
+                content="# Summary\nGreat paper.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2601.99999",
+                tags=[
+                    "profile:ml-research",
+                    "arxiv-id:2601.99999",
+                    "source:arxiv",
+                ],
+                confidence=0.85,
+            )
+            write_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 1
+            written_tags = write_calls[0][1]["tags"]
+            # No influx:rejected:* tag synthesized by Influx.
+            assert not any(
+                t.startswith("influx:rejected:")
+                for t in written_tags
+            )
+        finally:
+            await client.close()
+
+    async def test_tag_merge_preserves_existing_rejected_tag(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """version_conflict re-write preserves existing rejected tags."""
+        import json as _json
+
+        # First write returns version_conflict.
+        fake_lithos_server.write_responses.append(
+            _json.dumps({
+                "status": "version_conflict",
+                "note_id": "note-rejected-001",
+            })
+        )
+        # Read returns a note with an existing rejected tag.
+        fake_lithos_server.read_responses.append(
+            _json.dumps({
+                "id": "note-rejected-001",
+                "title": "Existing Paper",
+                "content": "# Summary\nOld content.",
+                "tags": [
+                    "profile:ml-research",
+                    "influx:rejected:robotics",
+                    "source:arxiv",
+                ],
+                "version": 2,
+            })
+        )
+        # Retry write succeeds.
+        fake_lithos_server.write_responses.append(
+            '{"status": "updated"}'
+        )
+
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Existing Paper",
+                content="# Summary\nNew content.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2601.88888",
+                tags=[
+                    "profile:ml-research",
+                    "arxiv-id:2601.88888",
+                    "source:arxiv",
+                ],
+                confidence=0.9,
+            )
+            assert result.status == "updated"
+            # The retry write should contain the merged tags.
+            write_calls = [
+                c for c in fake_lithos_server.calls
+                if c[0] == "lithos_write"
+            ]
+            # 2 writes: original + retry after version_conflict.
+            assert len(write_calls) == 2
+            retry_tags = write_calls[1][1]["tags"]
+            # Existing influx:rejected:robotics is preserved via merge.
+            assert "influx:rejected:robotics" in retry_tags
         finally:
             await client.close()
