@@ -27,6 +27,7 @@ Started: Sat Apr 25 14:42:15 UTC 2026
 - FakeLithosServer FIFO queue: when adding new `lithos_list` callers, prepend empty responses for earlier callers so downstream queued responses arrive correctly
 - `ArchiveDownloadHook` protocol: `(note: dict[str, object]) -> str` — returns archive path on success; raises `ExtractionError` on failure
 - Integration tests for sweep call `sweep()` directly with real `LithosClient` + `FakeLithosServer`; use `_queue_single_note()` pattern to queue list+read+write responses
+- For "persistently failing" test scenarios, use high-score (9) notes missing `full-text` + `influx:deep-extracted` with no Tier 2/3 hooks wired — low-score notes with text:html + archive path get cleared
 
 ---
 
@@ -296,4 +297,20 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - Terminal notes trigger NO hooks at all (re-extraction, Tier 2, Tier 3 all suppressed by influx:text-terminal in stage selection)
   - Two-run re-selection test: queue empty list response for run 2 and assert visited == []
   - All tests pass: 781 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-019
+- Created `tests/integration/test_repair_sweep_advancement.py` with 5 tests in `TestRetryOrderAdvancement`
+- `test_every_visited_note_is_rewritten`: seeds M=3 persistently-failing notes, asserts exactly M lithos_write calls with correct note IDs in order
+- `test_no_progress_still_rewrites`: verifies notes with no forward progress are still rewritten and influx:repair-needed stays
+- `test_two_runs_visit_distinct_notes`: B=5, M=3; two runs visit >= min(B, 2*M)=5 distinct notes; unvisited notes from run 1 appear in run 2
+- `test_run_k_notes_not_in_first_n_of_run_k_plus_1`: verifies unvisited notes come first in run 2's candidate list; overlap limited to M - len(unvisited)
+- `test_write_spy_confirms_updated_at_would_advance`: write-spy evidence that lithos_write is called per visited note in order (Lithos bumps updated_at on write)
+- "Persistently failing" = score=9 (Tier 2 + Tier 3 required) but no hooks wired → stages skipped → repair-needed stays
+- Files changed: `tests/integration/test_repair_sweep_advancement.py` (created), `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - Low-score notes with text:html + archive path get repair-needed CLEARED (all conditions met) — use high-score (9) for persistently-failing scenarios
+  - Multi-note sweep: queue list response with multiple items, then one read + one write response per note
+  - Two-run tests: clear fake_lithos.calls between runs, simulate Lithos ordering by queueing unvisited notes first
+  - All tests pass: 786 passed, pyright 0 errors, ruff clean
 ---
