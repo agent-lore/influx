@@ -302,7 +302,7 @@
         "Coverage \u2265 80% on `src/influx/lithos_client.py` and `src/influx/notifications.py`"
       ],
       "priority": 20,
-      "passes": false,
+      "passes": true,
       "notes": ""
     }
   ]

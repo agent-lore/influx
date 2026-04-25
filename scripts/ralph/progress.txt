@@ -364,3 +364,17 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - `probe_loop.run_once()` is needed in test app setup to initialize probe state before status endpoint checks
   - 622 tests pass (11 new integration tests added)
 ---
+
+## 2026-04-25 - US-020
+- Confirmed PRD 04 stub-recorder artifacts (fixtures, code, test references) were already fully removed in earlier stories (US-002/US-007)
+- No `tests/fixtures/lithos/stub_recorder.json` exists; no `WriteRecord`/`get_write_log`/`clear_write_log` imports remain in tests
+- Added v1 surface-freeze footer to `tasks/prd-05-mcp-client-webhook.md` — explicit freeze note per master PRD §14 listing frozen contracts (HTTP responses, Lithos tool call shapes, note structure, config schema)
+- Checked the Definition of Done checkbox for freeze note in the PRD doc
+- Verified all quality checks pass: ruff (0 errors), pyright (0 errors), pytest (622 passed)
+- Verified coverage: `lithos_client.py` 98%, `notifications.py` 98% — both well above 80% threshold
+- Files changed: `tasks/prd-05-mcp-client-webhook.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - PRD 04 stub artifacts were cleaned up incrementally during US-002 and US-007 — by US-020 nothing remained to delete
+  - `pytest-cov` is not installed by default in this env; `pip install pytest-cov` needed for coverage reports
+  - All 20 user stories complete — PRD 05 is DONE
+---
