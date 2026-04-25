@@ -162,7 +162,7 @@
         "After a terminal write failure no later candidate is rewritten in that run, and the next run revisits the same head note"
       ],
       "priority": 11,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -177,7 +177,7 @@
         "The fairness guarantee in §5.5 explicitly excludes notes in this chronic-oversize state (behavioral exclusion)"
       ],
       "priority": 12,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

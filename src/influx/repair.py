@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ClearingDecision",
+    "ContentTooLargeSkipped",
     "ExtractionOutcome",
     "ReExtractionResult",
     "ReExtractArchiveHook",
@@ -57,6 +58,20 @@ class SweepWriteError(LithosError):
     rewritten, ``updated_at`` does not advance, and readiness becomes
     degraded.
     """
+
+
+class ContentTooLargeSkipped(Exception):
+    """Raised when a sweep rewrite hits chronic ``content_too_large``.
+
+    §5.4 failure mode 2: the existing stored note remains untouched,
+    ``updated_at`` does NOT advance, the sweep continues to the next
+    candidate, and the event is logged + counted.  This is the sole
+    exemption from the retry-order advancement invariant.
+    """
+
+    def __init__(self, note_id: str) -> None:
+        self.note_id = note_id
+        super().__init__(f"chronic content_too_large on repair path for note {note_id}")
 
 
 # ── Abstract-only re-extraction outcome discriminator ────────────────
@@ -548,6 +563,9 @@ async def _rewrite_sweep_note(
     body = json.loads(text)
     status = body.get("status", "")
 
+    if status == "content_too_large":
+        raise ContentTooLargeSkipped(note_id)
+
     if status != "version_conflict":
         return
 
@@ -595,7 +613,10 @@ async def _rewrite_sweep_note(
 
     retry_text = retry_result.content[0].text  # type: ignore[union-attr]
     retry_body = json.loads(retry_text)
-    if retry_body.get("status") == "version_conflict":
+    retry_status = retry_body.get("status", "")
+    if retry_status == "content_too_large":
+        raise ContentTooLargeSkipped(note_id)
+    if retry_status == "version_conflict":
         raise SweepWriteError(
             f"sweep rewrite unresolved version_conflict "
             f"for note {note_id} after FR-MCP-7 retry",
@@ -791,6 +812,7 @@ async def sweep(
     )
 
     visited: list[dict[str, Any]] = []
+    content_too_large_skipped = 0
     for item in items:
         note_id = item.get("id", "")
         if not note_id:
@@ -798,14 +820,34 @@ async def sweep(
         note = await client.read_note(note_id=note_id)
         visited.append(note)
 
-        # Process and rewrite — raises SweepWriteError on terminal
-        # write failure, aborting the loop (§5.4 failure mode 1).
-        await _process_sweep_note(
-            note,
-            profile=profile,
-            client=client,
-            config=config,
-            hooks=effective_hooks,
+        try:
+            # Process and rewrite — raises SweepWriteError on terminal
+            # write failure, aborting the loop (§5.4 failure mode 1).
+            await _process_sweep_note(
+                note,
+                profile=profile,
+                client=client,
+                config=config,
+                hooks=effective_hooks,
+            )
+        except ContentTooLargeSkipped:
+            # §5.4 failure mode 2: chronic content_too_large on repair
+            # path.  The existing stored note remains untouched,
+            # updated_at does NOT advance, and the sweep continues.
+            content_too_large_skipped += 1
+            logger.warning(
+                "sweep: chronic content_too_large for note %s "
+                "— skipping (existing note untouched), "
+                "content_too_large_skipped=%d",
+                note_id,
+                content_too_large_skipped,
+            )
+
+    if content_too_large_skipped:
+        logger.info(
+            "repair sweep for %r: %d note(s) skipped due to chronic content_too_large",
+            profile,
+            content_too_large_skipped,
         )
 
     return visited

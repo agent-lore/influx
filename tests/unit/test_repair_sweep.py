@@ -1,10 +1,11 @@
-"""Tests for the repair sweep entry point (US-004, US-011).
+"""Tests for the repair sweep entry point (US-004, US-011, US-012).
 
 Verifies that ``sweep(profile)`` calls ``lithos_list`` with the
 correct tag set, limit, ordering, iterates returned notes via
 ``lithos_read``, returns cleanly when no candidates are found,
-and rewrites every visited note via ``lithos_write`` (retry-order
-advancement invariant, §5.4).
+rewrites every visited note via ``lithos_write`` (retry-order
+advancement invariant, §5.4), and handles chronic
+``content_too_large`` on the repair path (§5.4 failure mode 2).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import pytest
 
 from influx.config import AppConfig, RepairConfig
 from influx.errors import LithosError
-from influx.repair import SweepWriteError, sweep
+from influx.repair import ContentTooLargeSkipped, SweepWriteError, sweep
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -457,3 +458,176 @@ class TestSweepTransportFailure:
 
         # Only n1 was read — n2 never reached.
         assert client.read_note.await_count == 1
+
+
+# ── Chronic content_too_large exemption (US-012, §5.4 failure mode 2) ─
+
+
+class TestSweepContentTooLargeSkipped:
+    """Chronic ``content_too_large`` on repair path: skip, don't abort."""
+
+    async def test_content_too_large_does_not_abort_sweep(self) -> None:
+        """Sweep continues to next candidate after content_too_large."""
+        items = [
+            {"id": "n1", "title": "Oversize"},
+            {"id": "n2", "title": "Normal"},
+        ]
+        note1 = {
+            "id": "n1",
+            "content": "Large",
+            "tags": ["influx:repair-needed"],
+        }
+        note2 = {
+            "id": "n2",
+            "content": "Small",
+            "tags": ["influx:repair-needed"],
+        }
+        config = _make_config()
+        client = AsyncMock()
+        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.read_note = AsyncMock(side_effect=[note1, note2])
+        # n1 write → content_too_large; n2 write → success.
+        client.call_tool = AsyncMock(
+            side_effect=[
+                _make_write_result("content_too_large"),
+                _make_write_result("updated"),
+            ]
+        )
+
+        result = await sweep("ai-robotics", client=client, config=config)
+
+        # Both notes were visited (read).
+        assert len(result) == 2
+        assert result[0]["id"] == "n1"
+        assert result[1]["id"] == "n2"
+        # n2 was still written (sweep didn't abort).
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert len(write_calls) == 2
+
+    async def test_oversize_note_untouched_no_second_write(
+        self,
+    ) -> None:
+        """content_too_large note gets only one write attempt (no retry)."""
+        items = [{"id": "n1", "title": "Oversize"}]
+        note = {
+            "id": "n1",
+            "content": "Large",
+            "tags": ["influx:repair-needed"],
+        }
+        config = _make_config()
+        client = AsyncMock()
+        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.read_note = AsyncMock(return_value=note)
+        client.call_tool = AsyncMock(
+            return_value=_make_write_result("content_too_large"),
+        )
+
+        await sweep("ai-robotics", client=client, config=config)
+
+        # Only one write call — no version_conflict retry loop.
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert len(write_calls) == 1
+
+    async def test_other_notes_still_make_progress(self) -> None:
+        """Notes after the oversize one are rewritten normally."""
+        items = [
+            {"id": "n1", "title": "Oversize"},
+            {"id": "n2", "title": "Normal"},
+            {"id": "n3", "title": "Also Normal"},
+        ]
+        notes = [
+            {
+                "id": "n1",
+                "content": "Large",
+                "tags": ["influx:repair-needed"],
+            },
+            {
+                "id": "n2",
+                "content": "Small",
+                "tags": ["influx:repair-needed"],
+            },
+            {
+                "id": "n3",
+                "content": "Medium",
+                "tags": ["influx:repair-needed"],
+            },
+        ]
+        config = _make_config()
+        client = AsyncMock()
+        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.read_note = AsyncMock(side_effect=notes)
+        # n1 → oversize, n2 + n3 → success.
+        client.call_tool = AsyncMock(
+            side_effect=[
+                _make_write_result("content_too_large"),
+                _make_write_result("updated"),
+                _make_write_result("updated"),
+            ]
+        )
+
+        result = await sweep("ai-robotics", client=client, config=config)
+
+        assert len(result) == 3
+        # All three were read.
+        assert client.read_note.await_count == 3
+        # Three write calls total — n1 (failed), n2, n3.
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert len(write_calls) == 3
+
+    async def test_multiple_oversize_notes_all_skipped(self) -> None:
+        """Multiple content_too_large notes are all skipped; no abort."""
+        items = [
+            {"id": "n1", "title": "Big1"},
+            {"id": "n2", "title": "Big2"},
+        ]
+        notes = [
+            {
+                "id": "n1",
+                "content": "Large1",
+                "tags": ["influx:repair-needed"],
+            },
+            {
+                "id": "n2",
+                "content": "Large2",
+                "tags": ["influx:repair-needed"],
+            },
+        ]
+        config = _make_config()
+        client = AsyncMock()
+        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.read_note = AsyncMock(side_effect=notes)
+        client.call_tool = AsyncMock(
+            side_effect=[
+                _make_write_result("content_too_large"),
+                _make_write_result("content_too_large"),
+            ]
+        )
+
+        # Does NOT raise — both skipped, sweep completes.
+        result = await sweep("ai-robotics", client=client, config=config)
+
+        assert len(result) == 2
+
+
+class TestContentTooLargeSkippedException:
+    """Unit tests for the ContentTooLargeSkipped exception itself."""
+
+    def test_exception_stores_note_id(self) -> None:
+        exc = ContentTooLargeSkipped("note-xyz")
+        assert exc.note_id == "note-xyz"
+
+    def test_exception_message_contains_note_id(self) -> None:
+        exc = ContentTooLargeSkipped("note-abc")
+        assert "note-abc" in str(exc)
+
+    def test_exception_is_not_sweep_write_error(self) -> None:
+        """ContentTooLargeSkipped is NOT a SweepWriteError."""
+        exc = ContentTooLargeSkipped("n1")
+        assert not isinstance(exc, SweepWriteError)
+        assert not isinstance(exc, LithosError)

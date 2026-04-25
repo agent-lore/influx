@@ -18,6 +18,11 @@ Started: Sat Apr 25 14:42:15 UTC 2026
 - `StageSelection` frozen dataclass with 5 booleans: `archive_retry`, `text_extraction_retry`, `abstract_only_reextraction`, `tier2_retry`, `tier3_retry`
 - `ClearingDecision` frozen dataclass + `compute_clearing()` pure function determine post-stage tag removal for `influx:archive-missing` and `influx:repair-needed`
 - Clearing logic: archive-missing iff archive_path stored; repair-needed iff archive_ok AND text_ok AND tier2_ok AND tier3_ok (with terminal exemption waiving Tier 2/3)
+- `SweepHooks` frozen dataclass groups optional hooks (`re_extract_archive`, `tier2_enrich`, `tier3_extract`); `sweep()` accepts `hooks=` kwarg
+- `_rewrite_sweep_note()` uses `client.call_tool("lithos_write", ...)` directly (not `client.write_note()`) for sweep-specific version_conflict semantics
+- `SweepWriteError(LithosError)` signals terminal write failure — unresolved version_conflict or transport failure aborts the sweep
+- `ContentTooLargeSkipped(Exception)` signals non-fatal content_too_large on repair path — sweep catches and continues; NOT a LithosError subclass
+- Config mock in sweep tests needs `config.profiles = []`; client mock needs `client.call_tool` returning `_make_write_result()`
 
 ---
 
@@ -147,4 +152,56 @@ Started: Sat Apr 25 14:42:15 UTC 2026
   - Returns a new tag list (immutable pattern) — caller uses the returned list for further stages
   - ExtractionError catch treats exception as Transient (keeps tags unchanged)
   - All tests pass: 721 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-010
+- Created `tests/unit/test_text_terminal.py` with 24 tests across 6 test classes
+- Covers all three outcomes: Upgrade (replaces text:abstract-only with text:html/text:pdf, no terminal), Terminal (keeps abstract-only, adds influx:text-terminal), Transient (tags unchanged)
+- ExtractionError treated as Transient outcome (tags unchanged, no terminal)
+- AC-M2-3 initial-write negative tests: Upgrade, Transient, and ExtractionError never introduce influx:text-terminal; fresh note tags and pre-reextraction tags verified
+- Input immutability tests: apply_abstract_only_reextraction() never mutates input tag list
+- Files changed: `tests/unit/test_text_terminal.py` (created)
+- **Learnings for future iterations:**
+  - `apply_abstract_only_reextraction()` is sync; fake hooks are plain functions matching `ReExtractArchiveHook` protocol
+  - Use `_apply()` helper wrapper pattern (same as `_select()` and `_clear()` in other test files) to reduce boilerplate
+  - Terminal idempotency: function guards against adding duplicate `influx:text-terminal`
+  - All tests pass: 745 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-011
+- Implemented rewrite-on-every-visit retry-order advancement invariant in `src/influx/repair.py`
+- Added `SweepWriteError` exception (subclass of LithosError) for terminal write failures
+- Added `SweepHooks` frozen dataclass grouping optional `re_extract_archive`, `tier2_enrich`, `tier3_extract` hooks
+- Added `_rewrite_sweep_note()` async helper: writes note via `lithos_write`, handles version_conflict with FR-MCP-7 re-read + re-merge + retry once, raises `SweepWriteError` on unresolved conflict or transport failure
+- Added `_process_sweep_note()`: full per-note pipeline — parse note → select stages → execute stages (with hooks) → compute clearing → apply clearing → rewrite
+- Added `_get_profile_thresholds()` helper to extract thresholds from config
+- Overhauled `sweep()` to accept optional `SweepHooks`, process each visited note through the full pipeline, and abort on `SweepWriteError`
+- Updated `tests/unit/test_repair_sweep.py` with 8 new tests across 3 new test classes:
+  - `TestSweepRewriteInvariant`: every note triggers write, no-progress still rewrites, rewrite includes note fields
+  - `TestSweepVersionConflict`: re-read + retry on conflict, unresolved conflict aborts, no later candidate after abort
+  - `TestSweepTransportFailure`: transport failure aborts, no later candidate after abort
+- Updated existing test helpers (`_make_config`, `_make_client`) to support `config.profiles` and `client.call_tool`
+- Files changed: `src/influx/repair.py`, `tests/unit/test_repair_sweep.py`
+- **Learnings for future iterations:**
+  - `_rewrite_sweep_note()` calls `client.call_tool("lithos_write", args)` directly (not `client.write_note()`) because sweep needs different error semantics
+  - Config mock needs `config.profiles = []` for `_get_profile_thresholds()` fallback defaults
+  - Client mock needs `client.call_tool` returning `_make_write_result()` for the lithos_write path
+  - `SweepWriteError` inherits from `LithosError` so existing error handlers catch it naturally
+  - Note parsing failure in `_process_sweep_note` is caught broadly — note is still rewritten with original tags
+  - All tests pass: 753 passed, pyright 0 errors, ruff clean
+---
+
+## 2026-04-25 - US-012
+- Added `ContentTooLargeSkipped` exception to `src/influx/repair.py` — non-fatal, NOT a subclass of `LithosError`/`SweepWriteError`
+- Updated `_rewrite_sweep_note()` to detect `content_too_large` status from lithos_write response and raise `ContentTooLargeSkipped` (both initial write and FR-MCP-7 retry paths)
+- Updated `sweep()` to catch `ContentTooLargeSkipped`, log + count via `content_too_large_skipped` counter, and continue to next candidate
+- Added 7 unit tests in `tests/unit/test_repair_sweep.py`:
+  - `TestSweepContentTooLargeSkipped`: does not abort, untouched note gets one write attempt only, other notes still make progress, multiple oversize notes all skipped
+  - `TestContentTooLargeSkippedException`: stores note_id, message contains note_id, is NOT a SweepWriteError
+- Files changed: `src/influx/repair.py`, `tests/unit/test_repair_sweep.py`, `scripts/ralph/prd.json`
+- **Learnings for future iterations:**
+  - `ContentTooLargeSkipped` must NOT inherit from `LithosError` or `SweepWriteError` — sweep catches it separately from terminal failures
+  - `_rewrite_sweep_note` returns normally for success but raises for both fatal (`SweepWriteError`) and non-fatal (`ContentTooLargeSkipped`) write outcomes
+  - The `content_too_large` status check must come BEFORE the `version_conflict` check in `_rewrite_sweep_note` — a content_too_large is not a version conflict
+  - All tests pass: 760 passed, pyright 0 errors, ruff clean
 ---
