@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from influx.errors import ExtractionError
+from influx.errors import ExtractionError, LithosError
 
 if TYPE_CHECKING:
     from influx.config import AppConfig
@@ -31,6 +31,8 @@ __all__ = [
     "ReExtractionResult",
     "ReExtractArchiveHook",
     "StageSelection",
+    "SweepHooks",
+    "SweepWriteError",
     "Tier2EnrichHook",
     "Tier3ExtractHook",
     "apply_abstract_only_reextraction",
@@ -40,6 +42,21 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+# ── Sweep-specific exceptions ────────────────────────────────────────
+
+
+class SweepWriteError(LithosError):
+    """Raised when a sweep rewrite fails terminally (§5.4 failure mode 1).
+
+    A terminal write failure means either an unresolved
+    ``version_conflict`` after the FR-MCP-7 re-read + re-merge + retry,
+    or a generic write transport failure that exhausts the retry budget.
+    The sweep aborts the run on this error: no later candidate is
+    rewritten, ``updated_at`` does not advance, and readiness becomes
+    degraded.
+    """
 
 
 # ── Abstract-only re-extraction outcome discriminator ────────────────
@@ -192,6 +209,20 @@ class Tier3ExtractHook(Protocol):
     """
 
     def __call__(self, note: dict[str, object]) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SweepHooks:
+    """Optional hook callables for stage execution within the sweep.
+
+    When a hook is ``None``, the corresponding stage is skipped even if
+    stage selection would otherwise select it.  PRD 07 wires the real
+    implementations; tests inject fakes.
+    """
+
+    re_extract_archive: ReExtractArchiveHook | None = None
+    tier2_enrich: Tier2EnrichHook | None = None
+    tier3_extract: Tier3ExtractHook | None = None
 
 
 # ── Per-note stage selection (§5.2) ────────────────────────────────
@@ -456,6 +487,242 @@ def compute_clearing(
     )
 
 
+# ── Sweep rewrite helper (§5.4, AC-06-F) ─────────────────────────
+
+
+async def _rewrite_sweep_note(
+    client: LithosClient,
+    note: dict[str, Any],
+    tags: list[str],
+) -> None:
+    """Rewrite a single sweep-visited note via ``lithos_write`` (§5.4).
+
+    Builds the write args from the existing note dict with the updated
+    *tags* and calls ``lithos_write``.  On ``version_conflict``, performs
+    one re-read + tag re-merge + retry per FR-MCP-7 (AC-06-F first half).
+    On a second ``version_conflict`` or transport failure, raises
+    :class:`SweepWriteError` to abort the run (AC-06-F second half).
+
+    Parameters
+    ----------
+    client:
+        The Lithos MCP client.
+    note:
+        The note dict from ``lithos_read``.
+    tags:
+        The updated tag list to write (post-stage, post-clearing).
+
+    Raises
+    ------
+    SweepWriteError
+        On unresolved ``version_conflict`` (after FR-MCP-7 retry) or
+        generic transport failure — the sweep must abort.
+    """
+    note_id: str = note.get("id", "")
+    args: dict[str, Any] = {
+        "id": note_id,
+        "title": note.get("title", ""),
+        "content": note.get("content", ""),
+        "agent": "influx",
+        "path": note.get("path", ""),
+        "source_url": note.get("source_url", ""),
+        "tags": list(tags),
+        "confidence": note.get("confidence", 0.0),
+        "note_type": note.get("note_type", "summary"),
+        "namespace": note.get("namespace", "influx"),
+    }
+    version = note.get("version")
+    if version is not None:
+        args["expected_version"] = version
+
+    try:
+        result = await client.call_tool("lithos_write", args)
+    except LithosError as exc:
+        raise SweepWriteError(
+            f"sweep rewrite transport failure for note {note_id}",
+            operation="lithos_write",
+            detail=str(exc),
+        ) from exc
+
+    text = result.content[0].text  # type: ignore[union-attr]
+    body = json.loads(text)
+    status = body.get("status", "")
+
+    if status != "version_conflict":
+        return
+
+    # FR-MCP-7: re-read + re-merge tags + retry once.
+    logger.info(
+        "sweep rewrite version_conflict for note %s; re-reading and retrying once",
+        note_id,
+    )
+    try:
+        refreshed = await client.read_note(note_id=note_id)
+    except LithosError as exc:
+        raise SweepWriteError(
+            f"sweep re-read failed for note {note_id}",
+            operation="lithos_read",
+            detail=str(exc),
+        ) from exc
+
+    refreshed_tags: list[str] = refreshed.get("tags", [])
+    # Re-merge: union the existing tags with the sweep's intended tags
+    # while preserving the sweep's Influx-owned tag changes.
+    merged_tag_set: dict[str, None] = {}
+    for t in tags:
+        merged_tag_set[t] = None
+    for t in refreshed_tags:
+        if t not in merged_tag_set:
+            merged_tag_set[t] = None
+
+    retry_args = {
+        **args,
+        "tags": list(merged_tag_set),
+        "content": refreshed.get("content", args["content"]),
+    }
+    refresh_version = refreshed.get("version")
+    if refresh_version is not None:
+        retry_args["expected_version"] = refresh_version
+
+    try:
+        retry_result = await client.call_tool("lithos_write", retry_args)
+    except LithosError as exc:
+        raise SweepWriteError(
+            f"sweep rewrite retry transport failure for note {note_id}",
+            operation="lithos_write",
+            detail=str(exc),
+        ) from exc
+
+    retry_text = retry_result.content[0].text  # type: ignore[union-attr]
+    retry_body = json.loads(retry_text)
+    if retry_body.get("status") == "version_conflict":
+        raise SweepWriteError(
+            f"sweep rewrite unresolved version_conflict "
+            f"for note {note_id} after FR-MCP-7 retry",
+            operation="lithos_write",
+            detail="version_conflict_unresolved",
+        )
+
+
+# ── Per-note stage execution ──────────────────────────────────────
+
+
+def _get_profile_thresholds(
+    config: AppConfig,
+    profile: str,
+) -> tuple[int, int]:
+    """Return ``(full_text_threshold, deep_extract_threshold)``."""
+    for p in config.profiles:
+        if p.name == profile:
+            return p.thresholds.full_text, p.thresholds.deep_extract
+    # Fallback defaults from ProfileThresholds.
+    return 8, 9
+
+
+async def _process_sweep_note(
+    note: dict[str, Any],
+    *,
+    profile: str,
+    client: LithosClient,
+    config: AppConfig,
+    hooks: SweepHooks,
+) -> None:
+    """Select stages, execute, clear tags, rewrite one note (§5.2-5.4).
+
+    Raises :class:`SweepWriteError` on terminal write failure.
+    """
+    from influx.notes import parse_archive_path, parse_note, parse_profile_relevance
+
+    tags: list[str] = list(note.get("tags", []))
+    content: str = note.get("content", "")
+
+    # Parse note structure for stage selection inputs.
+    archive_path: str | None = None
+    max_profile_score: int = 0
+    try:
+        parsed = parse_note(content)
+        archive_path = parse_archive_path(parsed)
+        entries = parse_profile_relevance(parsed)
+        if entries:
+            max_profile_score = max(e.score for e in entries)
+    except Exception:
+        logger.warning(
+            "sweep: could not parse note %s; will still rewrite",
+            note.get("id", "?"),
+        )
+
+    ft_thresh, de_thresh = _get_profile_thresholds(config, profile)
+
+    stages = select_stages(
+        tags=tags,
+        archive_path=archive_path,
+        archive_succeeded_this_pass=False,
+        max_profile_score=max_profile_score,
+        full_text_threshold=ft_thresh,
+        deep_extract_threshold=de_thresh,
+    )
+
+    # ── Execute selected stages ─────────────────────────────────
+    current_tags = list(tags)
+
+    # Archive retry (PRD 04 hook — not yet wired).
+    # Placeholder: archive download hook would go here.
+    archive_succeeded = False
+
+    # Text extraction retry (PRD 07 hook — not yet wired).
+    # Placeholder: text extraction hook would go here.
+
+    # Abstract-only re-extraction.
+    if (
+        stages.abstract_only_reextraction
+        and hooks.re_extract_archive
+        and archive_path is not None
+    ):
+        current_tags = apply_abstract_only_reextraction(
+            tags=current_tags,
+            note=note,
+            archive_path=archive_path,
+            hook=hooks.re_extract_archive,
+        )
+
+    # Tier 2 retry.
+    if stages.tier2_retry and hooks.tier2_enrich:
+        try:
+            hooks.tier2_enrich(note)
+        except ExtractionError:
+            logger.info("sweep: tier2 enrichment failed for %s", note.get("id"))
+
+    # Tier 3 retry.
+    if stages.tier3_retry and hooks.tier3_extract:
+        try:
+            hooks.tier3_extract(note)
+        except ExtractionError:
+            logger.info("sweep: tier3 extraction failed for %s", note.get("id"))
+
+    # ── Compute and apply clearing ──────────────────────────────
+    # Re-parse archive_path from post-stage state if archive
+    # succeeded this pass (currently always False until wired).
+    post_archive_path = archive_path
+    if archive_succeeded:
+        post_archive_path = archive_path  # would be updated
+
+    clearing = compute_clearing(
+        tags=current_tags,
+        archive_path=post_archive_path,
+        max_profile_score=max_profile_score,
+        full_text_threshold=ft_thresh,
+        deep_extract_threshold=de_thresh,
+    )
+
+    if clearing.clear_archive_missing:
+        current_tags = [t for t in current_tags if t != "influx:archive-missing"]
+    if clearing.clear_repair_needed:
+        current_tags = [t for t in current_tags if t != "influx:repair-needed"]
+
+    # ── Rewrite (§5.4 retry-order advancement) ──────────────────
+    await _rewrite_sweep_note(client, note, current_tags)
+
+
 # ── Sweep entry point ──────────────────────────────────────────────
 
 
@@ -464,17 +731,43 @@ async def sweep(
     *,
     client: LithosClient,
     config: AppConfig,
+    hooks: SweepHooks | None = None,
 ) -> list[dict[str, Any]]:
     """Run the repair sweep for *profile* (PRD 06 §5.1 FR-REP-1).
 
     Fetches up to ``repair.max_items_per_run`` notes tagged
     ``influx:repair-needed`` + ``profile:<profile>``, ordered by
     ``updated_at`` ascending (oldest first).  Each candidate is
-    re-read via ``lithos_read`` before further processing.
+    re-read via ``lithos_read``, then stages are selected + executed,
+    clearing is applied, and the note is rewritten via ``lithos_write``
+    to advance ``updated_at`` (retry-order advancement, §5.4).
 
-    Returns the list of re-read note dicts so downstream stages
-    (US-005+) can hang per-note logic off this loop.
+    On terminal write failure (unresolved ``version_conflict`` after
+    FR-MCP-7 retry, or generic transport failure), the sweep aborts
+    and raises :class:`SweepWriteError`.  No later candidate is
+    rewritten in that run (AC-X-8 failure mode 1).
+
+    Parameters
+    ----------
+    hooks:
+        Optional hook callables for stage execution.  When ``None``,
+        a default empty :class:`SweepHooks` is used (stages that
+        require hooks are skipped, but notes are still rewritten).
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        The list of re-read note dicts that were visited (may be
+        shorter than the candidate list if the sweep aborted).
+
+    Raises
+    ------
+    SweepWriteError
+        On terminal write failure — the caller (service.py) treats
+        this as a run abort per FR-RES-3.
     """
+    effective_hooks = hooks or SweepHooks()
+
     limit = config.repair.max_items_per_run
     list_result = await client.list_notes(
         tags=["influx:repair-needed", f"profile:{profile}"],
@@ -504,5 +797,15 @@ async def sweep(
             continue
         note = await client.read_note(note_id=note_id)
         visited.append(note)
+
+        # Process and rewrite — raises SweepWriteError on terminal
+        # write failure, aborting the loop (§5.4 failure mode 1).
+        await _process_sweep_note(
+            note,
+            profile=profile,
+            client=client,
+            config=config,
+            hooks=effective_hooks,
+        )
 
     return visited

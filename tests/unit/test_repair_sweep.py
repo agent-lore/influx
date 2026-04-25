@@ -1,8 +1,10 @@
-"""Tests for the repair sweep entry point (US-004).
+"""Tests for the repair sweep entry point (US-004, US-011).
 
 Verifies that ``sweep(profile)`` calls ``lithos_list`` with the
 correct tag set, limit, ordering, iterates returned notes via
-``lithos_read``, and returns cleanly when no candidates are found.
+``lithos_read``, returns cleanly when no candidates are found,
+and rewrites every visited note via ``lithos_write`` (retry-order
+advancement invariant, §5.4).
 """
 
 from __future__ import annotations
@@ -11,8 +13,11 @@ import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from influx.config import AppConfig, RepairConfig
-from influx.repair import sweep
+from influx.errors import LithosError
+from influx.repair import SweepWriteError, sweep
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -26,25 +31,37 @@ def _make_list_result(items: list[dict[str, Any]]) -> MagicMock:
     return result
 
 
+def _make_write_result(status: str = "updated") -> MagicMock:
+    """Build a fake ``CallToolResult`` for ``lithos_write``."""
+    text_content = MagicMock()
+    text_content.text = json.dumps({"status": status})
+    result = MagicMock()
+    result.content = [text_content]
+    return result
+
+
 def _make_config(max_items: int = 100) -> MagicMock:
     """Build a minimal config mock with ``repair.max_items_per_run``."""
     config = MagicMock(spec=AppConfig)
     config.repair = MagicMock(spec=RepairConfig)
     config.repair.max_items_per_run = max_items
+    config.profiles = []
     return config
 
 
 def _make_client(
     list_items: list[dict[str, Any]] | None = None,
     read_responses: list[dict[str, Any]] | None = None,
+    write_status: str = "updated",
 ) -> AsyncMock:
-    """Build a mock LithosClient with ``list_notes`` / ``read_note``."""
+    """Build a mock LithosClient with ``list_notes`` / ``read_note`` / ``call_tool``."""
     client = AsyncMock()
     client.list_notes = AsyncMock(return_value=_make_list_result(list_items or []))
     if read_responses:
         client.read_note = AsyncMock(side_effect=read_responses)
     else:
         client.read_note = AsyncMock(return_value={"id": "", "content": "", "tags": []})
+    client.call_tool = AsyncMock(return_value=_make_write_result(write_status))
     return client
 
 
@@ -196,3 +213,247 @@ class TestSweepIteration:
         assert len(result) == 1
         assert result[0]["id"] == "note-good"
         client.read_note.assert_awaited_once()
+
+
+# ── Rewrite-on-every-visit (US-011, §5.4) ───────────────────────────
+
+
+class TestSweepRewriteInvariant:
+    """Every visited note is rewritten via ``lithos_write`` (AC-X-8)."""
+
+    async def test_every_note_triggers_lithos_write(self) -> None:
+        """All visited notes are written back even with no progress."""
+        items = [
+            {"id": "n1", "title": "A"},
+            {"id": "n2", "title": "B"},
+        ]
+        read_notes = [
+            {"id": "n1", "content": "C1", "tags": ["influx:repair-needed"]},
+            {"id": "n2", "content": "C2", "tags": ["influx:repair-needed"]},
+        ]
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=read_notes)
+
+        await sweep("ai-robotics", client=client, config=config)
+
+        # call_tool is used for lithos_write
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert len(write_calls) == 2
+
+    async def test_no_progress_still_rewrites(self) -> None:
+        """A note with no stage changes is still rewritten."""
+        items = [{"id": "n1", "title": "X"}]
+        read_notes = [
+            {"id": "n1", "content": "X", "tags": ["influx:repair-needed"]},
+        ]
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=read_notes)
+
+        await sweep("ai-robotics", client=client, config=config)
+
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert len(write_calls) == 1
+        # The tags are re-emitted even without changes.
+        write_args = write_calls[0].args[1]
+        assert "influx:repair-needed" in write_args["tags"]
+
+    async def test_rewrite_includes_note_fields(self) -> None:
+        """The rewrite carries the note's id, title, content, etc."""
+        items = [{"id": "n1", "title": "Paper"}]
+        read_notes = [
+            {
+                "id": "n1",
+                "title": "Paper Title",
+                "content": "Body text",
+                "tags": ["influx:repair-needed"],
+                "source_url": "https://example.com",
+                "confidence": 0.7,
+                "version": 5,
+            },
+        ]
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=read_notes)
+
+        await sweep("ai-robotics", client=client, config=config)
+
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        args = write_calls[0].args[1]
+        assert args["id"] == "n1"
+        assert args["title"] == "Paper Title"
+        assert args["content"] == "Body text"
+        assert args["source_url"] == "https://example.com"
+        assert args["confidence"] == 0.7
+        assert args["expected_version"] == 5
+
+
+# ── Version conflict handling (AC-06-F) ──────────────────────────────
+
+
+class TestSweepVersionConflict:
+    """Version-conflict handling: re-read + re-merge + retry once."""
+
+    async def test_version_conflict_triggers_reread_and_retry(
+        self,
+    ) -> None:
+        """First conflict → re-read + retry; second conflict → abort."""
+        items = [{"id": "n1", "title": "Paper"}]
+        note = {
+            "id": "n1",
+            "content": "C",
+            "tags": ["influx:repair-needed"],
+            "version": 1,
+        }
+        refreshed = {
+            "id": "n1",
+            "content": "C-refreshed",
+            "tags": ["influx:repair-needed", "external:tag"],
+            "version": 2,
+        }
+        config = _make_config()
+        client = AsyncMock()
+        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        # read_note: first call is the initial re-read, second is the
+        # FR-MCP-7 re-read after version_conflict.
+        client.read_note = AsyncMock(side_effect=[note, refreshed])
+        # call_tool: first write → version_conflict, retry → success.
+        client.call_tool = AsyncMock(
+            side_effect=[
+                _make_write_result("version_conflict"),
+                _make_write_result("updated"),
+            ]
+        )
+
+        await sweep("ai-robotics", client=client, config=config)
+
+        # Two lithos_write calls: initial + retry.
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert len(write_calls) == 2
+        # Retry uses refreshed version.
+        retry_args = write_calls[1].args[1]
+        assert retry_args["expected_version"] == 2
+        assert retry_args["content"] == "C-refreshed"
+
+    async def test_unresolved_conflict_aborts_sweep(self) -> None:
+        """Second version_conflict → SweepWriteError → abort."""
+        items = [
+            {"id": "n1", "title": "A"},
+            {"id": "n2", "title": "B"},
+        ]
+        note = {
+            "id": "n1",
+            "content": "C",
+            "tags": ["influx:repair-needed"],
+            "version": 1,
+        }
+        refreshed = {
+            "id": "n1",
+            "content": "C2",
+            "tags": ["influx:repair-needed"],
+            "version": 2,
+        }
+        config = _make_config()
+        client = AsyncMock()
+        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.read_note = AsyncMock(side_effect=[note, refreshed])
+        # Both writes return version_conflict.
+        client.call_tool = AsyncMock(
+            side_effect=[
+                _make_write_result("version_conflict"),
+                _make_write_result("version_conflict"),
+            ]
+        )
+
+        with pytest.raises(SweepWriteError, match="version_conflict"):
+            await sweep("ai-robotics", client=client, config=config)
+
+        # Only one note was attempted (abort after n1 failed).
+        assert client.read_note.await_count == 2  # initial + re-read
+
+    async def test_no_later_candidate_after_abort(self) -> None:
+        """After abort on note 1, note 2 is never rewritten."""
+        items = [
+            {"id": "n1", "title": "A"},
+            {"id": "n2", "title": "B"},
+        ]
+        note1 = {
+            "id": "n1",
+            "content": "C1",
+            "tags": ["influx:repair-needed"],
+            "version": 1,
+        }
+        refreshed1 = {
+            "id": "n1",
+            "content": "C1r",
+            "tags": ["influx:repair-needed"],
+            "version": 2,
+        }
+        config = _make_config()
+        client = AsyncMock()
+        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.read_note = AsyncMock(side_effect=[note1, refreshed1])
+        client.call_tool = AsyncMock(
+            side_effect=[
+                _make_write_result("version_conflict"),
+                _make_write_result("version_conflict"),
+            ]
+        )
+
+        with pytest.raises(SweepWriteError):
+            await sweep("ai-robotics", client=client, config=config)
+
+        # n2 was never read — the sweep aborted on n1.
+        read_ids = [c.kwargs["note_id"] for c in client.read_note.call_args_list]
+        assert "n2" not in read_ids
+
+
+# ── Transport failure (§5.4 failure mode 1) ──────────────────────────
+
+
+class TestSweepTransportFailure:
+    """Generic write transport failure aborts the run."""
+
+    async def test_write_transport_failure_aborts(self) -> None:
+        items = [{"id": "n1", "title": "A"}]
+        note = {
+            "id": "n1",
+            "content": "C",
+            "tags": ["influx:repair-needed"],
+        }
+        config = _make_config()
+        client = AsyncMock()
+        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.read_note = AsyncMock(return_value=note)
+        client.call_tool = AsyncMock(side_effect=LithosError("connection lost"))
+
+        with pytest.raises(SweepWriteError, match="transport failure"):
+            await sweep("ai-robotics", client=client, config=config)
+
+    async def test_transport_failure_no_later_candidate(self) -> None:
+        items = [
+            {"id": "n1", "title": "A"},
+            {"id": "n2", "title": "B"},
+        ]
+        note1 = {
+            "id": "n1",
+            "content": "C1",
+            "tags": ["influx:repair-needed"],
+        }
+        config = _make_config()
+        client = AsyncMock()
+        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.read_note = AsyncMock(return_value=note1)
+        client.call_tool = AsyncMock(side_effect=LithosError("connection lost"))
+
+        with pytest.raises(SweepWriteError):
+            await sweep("ai-robotics", client=client, config=config)
+
+        # Only n1 was read — n2 never reached.
+        assert client.read_note.await_count == 1
