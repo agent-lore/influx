@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass, field
 
 from influx.errors import InfluxError
+from influx.schemas import Tier3Extraction
 from influx.urls import normalise_url
 
 __all__ = [
@@ -523,6 +524,7 @@ def render_note(
     keywords: list[str],
     profile_entries: list[ProfileRelevanceEntry],
     full_text: str | None = None,
+    tier3_extraction: Tier3Extraction | None = None,
     user_notes: str | None = None,
 ) -> str:
     """Render a full canonical Lithos note (FR-NOTE-1..8).
@@ -550,6 +552,12 @@ def render_note(
     full_text:
         Tier-2 extracted plain text for the ``## Full Text`` section.
         When ``None`` or empty the section is omitted entirely (FR-ENR-6).
+    tier3_extraction:
+        Tier-3 deep extraction result. When provided, emits ``## Claims``,
+        ``## Datasets & Benchmarks``, ``## Builds On``, ``## Open Questions``
+        sections. ``potential_connections`` is NOT rendered (consumed by
+        PRD 08 LCMA only). When ``None`` all four sections are omitted
+        (FR-ENR-6).
     user_notes:
         Byte-exact ``## User Notes`` region from a previous parse,
         or ``None`` to append an empty ``## User Notes`` heading.
@@ -594,6 +602,21 @@ def render_note(
     # Full Text section (Tier 2) — omitted when absent/empty (FR-ENR-6, US-011)
     if full_text:
         output += f"\n## Full Text\n{full_text}\n"
+
+    # Tier 3 sections (US-012) — omitted entirely when absent (FR-ENR-6)
+    if tier3_extraction is not None:
+        output += "\n## Claims\n"
+        for claim in tier3_extraction.claims:
+            output += f"- {claim}\n"
+        output += "\n## Datasets & Benchmarks\n"
+        for ds in tier3_extraction.datasets:
+            output += f"- {ds}\n"
+        output += "\n## Builds On\n"
+        for item in tier3_extraction.builds_on:
+            output += f"- {item}\n"
+        output += "\n## Open Questions\n"
+        for q in tier3_extraction.open_questions:
+            output += f"- {q}\n"
 
     # Profile Relevance section — always emitted to keep the canonical
     # note shape stable (US-007); body is empty when no entries are given.
