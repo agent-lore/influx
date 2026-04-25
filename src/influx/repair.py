@@ -13,6 +13,7 @@ implementations ship with PRD 07.
 
 from __future__ import annotations
 
+import copy
 import enum
 import json
 import logging
@@ -368,6 +369,29 @@ def select_stages(
     )
 
 
+# ── Hook-call rollback helpers (finding #1) ──────────────────────────
+
+
+def _snapshot_note(note: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy mutable note state for hook-call rollback.
+
+    Hooks (``archive_download``, ``re_extract_archive``, ``tier2_enrich``,
+    ``tier3_extract``) receive the live mutable note dict.  When a hook
+    raises ``ExtractionError`` / ``LithosError`` the sweep treats that
+    as "stage failed this pass" (per US-003 / US-013) and must NOT
+    persist any partial in-place mutations the hook applied before
+    raising — otherwise a hook that appends e.g. ``full-text`` and
+    then raises could spuriously satisfy the clearing rules.
+    """
+    return copy.deepcopy(note)
+
+
+def _restore_note(note: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    """Restore *note* to *snapshot* state in place."""
+    note.clear()
+    note.update(snapshot)
+
+
 # ── Abstract-only re-extraction stage (§5.2) ──────────────────────
 
 
@@ -410,12 +434,17 @@ def apply_abstract_only_reextraction(
     list[str]
         A new tag list with the appropriate mutations applied.
     """
+    # Snapshot the mutable note dict so a hook that mutates it and then
+    # raises does not leak partial state into the rewrite (finding #1).
+    snapshot = _snapshot_note(note)
     try:
         result = hook(note, archive_path)
     except (ExtractionError, LithosError):
-        # Transient failure — keep tags unchanged.  ``LithosError``
-        # raised by the hook is treated as a per-stage failure (not a
-        # fatal sweep abort) per US-003 / US-013 (finding #4).
+        # Transient failure — keep tags unchanged AND roll back any
+        # in-place note mutations the hook applied before raising.
+        # ``LithosError`` raised by the hook is treated as a per-stage
+        # failure (not a fatal sweep abort) per US-003 / US-013.
+        _restore_note(note, snapshot)
         logger.info(
             "abstract-only re-extraction hook raised "
             "ExtractionError/LithosError (transient); tags unchanged"
@@ -797,6 +826,9 @@ async def _process_sweep_note(
     # Archive retry.
     archive_succeeded = False
     if stages.archive_retry and hooks.archive_download:
+        # Snapshot before the hook so a raise rolls back any partial
+        # in-place note mutations the hook applied (finding #1).
+        snapshot = _snapshot_note(note)
         try:
             downloaded_path = hooks.archive_download(note)
             archive_path = downloaded_path
@@ -815,8 +847,10 @@ async def _process_sweep_note(
                         + content[insert_pos:]
                     )
         except (ExtractionError, LithosError):
-            # Hook raises are per-stage failures, not fatal aborts
-            # (finding #4).
+            # Hook raises are per-stage failures, not fatal aborts.
+            # Restore the note dict so partial in-place mutations from
+            # the failing hook are NOT persisted (finding #1).
+            _restore_note(note, snapshot)
             logger.info(
                 "sweep: archive download failed for %s",
                 note.get("id"),
@@ -852,27 +886,34 @@ async def _process_sweep_note(
     # Tier 2 retry.
     if stages.tier2_retry and hooks.tier2_enrich:
         # Expose any tag mutations from earlier stages so the hook sees
-        # the latest tag set on the note dict (finding #3).
+        # the latest tag set on the note dict.
         note["tags"] = list(current_tags)
+        # Snapshot AFTER updating tags so an exception rolls back to
+        # the expected pre-hook state — including the latest current_tags
+        # rather than whatever was on the note before this stage ran.
+        snapshot = _snapshot_note(note)
         try:
             hooks.tier2_enrich(note)
             # Sync any tag/content mutations the hook applied to the
             # note dict back into the local working set.
             current_tags = list(note.get("tags", current_tags))
         except (ExtractionError, LithosError):
-            # Per-stage failure (finding #4).
+            # Per-stage failure: roll back any partial in-place
+            # mutations from the failing hook (finding #1).  Do NOT
+            # sync hook mutations into ``current_tags``.
+            _restore_note(note, snapshot)
             logger.info("sweep: tier2 enrichment failed for %s", note.get("id"))
-            current_tags = list(note.get("tags", current_tags))
 
     # Tier 3 retry.
     if stages.tier3_retry and hooks.tier3_extract:
         note["tags"] = list(current_tags)
+        snapshot = _snapshot_note(note)
         try:
             hooks.tier3_extract(note)
             current_tags = list(note.get("tags", current_tags))
         except (ExtractionError, LithosError):
+            _restore_note(note, snapshot)
             logger.info("sweep: tier3 extraction failed for %s", note.get("id"))
-            current_tags = list(note.get("tags", current_tags))
 
     # ── Compute and apply clearing ──────────────────────────────
     post_archive_path = archive_path

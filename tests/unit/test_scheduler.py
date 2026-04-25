@@ -377,3 +377,72 @@ class TestSweepWriteErrorMarksReadinessDegraded:
 
         assert probe_loop.marked is False
         assert probe_loop.cleared is False
+
+
+# ── Scheduled-fire repair_sweep invocation (US-014, finding #2) ──────
+
+
+class TestScheduledFireInvokesRepairSweep:
+    """Scheduled fires drive ``InfluxScheduler._fire_profile`` and run the sweep.
+
+    Finding #2: the existing US-014 positive test only proves the manual
+    ``POST /runs`` path.  This test drives the actual scheduled-fire
+    code path (``_fire_profile`` calling ``run_profile`` with
+    ``RunKind.SCHEDULED``) with a spy on ``repair_sweep`` and asserts
+    exactly one call for the profile.
+    """
+
+    async def test_scheduled_fire_invokes_repair_sweep_once(self) -> None:
+        config = _make_config(profiles=["alpha"])
+        coord = Coordinator()
+        sched = InfluxScheduler(config, coord)
+
+        sweep_calls: list[tuple[str, RunKind]] = []
+
+        async def spy_sweep(profile: str, **kwargs: Any) -> list[Any]:
+            # Capture the kind from the surrounding run.  We can infer
+            # SCHEDULED from the call site (``_fire_profile`` always
+            # passes ``RunKind.SCHEDULED``); record the profile name.
+            sweep_calls.append((profile, RunKind.SCHEDULED))
+            return []
+
+        async def empty_neg_block(*args: Any, **kwargs: Any) -> str:
+            return ""
+
+        class _NoopClient:
+            async def close(self) -> None: ...
+
+        with (
+            patch("influx.scheduler.repair_sweep", side_effect=spy_sweep),
+            patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch(
+                "influx.scheduler.build_negative_examples_block",
+                side_effect=empty_neg_block,
+            ),
+            patch("influx.service.post_run_webhook_hook"),
+        ):
+            await sched._fire_profile("alpha")
+
+        assert sweep_calls == [("alpha", RunKind.SCHEDULED)]
+        assert coord.is_busy("alpha") is False
+
+    async def test_scheduled_fire_uses_run_kind_scheduled(self) -> None:
+        """``_fire_profile`` calls ``run_profile`` with ``RunKind.SCHEDULED``."""
+        config = _make_config(profiles=["alpha"])
+        coord = Coordinator()
+        sched = InfluxScheduler(config, coord)
+
+        observed_kind: list[RunKind] = []
+
+        async def spy_run_profile(
+            profile: str, kind: RunKind, run_range: Any = None, **_: Any
+        ) -> None:
+            observed_kind.append(kind)
+
+        with patch(
+            "influx.scheduler.run_profile",
+            side_effect=spy_run_profile,
+        ):
+            await sched._fire_profile("alpha")
+
+        assert observed_kind == [RunKind.SCHEDULED]
