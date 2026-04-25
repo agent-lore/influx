@@ -222,6 +222,92 @@ class TestReExtractArchiveRollback:
         assert note["tags"] == ["text:abstract-only"]
         assert note["content"] == "ORIGINAL"
 
+    async def test_re_extract_hook_mutation_then_returns_transient_is_rolled_back(
+        self,
+    ) -> None:
+        """Hook mutates note then returns TRANSIENT — rewrite must not carry it.
+
+        Returning ``TRANSIENT`` is "failed this pass" with the same
+        semantics as raising ``ExtractionError`` / ``LithosError``, so
+        the live note dict must be rolled back before the rewrite step
+        serialises ``note["content"]`` into the ``lithos_write`` payload.
+        """
+        items = [{"id": "n1", "title": "Paper"}]
+        read_notes = [
+            {
+                "id": "n1",
+                "title": "Paper",
+                "content": "## Archive\npath: a.pdf\n",
+                "tags": [
+                    "influx:repair-needed",
+                    "text:abstract-only",
+                ],
+            }
+        ]
+
+        def transient_mutating_re_extract(
+            note: dict[str, object], archive_path: str
+        ) -> ReExtractionResult:
+            tags = list(note.get("tags", []))  # type: ignore[arg-type]
+            tags.append("influx:text-terminal")
+            note["tags"] = tags
+            note["content"] = "MUTATED"
+            return ReExtractionResult(outcome=ExtractionOutcome.TRANSIENT)
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=read_notes)
+        hooks = SweepHooks(re_extract_archive=transient_mutating_re_extract)
+
+        await sweep("p", client=client, config=config, hooks=hooks)
+
+        args = _last_write_args(client)
+        # influx:text-terminal MUST NOT be present — the hook reported
+        # TRANSIENT, so the Terminal-outcome semantics do not apply.
+        assert "influx:text-terminal" not in args["tags"]
+        # text:abstract-only is preserved.
+        assert "text:abstract-only" in args["tags"]
+        # influx:repair-needed remains because the stage did not succeed.
+        assert "influx:repair-needed" in args["tags"]
+        # Content rolled back to the original archive section — the
+        # hook's MUTATED body must NOT leak into the rewrite payload.
+        assert args["content"] == "## Archive\npath: a.pdf\n"
+
+    def test_helper_restores_note_state_on_transient_outcome(self) -> None:
+        """``apply_abstract_only_reextraction`` rolls back on TRANSIENT return.
+
+        A hook that mutates ``note["tags"]`` / ``note["content"]`` and
+        then returns ``TRANSIENT`` must leave the live note dict in its
+        pre-hook state — otherwise the mutation leaks into the rewrite
+        payload via ``note["content"]``.
+        """
+        note: dict[str, Any] = {
+            "id": "n1",
+            "tags": ["text:abstract-only", "influx:repair-needed"],
+            "content": "ORIGINAL",
+        }
+        original_tags = list(note["tags"])
+        original_content = note["content"]
+
+        def transient_mutating_hook(
+            note: dict[str, object], archive_path: str
+        ) -> ReExtractionResult:
+            note["tags"] = list(note.get("tags", [])) + [  # type: ignore[arg-type]
+                "influx:text-terminal",
+            ]
+            note["content"] = "MUTATED"
+            return ReExtractionResult(outcome=ExtractionOutcome.TRANSIENT)
+
+        result = apply_abstract_only_reextraction(
+            tags=original_tags,
+            note=note,
+            archive_path="a.pdf",
+            hook=transient_mutating_hook,
+        )
+
+        assert result == original_tags
+        assert note["tags"] == original_tags
+        assert note["content"] == original_content
+
     def test_helper_terminal_outcome_still_applies(self) -> None:
         """A successful hook return still drives the documented mutation."""
         note: dict[str, Any] = {

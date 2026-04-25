@@ -465,7 +465,12 @@ def apply_abstract_only_reextraction(
             new_tags.append("influx:text-terminal")
         return new_tags
 
-    # TRANSIENT — keep tags unchanged.
+    # TRANSIENT — keep tags unchanged AND roll back any in-place note
+    # mutations the hook applied before returning. A returned TRANSIENT
+    # is "failed this pass" with the same semantics as a raised
+    # ExtractionError/LithosError, so persisted note state must not
+    # carry the hook's partial work into the rewrite (finding #1).
+    _restore_note(note, snapshot)
     logger.info("abstract-only re-extraction returned TRANSIENT; tags unchanged")
     return list(tags)
 
