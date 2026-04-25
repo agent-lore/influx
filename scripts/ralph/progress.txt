@@ -11,7 +11,12 @@ Started: Sat Apr 25 06:30:16 UTC 2026
 - Fake Lithos SSE server fixture pattern: `FakeLithosServer` class in `tests/contract/test_lithos_client.py` with uvicorn on random port
 - `.venv` python symlink is broken (points to missing pyenv); system python3 at `/usr/local/bin/python3` works; need `pip install --target .venv/lib/python3.12/site-packages` for new pyright-visible packages
 - `LithosConfig` added to `config.py` with `url` and `transport` fields, env overrides `LITHOS_URL` and `LITHOS_MCP_TRANSPORT`
-- 509 tests passing after US-002
+- 533 tests passing after US-004
+- `src/influx/dedup.py` has `first_sentence()` and `compose_dedup_query()` for cache_lookup query composition
+- First-sentence regex `(?<=[a-z]{2})[.!?](?:\s|$)` skips abbreviations like "Mr." and "e.g." by requiring 2 lowercase letters before the terminator
+- `LithosClient._ensure_connected()` auto-calls `lithos_agent_register` on every new connection (including reconnects)
+- `LithosClient.reconnect()` method exists for SSE drop + re-register
+- Agent register payload: `{"id": "influx", "name": "Influx Pipeline", "type": "ingestion-pipeline"}`
 
 ---
 
@@ -37,4 +42,28 @@ Started: Sat Apr 25 06:30:16 UTC 2026
   - `LithosClient` uses `AsyncExitStack` to manage nested `sse_client` + `ClientSession` context managers
   - Lazy connection via `_ensure_connected()` with double-checked locking
   - 509 tests pass (4 new contract + 3 new unit + replaced 5 old stub tests)
+---
+
+## 2026-04-25 - US-003
+- Implemented auto `lithos_agent_register` on every new SSE connection (fired inside `_ensure_connected()`)
+- Added `reconnect()` method to `LithosClient` for SSE drop handling
+- Added `lithos_agent_register` tool to `FakeLithosServer`
+- Updated existing lifecycle tests to account for the extra `agent_register` call
+- Added 3 new contract tests: register on first call, no register before call, register again after reconnect
+- Files changed: `src/influx/lithos_client.py`, `tests/contract/test_lithos_client.py`
+- **Learnings for future iterations:**
+  - When adding auto-calls in `_ensure_connected()`, existing tests that count `len(calls)` need updating
+  - `_AGENT_REGISTER_ARGS` class-level dict keeps the payload DRY and testable
+  - `reconnect()` simply calls `close()` then `_ensure_connected()` — the auto-register fires as part of new connection
+  - 512 tests pass (3 new contract tests added)
+---
+
+## 2026-04-25 - US-004
+- Created `src/influx/dedup.py` with `first_sentence()` and `compose_dedup_query()` helpers
+- Created `tests/unit/test_dedup_query.py` with 21 tests covering all AC-05-B golden cases
+- Files changed: `src/influx/dedup.py`, `tests/unit/test_dedup_query.py`
+- **Learnings for future iterations:**
+  - First-sentence regex `(?<=[a-z]{2})[.!?](?:\s|$)` uses 2-lowercase-letter lookbehind to skip abbreviations (Mr., e.g., Dr.) while catching real sentence ends
+  - Ruff enforces SIM108 (ternary operator) — use `x if cond else y` instead of if/else blocks for simple assignments
+  - 533 tests pass (21 new unit tests added)
 ---

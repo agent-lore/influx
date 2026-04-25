@@ -56,7 +56,7 @@
         "tests/unit/test_dedup_query.py covers AC-05-B golden cases: no abstract → title only; abstract `\"Mr. Smith went home. He was tired.\"` → first sentence is `\"Mr. Smith went home\"` (because `.` is followed by whitespace at end of `home.`); abstract ending in `?` followed by EOF → that `?` IS a sentence end; abstract with no terminator → entire string capped at 200 chars"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
