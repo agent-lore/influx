@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from typing import Any
@@ -42,6 +43,7 @@ from influx.lithos_client import LithosClient
 from influx.notifications import HighlightItem, ProfileRunResult, RunStats
 from influx.repair import SweepWriteError
 from influx.repair import sweep as repair_sweep
+from influx.telemetry import current_run_id, get_tracer
 
 __all__ = [
     "InfluxScheduler",
@@ -138,25 +140,48 @@ async def run_profile(
     if config is None:
         return None
 
-    # When no ``item_provider`` is configured, fall back to the default
-    # no-op provider so the run still goes through its full pipeline
-    # (repair sweep + feedback ingestion + post-run hook).  Source
-    # acquisition becomes a no-op until a downstream PRD wires a real
-    # provider via ``app.state.item_provider``.
+    # ── Telemetry: influx.run span (FR-OBS-4) ──
     provider = item_provider if item_provider is not None else default_item_provider
+    run_id = str(uuid.uuid4())
+    run_id_token = current_run_id.set(run_id)
+    tracer = get_tracer()
+
+    try:
+        with tracer.span(
+            "influx.run",
+            attributes={
+                "influx.profile": profile,
+                "influx.run_id": run_id,
+                "influx.run_type": kind.value,
+            },
+        ):
+            return await _run_profile_body(
+                profile,
+                kind,
+                run_range,
+                config=config,
+                item_provider=provider,
+                probe_loop=probe_loop,
+            )
+    finally:
+        current_run_id.reset(run_id_token)
+
+
+async def _run_profile_body(
+    profile: str,
+    kind: RunKind,
+    run_range: dict[str, str | int] | None = None,
+    *,
+    config: AppConfig,
+    item_provider: ItemProvider,
+    probe_loop: Any | None = None,
+) -> ProfileRunResult | None:
+    """Inner implementation body of :func:`run_profile`."""
+    provider = item_provider
     profile_cfg = next((p for p in config.profiles if p.name == profile), None)
 
     def _handle_lcma_unknown_tool(exc: LCMAError, *, fallback_tool: str) -> None:
-        """Log + latch readiness for an LCMA ``unknown_tool`` failure.
-
-        Centralises the FR-LCMA-6 / US-007 deployment-error handling so
-        the same diagnostics fire whether the failure originates from
-        ``lithos_task_create``, an LCMA call inside the run body, or
-        ``lithos_task_complete`` in the finally block.  ``stage`` on the
-        ``LCMAError`` carries the offending tool name (set by
-        ``LithosClient._call_lcma_tool``); ``fallback_tool`` is used when
-        the exception was raised without a ``stage``.
-        """
+        """Log + latch readiness for an LCMA ``unknown_tool`` failure."""
         tool = getattr(exc, "stage", "") or fallback_tool
         logger.error(
             "LCMA deployment error: unknown_tool for %s during profile %r run "

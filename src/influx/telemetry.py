@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -26,8 +27,14 @@ if TYPE_CHECKING:
 __all__ = [
     "InfluxTracer",
     "SpanWrapper",
+    "current_run_id",
     "get_tracer",
 ]
+
+# Context variable for the current run ID — set by ``run_profile()`` so
+# that downstream call sites (e.g. filter scorer, source fetchers) can
+# attach ``influx.run_id`` to their spans without interface changes.
+current_run_id: ContextVar[str | None] = ContextVar("current_run_id", default=None)
 
 
 def _otel_enabled() -> bool:

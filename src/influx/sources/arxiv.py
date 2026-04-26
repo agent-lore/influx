@@ -40,6 +40,7 @@ from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import Tier1Enrichment, Tier3Extraction
+from influx.telemetry import current_run_id, get_tracer
 
 if TYPE_CHECKING:
     from influx.sources import FetchCache
@@ -822,16 +823,28 @@ def make_arxiv_item_provider(
         batch_scores: dict[str, ArxivScoreResult] = {}
         filter_failed = False
         if scorer is None and filter_scorer is not None:
-            try:
-                batch_scores = await filter_scorer(items, profile, filter_prompt)
-            except FilterScorerError:
-                _log.warning(
-                    "filter_scorer failed for profile %r; "
-                    "falling back to abstract-only ingestion for entire batch",
-                    profile,
-                    exc_info=True,
-                )
-                filter_failed = True
+            # ── Telemetry: influx.filter span (FR-OBS-4) ──
+            _tracer = get_tracer()
+            with _tracer.span(
+                "influx.filter",
+                attributes={
+                    "influx.profile": profile,
+                    "influx.run_id": current_run_id.get() or "",
+                    "influx.item_count": len(items),
+                },
+            ):
+                try:
+                    batch_scores = await filter_scorer(
+                        items, profile, filter_prompt
+                    )
+                except FilterScorerError:
+                    _log.warning(
+                        "filter_scorer failed for profile %r; "
+                        "falling back to abstract-only ingestion for entire batch",
+                        profile,
+                        exc_info=True,
+                    )
+                    filter_failed = True
 
         results: list[dict[str, Any]] = []
         for arxiv_item in items:

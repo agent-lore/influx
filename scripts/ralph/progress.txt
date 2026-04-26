@@ -9,6 +9,13 @@ Started: Sun Apr 26 17:50:45 UTC 2026
 - Import-stubbing pattern for simulating absent packages: save `sys.modules` keys, monkeypatch-delete them, override `builtins.__import__`, restore in finally block
 - Service-level tests: use `FastAPI` + `TestClient` for boot/serve assertions; `run_profile()` for run lifecycle
 - Telemetry singleton: use `get_tracer(force_rebuild=True)` in tests to pick up env changes
+- OTEL global TracerProvider: do NOT use `trace.set_tracer_provider()` — use `provider.get_tracer()` from a local `TracerProvider` to avoid "Overriding not allowed" warnings
+- Console fallback test pattern: use `ConsoleSpanExporter(out=io.StringIO())` instead of capsys/capfd
+- `_make_collecting_tracer()` helper in test_telemetry.py: returns `(InfluxTracer, collected_spans_list)` for span assertions
+- `run_profile()` delegates to `_run_profile_body()` — use `patch("influx.scheduler._run_profile_body")` to test span wiring without Lithos
+- `current_run_id` ContextVar in `telemetry.py` — set by `run_profile()`, read by downstream span sites (filter, fetchers) for `influx.run_id` attribute
+- `ArxivItem` fields: `arxiv_id`, `title`, `abstract`, `published` (datetime), `categories` — no `authors`, `updated`, `pdf_url`
+- `fetch_arxiv` is synchronous — mock with `MagicMock`, not `AsyncMock`
 
 ---
 
@@ -24,4 +31,31 @@ Started: Sun Apr 26 17:50:45 UTC 2026
   - `_otel_packages_available()` must check `opentelemetry.sdk.trace` and `opentelemetry.trace` (not `.api` / `.sdk`)
   - The telemetry wrapper uses a module-level singleton rebuilt via `get_tracer(force_rebuild=True)` — future stories (US-003..US-007) should use this to wire spans into call sites
   - ruff requires isort-compatible import ordering — `from collections.abc` before `from unittest.mock`
+---
+
+## 2026-04-26 - US-002
+- Implemented telemetry wrapper enabled path: span creation, attributes, and console fallback exporter
+- Files changed:
+  - `src/influx/telemetry.py` — added `_console_fallback_enabled()`, `_otlp_endpoint_configured()`, console fallback exporter wiring in `_build_tracer()`, switched to local `TracerProvider` (no global provider override)
+  - `tests/unit/test_telemetry.py` — 13 new tests (26 total): enabled span creation, attribute setting (individual + batch + merge), console fallback, AC-10-A regression guard; also fixed pre-existing pyright errors in `_blocked_import` type annotations
+- **Learnings for future iterations:**
+  - OTEL global `TracerProvider` cannot be overridden once set (`trace.set_tracer_provider()` logs warning and is silently ignored). Use `provider.get_tracer()` directly from a local `TracerProvider` instead of the global `trace.get_tracer()`
+  - `ConsoleSpanExporter` output cannot be reliably captured with `capsys` or `capfd` in pytest — use `ConsoleSpanExporter(out=io.StringIO())` to capture output directly in tests
+  - Console fallback condition: `INFLUX_OTEL_CONSOLE_FALLBACK=true` AND `OTEL_EXPORTER_OTLP_ENDPOINT` is unset/empty
+  - `_make_collecting_tracer()` test helper pattern: creates a local `TracerProvider` + `_CollectingExporter` + `InfluxTracer` for span assertions without global state
+---
+
+## 2026-04-26 - US-003
+- Wired telemetry spans into run orchestration (`influx.run`) and filter call site (`influx.filter`)
+- Files changed:
+  - `src/influx/telemetry.py` — added `current_run_id` ContextVar for threading run_id to downstream span sites
+  - `src/influx/scheduler.py` — extracted `_run_profile_body()` from `run_profile()`, wrapped body in `influx.run` span with `influx.profile`, `influx.run_id`, `influx.run_type` attributes; added `uuid` and `telemetry` imports
+  - `src/influx/sources/arxiv.py` — wrapped `filter_scorer()` call in `influx.filter` span with `influx.profile`, `influx.run_id`, `influx.item_count` attributes
+  - `tests/unit/test_telemetry_wiring.py` — 7 new tests: 3 for `influx.run` span (scheduled/manual/backfill run types), 2 for `influx.filter` span (direct + via provider), 2 for OTEL-disabled regression (AC-10-A)
+- **Learnings for future iterations:**
+  - `run_profile()` body was extracted to `_run_profile_body()` to avoid re-indenting 300+ lines when wrapping with a `with tracer.span(...)` block. Future span wiring at other call sites can follow the same pattern.
+  - `current_run_id` ContextVar pattern: `run_profile()` sets it before calling the provider; downstream sites (filter scorer in arxiv.py) read it via `current_run_id.get()`. This avoids changing function signatures to thread `run_id` through.
+  - When testing `run_profile()` span wiring, patch `_run_profile_body` as `AsyncMock(return_value=None)` to skip Lithos interactions.
+  - `fetch_arxiv` is synchronous — always use `MagicMock`, not `AsyncMock`, when mocking it.
+  - `ArxivItem` is a frozen dataclass with only 5 fields: `arxiv_id`, `title`, `abstract`, `published` (datetime), `categories`.
 ---
