@@ -1,177 +1,211 @@
 {
-  "project": "Influx v1 \u2014 PRD 09: RSS Fetcher + Multi-Profile Orchestration + Backfill",
-  "branchName": "ralph/rss-multiprofile-backfill",
-  "description": "Extends the arXiv-only single-profile pipeline along three independent axes: (S-11) an RSS/Atom fetcher in `src/influx/sources/rss.py` using `feedparser`, with per-feed `source_tag` (`rss` or `blog`) flowing into the canonical `source:*` tag and the archive bucket layout `/archive/<feed.source_tag>/{YYYY}/{MM}/{feed-slug}-{YYYY-MM-DD}-{url-hash}.html` where `{url-hash}` is the first 10 hex chars of SHA-256(normalised `source_url`); (S-12) multi-profile orchestration with `profile:*` tag union-merging on shared notes, per-profile `## Profile Relevance` bullet merging by profile name, per-profile rejection authority preserved on the ingest path (`influx:rejected:<profile>` blocks re-adding `profile:<profile>` even when the source matches that profile again), cross-profile parallelism with same-profile strict serial (already enforced by PRD 03's coordinator), and per-source fetch deduplication across profiles within a single scheduled fire (R-8); (S-13) a real `POST /backfills` handler in `src/influx/http_api.py` replacing PRD 03's stub estimator, with naive cost estimate `days \u00d7 len(categories) \u00d7 max_results_per_category` (Q-3), a `--confirm` gate triggered by `estimated_items > 1000` (FR-BF-6), `lithos_task_create(tags=[\"influx:backfill\", ...])` task tagging, no webhook POST (FR-NOT-4), and no repair sweep (FR-REP-2) \u2014 both gates already exist from PRDs 05/06 but this PRD ensures `kind=\"backfill\"` is correctly propagated from the API down. After this PRD, the v1 product is functionally complete; PRD 10 adds OTEL spans/metrics and rejection-rate logging.",
+  "project": "Influx v1 — PRD 10: OTEL Telemetry + Rejection-Rate Logging + Final Polish",
+  "branchName": "ralph/telemetry-polish",
+  "description": "Final v1 PRD covering S-14 (OTEL telemetry) and S-15 (rejection-rate logging + stub removal) at Milestone M4. Adds an opt-in, additive, optional-dependency OTEL telemetry wrapper at `src/influx/telemetry.py` that is a no-op when OTEL packages are absent and when `INFLUX_OTEL_ENABLED` is not set. When enabled, it emits the FR-OBS-4 spans (`influx.run`, `influx.fetch.arxiv`, `influx.fetch.rss`, `influx.filter`, `influx.enrich.tier1`, `influx.enrich.tier2`, `influx.enrich.tier3`, `influx.lithos.write`, `influx.lithos.retrieve`, `influx.archive.download`) carrying the `influx.profile`, `influx.run_id`, `influx.run_type`, `influx.source`, `influx.item_count` attributes, with optional console fallback (`INFLUX_OTEL_CONSOLE_FALLBACK=true`) when no collector is configured. Adds per-tag rejection-rate logging every `feedback.recalibrate_after_runs` runs per profile, backed by an in-memory counter (restart resets — FR-OBS-5 is informative only). Final polish strand removes any remaining `TODO(PRD-NN)` / `# STUB:` / temporary-seam markers introduced in PRDs 01-09, asserts AC-X-1 (no hardcoded constants outside config parsing), AC-X-2 (provider swap works without code change via `[models.extract]` `provider` switch from `anthropic` to `openrouter`), and AC-X-6 (≥80% coverage on pure modules; happy-path + error-envelope contract tests for every Lithos tool called by Influx). Updates Docker artefacts per master PRD §9.4.4 if not already done. After this PRD, v1 is functionally complete and a v1 tag candidate.",
   "userStories": [
     {
       "id": "US-001",
-      "title": "Add feedparser dependency and RSS source parser with recorded fixtures",
-      "description": "As an Influx operator, I want an RSS/Atom parser module so that feeds configured with `source_tag` of `rss` or `blog` produce per-item records (title, URL, published, summary) for downstream ingest, with each item inheriting its feed's `source_tag` verbatim (FR-SRC-4).",
+      "title": "Add OTEL optional dependency group and no-op telemetry wrapper module",
+      "description": "As an Influx operator, I want a telemetry wrapper module that is a no-op when OTEL is disabled or its optional packages are absent so that the base install runs identically with or without OTEL (FR-OBS-2, AC-M4-3, AC-10-A).",
       "acceptanceCriteria": [
-        "Add `feedparser` to project dependencies (e.g. `pyproject.toml`)",
-        "Create `src/influx/sources/rss.py` exposing a `feedparser`-based RSS/Atom parser that, given feed content and the feed's configured `name`, `url`, and `source_tag`, returns per-item records with at minimum `title`, `url`, `published`, `summary`",
-        "Each parsed item carries the feed's configured `source_tag` verbatim (FR-SRC-4); the parser does not infer or override `source_tag`",
-        "Recorded feed fixtures live under `tests/fixtures/rss/*.xml` covering at least one Atom feed and one RSS 2.0 feed",
-        "Unit test `tests/unit/test_rss_fetcher.py` covers: (1) Atom parsing yields the documented fields, (2) RSS 2.0 parsing yields the documented fields, (3) a feed configured with `source_tag=\"rss\"` yields items tagged `rss`, (4) a separate feed configured with `source_tag=\"blog\"` yields items tagged `blog`",
-        "No feed contributes items to more than one `source:*` bucket"
+        "Add `[project.optional-dependencies] otel = [\"opentelemetry-api\", \"opentelemetry-sdk\", \"opentelemetry-exporter-otlp-proto-http\"]` to `pyproject.toml`",
+        "Create `src/influx/telemetry.py` exposing a thin wrapper for span creation and attribute setting whose default behaviour is a no-op (concrete helper API is left to the implementer)",
+        "OTEL enablement is env-driven via `INFLUX_OTEL_ENABLED` with default false (FR-OBS-2, PRD §2.1 / §5.2). The wrapper is a no-op whenever OTEL is not enabled — including the default case where the env var is unset — performing no span creation and no attribute-setting calls (the body is a dictionary lookup / attribute access, not object instantiation — AC-10-A)",
+        "AC-M4-3 (service-level): with OTEL optional packages absent and OTEL disabled, the service starts, serves requests, and completes a run. The acceptance test exercises this at the service level (`influx serve` boot + a representative run). Import-stubbing of the OTEL packages is permitted as the test mechanism for simulating absent extras when a separate virtualenv path is impractical in CI; the assertion remains the service-level behaviour (start + serve + run), not just module import or wrapper no-op",
+        "Unit test `tests/unit/test_telemetry.py` asserts: (1) OTEL is off by default — the wrapper is a no-op when `INFLUX_OTEL_ENABLED` is not set (FR-OBS-2); (2) the wrapper is a no-op when `INFLUX_OTEL_ENABLED=false` (FR-OBS-2); (3) the wrapper is enabled when `INFLUX_OTEL_ENABLED=true` and OTEL optional packages are installed; (4) the wrapper remains a no-op when OTEL optional packages are simulated absent via import-stub regardless of `INFLUX_OTEL_ENABLED` (AC-M4-3)",
+        "Wrapper does not raise in any of the no-op paths (when invoked with documented/valid wrapper calls while OTEL is disabled or its optional packages are absent)",
+        "Packaging smoke check: `uv pip install .[otel]` (or an equivalent extras-resolution check such as `pip install .[otel]` / `uv pip compile --extra otel`) succeeds against the updated `pyproject.toml` so the optional-extras group resolves cleanly (Definition of Done item)",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "All existing tests still pass"
       ],
       "priority": 1,
       "passes": true,
-      "notes": ""
+      "notes": "Implementation guidance (non-binding): AC-M4-3 is a service-level contract (start + serve + complete a run with OTEL extras absent and OTEL disabled). Per PRD §7.4 / AC-M4-3, the preferred verification path is a virtualenv without the `otel` extras; if that is impractical in CI, simulate the missing extras via import-stubbing while still asserting the service-level behaviour rather than just module import. This is independent of the Docker story (US-010), which is scoped to `/archive`, port 8080, and the `CMD` line."
     },
     {
       "id": "US-002",
-      "title": "URL-hash for archive filename disambiguation with collision and determinism tests",
-      "description": "As the archive writer, I want a deterministic `url-hash` so that two distinct items from the same feed published on the same date map to distinct archive filenames, and re-ingesting the same URL always yields the same filename (AC-M3-4 sub-tests 2 and 3).",
+      "title": "Telemetry wrapper enabled path: span creation, attributes, and console fallback exporter",
+      "description": "As an Influx operator, I want the telemetry wrapper to emit OTEL spans when enabled and optionally print spans to stdout when no collector is configured so that I can observe runs locally without infrastructure (FR-OBS-2, FR-OBS-3, AC-M4-1).",
       "acceptanceCriteria": [
-        "Compute the first 10 hex chars of SHA-256 over the normalised `source_url` for use as the archive `{url-hash}` segment",
-        "The hash is computed over the canonical normalised `source_url` so it is stable across call sites",
-        "Determinism unit test in `tests/unit/test_archive_url_hash.py`: hashing the same URL twice yields the same 10-char hex string (AC-M3-4 sub-test 3 / AC-09-C)",
-        "Collision unit test: two URLs differing only by path segment (e.g. `https://feed-x.example/post-a` and `https://feed-x.example/post-b`) yield two distinct hash suffixes (AC-M3-4 sub-test 2 / AC-09-B)",
-        "The hash is derived from `normalise_url(source_url)` so callers operating on equivalent URLs receive the same hash"
+        "When `INFLUX_OTEL_ENABLED=true` and OTEL optional packages are installed, the wrapper creates real OTEL spans for the names passed to it",
+        "Attributes passed to the wrapper are set on the underlying span using OTEL's attribute API",
+        "When `INFLUX_OTEL_CONSOLE_FALLBACK=true` and no OTLP collector endpoint is configured, spans are observably emitted to stdout (FR-OBS-3)",
+        "Extend `tests/unit/test_telemetry.py` with: (1) enabled wrapper creates a span with the given name; (2) enabled wrapper sets the given attributes on the span; (3) with console fallback enabled and no collector configured, spans are observable on stdout. End-to-end export to a real OTLP collector is out of scope for this unit test",
+        "When `INFLUX_OTEL_ENABLED=false`, no span is created even if OTEL packages are installed (AC-10-A regression guard)",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "All existing tests still pass"
       ],
       "priority": 2,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-003",
-      "title": "RSS archive layout and note-path integration end-to-end",
-      "description": "As the Influx ingest pipeline, I want RSS items routed to source-tag-specific archive and note paths so that `source_tag`, the `source:*` tag, the note storage path, and the archive path all agree, satisfying AC-M3-4 sub-test 1.",
+      "title": "Wire telemetry spans into the run orchestration and filter call sites for influx.run and influx.filter",
+      "description": "As an operator, I want the per-profile run orchestration and the filter step to emit `influx.run` and `influx.filter` spans with the documented attributes so that a complete run is observable end-to-end (FR-OBS-4, AC-10-B).",
       "acceptanceCriteria": [
-        "RSS items are archived at `/archive/<source_tag>/{YYYY}/{MM}/{feed-slug}-{YYYY-MM-DD}-{url-hash}.html`, where `{url-hash}` is the first 10 hex chars of SHA-256 over the normalised `source_url`",
-        "RSS article fetches go through PRD 02's guarded HTTP client so that the SSRF guard and size/timeout caps apply (FR-SRC-5 / FR-RES-4)",
-        "Notes for `source_tag=\"rss\"` are stored at `articles/rss/{YYYY}/{MM}` and tagged `source:rss`",
-        "Notes for `source_tag=\"blog\"` are stored at `articles/blog/{YYYY}/{MM}` and tagged `source:blog`",
-        "The archive `{source}` segment, the note's `source:*` tag, and the note's storage path (FR-NOTE-2) all agree (AC-M3-4 sub-test 1 / AC-09-A)",
-        "Integration test `tests/integration/test_rss_to_lithos.py` drives an end-to-end ingest of a fixture feed and asserts the archive file exists on disk and the resulting note carries the expected `source:*` tag and storage path",
-        "End-to-end collision test (AC-09-B): ingesting two items from the same feed published on `2026-04-23` with URLs `https://feed-x.example/post-a` and `https://feed-x.example/post-b` produces two distinct archive files; both exist on disk after the run; neither overwrites the other",
-        "Determinism path-computation test (AC-09-C): hashing the same normalised URL `https://feed-x.example/post-a` twice yields the same `{url-hash}` and therefore the same archive filename component, verified at the helper / path-builder level without requiring a second end-to-end ingest"
+        "An `influx.run` span is created around the per-profile run lifecycle (covering both scheduled and HTTP-triggered invocations as listed in PRD §6 / FR-OBS-4) carrying `influx.profile`, `influx.run_id`, `influx.run_type` attributes. The exact instrumentation site (single shared orchestration entrypoint vs. per-caller wrapping) is left to the implementer",
+        "The filter step is wrapped in an `influx.filter` span at the actual scorer or its call site (e.g. in `src/influx/filter.py` and/or `src/influx/sources/arxiv.py`) carrying `influx.profile`, `influx.run_id`, `influx.item_count` attributes",
+        "All wrapping uses the `src/influx/telemetry.py` wrapper from US-001/US-002 — no direct `opentelemetry.*` imports leak into the run orchestration or filter modules",
+        "With OTEL disabled, run orchestration and filter behaviour are unchanged (AC-10-A regression check via existing tests)",
+        "Unit / integration test asserts that with OTEL enabled (using the in-memory exporter pattern from `tests/unit/test_telemetry.py`), invoking the run orchestration entrypoint produces an `influx.run` span and an `influx.filter` span with the documented attribute keys",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "All existing tests still pass"
       ],
       "priority": 3,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-004",
-      "title": "RSS web extraction fallback to feed summary when body is below min_web_chars",
-      "description": "As the article enrichment step, I want to fall back to the feed `<summary>` when the extracted web article body is shorter than `extraction.min_web_chars` so that thin or paywalled RSS items still produce usable notes (AC-09-J, FR-ENR-3).",
+      "title": "Wire telemetry spans into source fetchers (arxiv, rss)",
+      "description": "As an operator, I want each source fetcher to emit a per-fetch span so that I can attribute fetch latency and item counts to a given source within a run (FR-OBS-4).",
       "acceptanceCriteria": [
-        "When PRD 07's web extractor rejects an article because the extracted body fails the `extraction.min_web_chars` minimum (e.g. raises `ExtractionError`), the ingest path falls back to using the feed item's `<summary>` instead of the extracted body (FR-ENR-3)",
-        "Integration test covers the extractor-rejection / min-length-failure path with a fixture whose article body is intentionally short and asserts end-to-end that the feed `<summary>` is used as the summary source rather than the short extracted body (AC-09-J)"
+        "`src/influx/sources/arxiv.py` wraps its fetch entrypoint in an `influx.fetch.arxiv` span carrying applicable attributes from the FR-OBS-4 set (`influx.profile`, `influx.run_id`, `influx.source`, `influx.item_count`)",
+        "`src/influx/sources/rss.py` wraps its fetch entrypoint in an `influx.fetch.rss` span carrying applicable attributes from the FR-OBS-4 set (`influx.profile`, `influx.run_id`, `influx.source`, `influx.item_count`)",
+        "All wrapping uses the `src/influx/telemetry.py` wrapper — no direct `opentelemetry.*` imports in the source modules",
+        "With OTEL disabled, both fetchers behave identically to before (existing source tests still pass)",
+        "Unit / integration test (extending the OTEL test setup) asserts both `influx.fetch.arxiv` and `influx.fetch.rss` spans appear with the documented attribute keys when their respective fetchers run with OTEL enabled",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "All existing tests still pass"
       ],
       "priority": 4,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-005",
-      "title": "Multi-profile tag merging on shared notes (profile union and Profile Relevance bullets)",
-      "description": "As an Influx ingest pipeline running multiple profiles in one fire, I want `profile:*` tags and `## Profile Relevance` bullets union-merged on a single shared note so that one paper matching two profiles produces ONE note carrying both `profile:*` tags and two `## Profile Relevance` bullets (AC-M3-2, FR-NOTE-6).",
+      "title": "Wire telemetry spans for enrichment tier1/tier2/tier3 in their real callers",
+      "description": "As an operator, I want each enrichment tier to emit its own span at its actual call site so that LLM-call cost / latency per tier is observable (FR-OBS-4).",
       "acceptanceCriteria": [
-        "When a single source item matches two profiles in one run, exactly ONE note is produced (AC-M3-2)",
-        "The shared note carries both `profile:<A>` and `profile:<B>` tags (set union, not replacement)",
-        "The shared note has two `## Profile Relevance` entries merged by profile name (FR-NOTE-6)",
-        "Disjoint matches still produce one note per profile, each tagged with only the matching `profile:*` tag (AC-M3-3)",
-        "Re-ingesting an already-tagged note preserves existing `profile:*` tags and `## Profile Relevance` entries for profiles that are not part of the current run (idempotency / no destructive overwrite)",
-        "Unit test `tests/unit/test_multi_profile_merge.py` covers: union semantics, entry merging by profile name, idempotency on re-ingest, and the disjoint-match case",
-        "Integration test `tests/integration/test_multi_profile_shared_source.py` drives a two-profile run against a fixture whose item matches both profiles and asserts one note with both tags and two `## Profile Relevance` entries merged by profile name",
-        "Negative test asserts that running one profile alone does NOT remove or rewrite an existing `profile:<other-profile>` tag or its `## Profile Relevance` entry on a shared note (e.g. running `web-tech` alone preserves an existing `profile:ai-robotics` tag and bullet)"
+        "Tier 1 is instrumented either inside `tier1_enrich()` in `src/influx/enrich.py` or at its invocation site in `src/influx/sources/arxiv.py` — wrapped in an `influx.enrich.tier1` span carrying applicable attributes from the FR-OBS-4 set (`influx.profile`, `influx.run_id`, `influx.item_count`)",
+        "Tier 2 is instrumented on the full-text extraction path that backs it — i.e. at `src/influx/extraction/pipeline.py` and/or its invocation site in `src/influx/sources/arxiv.py` — wrapped in an `influx.enrich.tier2` span carrying applicable attributes from the FR-OBS-4 set (`influx.profile`, `influx.run_id`, `influx.item_count`)",
+        "Tier 3 is instrumented either inside `tier3_extract()` in `src/influx/enrich.py` or at its invocation site in `src/influx/sources/arxiv.py` — wrapped in an `influx.enrich.tier3` span carrying applicable attributes from the FR-OBS-4 set (`influx.profile`, `influx.run_id`, `influx.item_count`)",
+        "All wrapping uses the `src/influx/telemetry.py` wrapper — no direct `opentelemetry.*` imports in the enrich / extraction modules",
+        "With OTEL disabled, enrichment and extraction behaviour are unchanged (existing tests still pass)",
+        "Test asserts all three tier spans appear with the documented attribute keys when the corresponding tiers run with OTEL enabled",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "All existing tests still pass"
       ],
       "priority": 5,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-006",
-      "title": "Per-profile rejection authority preserved on the ingest path",
-      "description": "As the ingest path, I want `influx:rejected:<profile>` to block re-adding `profile:<profile>` and to block refreshing that profile's `## Profile Relevance` entry, so that a per-profile rejection is preserved across reruns even when the source matches that profile again (AC-M3-6, AC-09-K, FR-NOTE-6).",
+      "title": "Wire telemetry spans into storage / lithos_client / lcma for write, retrieve, and archive download",
+      "description": "As an operator, I want Lithos writes / retrievals and archive downloads to emit spans so that storage-tier latency is observable per run (FR-OBS-4).",
       "acceptanceCriteria": [
-        "When a note already has `influx:rejected:profile-a`, the ingest path MUST NOT re-add `profile:profile-a` even if the source matches that profile again (AC-M3-6)",
-        "When a note already has `influx:rejected:profile-a`, the ingest path MUST NOT refresh that profile's `## Profile Relevance` entry",
-        "If `profile-b` separately scores the same item \u2265 `relevance` in the same run, `profile:profile-b` IS added on the same note, and the rejection on `profile-a` is preserved (AC-09-K)",
-        "In a multi-profile run, when an Influx-authored note carries `influx:rejected:<profile>`, that note's title appears in the next run's filter prompt under the `NEGATIVE EXAMPLES` block for that profile (AC-M3-5), exercised end-to-end via an integration test",
-        "Integration test `tests/integration/test_profile_rejection_authority.py` drives a two-profile run where one profile is rejected and the other is not, asserting the rejection-authority post-condition: `influx:rejected:<rejected-profile>` present, `profile:<rejected-profile>` absent, `profile:<accepted-profile>` present"
+        "`src/influx/lithos_client.py` (or the Lithos write call sites in `src/influx/scheduler.py`) wraps Lithos writes in an `influx.lithos.write` span carrying `influx.profile`, `influx.run_id` attributes",
+        "`src/influx/lithos_client.py` (or `src/influx/lcma.py`) wraps Lithos retrievals in an `influx.lithos.retrieve` span carrying `influx.profile`, `influx.run_id` attributes",
+        "Archive download path (in `src/influx/storage.py` or wherever archive HTML is fetched / written) is wrapped in an `influx.archive.download` span carrying `influx.profile`, `influx.run_id`, `influx.source` attributes",
+        "All wrapping uses the `src/influx/telemetry.py` wrapper — no direct `opentelemetry.*` imports in storage / client modules",
+        "With OTEL disabled, storage and client modules behave identically to before (existing tests still pass)",
+        "Test asserts `influx.lithos.write`, `influx.lithos.retrieve`, and `influx.archive.download` spans all appear with the documented attribute keys when these operations run with OTEL enabled",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "All existing tests still pass"
       ],
       "priority": 6,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-007",
-      "title": "Per-source fetch deduplication across profiles in a single scheduled fire",
-      "description": "As the run coordinator, I want per-source fetches deduplicated across profiles within a single scheduled fire so that two profiles both subscribed to `cs.AI` fetch `cs.AI` exactly once, fanning the result out to all interested profiles (R-8 mitigation, AC-09-D).",
+      "title": "Integration test: in-memory OTEL exporter asserts the full FR-OBS-4 span + attribute set",
+      "description": "As a maintainer, I want a single integration test that exercises a representative run end-to-end with OTEL enabled and asserts every FR-OBS-4 span is emitted with its documented attributes (AC-M4-1, AC-10-B).",
       "acceptanceCriteria": [
-        "When a scheduled fire executes multiple profiles concurrently, shared sources are not redundantly fetched across profiles within the run, and fetched items are fanned out to all profiles subscribed to them (R-8 mitigation)",
-        "Applies to both arXiv and RSS sources",
-        "Cross-profile parallelism remains allowed (Q-4); same-profile strict serial remains enforced by PRD 03's coordinator",
-        "Integration test asserts that with two profiles both subscribed to `cs.AI`, `cs.AI` is fetched exactly once for the run and its items are delivered to both profiles (AC-09-D)"
+        "Create `tests/integration/test_otel_spans.py` that configures the telemetry wrapper to emit to an in-memory OTEL `InMemorySpanExporter` (or equivalent test exporter)",
+        "One or more integration scenarios in this file collectively exercise every FR-OBS-4 span (profile + arXiv fetch + RSS fetch + filter + tier1 + tier2 + tier3 enrich + Lithos write + Lithos retrieve + archive download) with `INFLUX_OTEL_ENABLED=true`. A single end-to-end scenario is acceptable but not required — the spans MAY be covered across multiple focused scenarios within the same file",
+        "Asserts (across the scenarios) that the union of exported spans contains the full FR-OBS-4 span list: `influx.run`, `influx.fetch.arxiv`, `influx.fetch.rss`, `influx.filter`, `influx.enrich.tier1`, `influx.enrich.tier2`, `influx.enrich.tier3`, `influx.lithos.write`, `influx.lithos.retrieve`, and `influx.archive.download` (AC-10-B, PRD §9)",
+        "For each captured span, asserts the applicable attributes from `{influx.profile, influx.run_id, influx.run_type, influx.source, influx.item_count}` are present per FR-OBS-4",
+        "A complementary assertion confirms that with `INFLUX_OTEL_ENABLED=false`, an equivalent invocation produces zero exported spans (AC-M4-2 / AC-10-A regression guard)",
+        "Test runs without requiring a live OTEL collector — only the in-memory exporter",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "All existing tests still pass"
       ],
       "priority": 7,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-008",
-      "title": "Real /backfills HTTP handler with naive estimator and confirm gate",
-      "description": "As the `/backfills` HTTP API, I want a real estimator and `confirm_required` gate so that backfills exceeding 1000 estimated items require explicit confirmation, replacing PRD 03's stub estimator (FR-BF-6, AC-M3-8, AC-09-E, AC-09-I).",
+      "title": "Per-profile rejection-rate logging cadence (every feedback.recalibrate_after_runs runs)",
+      "description": "As an operator, I want per-tag rejection rates logged every `feedback.recalibrate_after_runs` runs per profile so that I can monitor filter quality drift (FR-OBS-5, AC-M4-5, AC-10-D).",
       "acceptanceCriteria": [
-        "Replace the PRD 03 stub `/backfills` handler in `src/influx/http_api.py` with a real implementation",
-        "The estimator computes `estimated_items = days \u00d7 len(categories) \u00d7 max_results_per_category` (Q-3)",
-        "The handler supports both backfill range forms required by FR-BF-1 (a number-of-days form and an explicit from/to date form)",
-        "When `estimated_items > 1000` and `confirm` is not set, the handler returns `reason=\"confirm_required\"` with the `estimated_items` field populated (FR-BF-6, AC-M3-8)",
-        "When `estimated_items <= 1000`, the request is accepted without `confirm`",
-        "When `confirm=true` is supplied on a re-submission, the request is accepted regardless of estimated count",
-        "Unit tests in `tests/unit/test_backfill_estimator.py` cover: an estimate of 35 items accepted without confirm (AC-09-E); an estimate of 1500 items rejected with `reason=\"confirm_required\"` and a populated `estimated_items` (AC-09-I); resubmission with `confirm=true` accepted (AC-09-I); estimator math with multiple categories"
+        "Implement an in-memory per-profile run counter (keyed by profile name) that increments once per run for that profile (counting runs since the last recalibration log, per §2.2 of the PRD)",
+        "When the counter for a profile reaches a multiple of the global `feedback.recalibrate_after_runs` config setting, emit one structured JSON log line containing per-tag rejection rates for that profile (cadence is per profile; the threshold is read from the single root `feedback.recalibrate_after_runs` value)",
+        "Rejection rate is defined per tag, per PRD §2.2, as: the proportion of filter results carrying each tag that were subsequently rejected by the user via `influx:rejected:<profile>`. The implementation MUST retain enough information about filter-result tags to compute this metric against filter results (rather than redefining it against persisted note tags), while keeping the supporting state in-memory only and without introducing new Lithos tags (per PRD §3, out of scope: 'No new Lithos tags'). The specific mechanism for retaining filter-tag information is left to the implementer",
+        "The counter is in-memory only — a process restart resets it (FR-OBS-5 is informative only, per PRD §2.2)",
+        "Create `tests/unit/test_rejection_rate_logging.py` with a seeded state where `feedback.recalibrate_after_runs = 3`: assert the rejection-rate log line is emitted on the 3rd, 6th, and 9th runs and NOT on runs 1, 2, 4, 5, 7, 8 (AC-10-D)",
+        "Negative test: with `feedback.recalibrate_after_runs = 5`, the log line is NOT emitted on runs 1-4 and IS emitted on run 5",
+        "Per-profile isolation test: two profiles with independent counters emit at independent cadences",
+        "Log line is JSON-structured (matches FR-OBS-1) and includes the profile name and per-tag rejection-rate map",
+        "AC-M4-4: per-run structured logs emitted by the run orchestration include `filtered` and `ingested` counts (or equivalent named fields) per profile for that run, so operators can read those counts directly from the run's log output",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "All existing tests still pass"
       ],
       "priority": 8,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-009",
-      "title": "Backfill execution flow in CLI and run path with cache-lookup skip and arXiv pacing",
-      "description": "As an operator running `python -m influx backfill`, I want the CLI to handle estimate responses, confirm prompting, and full execution against arXiv so that `backfill --profile X --days 7` completes without overlapping a scheduled run for the same profile (AC-M3-7, FR-BF-1, FR-BF-2, FR-BF-3).",
+      "title": "Final stub / seam removal sweep with meta-test asserting no TODO(PRD-) or STUB markers",
+      "description": "As a maintainer, I want every remaining `TODO(PRD-NN)` / `# STUB:` / temporary-seam marker from PRDs 01-09 removed so that PRD 10 satisfies its own §4 ('No internal seams permitted') and AC-10-C (every prior 'seams permitted' item is resolved).",
       "acceptanceCriteria": [
-        "Finalise the `backfill` subcommand in the project's CLI entrypoint: supports `--days N` or `--from YYYY-MM-DD --to YYYY-MM-DD` as a mutually exclusive range form (FR-BF-1)",
-        "On `reason=\"confirm_required\"` from the API, the CLI surfaces `estimated_items` to the user and only submits `confirm=true` after explicit user acknowledgement \u2014 whether via a follow-up invocation with `--confirm` or an equivalent acknowledged retry flow (FR-BF-6)",
-        "Items already ingested (per `lithos_cache_lookup`) are skipped during the backfill run (FR-BF-2)",
-        "Backfill honours arXiv pacing / request spacing (FR-BF-3); the run respects the ~30s-per-day-of-backfill-per-profile budget",
-        "A backfill for profile `X` does not overlap with a scheduled run for the same profile; same-profile serialisation is enforced by PRD 03's coordinator (AC-M3-7)",
-        "Create `src/influx/backfill.py` housing the run flow (estimator integration, cache-lookup skip, pacing wiring)",
-        "Integration test `tests/integration/test_backfill_arxiv.py` drives `backfill --profile X --days 7` against a fake arXiv fixture and asserts: (1) the run completes, (2) already-ingested items are skipped (verified via the fake-Lithos cache-lookup recorder), (3) the run does not overlap with a concurrently scheduled run for the same profile"
+        "Search the codebase for `TODO(PRD-` and `# STUB:` markers introduced in PRDs 01-09 and either remove the marker (and any code it gates) or replace with a real implementation. Broader seam cleanup (e.g. `# stub` / `# no-op` / `# temporary seam` style comments) is handled as checklist / manual-review work under AC-10-C rather than by this automated search",
+        "Add `tests/meta/test_no_stubs.py` per PRD §9 — either a dedicated search-style test or a manual review checklist embedded as that file — that asserts the codebase contains no `TODO(PRD-` or `# STUB:` markers left behind. Scope and any necessary exclusions (e.g. PRD/spec markdown, vendored trees, generated artefacts) are left to the implementer. The separate AC-10-C checklist (covered by the next criterion) handles enumeration of resolved 'Internal seams permitted' items from PRD 01-09",
+        "Meta-test passes after the sweep",
+        "An explicit PRD-01..09 'seams permitted' checklist (in this PRD's completion notes or an equivalent location) enumerates each prior-PRD seam and confirms its resolution in source (AC-10-C)",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "Full test suite passes"
       ],
       "priority": 9,
-      "passes": true,
-      "notes": ""
+      "passes": false,
+      "notes": "Implementation guidance (non-binding): if the meta-test fails, listing the offending file paths and line numbers makes diagnosis easier."
     },
     {
       "id": "US-010",
-      "title": "Propagate kind=backfill through task tagging, webhook gate, and repair-sweep gate",
-      "description": "As the backfill pipeline, I want `kind=\"backfill\"` propagated end-to-end so that backfills create `lithos_task_create` tasks tagged `influx:backfill` (not `influx:run`), never POST a webhook, and never call the repair sweep (AC-09-F, AC-09-G, AC-09-H, FR-BF-4, FR-BF-5, FR-NOT-4, FR-REP-2).",
+      "title": "Docker artefacts updated per master PRD §9.4.4",
+      "description": "As an operator, I want `docker/Dockerfile` and `docker/docker-compose.yml` to reflect the v1 runtime contract (`/archive` mount, port 8080 exposed, `CMD [\"influx\", \"serve\"]`) so that v1 ships a runnable container (Definition of Done item).",
       "acceptanceCriteria": [
-        "Along the run/task-creation path, `lithos_task_create` receives the tag `influx:backfill` when `kind=\"backfill\"` and `influx:run` otherwise (FR-BF-5, FR-LCMA-5 backfill arm)",
-        "The backfill code path does not POST a webhook (FR-BF-4 / FR-NOT-4); the existing PRD 05 webhook gate is exercised end-to-end with `kind=\"backfill\"` propagated from the API down (AC-09-G)",
-        "The backfill code path does not invoke `lithos_list(tags=[\"influx:repair-needed\", ...])` (FR-REP-2); the existing PRD 06 repair-sweep gate is exercised end-to-end with `kind=\"backfill\"` (AC-09-H)",
-        "Integration assertion in `tests/integration/test_backfill_arxiv.py` verifies the created Lithos task carries the tag `influx:backfill` and NOT `influx:run` (AC-09-F)",
-        "Integration assertion verifies that no webhook HTTP call was issued during the backfill (AC-09-G)",
-        "Integration assertion verifies that the repair sweep was not invoked during the backfill \u2014 i.e. no `lithos_list(tags=[\"influx:repair-needed\", ...])` call recorded (AC-09-H)",
-        "Non-backfill regression test confirms that scheduled and manual runs continue to create `lithos_task_create` calls tagged `influx:run` rather than `influx:backfill`, so that the run-kind correctly selects between the two task tags (FR-BF-5)"
+        "`docker/Dockerfile` ends with `CMD [\"influx\", \"serve\"]` (or equivalent entrypoint that ultimately runs `influx serve`)",
+        "`docker/Dockerfile` exposes port 8080",
+        "`docker/docker-compose.yml` mounts `/archive` as a volume on the influx service",
+        "Typecheck passes",
+        "Lint (ruff) passes",
+        "All existing tests still pass"
       ],
       "priority": 10,
-      "passes": true,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "Final v1 gate: assert AC-X-1, AC-X-2, AC-X-6 and ≥80% pure-module coverage",
+      "description": "As a maintainer, I want the final v1 gate satisfied: no hardcoded constants outside config parsing (AC-X-1), provider swap works without code change (AC-X-2), pure-module coverage ≥ 80% with happy-path + error-envelope contract tests for every Lithos tool called by Influx (AC-X-6).",
+      "acceptanceCriteria": [
+        "AC-X-1 (part 1 — config-driven tunability): every tunable value called out in master PRD §7.5 / the requirements (filter, enrichment, download/archive, resilience, extraction tunables) can be set in `influx.toml` and takes effect on the next process start. Evidence that tunables are config-driven and pick up new values on restart is required; the specific verification mechanism (integration test, config-roundtrip test, targeted unit/contract tests, or a documented manual smoke procedure) is left to the implementer",
+        "AC-X-1 (part 2 — no stray constants): a grep / linter check confirms no hardcoded tunable constants live in `filter.py`, `enrich.py`, `storage.py`, resilience modules, or extraction code paths — defaults live only in config-parsing code (the enforcement mechanism — ad-hoc grep, committed meta-test, or CI script — is left to the implementer)",
+        "AC-X-2 (final, per PRD §8 / master PRD §7.5): the `[models.extract]` `provider` setting is config-driven and can be switched between two supported provider blocks (e.g. swapping the configured provider for an alternate `[providers.<name>]` block) to redirect deep-extraction traffic without code changes — verified by running the integration suite with the alternate provider block. Note: the current extract caller targets an OpenAI-compatible `/chat/completions` API (see `src/influx/enrich.py`) and the shipped example config already routes `[models.extract]` through OpenRouter rather than direct Anthropic; if direct-Anthropic support is desired as one of the swappable providers, that is an explicit prerequisite outside this criterion",
+        "AC-X-6: pure-module coverage (config, URL, path, schemas, prompts, slug per master PRD §18.2) is ≥ 80% — measurement tooling and reporting mechanism are left to the implementer",
+        "AC-X-6: every Lithos tool called by Influx has both a happy-path contract test and an error-envelope contract test — enumerated explicitly in the test file or a checklist",
+        "`python -m influx validate-config` against `influx.example.toml` succeeds with the full v0.7 validation pipeline (config schema + prompt vars + JSON-mode + SSE dry-connect) — verified by an automated test or documented manual smoke step",
+        "Ruff, pyright (or equivalent typecheck), and pytest all green",
+        "Typecheck passes"
+      ],
+      "priority": 11,
+      "passes": false,
       "notes": ""
     }
-  ],
-  "definitionOfDone": [
-    "All AC-M3-1 through AC-M3-8 (master PRD \u00a77.3) are demonstrably exercised by tests",
-    "All AC-09-A through AC-09-K (PRD 09 \u00a78 new-for-this-PRD) are demonstrably exercised by tests",
-    "No remaining stubs in the codebase except OTEL spans/metrics (PRD 10) and per-tag rejection-rate logging (PRD 10)",
-    "The `run_profile` hook left by PRD 03 is a single well-typed function that handles arXiv + RSS + scheduled + manual + backfill cases",
-    "`uv run pytest tests/unit/test_rss_fetcher.py tests/unit/test_archive_url_hash.py tests/unit/test_multi_profile_merge.py tests/unit/test_backfill_estimator.py tests/integration/test_rss_to_lithos.py tests/integration/test_multi_profile_shared_source.py tests/integration/test_backfill_arxiv.py tests/integration/test_profile_rejection_authority.py` all pass",
-    "Coverage on `src/influx/sources/rss.py`, `src/influx/backfill.py`, and the multi-profile orchestration code paths in `src/influx/service.py` is \u2265 80%",
-    "`uv run ruff check src tests` passes with zero violations on changed files",
-    "`uv run pyright` passes (project-wide typecheck green)",
-    "Backfill `kind=\"backfill\"` is correctly propagated from the `/backfills` API down to task tagging, webhook gate, and repair-sweep gate"
   ]
 }
