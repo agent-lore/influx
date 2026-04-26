@@ -74,7 +74,14 @@ class TestBuildQueryUrl:
         assert "max_results=42" in url
 
     def test_backfill_range_adds_submitted_date_clause(self) -> None:
-        """Finding 1: ``backfill --days N`` must constrain the URL."""
+        """Finding 1: ``backfill --days N`` must constrain the URL.
+
+        Review finding 2: the BackfillRange is half-open
+        ``[date_from, date_to)`` so ``days=N`` covers exactly N
+        calendar days.  The arXiv ``submittedDate:[... TO ...]`` query
+        is inclusive on both endpoints, so the upper bound is emitted
+        as the last minute of the day BEFORE ``date_to``.
+        """
         from datetime import date
 
         rng = BackfillRange(
@@ -86,10 +93,30 @@ class TestBuildQueryUrl:
             max_results=200,
             backfill_range=rng,
         )
-        # AND-clause restricts the query to the requested window so a
-        # backfill actually fetches historical items.
-        assert "submittedDate:[202604200000+TO+202604272359]" in url
+        # 7-day window (Apr 20..Apr 26 inclusive); upper bound is
+        # ``date_to - 1 day`` at 2359 because the arXiv query is
+        # inclusive on both endpoints.
+        assert "submittedDate:[202604200000+TO+202604262359]" in url
         assert "(cat:cs.AI)+AND+submittedDate" in url
+
+    def test_backfill_range_zero_day_window_emits_empty_range(self) -> None:
+        """Zero-day window (``date_from == date_to``) emits an empty range
+        rather than an inverted query that would server-error.
+        """
+        from datetime import date
+
+        rng = BackfillRange(
+            date_from=date(2026, 4, 20),
+            date_to=date(2026, 4, 20),
+        )
+        url = build_query_url(
+            categories=["cs.AI"],
+            max_results=200,
+            backfill_range=rng,
+        )
+        # Both bounds collapse to the same minute — server returns
+        # no items.
+        assert "submittedDate:[202604200000+TO+202604200000]" in url
 
 
 # ── Backfill range resolver ────────────────────────────────────────

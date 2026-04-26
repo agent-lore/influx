@@ -22,6 +22,7 @@ import asyncio
 import json
 from collections.abc import Generator
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -299,9 +300,7 @@ class TestBackfillCacheLookupSkip:
         assert write_calls[0][1]["title"] == "Backfill Paper Alpha"
 
         # Verify: TWO cache_lookup calls (both items checked).
-        cache_calls = [
-            c for c in fake_lithos.calls if c[0] == "lithos_cache_lookup"
-        ]
+        cache_calls = [c for c in fake_lithos.calls if c[0] == "lithos_cache_lookup"]
         assert len(cache_calls) == 2
 
     def test_all_cache_hits_produce_zero_writes(
@@ -546,9 +545,7 @@ class TestBackfillTaskTagging:
         assert result is not None
 
         # Verify task_create was called with influx:backfill tag.
-        task_calls = [
-            c for c in fake_lithos.calls if c[0] == "lithos_task_create"
-        ]
+        task_calls = [c for c in fake_lithos.calls if c[0] == "lithos_task_create"]
         assert len(task_calls) == 1
         tags = task_calls[0][1]["tags"]
         assert "influx:backfill" in tags
@@ -594,9 +591,7 @@ class TestBackfillTaskTagging:
             )
 
         # Verify task_create was called with influx:run tag.
-        task_calls = [
-            c for c in fake_lithos.calls if c[0] == "lithos_task_create"
-        ]
+        task_calls = [c for c in fake_lithos.calls if c[0] == "lithos_task_create"]
         assert len(task_calls) == 1
         tags = task_calls[0][1]["tags"]
         assert "influx:run" in tags
@@ -665,9 +660,7 @@ class TestBackfillRangePropagation:
         # Pacing sleep called with arxiv_request_min_interval_seconds.
         assert mock_sleep.called
         sleep_arg = mock_sleep.call_args[0][0]
-        assert sleep_arg == float(
-            config.resilience.arxiv_request_min_interval_seconds
-        )
+        assert sleep_arg == float(config.resilience.arxiv_request_min_interval_seconds)
 
     def test_backfill_from_to_threaded_into_fetch_arxiv(
         self,

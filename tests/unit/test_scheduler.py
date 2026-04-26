@@ -62,16 +62,21 @@ class TestRunProfileStub:
 
 
 class TestJobRegistration:
-    async def test_one_job_per_profile(self) -> None:
-        """One scheduler job is registered per profile (AC-M1-3)."""
+    async def test_single_tick_dispatcher_for_all_profiles(self) -> None:
+        """One ``influx-tick`` dispatcher job is registered for the run.
+
+        Review finding 1: per-profile dedup must be scoped to the entire
+        cron tick.  The scheduler now registers a single dispatcher job
+        that fans out to all profiles, so ``len(jobs) == 1`` regardless
+        of profile count.
+        """
         config = _make_config(profiles=["alpha", "beta"])
         coord = Coordinator()
         sched = InfluxScheduler(config, coord)
         sched.start()
         try:
-            assert len(sched.jobs) == 2
-            job_ids = {j.id for j in sched.jobs}
-            assert job_ids == {"profile-alpha", "profile-beta"}
+            assert len(sched.jobs) == 1
+            assert sched.jobs[0].id == "influx-tick"
         finally:
             sched.stop()
 
@@ -83,6 +88,7 @@ class TestJobRegistration:
         sched.start()
         try:
             job = sched.jobs[0]
+            assert job.id == "influx-tick"
             assert job.max_instances == 1
             assert job.coalesce is True
             assert job.misfire_grace_time == 7200
@@ -100,14 +106,14 @@ class TestJobRegistration:
         finally:
             sched.stop()
 
-    async def test_single_profile_one_job(self) -> None:
+    async def test_single_profile_one_dispatcher_job(self) -> None:
         config = _make_config(profiles=["solo"])
         coord = Coordinator()
         sched = InfluxScheduler(config, coord)
         sched.start()
         try:
             assert len(sched.jobs) == 1
-            assert sched.jobs[0].id == "profile-solo"
+            assert sched.jobs[0].id == "influx-tick"
         finally:
             sched.stop()
 

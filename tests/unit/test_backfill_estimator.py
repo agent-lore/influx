@@ -92,7 +92,9 @@ class TestEstimatorMath:
         """7 days × 1 category × 5 max_results = 35."""
         config = _make_config(categories=["cs.AI"], max_results=5)
         result = estimate_backfill_items(
-            "test-profile", config, days=7,
+            "test-profile",
+            config,
+            days=7,
         )
         assert result == 35
 
@@ -103,7 +105,9 @@ class TestEstimatorMath:
             max_results=50,
         )
         result = estimate_backfill_items(
-            "test-profile", config, days=10,
+            "test-profile",
+            config,
+            days=10,
         )
         assert result == 1500
 
@@ -123,7 +127,9 @@ class TestEstimatorMath:
         """Unknown profile name yields 0 (no categories to count)."""
         config = _make_config(categories=["cs.AI"], max_results=200)
         result = estimate_backfill_items(
-            "nonexistent", config, days=365,
+            "nonexistent",
+            config,
+            days=365,
         )
         assert result == 0
 
@@ -131,7 +137,9 @@ class TestEstimatorMath:
         """Zero days yields zero items."""
         config = _make_config(categories=["cs.AI"], max_results=200)
         result = estimate_backfill_items(
-            "test-profile", config, days=0,
+            "test-profile",
+            config,
+            days=0,
         )
         assert result == 0
 
@@ -153,7 +161,9 @@ class TestEstimatorMath:
             max_results=200,
         )
         result = estimate_backfill_items(
-            "test-profile", config, days=7,
+            "test-profile",
+            config,
+            days=7,
         )
         assert result == 8400
 

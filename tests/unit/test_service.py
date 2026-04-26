@@ -297,12 +297,11 @@ class TestInfluxService:
                 raise
 
         with patch("influx.scheduler.run_profile", long_run_profile):
-            # Directly invoke _fire_profile to simulate a scheduler fire
+            # Directly invoke _fire_tick to simulate a scheduler fire
             # — avoids waiting for cron while still exercising the real
-            # _fire_profile path that registers the task on active_tasks.
-            fire_task = asyncio.get_event_loop().create_task(
-                svc.scheduler._fire_profile("ai-robotics")
-            )
+            # tick-dispatcher path that registers the task on
+            # active_tasks (review finding 1).
+            fire_task = asyncio.get_event_loop().create_task(svc.scheduler._fire_tick())
             await fired.wait()
 
             # Task must be tracked so shutdown can await it.

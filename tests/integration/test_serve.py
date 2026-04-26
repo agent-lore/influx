@@ -313,7 +313,12 @@ class TestServiceLifespan:
         assert len(svc.scheduler.jobs) == 0
 
     async def test_lifespan_ac_m1_3_endpoints_and_jobs(self) -> None:
-        """AC-M1-3: /live, /ready, /status are bound; one job per profile."""
+        """AC-M1-3: /live, /ready, /status are bound; tick dispatcher exists.
+
+        After review finding 1 the scheduler registers a single
+        ``influx-tick`` dispatcher job that fans out to all profiles, so
+        the per-source FetchCache scope covers the whole cron tick.
+        """
         config = _make_config(profiles=["ai-robotics", "web-tech"])
         svc = InfluxService(config, with_lifespan=True)
 
@@ -324,11 +329,10 @@ class TestServiceLifespan:
             assert "/ready" in paths
             assert "/status" in paths
 
-            # One scheduler job per profile
+            # Single tick-dispatcher job that fans out to all profiles.
             job_ids = {j.id for j in svc.scheduler.jobs}
-            assert "profile-ai-robotics" in job_ids
-            assert "profile-web-tech" in job_ids
-            assert len(svc.scheduler.jobs) == 2
+            assert "influx-tick" in job_ids
+            assert len(svc.scheduler.jobs) == 1
 
 
 # ── Subprocess integration test (AC-03-E) ───────────────────────────

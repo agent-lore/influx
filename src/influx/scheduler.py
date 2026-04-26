@@ -425,17 +425,26 @@ class InfluxScheduler:
         return self._scheduler.get_jobs()
 
     def start(self) -> None:
-        """Register per-profile cron jobs and start the scheduler."""
-        trigger = CronTrigger.from_crontab(
-            self._config.schedule.cron,
-            timezone=self._config.schedule.timezone,
-        )
-        for profile in self._config.profiles:
+        """Register a single tick-dispatcher job that fans out to all profiles.
+
+        Replaces the previous per-profile job registration with one
+        ``influx-tick`` job that brackets a single
+        :meth:`FetchCache.begin_fire` / :meth:`FetchCache.end_fire` around
+        the entire fan-out (review finding 1).  This guarantees that all
+        profiles firing for a single cron tick share the same cache
+        scope — so two profiles both subscribed to ``cs.AI`` fetch
+        ``cs.AI`` exactly once for the run, even when one profile
+        finishes before the other starts.
+        """
+        if self._config.profiles:
+            trigger = CronTrigger.from_crontab(
+                self._config.schedule.cron,
+                timezone=self._config.schedule.timezone,
+            )
             self._scheduler.add_job(
-                self._fire_profile,
+                self._fire_tick,
                 trigger=trigger,
-                args=[profile.name],
-                id=f"profile-{profile.name}",
+                id="influx-tick",
                 max_instances=1,
                 coalesce=True,
                 misfire_grace_time=self._config.schedule.misfire_grace_seconds,
@@ -467,22 +476,16 @@ class InfluxScheduler:
         """
         self._scheduler.shutdown(wait=wait)
 
-    async def _fire_profile(self, profile_name: str) -> None:
-        """Job handler: acquire lock, call ``run_profile``, release.
+    async def _fire_tick(self) -> None:
+        """Single-tick dispatcher: bracket fetch-cache scope, fan out profiles.
 
-        A same-profile lock conflict is logged and swallowed so that
-        the scheduler is not crashed by overlap (FR-SCHED-3).
-
-        Registers the current task on the shared ``active_tasks`` set
-        (if provided) so ``InfluxService.stop`` can await this fire
-        within ``schedule.shutdown_grace_seconds`` instead of cancelling
-        it immediately (US-008 bounded graceful-shutdown contract).
-
-        Brackets the call with ``FetchCache.begin_fire`` /
-        ``end_fire`` so per-source dedup is scoped to the cron tick:
-        the first concurrent fire clears any stale entries from a prior
-        tick, and the cache is wiped again once the last in-flight fire
-        completes (review finding 2).
+        Registers the dispatch task on ``active_tasks`` (if provided) so
+        ``InfluxService.stop`` can await it within
+        ``schedule.shutdown_grace_seconds`` (US-008).  Calls
+        :meth:`FetchCache.begin_fire` / :meth:`FetchCache.end_fire` once
+        around the whole fan-out so per-source fetches are deduplicated
+        across all profiles for the cron tick (review finding 1, R-8,
+        AC-09-D).
         """
         if self._active_tasks is not None:
             current = asyncio.current_task()
@@ -491,6 +494,31 @@ class InfluxScheduler:
                 current.add_done_callback(self._active_tasks.discard)
         if self._fetch_cache is not None:
             self._fetch_cache.begin_fire()
+        try:
+            await asyncio.gather(
+                *(
+                    self._fire_profile(profile.name)
+                    for profile in self._config.profiles
+                ),
+                return_exceptions=True,
+            )
+        finally:
+            if self._fetch_cache is not None:
+                self._fetch_cache.end_fire()
+
+    async def _fire_profile(self, profile_name: str) -> None:
+        """Per-profile fire: acquire lock, call ``run_profile``, release.
+
+        A same-profile lock conflict is logged and swallowed so that
+        the scheduler is not crashed by overlap (FR-SCHED-3).
+
+        The fetch-cache scope is bracketed by the parent
+        :meth:`_fire_tick` dispatcher so all profiles within one cron
+        tick share the same dedup window (review finding 1).  Tests
+        that invoke ``_fire_profile`` directly intentionally do NOT
+        bracket the cache here — they exercise the per-profile lock /
+        coordinator behaviour without per-tick fan-out.
+        """
         try:
             async with self._coordinator.hold(profile_name):
                 await run_profile(
@@ -505,6 +533,3 @@ class InfluxScheduler:
                 "Scheduled fire for %r skipped — profile already busy",
                 profile_name,
             )
-        finally:
-            if self._fetch_cache is not None:
-                self._fetch_cache.end_fire()

@@ -72,18 +72,18 @@ async def status(request: Request) -> JSONResponse:
 
     probe_state = probe_loop.state
 
-    # Build per-profile status.
+    # Build per-profile status.  After review finding 1, all profiles
+    # fire from a single ``influx-tick`` dispatcher job so per-profile
+    # ``next_run_at`` is sourced from that shared trigger.
     profiles: dict[str, Any] = {}
     job_map = {j.id: j for j in scheduler.jobs}
+    tick_job = job_map.get("influx-tick")
+    next_run: str | None = None
+    if tick_job is not None and tick_job.next_run_time is not None:
+        next_run = tick_job.next_run_time.astimezone(UTC).isoformat()
     for profile in config.profiles:
-        job_id = f"profile-{profile.name}"
-        job = job_map.get(job_id)
-        next_run: str | None = None
-        if job is not None and job.next_run_time is not None:
-            next_run = job.next_run_time.astimezone(UTC).isoformat()
-
         profiles[profile.name] = {
-            "scheduled": job is not None,
+            "scheduled": tick_job is not None,
             "currently_running": coordinator.is_busy(profile.name),
             "next_run_at": next_run,
             "last_run_at": None,

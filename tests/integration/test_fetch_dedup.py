@@ -217,9 +217,7 @@ class TestArxivFetchDedup:
         assert fetch_count == 1, f"Expected 1 fetch, got {fetch_count}"
 
         # Verify Profile A got items
-        write_calls_a = [
-            c for c in fake_lithos.calls if c[0] == "lithos_write"
-        ]
+        write_calls_a = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         assert len(write_calls_a) >= 1
         a_titles = {c[1]["title"] for c in write_calls_a}
         assert "Shared cs.AI Paper" in a_titles
@@ -271,8 +269,10 @@ class TestArxivFetchDedup:
                     name=PROFILE_A,
                     description="AI robotics",
                     thresholds=ProfileThresholds(
-                        relevance=100, full_text=100,
-                        deep_extract=100, notify_immediate=8,
+                        relevance=100,
+                        full_text=100,
+                        deep_extract=100,
+                        notify_immediate=8,
                     ),
                     sources=ProfileSources(
                         arxiv=ArxivSourceConfig(
@@ -287,8 +287,10 @@ class TestArxivFetchDedup:
                     name=PROFILE_B,
                     description="Web tech",
                     thresholds=ProfileThresholds(
-                        relevance=100, full_text=100,
-                        deep_extract=100, notify_immediate=8,
+                        relevance=100,
+                        full_text=100,
+                        deep_extract=100,
+                        notify_immediate=8,
                     ),
                     sources=ProfileSources(
                         arxiv=ArxivSourceConfig(
@@ -639,6 +641,79 @@ class TestFetchCacheConcurrencyAndScope:
         # Last fire ends; cache is cleared.
         cache.end_fire()
         assert not cache.has("arxiv:cs.AI")
+
+    def test_sequential_same_tick_profiles_share_one_fetch(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Review-finding 1 regression: when two profiles fire from the
+        SAME cron tick but execute sequentially (profile A finishes
+        before profile B starts), the shared fetch must still happen
+        exactly once.
+
+        Production wires this through ``InfluxScheduler._fire_tick``,
+        which brackets a single ``begin_fire`` / ``end_fire`` around
+        the whole fan-out.  This test drives the dispatcher with
+        sequential per-profile fires (gather not used) and asserts the
+        cache scope encompasses both.
+        """
+        from influx.coordinator import Coordinator
+        from influx.scheduler import InfluxScheduler
+
+        config = _make_config(lithos_url=fake_lithos_url)
+        fetch_cache = FetchCache()
+        fetch_count = 0
+
+        def counting_fetch(**kwargs: Any) -> list[ArxivItem]:
+            nonlocal fetch_count
+            fetch_count += 1
+            return list(_FIXTURE_ARXIV_ITEMS)
+
+        provider = make_item_provider(
+            config,
+            fetch_cache=fetch_cache,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        coordinator = Coordinator()
+        scheduler = InfluxScheduler(
+            config,
+            coordinator,
+            item_provider=provider,
+            fetch_cache=fetch_cache,
+        )
+
+        # Repair sweep + feedback for each profile.
+        for _ in range(4):
+            fake_lithos.list_responses.append(json.dumps({"items": []}))
+        # Profile B sees A's note as a cache hit (only one fetch happened).
+        fake_lithos.cache_lookup_responses.append(
+            json.dumps({"hit": False, "stale_exists": False})
+        )
+        fake_lithos.cache_lookup_responses.append(
+            json.dumps({"hit": True, "stale_exists": False})
+        )
+
+        async def sequential_within_one_tick() -> None:
+            # Bracket like the tick dispatcher does; iterate sequentially
+            # so profile B starts strictly after profile A completes.
+            fetch_cache.begin_fire()
+            try:
+                await scheduler._fire_profile(PROFILE_A)
+                await scheduler._fire_profile(PROFILE_B)
+            finally:
+                fetch_cache.end_fire()
+
+        with patch(
+            "influx.sources.arxiv.fetch_arxiv",
+            side_effect=counting_fetch,
+        ):
+            asyncio.run(sequential_within_one_tick())
+
+        # Critical: only ONE fetch even though profile B started AFTER
+        # profile A finished — same cron tick, same fire scope.
+        assert fetch_count == 1, f"Expected 1 fetch, got {fetch_count}"
 
     def test_concurrent_profiles_dedup_shared_arxiv_fetch(
         self,

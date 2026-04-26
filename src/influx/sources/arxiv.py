@@ -196,14 +196,26 @@ def build_query_url(
     results to items submitted within the requested window so that
     ``backfill --days N`` actually fetches historical items rather than
     the current feed window (FR-BF-1).
+
+    Range convention (review finding 2): ``BackfillRange`` is half-open
+    ``[date_from, date_to)``.  ``date_to`` is exclusive, so a request
+    with ``days=N`` covers exactly N calendar days and an explicit
+    ``from=A, to=B`` covers exactly ``(B - A).days`` calendar days.
+    Because the arXiv ``submittedDate:[... TO ...]`` clause is itself
+    inclusive on both endpoints, the upper bound is emitted as the last
+    minute (``2359``) of the day BEFORE ``date_to``.
     """
     cat_expr = "+OR+".join(f"cat:{c}" for c in categories)
     if backfill_range is not None:
         from_stamp = backfill_range.date_from.strftime("%Y%m%d") + "0000"
-        to_stamp = backfill_range.date_to.strftime("%Y%m%d") + "2359"
-        cat_expr = (
-            f"({cat_expr})+AND+submittedDate:[{from_stamp}+TO+{to_stamp}]"
-        )
+        last_included = backfill_range.date_to - timedelta(days=1)
+        if last_included < backfill_range.date_from:
+            # Zero-day window — emit a degenerate equal-bound range so
+            # the server returns no items rather than an inverted query.
+            to_stamp = backfill_range.date_from.strftime("%Y%m%d") + "0000"
+        else:
+            to_stamp = last_included.strftime("%Y%m%d") + "2359"
+        cat_expr = f"({cat_expr})+AND+submittedDate:[{from_stamp}+TO+{to_stamp}]"
     return (
         f"{_ARXIV_API_URL}"
         f"?search_query={cat_expr}"
@@ -349,7 +361,9 @@ def fetch_arxiv(
     if backfill_range is not None:
         # Server-side ``submittedDate`` already constrains the window;
         # apply the same bounds client-side as a defense-in-depth check
-        # against off-by-one timezone drift (FR-BF-1).
+        # against off-by-one timezone drift (FR-BF-1).  The range is
+        # half-open ``[date_from, date_to)`` so that ``days=N`` covers
+        # exactly N calendar days (review finding 2).
         from_dt = datetime.combine(
             backfill_range.date_from,
             datetime.min.time(),
@@ -357,10 +371,10 @@ def fetch_arxiv(
         )
         to_dt = datetime.combine(
             backfill_range.date_to,
-            datetime.max.time(),
+            datetime.min.time(),
             tzinfo=UTC,
         )
-        return [it for it in items if from_dt <= it.published <= to_dt]
+        return [it for it in items if from_dt <= it.published < to_dt]
     return _filter_by_lookback(
         items,
         arxiv_config.lookback_days,
@@ -704,9 +718,7 @@ def make_arxiv_item_provider(
         # same window dedup, but distinct windows do not collide.
         arxiv_cfg = profile_cfg.sources.arxiv
         backfill_range = (
-            resolve_backfill_range(run_range)
-            if kind == RunKind.BACKFILL
-            else None
+            resolve_backfill_range(run_range) if kind == RunKind.BACKFILL else None
         )
         cache_key = "arxiv:" + build_query_url(
             categories=arxiv_cfg.categories,
