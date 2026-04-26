@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>AI Research Blog</title>
+  <link href="https://ai-research.example/feed.atom" rel="self"/>
+  <link href="https://ai-research.example/"/>
+  <updated>2026-04-20T12:00:00Z</updated>
+  <id>https://ai-research.example/</id>
+
+  <entry>
+    <title>Advances in Transformer Architectures</title>
+    <link href="https://ai-research.example/posts/transformer-advances"/>
+    <id>https://ai-research.example/posts/transformer-advances</id>
+    <published>2026-04-20T10:00:00Z</published>
+    <updated>2026-04-20T10:00:00Z</updated>
+    <summary>Recent developments in transformer architecture design have led to significant improvements in both efficiency and performance across various NLP tasks.</summary>
+    <author>
+      <name>Jane Doe</name>
+    </author>
+  </entry>
+
+  <entry>
+    <title>Multi-Agent Reinforcement Learning Survey</title>
+    <link href="https://ai-research.example/posts/marl-survey"/>
+    <id>https://ai-research.example/posts/marl-survey</id>
+    <published>2026-04-18T08:30:00Z</published>
+    <updated>2026-04-18T08:30:00Z</updated>
+    <summary>A comprehensive survey of multi-agent reinforcement learning approaches, covering cooperative, competitive, and mixed-motive settings.</summary>
+    <author>
+      <name>John Smith</name>
+    </author>
+  </entry>
+</feed>

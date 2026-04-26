@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <link href="http://arxiv.org/api/query?search_query=cat:cs.CL&amp;sortBy=submittedDate&amp;sortOrder=descending&amp;max_results=200" rel="self" type="application/atom+xml"/>
+  <title type="html">ArXiv Query: cat:cs.CL</title>
+  <id>http://arxiv.org/api/query?search_query=cat:cs.CL</id>
+  <updated>2026-04-23T00:00:00-04:00</updated>
+  <opensearch:totalResults xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">4</opensearch:totalResults>
+  <opensearch:startIndex xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">0</opensearch:startIndex>
+  <opensearch:itemsPerPage xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">200</opensearch:itemsPerPage>
+  <entry>
+    <id>http://arxiv.org/abs/2604.33333v1</id>
+    <updated>2026-04-23T16:00:00Z</updated>
+    <published>2026-04-23T16:00:00Z</published>
+    <title>Scaling Laws for Multilingual Language Models</title>
+    <summary>  We study scaling laws for multilingual language models trained on
+diverse corpora spanning 50 languages. Our findings suggest that
+cross-lingual transfer improves sub-linearly with model size.
+</summary>
+    <author><name>David Lee</name></author>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+    <link href="http://arxiv.org/abs/2604.33333v1" rel="alternate" type="text/html"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2604.44444v2</id>
+    <updated>2026-04-22T12:00:00Z</updated>
+    <published>2026-04-20T10:00:00Z</published>
+    <title>Attention Is All You Need, Revisited</title>
+    <summary>  A comprehensive revisitation of the transformer architecture with
+novel positional encoding schemes and efficiency improvements for
+long-context scenarios.
+</summary>
+    <author><name>Eve Wilson</name></author>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <link href="http://arxiv.org/abs/2604.44444v2" rel="alternate" type="text/html"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2603.55555v1</id>
+    <updated>2026-03-15T09:00:00Z</updated>
+    <published>2026-03-15T09:00:00Z</published>
+    <title>Old Paper About NLP Foundations</title>
+    <summary>  This paper from last month covers foundational NLP techniques
+that should be filtered out by lookback_days=1.
+</summary>
+    <author><name>Frank Old</name></author>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <link href="http://arxiv.org/abs/2603.55555v1" rel="alternate" type="text/html"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2601.66666v1</id>
+    <updated>2026-01-10T08:00:00Z</updated>
+    <published>2026-01-10T08:00:00Z</published>
+    <title>Very Old Paper From January</title>
+    <summary>  This paper from January should definitely be filtered out
+by any reasonable lookback window.
+</summary>
+    <author><name>Gina Ancient</name></author>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <link href="http://arxiv.org/abs/2601.66666v1" rel="alternate" type="text/html"/>
+  </entry>
+</feed>
