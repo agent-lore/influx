@@ -70,6 +70,8 @@ class ProbeState:
     max_age: float = 0.0
     repair_write_failure: bool = False
     repair_write_failure_detail: str = ""
+    lcma_unknown_tool_failure: bool = False
+    lcma_unknown_tool_failure_detail: str = ""
 
     def _has_run(self) -> bool:
         """Return ``True`` once at least one probe cycle has completed."""
@@ -100,6 +102,8 @@ class ProbeState:
             return False
         if self.repair_write_failure:
             return False
+        if self.lcma_unknown_tool_failure:
+            return False
         return self.lithos.status == "ok" and self.llm_credentials.status == "ok"
 
     @property
@@ -116,6 +120,8 @@ class ProbeState:
         if self.is_stale():
             return "degraded"
         if self.repair_write_failure:
+            return "degraded"
+        if self.lcma_unknown_tool_failure:
             return "degraded"
         if self.lithos.status == "ok" and self.llm_credentials.status == "ok":
             return "ok"
@@ -223,6 +229,9 @@ class ProbeLoop:
         # is invoked by a successful sweep.
         self._repair_write_failure = False
         self._repair_write_failure_detail = ""
+        # LCMA unknown_tool failure latch (PRD 08 FR-LCMA-6).
+        self._lcma_unknown_tool_failure = False
+        self._lcma_unknown_tool_failure_detail = ""
         self._state = ProbeState(max_age=self._max_age)
         self._task: asyncio.Task[None] | None = None
 
@@ -243,6 +252,8 @@ class ProbeLoop:
             max_age=self._max_age,
             repair_write_failure=self._repair_write_failure,
             repair_write_failure_detail=self._repair_write_failure_detail,
+            lcma_unknown_tool_failure=self._lcma_unknown_tool_failure,
+            lcma_unknown_tool_failure_detail=self._lcma_unknown_tool_failure_detail,
         )
 
     def mark_repair_write_failure(
@@ -271,6 +282,33 @@ class ProbeLoop:
         self._repair_write_failure_detail = ""
         self._state.repair_write_failure = False
         self._state.repair_write_failure_detail = ""
+
+    def mark_lcma_unknown_tool_failure(
+        self,
+        *,
+        profile: str = "",
+        detail: str = "",
+    ) -> None:
+        """Latch an LCMA unknown_tool failure (PRD 08, FR-LCMA-6).
+
+        Called by ``run_profile`` when ``LCMAError("unknown_tool")``
+        propagates from an LCMA-dependent call.  Flips
+        ``ProbeState.lcma_unknown_tool_failure`` so ``/ready`` reports
+        degraded.
+        """
+        self._lcma_unknown_tool_failure = True
+        self._lcma_unknown_tool_failure_detail = detail or f"profile={profile!r}"
+        self._state.lcma_unknown_tool_failure = True
+        self._state.lcma_unknown_tool_failure_detail = (
+            self._lcma_unknown_tool_failure_detail
+        )
+
+    def clear_lcma_unknown_tool_failure(self) -> None:
+        """Clear the LCMA unknown_tool failure latch."""
+        self._lcma_unknown_tool_failure = False
+        self._lcma_unknown_tool_failure_detail = ""
+        self._state.lcma_unknown_tool_failure = False
+        self._state.lcma_unknown_tool_failure_detail = ""
 
     async def start(self) -> None:
         """Start the background probe loop as an ``asyncio.Task``."""

@@ -22,6 +22,8 @@ Started: Sun Apr 26 06:31:01 UTC 2026
 - Item provider items can carry `builds_on: list[str]` for Tier 3 builds_on items; `item.get("builds_on")` returns None if absent
 - `resolve_builds_on()` in `lcma.py` takes `client` and `builds_on` — uses `cache_lookup` + exact `source_url` match to upsert `builds_on` edges
 - `cache_lookup` hit response shape: `{"hit": true, "source_url": "...", "note_id": "...", "title": "..."}` — verify `source_url` matches before upserting edge
+- `ProbeState` / `ProbeLoop` support multiple readiness latches: `repair_write_failure` (sweep errors) and `lcma_unknown_tool_failure` (LCMA deployment errors) — each has `mark_*` and `clear_*` methods
+- `FakeLithosServer.raise_on_retrieve` flag simulates `unknown_tool` errors by making the retrieve handler raise, which FastMCP converts to `isError=True`
 
 ---
 
@@ -106,4 +108,20 @@ Started: Sun Apr 26 06:31:01 UTC 2026
   - `FakeLithosServer.cache_lookup_responses` queue is consumed in order — queue dedup lookup (miss) before builds_on lookup (hit/miss) in integration tests
   - The arxiv source now populates `contributions` and `builds_on` on the item dict from Tier 1/Tier 3 results
   - `builds_on` field is `None` when no Tier 3 extraction was performed; `resolve_builds_on` handles `None` gracefully (early return)
+---
+
+## 2026-04-26 - US-007
+- Added `lcma_unknown_tool_failure` latch to `ProbeState` and `ProbeLoop` in `src/influx/probes.py` — mirrors the existing `repair_write_failure` pattern
+- Caught `LCMAError("unknown_tool")` in `run_profile()` in `src/influx/scheduler.py` — logs deployment error at ERROR level, marks readiness degraded via `probe_loop.mark_lcma_unknown_tool_failure()`, then re-raises to abort the run
+- Added `raise_on_retrieve` flag to `FakeLithosServer` in `tests/contract/test_lithos_client.py` — when True, `lithos_retrieve` handler raises ValueError which FastMCP converts to `isError=True`, triggering `LCMAError("unknown_tool")`
+- Added 2 integration tests in `tests/integration/test_lcma_edges_end_to_end.py`:
+  - `test_retrieve_unknown_tool_aborts_run` — verifies AC-08-E: run aborts, prior write remains, no edge_upsert calls, task_complete fires with outcome="error"
+  - `test_retrieve_unknown_tool_degrades_readiness` — verifies AC-M2-9: readiness reports degraded after unknown_tool failure
+- Files changed: `src/influx/probes.py` (modified), `src/influx/scheduler.py` (modified), `tests/contract/test_lithos_client.py` (modified), `tests/integration/test_lcma_edges_end_to_end.py` (modified)
+- **Learnings for future iterations:**
+  - The `LCMAError` catch in `run_profile()` is placed before the generic `except Exception` to handle it specifically (deployment-error log + readiness latch) before re-raising
+  - `ProbeState.lcma_unknown_tool_failure` latch follows the same pattern as `repair_write_failure` — sticky until explicitly cleared
+  - `FakeLithosServer.raise_on_retrieve` is captured via `server_self = self` in `_register_tools()` since closures can't directly reference mutating `self` attributes through simple variable capture
+  - `task_complete` still fires in `finally` block even when `LCMAError("unknown_tool")` aborts the run — it records `outcome="error"`
+  - `clear_lithos` autouse fixture in integration tests resets `raise_on_retrieve = False` to avoid cross-test contamination
 ---

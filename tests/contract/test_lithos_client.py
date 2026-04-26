@@ -56,6 +56,8 @@ class FakeLithosServer:
         self.edge_upsert_responses: list[str] = []
         self.task_create_responses: list[str] = []
         self.task_complete_responses: list[str] = []
+        # When True, lithos_retrieve raises to simulate unknown_tool (FR-LCMA-6).
+        self.raise_on_retrieve: bool = False
         self._register_tools()
 
     def _register_tools(self) -> None:
@@ -70,6 +72,7 @@ class FakeLithosServer:
         edge_upsert_responses = self.edge_upsert_responses
         task_create_responses = self.task_create_responses
         task_complete_responses = self.task_complete_responses
+        server_self = self  # capture for closures that need mutable flags
 
         @self._mcp.tool(name="lithos_ping")
         async def lithos_ping() -> str:
@@ -201,6 +204,8 @@ class FakeLithosServer:
                     },
                 )
             )
+            if server_self.raise_on_retrieve:
+                raise ValueError("unknown tool: lithos_retrieve")
             if retrieve_responses:
                 return retrieve_responses.pop(0)
             return _json.dumps({"results": []})

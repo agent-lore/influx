@@ -30,6 +30,8 @@ from influx.config import (
     SecurityConfig,
 )
 from influx.coordinator import RunKind
+from influx.errors import LCMAError
+from influx.probes import ProbeLoop
 from influx.scheduler import run_profile
 from tests.contract.test_lithos_client import FakeLithosServer
 
@@ -111,6 +113,7 @@ def clear_lithos(fake_lithos: FakeLithosServer) -> None:
     fake_lithos.edge_upsert_responses.clear()
     fake_lithos.task_create_responses.clear()
     fake_lithos.task_complete_responses.clear()
+    fake_lithos.raise_on_retrieve = False
 
 
 # ── US-004: Task bracketing ──────────────────────────────────────
@@ -516,3 +519,102 @@ class TestBuildsOnResolver:
         edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")
         builds_on_edges = [c for c in edge_calls if c["type"] == "builds_on"]
         assert len(builds_on_edges) == 0
+
+
+# ── US-007: Abort on LCMAError("unknown_tool") ──────────────────
+
+
+class TestUnknownToolAbort:
+    """LCMAError("unknown_tool") aborts run, degrades readiness."""
+
+    def test_retrieve_unknown_tool_aborts_run(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Retrieve unknown_tool mid-run: aborts, no edges, notes remain."""
+        config = _make_config(fake_lithos_url)
+
+        # Make lithos_retrieve raise (simulates unknown_tool on Lithos).
+        fake_lithos.raise_on_retrieve = True
+
+        items = [
+            {
+                "title": "Paper Written Before Abort",
+                "source_url": "https://arxiv.org/abs/2601.00099",
+                "content": "# Summary\nA paper.",
+                "tags": ["profile:ai-robotics", "source:arxiv"],
+                "confidence": 0.9,
+                "score": 9,
+            }
+        ]
+
+        with pytest.raises(LCMAError, match="unknown_tool"):
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=_single_item_provider(items),
+                )
+            )
+
+        # (1) The prior lithos_write call remains visible (note was written).
+        write_calls = _calls_by_tool(fake_lithos.calls, "lithos_write")
+        assert len(write_calls) == 1
+        assert write_calls[0]["title"] == "Paper Written Before Abort"
+
+        # (2) lithos_retrieve was attempted (and failed).
+        retrieve_calls = _calls_by_tool(fake_lithos.calls, "lithos_retrieve")
+        assert len(retrieve_calls) == 1
+
+        # (3) No lithos_edge_upsert calls were recorded.
+        edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")
+        assert len(edge_calls) == 0
+
+        # (4) task_complete was still called with outcome="error".
+        complete_calls = _calls_by_tool(fake_lithos.calls, "lithos_task_complete")
+        assert len(complete_calls) == 1
+        assert complete_calls[0]["outcome"] == "error"
+
+    def test_retrieve_unknown_tool_degrades_readiness(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """lithos_retrieve unknown_tool → readiness reports degraded (AC-M2-9)."""
+        config = _make_config(fake_lithos_url)
+        probe_loop = ProbeLoop(config, interval=30.0)
+        probe_loop.run_once()
+
+        # Readiness is ok before the failure.
+        assert probe_loop.state.is_ready is True
+
+        fake_lithos.raise_on_retrieve = True
+
+        items = [
+            {
+                "title": "Paper Before Degraded",
+                "source_url": "https://arxiv.org/abs/2601.00100",
+                "content": "# Summary\nPaper.",
+                "tags": ["profile:ai-robotics", "source:arxiv"],
+                "confidence": 0.9,
+                "score": 9,
+            }
+        ]
+
+        with pytest.raises(LCMAError, match="unknown_tool"):
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=_single_item_provider(items),
+                    probe_loop=probe_loop,
+                )
+            )
+
+        # Readiness is now degraded.
+        assert probe_loop.state.is_ready is False
+        assert probe_loop.state.overall_status == "degraded"
+        assert probe_loop.state.lcma_unknown_tool_failure is True

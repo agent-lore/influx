@@ -28,6 +28,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
+from influx.errors import LCMAError
 from influx.feedback import build_negative_examples_block
 from influx.lcma import after_write as lcma_after_write
 from influx.lcma import resolve_builds_on as lcma_resolve_builds_on
@@ -262,6 +263,20 @@ async def run_profile(
 
             post_run_webhook_hook(result, config, kind=kind)
             return result
+        except LCMAError as exc:
+            outcome = "error"
+            if str(exc) == "unknown_tool":
+                logger.error(
+                    "LCMA deployment error: unknown_tool during profile %r run — "
+                    "aborting run. Check that the connected Lithos deployment "
+                    "supports the required LCMA tools.",
+                    profile,
+                )
+                if probe_loop is not None and hasattr(
+                    probe_loop, "mark_lcma_unknown_tool_failure"
+                ):
+                    probe_loop.mark_lcma_unknown_tool_failure(profile=profile)
+            raise
         except Exception:
             outcome = "error"
             raise

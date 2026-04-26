@@ -119,7 +119,7 @@
         "Tests in `tests/integration/test_lcma_edges_end_to_end.py` cover the mid-run `lithos_retrieve` unknown-tool abort path (AC-08-E): a fake Lithos that returns `unknown_tool` for `lithos_retrieve` after the first note write asserts (1) the run aborts, (2) the prior `lithos_write` call remains visible in the fake-Lithos recorder (i.e. the already-written note remains in Lithos), (3) no `lithos_edge_upsert` calls are recorded for that run, (4) readiness reports degraded"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
