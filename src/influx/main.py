@@ -389,6 +389,20 @@ def _cmd_backfill(args: argparse.Namespace) -> None:
         2  — network error
         64 — confirm_required without ``--confirm``
     """
+    from influx.backfill import BackfillRangeError, validate_backfill_range
+
+    # FR-BF-1: enforce mutual exclusivity of --days vs --from/--to at the
+    # CLI level so the user gets a clear error before any network call.
+    try:
+        validate_backfill_range(
+            days=args.days,
+            date_from=args.from_date,
+            date_to=args.to_date,
+        )
+    except BackfillRangeError as exc:
+        print(f"influx: {exc}", file=sys.stderr)
+        sys.exit(EXIT_USAGE)
+
     import httpx
 
     url = f"{_admin_base_url()}/backfills"

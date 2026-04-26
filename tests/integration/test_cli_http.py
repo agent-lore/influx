@@ -242,7 +242,11 @@ class TestBackfillCliIntegration:
         self,
         serve_process: tuple[subprocess.Popen[bytes], int],
     ) -> None:
-        """backfill → 202 → exit 0 + printed request_id."""
+        """backfill --confirm → 202 → exit 0 + printed request_id.
+
+        Uses ``--confirm`` because the real estimator (US-008) yields
+        >1000 items for the default config, triggering the confirm gate.
+        """
         _proc, port = serve_process
         env = os.environ.copy()
         env["INFLUX_ADMIN_PORT"] = str(port)
@@ -257,6 +261,7 @@ class TestBackfillCliIntegration:
                 "ai-robotics",
                 "--days",
                 "7",
+                "--confirm",
             ],
             env=env,
             capture_output=True,
@@ -272,7 +277,7 @@ class TestBackfillCliIntegration:
         self,
         serve_process: tuple[subprocess.Popen[bytes], int],
     ) -> None:
-        """backfill with --from/--to → 202 → exit 0."""
+        """backfill with --from/--to --confirm → 202 → exit 0."""
         _proc, port = serve_process
         env = os.environ.copy()
         env["INFLUX_ADMIN_PORT"] = str(port)
@@ -289,6 +294,7 @@ class TestBackfillCliIntegration:
                 "2026-01-01",
                 "--to",
                 "2026-01-31",
+                "--confirm",
             ],
             env=env,
             capture_output=True,

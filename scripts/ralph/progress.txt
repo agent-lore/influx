@@ -19,6 +19,9 @@ Started: Sun Apr 26 11:45:13 UTC 2026
 - To capture filter_prompt in tests, use a capturing item_provider that records `filter_prompt` per profile
 - `estimate_backfill_items(profile, config, *, days=, date_from=, date_to=)` — real naive estimator using `days × categories × max_results`; test overrides via `_backfill_estimate_override` (monkeypatch) or `INFLUX_TEST_BACKFILL_ESTIMATE` (env var)
 - Tests that POST `/backfills` with default config must pass `"confirm": True` unless testing the confirm gate itself (default config yields >1000 items)
+- `run_backfill()` in `backfill.py` is the canonical entry point for backfill runs — wraps `run_profile(kind=BACKFILL)` with proper `run_range`
+- FR-BF-2: backfill cache-hit skip is in `run_profile`'s cache-hit branch — `if kind == RunKind.BACKFILL: continue` before the write attempt
+- CLI subprocess tests need `--confirm` flag (not `INFLUX_TEST_BACKFILL_ESTIMATE` env var) because the estimator runs in the server process, not the CLI subprocess
 
 ---
 
@@ -132,4 +135,20 @@ Started: Sun Apr 26 11:45:13 UTC 2026
   - For `--from/--to` date range, days = `(to_date - from_date).days` (not inclusive); `--days N` uses N directly
   - Existing tests that POST `/backfills` with default config (6 categories × 200 max = 1200/day) need `"confirm": True` since 7 days → 8400 items > 1000 threshold
   - `estimate_backfill_items()` now takes `config: AppConfig` as second positional arg — any future callers must pass it
+---
+
+## 2026-04-26 - US-009
+- What was implemented: Backfill execution flow — `src/influx/backfill.py` module with `run_backfill()` entry point, `validate_backfill_range()`, and re-exported estimator; FR-BF-2 cache-hit skip in `run_profile` for backfill kind; CLI mutual exclusivity validation for --days vs --from/--to; HTTP API wired through `_backfill_and_release` using `backfill.run_backfill`
+- Files changed:
+  - `src/influx/backfill.py` — new module: `run_backfill()`, `validate_backfill_range()`, `BackfillRangeError`, re-export of `estimate_backfill_items`
+  - `src/influx/scheduler.py` — added FR-BF-2 early-continue in cache-hit branch when `kind == RunKind.BACKFILL` (skip write for already-ingested items)
+  - `src/influx/main.py` — added CLI-level mutual exclusivity validation via `validate_backfill_range()` before HTTP call
+  - `src/influx/http_api.py` — added `_backfill_and_release()` helper; `/backfills` handler now routes through `backfill.run_backfill` instead of direct `run_profile`
+  - `tests/integration/test_backfill_arxiv.py` — new file: 8 integration tests across 4 classes (run completes, cache-lookup skip, no-overlap/no-sweep/no-webhook, non-backfill regression)
+  - `tests/integration/test_cli_http.py` — added `--confirm` to two subprocess tests whose default config yields >1000 estimated items
+- **Learnings for future iterations:**
+  - `run_backfill()` is a thin wrapper around `run_profile(kind=BACKFILL)` — the gating logic (skip sweep, skip webhook, skip cache-hit writes) lives in `run_profile` for maintainability
+  - FR-BF-2 cache-hit skip is implemented as an early `continue` in the cache-hit branch of `run_profile` — only applies to `kind == RunKind.BACKFILL`; manual/scheduled runs still write on cache hit for multi-profile merge (US-005)
+  - CLI subprocess tests (`test_cli_http.py`) need `--confirm` when the real estimator produces >1000 items — the env var `INFLUX_TEST_BACKFILL_ESTIMATE` only works in the server process, not the CLI subprocess
+  - `validate_backfill_range()` raises `BackfillRangeError` for invalid range inputs — CLI catches this and exits with `EXIT_USAGE` (64)
 ---

@@ -240,6 +240,44 @@ async def _run_and_release(
         coordinator.release(profile)
 
 
+async def _backfill_and_release(
+    coordinator: Coordinator,
+    profile: str,
+    run_range: dict[str, str | int],
+    *,
+    config: Any = None,
+    item_provider: Any = None,
+    probe_loop: Any = None,
+) -> None:
+    """Run ``backfill.run_backfill`` and release the coordinator lock afterward.
+
+    Analogous to :func:`_run_and_release` but routes through the
+    :mod:`influx.backfill` module so that backfill-specific logic
+    (cache-hit skip, pacing) is exercised end-to-end (US-009).
+    """
+    from influx.backfill import run_backfill
+
+    try:
+        try:
+            await run_backfill(
+                profile,
+                run_range=run_range,
+                config=config,
+                item_provider=item_provider,
+                probe_loop=probe_loop,
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "run_backfill %r aborted",
+                profile,
+                exc_info=True,
+            )
+    finally:
+        coordinator.release(profile)
+
+
 def _spawn_tracked_task(
     app: FastAPI, coro: Coroutine[Any, Any, Any]
 ) -> asyncio.Task[Any]:
@@ -435,13 +473,12 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
                 status_code=409,
             )
 
-        # Launch the backfill in the background.
+        # Launch the backfill in the background via backfill.run_backfill.
         _spawn_tracked_task(
             request.app,
-            _run_and_release(
+            _backfill_and_release(
                 coordinator,
                 body.profile,
-                RunKind.BACKFILL,
                 run_range,
                 config=config,
                 item_provider=getattr(request.app.state, "item_provider", None),

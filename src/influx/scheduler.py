@@ -242,6 +242,11 @@ async def run_profile(
                     cache_result.content[0].text  # type: ignore[union-attr]
                 )
                 if cache_body.get("hit"):
+                    # FR-BF-2: backfills skip already-ingested items
+                    # entirely — no write attempt, no network traffic.
+                    if kind == RunKind.BACKFILL:
+                        continue
+
                     # US-005: multi-profile merge — still attempt a write
                     # so that version_conflict handling merges profile tags
                     # and Profile Relevance entries from the existing note.

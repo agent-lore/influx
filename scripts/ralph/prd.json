@@ -142,7 +142,7 @@
         "Integration test `tests/integration/test_backfill_arxiv.py` drives `backfill --profile X --days 7` against a fake arXiv fixture and asserts: (1) the run completes, (2) already-ingested items are skipped (verified via the fake-Lithos cache-lookup recorder), (3) the run does not overlap with a concurrently scheduled run for the same profile"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
