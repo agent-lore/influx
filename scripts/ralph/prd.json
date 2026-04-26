@@ -35,7 +35,7 @@
         "Unit tests live in `tests/unit/test_builds_on_arxiv_id_extraction.py` covering: (1) prefix + parenthesised arXiv ID, (2) bare `arXiv:<id>` with no prefix, (3) item with no arXiv ID returns no match, (4) prefix with trailing whitespace is trimmed"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -52,7 +52,7 @@
         "`validate-config` (PRD 05) remains unchanged — no startup probe is added (FR-LCMA-1)"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

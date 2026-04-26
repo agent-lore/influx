@@ -23,40 +23,13 @@ from urllib.parse import urlparse
 from mcp import types as mcp_types
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
+from mcp.shared.exceptions import McpError
 
 from influx.dedup import compose_dedup_query
 from influx.errors import ConfigError, LCMAError, LithosError
 from influx.notes import merge_tags as _canonical_merge_tags
 
 __all__ = ["LithosClient", "WriteResult"]
-
-
-# ── LCMA tool stubs (PRD 08 seam) ──────────────────────────────────
-#
-# These functions expose the frozen ``lithos_*`` LCMA tool names as
-# stubs that raise ``LCMAError("not implemented")`` until PRD 08
-# fills them in (§4 internal seams permitted, Definition of Done
-# item 3).
-
-
-def lithos_retrieve(**kwargs: Any) -> None:  # noqa: ARG001
-    """LCMA stub — raises ``LCMAError`` until PRD 08."""
-    raise LCMAError("not implemented")
-
-
-def lithos_edge_upsert(**kwargs: Any) -> None:  # noqa: ARG001
-    """LCMA stub — raises ``LCMAError`` until PRD 08."""
-    raise LCMAError("not implemented")
-
-
-def lithos_task_create(**kwargs: Any) -> None:  # noqa: ARG001
-    """LCMA stub — raises ``LCMAError`` until PRD 08."""
-    raise LCMAError("not implemented")
-
-
-def lithos_task_complete(**kwargs: Any) -> None:  # noqa: ARG001
-    """LCMA stub — raises ``LCMAError`` until PRD 08."""
-    raise LCMAError("not implemented")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -631,6 +604,91 @@ class LithosClient:
         if order is not None:
             args["order"] = order
         return await self.call_tool("lithos_list", args)
+
+    # ── LCMA wrappers (PRD 08) ──────────────────────────────────────
+
+    async def _call_lcma_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> mcp_types.CallToolResult:
+        """Call an LCMA tool, translating unknown-tool failures.
+
+        Raises ``LCMAError("unknown_tool")`` when the connected Lithos
+        deployment does not support the requested tool (FR-LCMA-6).
+        """
+        try:
+            result = await self.call_tool(name, arguments)
+        except McpError as exc:
+            # MCP server returns JSON-RPC error for unregistered tools.
+            raise LCMAError("unknown_tool") from exc
+        if result.isError:
+            raise LCMAError("unknown_tool")
+        return result
+
+    async def retrieve(
+        self,
+        *,
+        query: str,
+        limit: int,
+        agent_id: str,
+        task_id: str,
+        tags: list[str],
+    ) -> mcp_types.CallToolResult:
+        """Call ``lithos_retrieve`` (FR-LCMA-2)."""
+        return await self._call_lcma_tool(
+            "lithos_retrieve",
+            {
+                "query": query,
+                "limit": limit,
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "tags": tags,
+            },
+        )
+
+    async def edge_upsert(
+        self,
+        *,
+        type: str,
+        evidence: dict[str, Any],
+        source_note_id: str = "",
+        target_note_id: str = "",
+    ) -> mcp_types.CallToolResult:
+        """Call ``lithos_edge_upsert`` (FR-LCMA-3)."""
+        args: dict[str, Any] = {
+            "type": type,
+            "evidence": evidence,
+        }
+        if source_note_id:
+            args["source_note_id"] = source_note_id
+        if target_note_id:
+            args["target_note_id"] = target_note_id
+        return await self._call_lcma_tool("lithos_edge_upsert", args)
+
+    async def task_create(
+        self,
+        *,
+        title: str,
+        agent: str,
+        tags: list[str],
+    ) -> mcp_types.CallToolResult:
+        """Call ``lithos_task_create`` (FR-LCMA-5)."""
+        return await self._call_lcma_tool(
+            "lithos_task_create",
+            {"title": title, "agent": agent, "tags": tags},
+        )
+
+    async def task_complete(
+        self,
+        *,
+        task_id: str,
+        agent: str,
+        outcome: str | None = None,
+    ) -> mcp_types.CallToolResult:
+        """Call ``lithos_task_complete`` (FR-LCMA-5)."""
+        args: dict[str, Any] = {"task_id": task_id, "agent": agent}
+        if outcome is not None:
+            args["outcome"] = outcome
+        return await self._call_lcma_tool("lithos_task_complete", args)
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None

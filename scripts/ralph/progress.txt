@@ -5,7 +5,9 @@ Started: Sun Apr 26 06:31:01 UTC 2026
 ## Codebase Patterns
 - Use `uv run` prefix for all Python tooling (pytest, ruff, pyright)
 - Error hierarchy lives in `src/influx/errors.py` — LCMAError, LithosError, ConfigError all derive from InfluxError
-- LCMA stubs live in `src/influx/lithos_client.py` as module-level functions (not methods on LithosClient)
+- LCMA wrappers are async methods on `LithosClient`: `retrieve()`, `edge_upsert()`, `task_create()`, `task_complete()`
+- `_call_lcma_tool()` helper translates `McpError` and `isError` responses into `LCMAError("unknown_tool")`
+- FastMCP tool handlers cannot use `**kwargs` — use explicit named parameters
 - Config thresholds including `lcma_edge_score` live in `ProfileThresholds` in `src/influx/config.py`
 - Tier3 `builds_on` items and Tier1 `contributions` are defined in `src/influx/schemas.py` (Tier3Extraction, Tier1Enrichment)
 - Tests organized under `tests/unit/`, `tests/contract/`, `tests/integration/`
@@ -22,4 +24,31 @@ Started: Sun Apr 26 06:31:01 UTC 2026
   - Whitespace collapse uses `re.compile(r"\s+")` before truncation
   - Truncation is simple character slice to 500 chars, no word-aware wrapping
   - Empty-after-strip contributions are skipped and don't count toward the 3-item cap
+---
+
+## 2026-04-26 - US-002
+- Implemented `extract_arxiv_ref(item)` in `src/influx/lcma.py`
+- Created 10 unit tests in `tests/unit/test_builds_on_arxiv_id_extraction.py`
+- Files changed: `src/influx/lcma.py` (modified), `tests/unit/test_builds_on_arxiv_id_extraction.py` (new)
+- **Learnings for future iterations:**
+  - arXiv regex: `arXiv:(\d{4}\.\d{4,5}(?:v\d+)?)` handles 4/5-digit IDs and optional version suffix
+  - Prior title is text before the arXiv reference, with trailing `(` and whitespace stripped
+  - Falls back to arxiv_id itself as prior_title when no prefix text exists (AC-08-D)
+  - `extract_arxiv_ref` is exported in `__all__` alongside `compose_retrieve_query`
+---
+
+## 2026-04-26 - US-003
+- Replaced 4 LCMA stubs (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`) with real async methods on `LithosClient`
+- Added `_call_lcma_tool()` helper that translates `McpError` and `isError` responses into `LCMAError("unknown_tool")`
+- Created 14 contract tests in `tests/contract/test_lcma_calls.py` covering happy-path for all 4 tools + unknown_tool for retrieve and edge_upsert
+- Updated `tests/unit/test_lithos_client.py` to remove stub tests and verify stubs are gone
+- Files changed: `src/influx/lithos_client.py` (modified), `tests/unit/test_lithos_client.py` (modified), `tests/contract/test_lcma_calls.py` (new)
+- **Learnings for future iterations:**
+  - `McpError` is imported from `mcp.shared.exceptions` and wraps `ErrorData` with `code` and `message`
+  - MCP error code `-32601` (METHOD_NOT_FOUND) is used for unknown tools
+  - FastMCP `**kwargs` tool handlers don't work — the framework needs explicit parameter names to build input schemas
+  - For unknown_tool tests, use a `FakeMinimalServer` that only registers `lithos_agent_register` (no LCMA tools)
+  - `edge_upsert` uses explicit keyword params (`type`, `evidence`, `source_note_id`, `target_note_id`)
+  - `task_complete` has optional `outcome` parameter
+  - The `cache_lookup` contract (FR-MCP-3, R-7) is non-regressed — still requires both `query` and `source_url`
 ---
