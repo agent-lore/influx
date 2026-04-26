@@ -1,139 +1,27 @@
 # Ralph Progress Log
-Started: Sun Apr 26 06:31:01 UTC 2026
+Started: Sun Apr 26 11:45:13 UTC 2026
 ---
 
 ## Codebase Patterns
-- Use `uv run` prefix for all Python tooling (pytest, ruff, pyright)
-- Error hierarchy lives in `src/influx/errors.py` — LCMAError, LithosError, ConfigError all derive from InfluxError
-- LCMA wrappers are async methods on `LithosClient`: `retrieve()`, `edge_upsert()`, `task_create()`, `task_complete()`
-- `_call_lcma_tool()` helper translates `McpError` and `isError` responses into `LCMAError("unknown_tool")`
-- FastMCP tool handlers cannot use `**kwargs` — use explicit named parameters
-- Config thresholds including `lcma_edge_score` live in `ProfileThresholds` in `src/influx/config.py`
-- Tier3 `builds_on` items and Tier1 `contributions` are defined in `src/influx/schemas.py` (Tier3Extraction, Tier1Enrichment)
-- Tests organized under `tests/unit/`, `tests/contract/`, `tests/integration/`
-- Project uses `from __future__ import annotations` consistently
-- `FakeLithosServer` in `tests/contract/test_lithos_client.py` has all LCMA tools (retrieve, edge_upsert, task_create, task_complete) with FIFO response queues — use it for integration tests
-- `_NoopClient` stubs in unit tests that call `run_profile` with non-backfill RunKind must provide `task_create()` and `task_complete()` methods that return valid `CallToolResult`
-- `run_task_id` is available in `run_profile()` scope after task_create — downstream stories (US-005, US-006) can access it for after_write hooks
-- `after_write()` in `lcma.py` takes `client`, `title`, `contributions`, `run_task_id`, `profile`, `lcma_edge_score` — returns `list[dict]` of `{"title", "score"}` for webhook digest
-- Retrieve response shape: `{"results": [{"title": ..., "score": ..., "receipt_id": ..., "note_id": ...}]}`
-- `HighlightItem` already has `related_in_lithos: list[dict[str, Any]]` with `default_factory=list` — attach after_write results here
-- Item provider items can carry `contributions: list[str]` for Tier 1 contributions; `item.get("contributions")` returns None if absent
-- Item provider items can carry `builds_on: list[str]` for Tier 3 builds_on items; `item.get("builds_on")` returns None if absent
-- `resolve_builds_on()` in `lcma.py` takes `client` and `builds_on` — uses `cache_lookup` + exact `source_url` match to upsert `builds_on` edges
-- `cache_lookup` hit response shape: `{"hit": true, "source_url": "...", "note_id": "...", "title": "..."}` — verify `source_url` matches before upserting edge
-- `ProbeState` / `ProbeLoop` support multiple readiness latches: `repair_write_failure` (sweep errors) and `lcma_unknown_tool_failure` (LCMA deployment errors) — each has `mark_*` and `clear_*` methods
-- `FakeLithosServer.raise_on_retrieve` flag simulates `unknown_tool` errors by making the retrieve handler raise, which FastMCP converts to `isError=True`
+- Use `feedparser.parse(content)` for RSS/Atom parsing; access entry fields via `str(entry.get("field", ""))` to satisfy pyright
+- `RssSourceEntry` has Literal type for `source_tag` — test helpers must use `Literal["rss", "blog"]` not bare `str`
+- Frozen dataclasses with `slots=True` for immutable records (matches arXiv pattern)
+- Test fixtures live under `tests/fixtures/<source>/*.xml`
+- Config schema already has `RssSourceEntry` and `ProfileSources.rss` from prior PRDs
+- `slugify_feed_name()` in `src/influx/slugs.py` for FR-ST-2 slug generation
 
 ---
 
 ## 2026-04-26 - US-001
-- Implemented `compose_retrieve_query(title, contributions)` in `src/influx/lcma.py`
-- Created 16 golden-file unit tests in `tests/unit/test_lcma_query_composition.py`
-- Files changed: `src/influx/lcma.py` (new), `tests/unit/test_lcma_query_composition.py` (new)
+- What was implemented: RSS/Atom parser module with feedparser, test fixtures, and unit tests
+- Files changed:
+  - `pyproject.toml` — added `feedparser>=6.0,<7` dependency
+  - `src/influx/sources/rss.py` — new module: `RssFeedItem` dataclass + `parse_feed()` function
+  - `tests/fixtures/rss/sample_atom.xml` — Atom feed fixture with 2 entries
+  - `tests/fixtures/rss/sample_rss2.xml` — RSS 2.0 feed fixture with 2 entries
+  - `tests/unit/test_rss_fetcher.py` — 9 tests covering Atom parsing, RSS 2.0 parsing, source_tag passthrough, feed_name, and no cross-bucket leakage
 - **Learnings for future iterations:**
-  - The query composition joins title + up to 3 non-empty stripped contributions with ` | ` separator
-  - Whitespace collapse uses `re.compile(r"\s+")` before truncation
-  - Truncation is simple character slice to 500 chars, no word-aware wrapping
-  - Empty-after-strip contributions are skipped and don't count toward the 3-item cap
----
-
-## 2026-04-26 - US-002
-- Implemented `extract_arxiv_ref(item)` in `src/influx/lcma.py`
-- Created 10 unit tests in `tests/unit/test_builds_on_arxiv_id_extraction.py`
-- Files changed: `src/influx/lcma.py` (modified), `tests/unit/test_builds_on_arxiv_id_extraction.py` (new)
-- **Learnings for future iterations:**
-  - arXiv regex: `arXiv:(\d{4}\.\d{4,5}(?:v\d+)?)` handles 4/5-digit IDs and optional version suffix
-  - Prior title is text before the arXiv reference, with trailing `(` and whitespace stripped
-  - Falls back to arxiv_id itself as prior_title when no prefix text exists (AC-08-D)
-  - `extract_arxiv_ref` is exported in `__all__` alongside `compose_retrieve_query`
----
-
-## 2026-04-26 - US-003
-- Replaced 4 LCMA stubs (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`) with real async methods on `LithosClient`
-- Added `_call_lcma_tool()` helper that translates `McpError` and `isError` responses into `LCMAError("unknown_tool")`
-- Created 14 contract tests in `tests/contract/test_lcma_calls.py` covering happy-path for all 4 tools + unknown_tool for retrieve and edge_upsert
-- Updated `tests/unit/test_lithos_client.py` to remove stub tests and verify stubs are gone
-- Files changed: `src/influx/lithos_client.py` (modified), `tests/unit/test_lithos_client.py` (modified), `tests/contract/test_lcma_calls.py` (new)
-- **Learnings for future iterations:**
-  - `McpError` is imported from `mcp.shared.exceptions` and wraps `ErrorData` with `code` and `message`
-  - MCP error code `-32601` (METHOD_NOT_FOUND) is used for unknown tools
-  - FastMCP `**kwargs` tool handlers don't work — the framework needs explicit parameter names to build input schemas
-  - For unknown_tool tests, use a `FakeMinimalServer` that only registers `lithos_agent_register` (no LCMA tools)
-  - `edge_upsert` uses explicit keyword params (`type`, `evidence`, `source_note_id`, `target_note_id`)
-  - `task_complete` has optional `outcome` parameter
-  - The `cache_lookup` contract (FR-MCP-3, R-7) is non-regressed — still requires both `query` and `source_url`
----
-
-## 2026-04-26 - US-004
-- Bracketed each per-profile run with `lithos_task_create` / `lithos_task_complete` in `run_profile()` in `src/influx/scheduler.py`
-- `task_create` called at start for non-backfill runs; `task_complete` called in `finally` block with `outcome="success"` or `outcome="error"`
-- `run_task_id` captured from `task_create` response for downstream LCMA processing (US-005, US-006)
-- Added LCMA tools (retrieve, edge_upsert, task_create, task_complete) to `FakeLithosServer` in `tests/contract/test_lithos_client.py`
-- Created `tests/integration/test_lcma_edges_end_to_end.py` with 4 tests: manual run, scheduled run, backfill exclusion, error outcome
-- Updated 3 `_NoopClient` stubs in `tests/unit/test_scheduler.py` to include `task_create`/`task_complete` methods
-- Files changed: `src/influx/scheduler.py` (modified), `tests/contract/test_lithos_client.py` (modified), `tests/unit/test_scheduler.py` (modified), `tests/integration/test_lcma_edges_end_to_end.py` (new)
-- **Learnings for future iterations:**
-  - `task_create` returns `{"task_id": "..."}` — parse with `json.loads(result.content[0].text)`
-  - Task bracketing only applies to RunKind.SCHEDULED and RunKind.MANUAL, not BACKFILL (PRD 08 §4)
-  - `task_complete` takes `task_id`, `agent`, and optional `outcome` — does NOT take `tags`
-  - The `run_task_id` variable is in scope throughout the run body, ready for US-005/US-006 after_write hooks
-  - When `task_complete` itself fails, log a warning but don't mask the original exception
----
-
-## 2026-04-26 - US-005
-- Implemented `after_write()` in `src/influx/lcma.py` — composes query, calls `lithos_retrieve`, filters by `lcma_edge_score`, upserts `related_to` edges, returns high-scoring results for webhook digest
-- Wired `after_write` into `scheduler.py` post-write path — called after every successful `write_note` when `run_task_id` is available (non-backfill runs)
-- Attached `related_in_lithos` results to `HighlightItem` for downstream webhook digest (US-008)
-- Added 2 integration tests: high-score edge upsert + low-score no edge
-- Files changed: `src/influx/lcma.py` (modified), `src/influx/scheduler.py` (modified), `tests/integration/test_lcma_edges_end_to_end.py` (modified)
-- **Learnings for future iterations:**
-  - `after_write` returns `list[dict[str, Any]]` with `{"title": str, "score": float}` entries — these are the high-scoring retrieve results
-  - The `lcma_edge_score` threshold comes from `profile_cfg.thresholds.lcma_edge_score` (default 0.75)
-  - `FakeLithosServer.retrieve_responses` queue lets integration tests inject specific retrieve results
-  - For integration tests with items, use `_single_item_provider()` helper to wrap items in an async provider
-  - Backfill runs skip `after_write` because `run_task_id` is None (no task bracketing for backfills)
-  - The `contributions` field on items is optional — `item.get("contributions")` returns None when absent, and `compose_retrieve_query` handles None gracefully
----
-
-## 2026-04-26 - US-006
-- Implemented `resolve_builds_on()` in `src/influx/lcma.py` — processes Tier 3 `builds_on` items, calls `lithos_cache_lookup` per arXiv ref, upserts `builds_on` edges on exact `source_url` match
-- Wired `resolve_builds_on` into `scheduler.py` post-write path alongside `after_write` (only for non-backfill runs with `run_task_id`)
-- Added `contributions` and `builds_on` fields to the arxiv source item dict from Tier 1/Tier 3 extraction results
-- Added 2 integration tests: cache hit → `builds_on` edge, cache miss → no edge
-- Files changed: `src/influx/lcma.py` (modified), `src/influx/scheduler.py` (modified), `src/influx/sources/arxiv.py` (modified), `tests/integration/test_lcma_edges_end_to_end.py` (modified)
-- **Learnings for future iterations:**
-  - `resolve_builds_on` uses `client.cache_lookup(query=prior_title, source_url=arxiv_url)` — the existing `cache_lookup` method enforces both-args-required (FR-MCP-3, R-7)
-  - Cache hit response must include `source_url` matching the requested URL for exact-match verification
-  - `FakeLithosServer.cache_lookup_responses` queue is consumed in order — queue dedup lookup (miss) before builds_on lookup (hit/miss) in integration tests
-  - The arxiv source now populates `contributions` and `builds_on` on the item dict from Tier 1/Tier 3 results
-  - `builds_on` field is `None` when no Tier 3 extraction was performed; `resolve_builds_on` handles `None` gracefully (early return)
----
-
-## 2026-04-26 - US-007
-- Added `lcma_unknown_tool_failure` latch to `ProbeState` and `ProbeLoop` in `src/influx/probes.py` — mirrors the existing `repair_write_failure` pattern
-- Caught `LCMAError("unknown_tool")` in `run_profile()` in `src/influx/scheduler.py` — logs deployment error at ERROR level, marks readiness degraded via `probe_loop.mark_lcma_unknown_tool_failure()`, then re-raises to abort the run
-- Added `raise_on_retrieve` flag to `FakeLithosServer` in `tests/contract/test_lithos_client.py` — when True, `lithos_retrieve` handler raises ValueError which FastMCP converts to `isError=True`, triggering `LCMAError("unknown_tool")`
-- Added 2 integration tests in `tests/integration/test_lcma_edges_end_to_end.py`:
-  - `test_retrieve_unknown_tool_aborts_run` — verifies AC-08-E: run aborts, prior write remains, no edge_upsert calls, task_complete fires with outcome="error"
-  - `test_retrieve_unknown_tool_degrades_readiness` — verifies AC-M2-9: readiness reports degraded after unknown_tool failure
-- Files changed: `src/influx/probes.py` (modified), `src/influx/scheduler.py` (modified), `tests/contract/test_lithos_client.py` (modified), `tests/integration/test_lcma_edges_end_to_end.py` (modified)
-- **Learnings for future iterations:**
-  - The `LCMAError` catch in `run_profile()` is placed before the generic `except Exception` to handle it specifically (deployment-error log + readiness latch) before re-raising
-  - `ProbeState.lcma_unknown_tool_failure` latch follows the same pattern as `repair_write_failure` — sticky until explicitly cleared
-  - `FakeLithosServer.raise_on_retrieve` is captured via `server_self = self` in `_register_tools()` since closures can't directly reference mutating `self` attributes through simple variable capture
-  - `task_complete` still fires in `finally` block even when `LCMAError("unknown_tool")` aborts the run — it records `outcome="error"`
-  - `clear_lithos` autouse fixture in integration tests resets `raise_on_retrieve = False` to avoid cross-test contamination
----
-
-## 2026-04-26 - US-008
-- Extended webhook digest unit tests with positive and negative `related_in_lithos` cases (AC-08-F)
-- Added `test_related_in_lithos_populated_from_retrieve` — verifies highlight carries `{"title", "score"}` entries from high-scoring retrieve results
-- Renamed `test_related_in_lithos_always_empty` → `test_related_in_lithos_empty_when_no_results` — verifies empty list when no high-scoring results
-- Updated `_make_item` helper to accept optional `related_in_lithos` parameter
-- Files changed: `tests/unit/test_webhook_digest.py` (modified)
-- **Learnings for future iterations:**
-  - The `related_in_lithos` plumbing was fully wired in US-005: `HighlightItem` dataclass field, `scheduler.py` populates from `lcma_after_write()`, `to_dict()` serializes. US-008 only needed test coverage.
-  - `HighlightItem` is frozen — `related_in_lithos` must be set at construction time (passed to `__init__`)
-  - The `_make_item` test helper defaults `related_in_lithos=[]` — pass explicit values for positive test cases
+  - feedparser's `.get()` returns typed unions that pyright checks strictly — always wrap with `str()` for string fields
+  - RssSourceEntry.source_tag is `Literal["rss", "blog"]` not `str` — test helpers need matching type annotations
+  - The existing config schema already validates RSS feeds; no config changes needed for the parser itself
 ---

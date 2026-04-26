@@ -20,6 +20,7 @@ dependencies = [
     "apscheduler>=3.10,<4",
     "trafilatura>=2.0",
     "pypdf>=5.0",
+    "feedparser>=6.0,<7",
 ]
 
 [project.scripts]

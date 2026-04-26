@@ -1,22 +1,19 @@
 {
-  "project": "Influx v1 — PRD 08: LCMA Integration (lithos_retrieve, lithos_edge_upsert, Tasks)",
-  "branchName": "ralph/08-lcma-integration",
-  "description": "Replace the LCMA stubs from PRD 05 in `lithos_client.py` with real wrappers and wire LCMA into the per-profile run flow. Adds a new `src/influx/lcma.py` module containing: (1) a deterministic `lithos_retrieve` query composition helper (FR-LCMA-2: title + up to 3 trimmed non-empty `Tier1Enrichment.contributions` joined by ` | `, internal whitespace collapsed, truncated to 500 chars), (2) an arXiv-ID extraction helper for Tier 3 `builds_on` items, (3) an `after_write(note, run_task_id, profile)` function that calls `lithos_retrieve(agent_id=\"influx\", task_id=run_task_id, tags=[f\"profile:{profile}\"], limit=5)` after every canonical note write and emits `lithos_edge_upsert(type=\"related_to\", evidence={\"kind\": \"lithos_retrieve\", \"score\": ..., \"receipt_id\": ...})` for results with `score >= thresholds.lcma_edge_score` (default 0.75), and (4) a Tier 3 `builds_on` resolver that calls `lithos_cache_lookup(query=<prior_title>, source_url=https://arxiv.org/abs/<id>)` (BOTH args required per FR-MCP-3, R-7) and upserts `type=\"builds_on\"` with `evidence={\"kind\": \"tier3_builds_on_extraction\"}` only on exact `source_url` match (no fuzzy matching). `service.py` brackets each scheduled / manual `POST /runs` per-profile run with `lithos_task_create(title=f\"Influx run {profile} {date}\", agent=\"influx\", tags=[\"influx:run\", f\"profile:{profile}\"])` / `lithos_task_complete(task_id, agent=\"influx\", outcome=...)`. `LCMAError(\"unknown_tool\")` from any LCMA-dependent call aborts the current run, logs a deployment error, and marks readiness degraded (FR-LCMA-6 + FR-RES-3). The webhook digest from PRD 05 gains a populated `related_in_lithos` field (title + score) sourced from high-scoring `lithos_retrieve` results captured during the run (FR-NOT-6). LCMA is a deployment prerequisite (FR-LCMA-1): Influx does not enumerate LCMA capabilities at startup; misconfigured deployments are discovered at first use. `validate-config` is unchanged. Backfill task tagging (`influx:backfill`), multi-profile orchestration, RSS, and OTEL spans for LCMA calls are deferred to PRDs 09 / 10.",
+  "project": "Influx v1 — PRD 09: RSS Fetcher + Multi-Profile Orchestration + Backfill",
+  "branchName": "ralph/rss-multiprofile-backfill",
+  "description": "Extends the arXiv-only single-profile pipeline along three independent axes: (S-11) an RSS/Atom fetcher in `src/influx/sources/rss.py` using `feedparser`, with per-feed `source_tag` (`rss` or `blog`) flowing into the canonical `source:*` tag and the archive bucket layout `/archive/<feed.source_tag>/{YYYY}/{MM}/{feed-slug}-{YYYY-MM-DD}-{url-hash}.html` where `{url-hash}` is the first 10 hex chars of SHA-256(normalised `source_url`); (S-12) multi-profile orchestration with `profile:*` tag union-merging on shared notes, per-profile `## Profile Relevance` bullet merging by profile name, per-profile rejection authority preserved on the ingest path (`influx:rejected:<profile>` blocks re-adding `profile:<profile>` even when the source matches that profile again), cross-profile parallelism with same-profile strict serial (already enforced by PRD 03's coordinator), and per-source fetch deduplication across profiles within a single scheduled fire (R-8); (S-13) a real `POST /backfills` handler in `src/influx/http_api.py` replacing PRD 03's stub estimator, with naive cost estimate `days × len(categories) × max_results_per_category` (Q-3), a `--confirm` gate triggered by `estimated_items > 1000` (FR-BF-6), `lithos_task_create(tags=[\"influx:backfill\", ...])` task tagging, no webhook POST (FR-NOT-4), and no repair sweep (FR-REP-2) — both gates already exist from PRDs 05/06 but this PRD ensures `kind=\"backfill\"` is correctly propagated from the API down. After this PRD, the v1 product is functionally complete; PRD 10 adds OTEL spans/metrics and rejection-rate logging.",
   "userStories": [
     {
       "id": "US-001",
-      "title": "Implement deterministic lithos_retrieve query composition helper with golden tests",
-      "description": "As a developer, I want a pure `compose_retrieve_query(title, contributions)` helper in `src/influx/lcma.py` that produces the exact deterministic query string per FR-LCMA-2, so contract and integration tests can assert query content without hitting Lithos.",
+      "title": "Add feedparser dependency and RSS source parser with recorded fixtures",
+      "description": "As an Influx operator, I want an RSS/Atom parser module so that feeds configured with `source_tag` of `rss` or `blog` produce per-item records (title, URL, published, summary) for downstream ingest, with each item inheriting its feed's `source_tag` verbatim (FR-SRC-4).",
       "acceptanceCriteria": [
-        "`src/influx/lcma.py` is created and provides a dedicated query-composition helper that implements FR-LCMA-2. The exact exported symbol name and signature are left to the implementer provided the helper is callable from contract / integration tests with a `(title, contributions)` input and returns the composed query string",
-        "When `contributions` is `None` or absent, the result is the title (with internal whitespace collapsed) truncated to 500 characters",
-        "When `contributions` is present, the helper appends the first up to 3 elements in original list order, each `.strip()`-ed, skipping any element that is empty after trimming, joined to the title with the single separator ` | ` (one space, pipe, one space)",
-        "Fewer than 3 non-empty contributions is allowed (e.g. 0, 1, 2 non-empty elements all valid)",
-        "Internal whitespace runs (multiple spaces, tabs, newlines) in the composed string are collapsed to a single space (AC-08-B)",
-        "The composed string is truncated to 500 characters via simple character slice (no partial-word re-wrap) (AC-08-A)",
-        "Golden-file unit tests live in `tests/unit/test_lcma_query_composition.py` and cover at least the 5 cases from AC-08-A: (1) title only, (2) title + 1 contribution, (3) title + 3 contributions, (4) title + 5 contributions (only first 3 used), (5) 600-char title truncated to 500",
-        "Additional test asserts whitespace collapse (e.g. `\"hello\\n\\nworld\"` becomes `\"hello world\"`) covering AC-08-B",
-        "Additional test asserts that elements which are empty after trimming are skipped, per FR-LCMA-2 step 2 (the first up to 3 `contributions` are taken in original list order, each `.strip()`-ed, and any element that is empty after trimming is skipped)"
+        "Add `feedparser` to project dependencies (e.g. `pyproject.toml`)",
+        "Create `src/influx/sources/rss.py` exposing a `feedparser`-based RSS/Atom parser that, given feed content and the feed's configured `name`, `url`, and `source_tag`, returns per-item records with at minimum `title`, `url`, `published`, `summary`",
+        "Each parsed item carries the feed's configured `source_tag` verbatim (FR-SRC-4); the parser does not infer or override `source_tag`",
+        "Recorded feed fixtures live under `tests/fixtures/rss/*.xml` covering at least one Atom feed and one RSS 2.0 feed",
+        "Unit test `tests/unit/test_rss_fetcher.py` covers: (1) Atom parsing yields the documented fields, (2) RSS 2.0 parsing yields the documented fields, (3) a feed configured with `source_tag=\"rss\"` yields items tagged `rss`, (4) a separate feed configured with `source_tag=\"blog\"` yields items tagged `blog`",
+        "No feed contributes items to more than one `source:*` bucket"
       ],
       "priority": 1,
       "passes": true,
@@ -24,129 +21,157 @@
     },
     {
       "id": "US-002",
-      "title": "Implement arXiv-ID extraction helper for Tier 3 builds_on items",
-      "description": "As a developer, I want an `extract_arxiv_ref(item: str) -> tuple[str, str] | None` helper in `src/influx/lcma.py` that recognises arXiv IDs inside Tier 3 `builds_on` strings and returns `(prior_title, arxiv_id)`, so the builds_on resolver can drive `lithos_cache_lookup` deterministically.",
+      "title": "URL-hash for archive filename disambiguation with collision and determinism tests",
+      "description": "As the archive writer, I want a deterministic `url-hash` so that two distinct items from the same feed published on the same date map to distinct archive filenames, and re-ingesting the same URL always yields the same filename (AC-M3-4 sub-tests 2 and 3).",
       "acceptanceCriteria": [
-        "`src/influx/lcma.py` provides an arXiv-ID extraction helper that satisfies AC-08-C / AC-08-D and is callable from the unit tests below. The exact exported symbol name and signature are left to the implementer provided the helper accepts a Tier 3 `builds_on` item and returns either a `(prior_title, arxiv_id)` pair or an empty / `None` result when no arXiv ID is present",
-        "Returns no match (e.g. `None`) when no recognisable arXiv ID is present in the input item",
-        "Recognises the `arXiv:<id>` form embedded in parentheses or freestanding (e.g. `\"FooNet (arXiv:2412.12345)\"` and `\"arXiv:2412.12345\"`)",
-        "For `\"FooNet (arXiv:2412.12345)\"` yields `prior_title=\"FooNet\"` and `arxiv_id=\"2412.12345\"` (AC-08-C). The textual prefix is the substring preceding the arXiv ID, trimmed as needed to match the documented example",
-        "For an item containing only an arXiv ID with no prefix text, the helper falls back to the arXiv ID itself as `prior_title` (AC-08-D)",
-        "Unit tests live in `tests/unit/test_builds_on_arxiv_id_extraction.py` covering: (1) prefix + parenthesised arXiv ID, (2) bare `arXiv:<id>` with no prefix, (3) item with no arXiv ID returns no match, (4) prefix with trailing whitespace is trimmed"
+        "Compute the first 10 hex chars of SHA-256 over the normalised `source_url` for use as the archive `{url-hash}` segment",
+        "The hash is computed over the canonical normalised `source_url` so it is stable across call sites",
+        "Determinism unit test in `tests/unit/test_archive_url_hash.py`: hashing the same URL twice yields the same 10-char hex string (AC-M3-4 sub-test 3 / AC-09-C)",
+        "Collision unit test: two URLs differing only by path segment (e.g. `https://feed-x.example/post-a` and `https://feed-x.example/post-b`) yield two distinct hash suffixes (AC-M3-4 sub-test 2 / AC-09-B)",
+        "The hash is derived from `normalise_url(source_url)` so callers operating on equivalent URLs receive the same hash"
       ],
       "priority": 2,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-003",
-      "title": "Replace LCMA stubs in lithos_client.py with real MCP wrappers and add envelope contract tests",
-      "description": "As a developer, I want `lithos_client.py` to expose real wrappers for the four LCMA tools previously stubbed by PRD 05 (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`) that issue MCP tool calls and translate envelope errors into typed exceptions, so the rest of the codebase can drive LCMA against a real or fake Lithos. `lithos_cache_lookup` already exists as `LithosClient.cache_lookup()` and is reused as-is by the `builds_on` resolver — it is not (re)introduced as a new LCMA wrapper here.",
+      "title": "RSS archive layout and note-path integration end-to-end",
+      "description": "As the Influx ingest pipeline, I want RSS items routed to source-tag-specific archive and note paths so that `source_tag`, the `source:*` tag, the note storage path, and the archive path all agree, satisfying AC-M3-4 sub-test 1.",
       "acceptanceCriteria": [
-        "`src/influx/lithos_client.py` no longer contains any `NotImplementedError` or `LCMAError(\"not implemented\")` stubs for the four LCMA tools listed above (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`)",
-        "Real wrappers exist for the four LCMA tools (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`) with the documented call surface from PRD 08 §5 (e.g. `lithos_retrieve(query, limit, agent_id, task_id, tags)`). Each LCMA tool may be exposed as an async instance method on `LithosClient` (matching the existing `cache_lookup` / `read_note` / `write_note` style) or as a wrapper that accepts a `LithosClient` (or equivalent session/context) plus the tool keyword arguments",
-        "Each wrapper forwards the call to the correct underlying MCP tool using the documented arguments from PRD 08 §5 and returns the underlying call result to its caller. The exact return type / shape is left to the implementer; downstream stories (US-004, US-005, US-006) are responsible for consuming whatever fields they need (e.g. `task_id`, per-result `score` / `receipt_id`, cache-lookup `source_url`) from that result",
-        "When an LCMA-dependent call fails because the tool is unknown / unsupported on the connected Lithos deployment, the wrapper raises `LCMAError(\"unknown_tool\")` — translating the failure from whichever surface the MCP client exposes it on (e.g. a `CallToolResult` with `isError=True`, or an exception raised by the underlying session) — preserving the contract used by FR-LCMA-6",
-        "The existing `LithosClient.cache_lookup(query, source_url)` helper in `src/influx/lithos_client.py` continues to enforce the `lithos_cache_lookup` contract (FR-MCP-3, R-7: BOTH arguments required) and is not regressed by this story",
-        "Contract tests in `tests/contract/test_lcma_calls.py` cover: (1) happy-path call for each of the four LCMA tools, (2) at least one `unknown_tool` test for `lithos_retrieve` and one for `lithos_edge_upsert` asserting `LCMAError(\"unknown_tool\")` is raised",
-        "`validate-config` (PRD 05) remains unchanged — no startup probe is added (FR-LCMA-1)"
+        "RSS items are archived at `/archive/<source_tag>/{YYYY}/{MM}/{feed-slug}-{YYYY-MM-DD}-{url-hash}.html`, where `{url-hash}` is the first 10 hex chars of SHA-256 over the normalised `source_url`",
+        "RSS article fetches go through PRD 02's guarded HTTP client so that the SSRF guard and size/timeout caps apply (FR-SRC-5 / FR-RES-4)",
+        "Notes for `source_tag=\"rss\"` are stored at `articles/rss/{YYYY}/{MM}` and tagged `source:rss`",
+        "Notes for `source_tag=\"blog\"` are stored at `articles/blog/{YYYY}/{MM}` and tagged `source:blog`",
+        "The archive `{source}` segment, the note's `source:*` tag, and the note's storage path (FR-NOTE-2) all agree (AC-M3-4 sub-test 1 / AC-09-A)",
+        "Integration test `tests/integration/test_rss_to_lithos.py` drives an end-to-end ingest of a fixture feed and asserts the archive file exists on disk and the resulting note carries the expected `source:*` tag and storage path",
+        "End-to-end collision test (AC-09-B): ingesting two items from the same feed published on `2026-04-23` with URLs `https://feed-x.example/post-a` and `https://feed-x.example/post-b` produces two distinct archive files; both exist on disk after the run; neither overwrites the other",
+        "Determinism path-computation test (AC-09-C): hashing the same normalised URL `https://feed-x.example/post-a` twice yields the same `{url-hash}` and therefore the same archive filename component, verified at the helper / path-builder level without requiring a second end-to-end ingest"
       ],
       "priority": 3,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-004",
-      "title": "Bracket each per-profile run with lithos_task_create / lithos_task_complete in the shared run path",
-      "description": "As a developer, I want the shared per-profile run path (`run_profile()` in `src/influx/scheduler.py`, used by both scheduled and manual `POST /runs` flows) to wrap each profile run with `lithos_task_create` at the start and `lithos_task_complete` at the end, so every Influx run is observable as a Lithos task carrying the `influx:run` and `profile:<name>` tags (FR-LCMA-5, AC-M2-10).",
+      "title": "RSS web extraction fallback to feed summary when body is below min_web_chars",
+      "description": "As the article enrichment step, I want to fall back to the feed `<summary>` when the extracted web article body is shorter than `extraction.min_web_chars` so that thin or paywalled RSS items still produce usable notes (AC-09-J, FR-ENR-3).",
       "acceptanceCriteria": [
-        "The shared per-profile run path (`run_profile()` or an equivalent wrapper used by both scheduled and manual `POST /runs` flows) calls `lithos_task_create(title=f\"Influx run {profile} {date}\", agent=\"influx\", tags=[\"influx:run\", f\"profile:{profile}\"])` such that the full per-profile run is bracketed by the task (FR-LCMA-5). The exact placement of the `lithos_task_create` call within the run is left to the implementer provided the whole run executes inside the task",
-        "The returned `task_id` is captured into a `run_task_id` value that is made available to downstream per-write LCMA processing within the same shared run path",
-        "`lithos_task_complete(task_id=run_task_id, agent=\"influx\", outcome=...)` is called at the end of the profile run, on both success and ordinary failure paths (i.e. completion is in a `finally`-style block), so the full run is bracketed by the task",
-        "Backfill flows are NOT modified in this PRD — they continue to work as in PRD 06 / 07. Only scheduled and manual `POST /runs` flows are touched (PRD 08 §4 internal seam)",
-        "Integration test verifies that a profile run produces exactly one `lithos_task_create` and one `lithos_task_complete` in the fake-Lithos recorder. The `lithos_task_create` call carries `tags=[\"influx:run\", f\"profile:{profile}\"]` (and `agent=\"influx\"`); the `lithos_task_complete` call carries the matching `task_id`, `agent=\"influx\"`, and an `outcome` value (per the `lithos_task_complete(task_id, agent, outcome?)` contract — `tags` are NOT passed to complete)"
+        "When PRD 07's web extractor rejects an article because the extracted body fails the `extraction.min_web_chars` minimum (e.g. raises `ExtractionError`), the ingest path falls back to using the feed item's `<summary>` instead of the extracted body (FR-ENR-3)",
+        "Integration test covers the extractor-rejection / min-length-failure path with a fixture whose article body is intentionally short and asserts end-to-end that the feed `<summary>` is used as the summary source rather than the short extracted body (AC-09-J)"
       ],
       "priority": 4,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-005",
-      "title": "Implement after_write retrieve + related_to edge wiring in lcma.py and call from post-write hook",
-      "description": "As a developer, I want an `after_write(note, run_task_id, profile)` function in `src/influx/lcma.py` that calls `lithos_retrieve` with the composed query and emits `lithos_edge_upsert(type=\"related_to\", ...)` for high-scoring results, so each canonical note write surfaces related Lithos memory as graph edges (FR-LCMA-2, FR-LCMA-3, AC-M2-5, AC-M2-6).",
+      "title": "Multi-profile tag merging on shared notes (profile union and Profile Relevance bullets)",
+      "description": "As an Influx ingest pipeline running multiple profiles in one fire, I want `profile:*` tags and `## Profile Relevance` bullets union-merged on a single shared note so that one paper matching two profiles produces ONE note carrying both `profile:*` tags and two `## Profile Relevance` bullets (AC-M3-2, FR-NOTE-6).",
       "acceptanceCriteria": [
-        "A post-write hook function (e.g. `after_write`) is exported from `src/influx/lcma.py`. Its exact signature is left to the implementer provided it carries the `note`, `run_task_id`, `profile`, and access to the current `LithosClient` (or an equivalent shared run context that exposes the LCMA wrappers)",
-        "It composes the query via the US-001 helper using the note's title and, when available, the note's Tier 1 `contributions` (FR-LCMA-2). The data source for the Tier 1 contributions is left to the implementer (e.g. structured run data, the canonical note's existing sections, or any equivalent path). When contributions are absent or `None`, the helper is invoked with the title only",
-        "It calls `lithos_retrieve(query=<composed>, limit=5, agent_id=\"influx\", task_id=run_task_id, tags=[f\"profile:{profile}\"])`",
-        "For each retrieved result with `score >= thresholds.lcma_edge_score` (default 0.75, sourced from existing config), it calls `lithos_edge_upsert(type=\"related_to\", ...)` whose `evidence` contains at least `{\"kind\": \"lithos_retrieve\", \"score\": <result.score>, \"receipt_id\": <result.receipt_id>}` (additional evidence fields are permitted, matching AC-M2-6)",
-        "Results with `score < thresholds.lcma_edge_score` do NOT produce edges",
-        "The high-scoring retrieve results are made available for the webhook digest (US-008) to consume during digest assembly. The exact carrier (e.g. attaching to the note / highlight record, an existing field such as the one on `src/influx/notifications.py`, or any equivalent per-run structure) is left to the implementer",
-        "The LCMA post-write hook is invoked after each successful canonical note write in the shared write path (e.g. immediately after `client.write_note()` in the per-profile run flow, including the arXiv source path identified in PRD 08 §6), passing the current `LithosClient` (or an equivalent shared run context) along with `note`, `run_task_id`, and `profile`. The exact placement within the run path is left to the implementer provided every successful canonical note write triggers the hook",
-        "Integration test in `tests/integration/test_lcma_edges_end_to_end.py` runs a profile end-to-end with a fake Lithos that returns at least one retrieve result with `score >= 0.75` and asserts the fake-Lithos recorder shows one `lithos_edge_upsert(type=\"related_to\", ...)` with the correct `evidence` payload",
-        "Integration test also asserts that a result with `score = 0.5` does NOT produce an edge"
+        "When a single source item matches two profiles in one run, exactly ONE note is produced (AC-M3-2)",
+        "The shared note carries both `profile:<A>` and `profile:<B>` tags (set union, not replacement)",
+        "The shared note has two `## Profile Relevance` entries merged by profile name (FR-NOTE-6)",
+        "Disjoint matches still produce one note per profile, each tagged with only the matching `profile:*` tag (AC-M3-3)",
+        "Re-ingesting an already-tagged note preserves existing `profile:*` tags and `## Profile Relevance` entries for profiles that are not part of the current run (idempotency / no destructive overwrite)",
+        "Unit test `tests/unit/test_multi_profile_merge.py` covers: union semantics, entry merging by profile name, idempotency on re-ingest, and the disjoint-match case",
+        "Integration test `tests/integration/test_multi_profile_shared_source.py` drives a two-profile run against a fixture whose item matches both profiles and asserts one note with both tags and two `## Profile Relevance` entries merged by profile name",
+        "Negative test asserts that running one profile alone does NOT remove or rewrite an existing `profile:<other-profile>` tag or its `## Profile Relevance` entry on a shared note (e.g. running `web-tech` alone preserves an existing `profile:ai-robotics` tag and bullet)"
       ],
       "priority": 5,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-006",
-      "title": "Implement Tier 3 builds_on resolver with lithos_cache_lookup and exact source_url match upsert",
-      "description": "As a developer, I want a `resolve_builds_on(note, run_task_id, profile)` function in `src/influx/lcma.py` that processes Tier 3 `builds_on` items, attempts arXiv-ID resolution via `lithos_cache_lookup`, and upserts `type=\"builds_on\"` edges only on exact `source_url` match, so Tier 3 extractions feed the Lithos graph without fuzzy matching (FR-LCMA-4, AC-M2-7, AC-M2-8).",
+      "title": "Per-profile rejection authority preserved on the ingest path",
+      "description": "As the ingest path, I want `influx:rejected:<profile>` to block re-adding `profile:<profile>` and to block refreshing that profile's `## Profile Relevance` entry, so that a per-profile rejection is preserved across reruns even when the source matches that profile again (AC-M3-6, AC-09-K, FR-NOTE-6).",
       "acceptanceCriteria": [
-        "Tier 3 `builds_on` resolution runs after each successful canonical note write — either inside the US-005 post-write hook (e.g. `after_write`) or via a separate helper invoked from the same shared write path — and has access to the `note`, `run_task_id`, `profile`, and the current `LithosClient` (or equivalent shared run context exposing the LCMA wrappers, including `lithos_cache_lookup`). The exact module split, exported symbol, and signature are left to the implementer",
-        "The resolver reaches the `lithos_cache_lookup(query, source_url)` contract end-to-end via the existing `LithosClient.cache_lookup()` helper (or, at the implementer's discretion, a wrapper / refinement of it that exposes the result shape the resolver needs), preserving the FR-MCP-3 / R-7 BOTH-args requirement",
-        "For each Tier 3 `builds_on` item, it calls the US-002 helper to obtain `(prior_title, arxiv_id)`; items returning `None` are silently skipped",
-        "For items with an arXiv ID, it calls `lithos_cache_lookup(query=prior_title, source_url=f\"https://arxiv.org/abs/{arxiv_id}\")`. BOTH arguments must be passed (FR-MCP-3, R-7)",
-        "On exact `source_url` match in the lookup result, it calls `lithos_edge_upsert(type=\"builds_on\", ...)` with `evidence={\"kind\": \"tier3_builds_on_extraction\"}`",
-        "When the cache lookup returns no match or a different `source_url`, NO edge is upserted (AC-M2-8). No fuzzy title matching is performed",
-        "When the item contains only an arXiv ID with no prefix, `prior_title` falls back to the arXiv ID string itself for the lookup (AC-08-D)",
-        "Integration tests in `tests/integration/test_lcma_edges_end_to_end.py` extend coverage with: (1) Tier 3 `builds_on=[\"FooNet (arXiv:2412.12345)\"]` with a fake-Lithos cache hit on the arXiv URL → one `lithos_edge_upsert(type=\"builds_on\")` with the expected evidence, (2) same input with a fake-Lithos miss → zero `builds_on` edges"
+        "When a note already has `influx:rejected:profile-a`, the ingest path MUST NOT re-add `profile:profile-a` even if the source matches that profile again (AC-M3-6)",
+        "When a note already has `influx:rejected:profile-a`, the ingest path MUST NOT refresh that profile's `## Profile Relevance` entry",
+        "If `profile-b` separately scores the same item ≥ `relevance` in the same run, `profile:profile-b` IS added on the same note, and the rejection on `profile-a` is preserved (AC-09-K)",
+        "In a multi-profile run, when an Influx-authored note carries `influx:rejected:<profile>`, that note's title appears in the next run's filter prompt under the `NEGATIVE EXAMPLES` block for that profile (AC-M3-5), exercised end-to-end via an integration test",
+        "Integration test `tests/integration/test_profile_rejection_authority.py` drives a two-profile run where one profile is rejected and the other is not, asserting the rejection-authority post-condition: `influx:rejected:<rejected-profile>` present, `profile:<rejected-profile>` absent, `profile:<accepted-profile>` present"
       ],
       "priority": 6,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-007",
-      "title": "Abort run on LCMAError(\"unknown_tool\") with deployment-error log and degraded readiness",
-      "description": "As an operator, I want any LCMA-dependent call that fails with `LCMAError(\"unknown_tool\")` to abort the current run, log a clear deployment error, and mark readiness degraded, so misconfigured Lithos deployments surface immediately at first use rather than silently producing partial graphs (FR-LCMA-6, AC-M2-9, AC-08-E).",
+      "title": "Per-source fetch deduplication across profiles in a single scheduled fire",
+      "description": "As the run coordinator, I want per-source fetches deduplicated across profiles within a single scheduled fire so that two profiles both subscribed to `cs.AI` fetch `cs.AI` exactly once, fanning the result out to all interested profiles (R-8 mitigation, AC-09-D).",
       "acceptanceCriteria": [
-        "When any LCMA-dependent call introduced by PRD 08 — at minimum `lithos_task_create`, `lithos_retrieve`, `lithos_edge_upsert`, or `lithos_task_complete` — raises `LCMAError(\"unknown_tool\")`, the current per-profile run aborts immediately, a clear deployment-error log is emitted, and readiness is marked degraded (AC-M2-9, FR-LCMA-6). Already-completed side effects earlier in the run (e.g. notes already written via `lithos_write`, edges already upserted, a `lithos_task_create` already issued) are NOT rolled back",
-        "A clear deployment / configuration log entry is emitted that identifies the failure context (sufficient for an operator to diagnose the misconfigured LCMA tool and affected run); the exact log level and field set are left to the implementer",
-        "Readiness state is marked degraded via the probe/readiness subsystem — the implementation may extend the existing readiness latch (e.g. the repair-sweep latch in `probes.py`) or add a new latch dedicated to LCMA `unknown_tool` failures, as needed",
-        "Specifically for the AC-08-E scenario — `lithos_retrieve` raising `LCMAError(\"unknown_tool\")` mid-run — the aborted partial run produces NO `lithos_edge_upsert` calls (because the very first retrieve fails before any edge can be derived), while already-written notes from prior `lithos_write` calls in the same run remain in Lithos and are not rolled back. This is the AC-08-E guarantee and is narrower than the generic abort rule above, which applies to other LCMA `unknown_tool` failure points (e.g. an end-of-run `lithos_task_complete` failure, where edges may already have been upserted earlier in the run)",
-        "Tests in `tests/integration/test_lcma_edges_end_to_end.py` cover the mid-run `lithos_retrieve` unknown-tool abort path (AC-08-E): a fake Lithos that returns `unknown_tool` for `lithos_retrieve` after the first note write asserts (1) the run aborts, (2) the prior `lithos_write` call remains visible in the fake-Lithos recorder (i.e. the already-written note remains in Lithos), (3) no `lithos_edge_upsert` calls are recorded for that run, (4) readiness reports degraded"
+        "When a scheduled fire executes multiple profiles concurrently, shared sources are not redundantly fetched across profiles within the run, and fetched items are fanned out to all profiles subscribed to them (R-8 mitigation)",
+        "Applies to both arXiv and RSS sources",
+        "Cross-profile parallelism remains allowed (Q-4); same-profile strict serial remains enforced by PRD 03's coordinator",
+        "Integration test asserts that with two profiles both subscribed to `cs.AI`, `cs.AI` is fetched exactly once for the run and its items are delivered to both profiles (AC-09-D)"
       ],
       "priority": 7,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
       "id": "US-008",
-      "title": "Populate related_in_lithos on webhook digest highlights from captured retrieve results",
-      "description": "As a webhook consumer, I want the digest highlights produced by `notifications.py` (PRD 05) to carry a populated `related_in_lithos` field listing high-scoring `lithos_retrieve` matches captured during the run, so users see related Lithos memory alongside each highlighted note (FR-NOT-6, AC-08-F).",
+      "title": "Real /backfills HTTP handler with naive estimator and confirm gate",
+      "description": "As the `/backfills` HTTP API, I want a real estimator and `confirm_required` gate so that backfills exceeding 1000 estimated items require explicit confirmation, replacing PRD 03's stub estimator (FR-BF-6, AC-M3-8, AC-09-E, AC-09-I).",
       "acceptanceCriteria": [
-        "Highlighted digest entries emitted by `src/influx/notifications.py` expose a populated `related_in_lithos` field sourced from the high-scoring `lithos_retrieve` results captured during the run (US-005). Whether the data is attached to the upstream highlight item (e.g. `HighlightItem`) before `build_digest()` runs, or assembled inside `notifications.py` from a per-run collector, is left to the implementer",
-        "Each `related_in_lithos` entry is a `{\"title\": <str>, \"score\": <float>}` object derived from a `lithos_retrieve` result whose score met `thresholds.lcma_edge_score` (AC-08-F: title + score from high-scoring retrieve results)",
-        "When a highlighted note has no high-scoring retrieve results, `related_in_lithos` is an empty list (not absent, not null), preserving the field shape from PRD 05",
-        "Existing webhook digest tests are extended with at least one positive case (highlight with a populated `related_in_lithos` list) and one negative case (highlight with an empty `related_in_lithos` list)",
-        "No new external dependency is added"
+        "Replace the PRD 03 stub `/backfills` handler in `src/influx/http_api.py` with a real implementation",
+        "The estimator computes `estimated_items = days × len(categories) × max_results_per_category` (Q-3)",
+        "The handler supports both backfill range forms required by FR-BF-1 (a number-of-days form and an explicit from/to date form)",
+        "When `estimated_items > 1000` and `confirm` is not set, the handler returns `reason=\"confirm_required\"` with the `estimated_items` field populated (FR-BF-6, AC-M3-8)",
+        "When `estimated_items <= 1000`, the request is accepted without `confirm`",
+        "When `confirm=true` is supplied on a re-submission, the request is accepted regardless of estimated count",
+        "Unit tests in `tests/unit/test_backfill_estimator.py` cover: an estimate of 35 items accepted without confirm (AC-09-E); an estimate of 1500 items rejected with `reason=\"confirm_required\"` and a populated `estimated_items` (AC-09-I); resubmission with `confirm=true` accepted (AC-09-I); estimator math with multiple categories"
       ],
       "priority": 8,
-      "passes": true,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Backfill execution flow in CLI and run path with cache-lookup skip and arXiv pacing",
+      "description": "As an operator running `python -m influx backfill`, I want the CLI to handle estimate responses, confirm prompting, and full execution against arXiv so that `backfill --profile X --days 7` completes without overlapping a scheduled run for the same profile (AC-M3-7, FR-BF-1, FR-BF-2, FR-BF-3).",
+      "acceptanceCriteria": [
+        "Finalise the `backfill` subcommand in the project's CLI entrypoint: supports `--days N` or `--from YYYY-MM-DD --to YYYY-MM-DD` as a mutually exclusive range form (FR-BF-1)",
+        "On `reason=\"confirm_required\"` from the API, the CLI surfaces `estimated_items` to the user and only submits `confirm=true` after explicit user acknowledgement — whether via a follow-up invocation with `--confirm` or an equivalent acknowledged retry flow (FR-BF-6)",
+        "Items already ingested (per `lithos_cache_lookup`) are skipped during the backfill run (FR-BF-2)",
+        "Backfill honours arXiv pacing / request spacing (FR-BF-3); the run respects the ~30s-per-day-of-backfill-per-profile budget",
+        "A backfill for profile `X` does not overlap with a scheduled run for the same profile; same-profile serialisation is enforced by PRD 03's coordinator (AC-M3-7)",
+        "Create `src/influx/backfill.py` housing the run flow (estimator integration, cache-lookup skip, pacing wiring)",
+        "Integration test `tests/integration/test_backfill_arxiv.py` drives `backfill --profile X --days 7` against a fake arXiv fixture and asserts: (1) the run completes, (2) already-ingested items are skipped (verified via the fake-Lithos cache-lookup recorder), (3) the run does not overlap with a concurrently scheduled run for the same profile"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Propagate kind=backfill through task tagging, webhook gate, and repair-sweep gate",
+      "description": "As the backfill pipeline, I want `kind=\"backfill\"` propagated end-to-end so that backfills create `lithos_task_create` tasks tagged `influx:backfill` (not `influx:run`), never POST a webhook, and never call the repair sweep (AC-09-F, AC-09-G, AC-09-H, FR-BF-4, FR-BF-5, FR-NOT-4, FR-REP-2).",
+      "acceptanceCriteria": [
+        "Along the run/task-creation path, `lithos_task_create` receives the tag `influx:backfill` when `kind=\"backfill\"` and `influx:run` otherwise (FR-BF-5, FR-LCMA-5 backfill arm)",
+        "The backfill code path does not POST a webhook (FR-BF-4 / FR-NOT-4); the existing PRD 05 webhook gate is exercised end-to-end with `kind=\"backfill\"` propagated from the API down (AC-09-G)",
+        "The backfill code path does not invoke `lithos_list(tags=[\"influx:repair-needed\", ...])` (FR-REP-2); the existing PRD 06 repair-sweep gate is exercised end-to-end with `kind=\"backfill\"` (AC-09-H)",
+        "Integration assertion in `tests/integration/test_backfill_arxiv.py` verifies the created Lithos task carries the tag `influx:backfill` and NOT `influx:run` (AC-09-F)",
+        "Integration assertion verifies that no webhook HTTP call was issued during the backfill (AC-09-G)",
+        "Integration assertion verifies that the repair sweep was not invoked during the backfill — i.e. no `lithos_list(tags=[\"influx:repair-needed\", ...])` call recorded (AC-09-H)",
+        "Non-backfill regression test confirms that scheduled and manual runs continue to create `lithos_task_create` calls tagged `influx:run` rather than `influx:backfill`, so that the run-kind correctly selects between the two task tags (FR-BF-5)"
+      ],
+      "priority": 10,
+      "passes": false,
       "notes": ""
     }
   ],
   "definitionOfDone": [
-    "All AC-M2-5 through AC-M2-10 (master PRD §7.2) are demonstrably exercised by tests",
-    "All AC-08-A through AC-08-F (PRD 08 §8 new-for-this-PRD) are demonstrably exercised by tests",
-    "`src/influx/lithos_client.py` no longer contains any `NotImplementedError` or `LCMAError(\"not implemented\")` stubs for the four LCMA tools (`lithos_retrieve`, `lithos_edge_upsert`, `lithos_task_create`, `lithos_task_complete`)",
-    "`uv run pytest tests/unit/test_lcma_query_composition.py tests/unit/test_builds_on_arxiv_id_extraction.py tests/contract/test_lcma_calls.py tests/integration/test_lcma_edges_end_to_end.py` all pass",
-    "Coverage on `src/influx/lcma.py` is ≥ 80% as measured by the project's existing coverage tool",
+    "All AC-M3-1 through AC-M3-8 (master PRD §7.3) are demonstrably exercised by tests",
+    "All AC-09-A through AC-09-K (PRD 09 §8 new-for-this-PRD) are demonstrably exercised by tests",
+    "No remaining stubs in the codebase except OTEL spans/metrics (PRD 10) and per-tag rejection-rate logging (PRD 10)",
+    "The `run_profile` hook left by PRD 03 is a single well-typed function that handles arXiv + RSS + scheduled + manual + backfill cases",
+    "`uv run pytest tests/unit/test_rss_fetcher.py tests/unit/test_archive_url_hash.py tests/unit/test_multi_profile_merge.py tests/unit/test_backfill_estimator.py tests/integration/test_rss_to_lithos.py tests/integration/test_multi_profile_shared_source.py tests/integration/test_backfill_arxiv.py tests/integration/test_profile_rejection_authority.py` all pass",
+    "Coverage on `src/influx/sources/rss.py`, `src/influx/backfill.py`, and the multi-profile orchestration code paths in `src/influx/service.py` is ≥ 80%",
     "`uv run ruff check src tests` passes with zero violations on changed files",
     "`uv run pyright` passes (project-wide typecheck green)",
-    "`validate-config` behaviour is unchanged from PRD 05 (no LCMA startup probe added)",
-    "Webhook digest highlights carry the `related_in_lithos` field populated end-to-end"
+    "Backfill `kind=\"backfill\"` is correctly propagated from the `/backfills` API down to task tagging, webhook gate, and repair-sweep gate"
   ]
 }
