@@ -54,4 +54,6 @@ ENV INFLUX_DATA_DIR=/data
 
 USER 1000:1000
 
-CMD ["influx"]
+EXPOSE 8080
+
+CMD ["influx", "serve"]

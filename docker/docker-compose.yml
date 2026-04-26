@@ -10,6 +10,7 @@ services:
     user: "${INFLUX_UID:-1000}:${INFLUX_GID:-1000}"
     volumes:
       - ${INFLUX_DATA_PATH:-./data}:/data
+      - ${INFLUX_ARCHIVE_PATH:-./archive}:/archive
     environment:
       - INFLUX_CONFIG=/data/influx.toml
       - INFLUX_DATA_DIR=/data
