@@ -124,20 +124,37 @@ class InfluxTracer:
             yield SpanWrapper(otel_span)
 
 
+def _console_fallback_enabled() -> bool:
+    """Return ``True`` when the console fallback exporter is requested."""
+    return os.environ.get("INFLUX_OTEL_CONSOLE_FALLBACK", "").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def _otlp_endpoint_configured() -> bool:
+    """Return ``True`` when an OTLP collector endpoint is configured."""
+    return bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""))
+
+
 def _build_tracer() -> InfluxTracer:
     """Construct an ``InfluxTracer`` based on current env + package state."""
     if not _otel_enabled() or not _otel_packages_available():
         return InfluxTracer(enabled=False)
 
-    from opentelemetry import trace
     from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
-    provider = trace.get_tracer_provider()
-    if not isinstance(provider, TracerProvider):
-        provider = TracerProvider()
-        trace.set_tracer_provider(provider)
+    provider = TracerProvider()
 
-    tracer = trace.get_tracer("influx")
+    # Console fallback: emit spans to stdout when no collector is configured
+    if _console_fallback_enabled() and not _otlp_endpoint_configured():
+        from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+
+        provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+
+    tracer = provider.get_tracer("influx")
     return InfluxTracer(enabled=True, tracer=tracer)
 
 

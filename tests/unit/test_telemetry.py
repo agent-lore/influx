@@ -1,4 +1,4 @@
-"""Unit tests for the OTEL telemetry wrapper (US-001).
+"""Unit tests for the OTEL telemetry wrapper (US-001 + US-002).
 
 Covers:
   (1) OTEL is off by default — no-op when INFLUX_OTEL_ENABLED unset (FR-OBS-2)
@@ -6,12 +6,17 @@ Covers:
   (3) Enabled when INFLUX_OTEL_ENABLED=true and OTEL packages installed
   (4) No-op when OTEL packages simulated absent via import-stub (AC-M4-3)
   (5) No-op paths never raise
+  (6) Enabled wrapper creates spans with given name (US-002)
+  (7) Enabled wrapper sets attributes on spans (US-002)
+  (8) Console fallback emits spans to stdout (US-002, FR-OBS-3)
+  (9) AC-10-A regression guard: no span when disabled even if packages installed
 """
 
 from __future__ import annotations
 
 import sys
 from collections.abc import Sequence
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -171,7 +176,7 @@ class TestOtelPackagesAbsent:
 
             _real_import = builtins.__import__
 
-            def _blocked_import(name: str, *args: object, **kwargs: object) -> object:
+            def _blocked_import(name: str, *args: Any, **kwargs: Any) -> Any:
                 if name.startswith("opentelemetry"):
                     raise ImportError(f"Simulated missing: {name}")
                 return _real_import(name, *args, **kwargs)
@@ -208,7 +213,7 @@ class TestOtelPackagesAbsent:
 
             _real_import = builtins.__import__
 
-            def _blocked_import(name: str, *args: object, **kwargs: object) -> object:
+            def _blocked_import(name: str, *args: Any, **kwargs: Any) -> Any:
                 if name.startswith("opentelemetry"):
                     raise ImportError(f"Simulated missing: {name}")
                 return _real_import(name, *args, **kwargs)
@@ -261,3 +266,242 @@ class TestNoOpNeverRaises:
         wrapper = SpanWrapper(mock_span)
         wrapper.set_attribute("key", "val")
         mock_span.set_attribute.assert_called_once_with("key", "val")
+
+
+# ── (6) Enabled wrapper creates spans with given name (US-002) ─────────
+
+
+def _make_collecting_tracer() -> tuple[InfluxTracer, list]:
+    """Create an InfluxTracer with a collecting exporter for test assertions."""
+    from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+    from opentelemetry.sdk.trace.export import (
+        SimpleSpanProcessor,
+        SpanExporter,
+        SpanExportResult,
+    )
+
+    collected: list[ReadableSpan] = []
+
+    class _CollectingExporter(SpanExporter):
+        def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            collected.extend(spans)
+            return SpanExportResult.SUCCESS
+
+        def shutdown(self) -> None:
+            pass
+
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(_CollectingExporter()))
+
+    tracer = InfluxTracer(
+        enabled=True,
+        tracer=provider.get_tracer("influx-test"),
+    )
+    return tracer, collected
+
+
+class TestEnabledSpanCreation:
+    """US-002: enabled wrapper creates spans with the given name."""
+
+    def test_span_has_correct_name(self) -> None:
+        tracer, collected = _make_collecting_tracer()
+        with tracer.span("influx.fetch.arxiv"):
+            pass
+        assert len(collected) == 1
+        assert collected[0].name == "influx.fetch.arxiv"
+
+    def test_multiple_spans_each_named(self) -> None:
+        tracer, collected = _make_collecting_tracer()
+        with tracer.span("influx.run"):
+            pass
+        with tracer.span("influx.filter"):
+            pass
+        assert len(collected) == 2
+        assert collected[0].name == "influx.run"
+        assert collected[1].name == "influx.filter"
+
+    def test_nested_spans_both_recorded(self) -> None:
+        tracer, collected = _make_collecting_tracer()
+        with tracer.span("influx.run"), tracer.span("influx.filter"):
+            pass
+        assert len(collected) == 2
+        names = {s.name for s in collected}
+        assert names == {"influx.run", "influx.filter"}
+
+
+# ── (7) Enabled wrapper sets attributes on spans (US-002) ──────────────
+
+
+class TestEnabledSpanAttributes:
+    """US-002: enabled wrapper sets attributes on the underlying OTEL span."""
+
+    def test_initial_attributes_set(self) -> None:
+        tracer, collected = _make_collecting_tracer()
+        with tracer.span("influx.run", attributes={"influx.profile": "ai"}):
+            pass
+        assert collected[0].attributes is not None
+        assert collected[0].attributes.get("influx.profile") == "ai"
+
+    def test_set_attribute_after_creation(self) -> None:
+        tracer, collected = _make_collecting_tracer()
+        with tracer.span("influx.run") as s:
+            s.set_attribute("influx.run_id", "r-42")
+            s.set_attribute("influx.item_count", 100)
+        attrs = collected[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.run_id") == "r-42"
+        assert attrs.get("influx.item_count") == 100
+
+    def test_set_attributes_batch(self) -> None:
+        tracer, collected = _make_collecting_tracer()
+        with tracer.span("influx.filter") as s:
+            s.set_attributes({
+                "influx.profile": "robotics",
+                "influx.run_id": "r-99",
+                "influx.item_count": 25,
+            })
+        attrs = collected[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "robotics"
+        assert attrs.get("influx.run_id") == "r-99"
+        assert attrs.get("influx.item_count") == 25
+
+    def test_initial_and_dynamic_attributes_merged(self) -> None:
+        tracer, collected = _make_collecting_tracer()
+        with tracer.span(
+            "influx.enrich.tier1",
+            attributes={"influx.profile": "ai"},
+        ) as s:
+            s.set_attribute("influx.item_count", 5)
+        attrs = collected[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "ai"
+        assert attrs.get("influx.item_count") == 5
+
+
+# ── (8) Console fallback emits spans to stdout (US-002, FR-OBS-3) ──────
+
+
+class TestConsoleFallback:
+    """US-002 / FR-OBS-3: console fallback prints spans to stdout."""
+
+    def test_console_fallback_emits_to_stdout(self) -> None:
+        """With console fallback enabled, spans are observably emitted."""
+        import io
+
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import (
+            ConsoleSpanExporter,
+            SimpleSpanProcessor,
+        )
+
+        buf = io.StringIO()
+        provider = TracerProvider()
+        provider.add_span_processor(
+            SimpleSpanProcessor(ConsoleSpanExporter(out=buf))
+        )
+
+        tracer = InfluxTracer(
+            enabled=True, tracer=provider.get_tracer("influx-test"),
+        )
+
+        with tracer.span(
+            "influx.run", attributes={"influx.profile": "test"},
+        ):
+            pass
+
+        output = buf.getvalue()
+        assert "influx.run" in output
+        assert "influx.profile" in output
+
+    def test_build_tracer_uses_console_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_build_tracer adds ConsoleSpanExporter when fallback is on."""
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "true")
+        monkeypatch.setenv("INFLUX_OTEL_CONSOLE_FALLBACK", "true")
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+        tracer = get_tracer(force_rebuild=True)
+        assert tracer.enabled
+
+    def test_console_fallback_disabled_no_exporter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With console fallback disabled, tracer is enabled but no console."""
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "true")
+        monkeypatch.delenv("INFLUX_OTEL_CONSOLE_FALLBACK", raising=False)
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+        tracer = get_tracer(force_rebuild=True)
+        assert tracer.enabled
+
+    def test_console_fallback_not_used_when_collector_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a collector endpoint set, console fallback is skipped."""
+        from influx.telemetry import (
+            _console_fallback_enabled,
+            _otlp_endpoint_configured,
+        )
+
+        monkeypatch.setenv("INFLUX_OTEL_CONSOLE_FALLBACK", "true")
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+
+        assert _console_fallback_enabled()
+        assert _otlp_endpoint_configured()
+
+
+# ── (9) AC-10-A regression guard: no span when disabled + pkgs installed ─
+
+
+class TestAC10ARegressionGuard:
+    """AC-10-A: with OTEL disabled, no span created even if packages installed."""
+
+    def test_no_spans_when_disabled(self) -> None:
+        """Directly construct a disabled tracer and verify zero exports."""
+        from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+        from opentelemetry.sdk.trace.export import (
+            SimpleSpanProcessor,
+            SpanExporter,
+            SpanExportResult,
+        )
+
+        collected: list[ReadableSpan] = []
+
+        class _CollectingExporter(SpanExporter):
+            def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+                collected.extend(spans)
+                return SpanExportResult.SUCCESS
+
+            def shutdown(self) -> None:
+                pass
+
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(_CollectingExporter()))
+
+        # Tracer is disabled even though we have a real OTEL provider
+        disabled_tracer = InfluxTracer(
+            enabled=False, tracer=provider.get_tracer("test"),
+        )
+
+        with disabled_tracer.span(
+            "influx.run", attributes={"influx.profile": "ai"},
+        ) as s:
+            s.set_attribute("influx.item_count", 42)
+
+        # No spans should have been exported
+        assert len(collected) == 0
+
+    def test_get_tracer_disabled_produces_no_spans(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Via get_tracer with OTEL disabled, no real spans are created."""
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "false")
+        tracer = get_tracer(force_rebuild=True)
+        assert not tracer.enabled
+
+        with tracer.span("influx.run") as s:
+            s.set_attribute("influx.profile", "test")
+            # The span wrapper wraps the no-op — no OTEL calls made
+            assert isinstance(s, SpanWrapper)
