@@ -94,7 +94,7 @@
         "Integration test `tests/integration/test_profile_rejection_authority.py` drives a two-profile run where one profile is rejected and the other is not, asserting the rejection-authority post-condition: `influx:rejected:<rejected-profile>` present, `profile:<rejected-profile>` absent, `profile:<accepted-profile>` present"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

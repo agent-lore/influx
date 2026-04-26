@@ -15,6 +15,8 @@ Started: Sun Apr 26 11:45:13 UTC 2026
 - `build_rss_note_item()` in `sources/rss.py` builds complete `ProfileItem` dict with archive download + article extraction (fallback to feed summary) + note rendering
 - RSS note path = `articles/{source_tag}/{YYYY}/{MM}`, tags include `source:{source_tag}`, archive under `{source_tag}/{YYYY}/{MM}/`
 - Integration tests for RSS use `FakeArticleServer` (simple `http.server` serving HTML) with `SecurityConfig(allow_private_ips=True)`
+- Rejection authority enforced at 3 layers: `merge_tags()`, `merge_profile_relevance_union()`, and `build_negative_examples_block()` — all respect `influx:rejected:<profile>` tags
+- To capture filter_prompt in tests, use a capturing item_provider that records `filter_prompt` per profile
 
 ---
 
@@ -84,4 +86,16 @@ Started: Sun Apr 26 11:45:13 UTC 2026
   - `_replace_profile_relevance_section()` finds `## Profile Relevance` heading and replaces up to next `## ` heading, preserving other sections (e.g. `## User Notes`)
   - Integration tests for multi-profile merge use FakeLithosServer with queued responses: cache_lookup → hit, write → version_conflict, read → existing note, write → updated
   - `_render_profile_relevance_body` is a private helper in `notes.py` — import with alias `_render_pr_body` to keep lines short
+---
+
+## 2026-04-26 - US-006
+- What was implemented: Per-profile rejection authority preserved on the ingest path (AC-M3-5, AC-M3-6, AC-09-K)
+- Files changed:
+  - `tests/integration/test_profile_rejection_authority.py` — new file: 3 integration tests across 2 classes exercising rejection authority end-to-end
+- **Learnings for future iterations:**
+  - The core rejection authority logic was already implemented in US-005's `merge_tags()` and `merge_profile_relevance_union()` — US-006 only needed integration tests to exercise it end-to-end
+  - Rejection authority is enforced at three layers: tag merge (`merge_tags()`), Profile Relevance merge (`merge_profile_relevance_union()`), and feedback loop (`build_negative_examples_block()`)
+  - To test rejection authority, queue FakeLithosServer responses for version_conflict flow: existing note has `influx:rejected:<profile>` tag → merge drops `profile:<profile>` → old Profile Relevance entry preserved
+  - To test NEGATIVE EXAMPLES in filter prompt, use a capturing item_provider that records `filter_prompt` per profile; queue lithos_list response with rejected titles
+  - The feedback `lithos_list` call is per-profile (`influx:rejected:<profile>`), so one profile's rejections don't leak into another profile's filter prompt
 ---
