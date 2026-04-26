@@ -61,7 +61,7 @@
         "Integration test covers the extractor-rejection / min-length-failure path with a fixture whose article body is intentionally short and asserts end-to-end that the feed `<summary>` is used as the summary source rather than the short extracted body (AC-09-J)"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

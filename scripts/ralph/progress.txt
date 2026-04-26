@@ -12,7 +12,7 @@ Started: Sun Apr 26 11:45:13 UTC 2026
 - `url_hash(source_url)` in `src/influx/urls.py` returns 10-char hex SHA-256 of normalised URL for archive filename disambiguation
 - RSS archive `item_id` for `build_archive_path()` = `f"{feed_slug}-{YYYY-MM-DD}-{url_hash}"`
 - `download_archive()` in `storage.py` accepts `expected_content_type` param (default `"pdf"`, pass `"html"` for RSS)
-- `build_rss_note_item()` in `sources/rss.py` builds complete `ProfileItem` dict with archive download + note rendering
+- `build_rss_note_item()` in `sources/rss.py` builds complete `ProfileItem` dict with archive download + article extraction (fallback to feed summary) + note rendering
 - RSS note path = `articles/{source_tag}/{YYYY}/{MM}`, tags include `source:{source_tag}`, archive under `{source_tag}/{YYYY}/{MM}/`
 - Integration tests for RSS use `FakeArticleServer` (simple `http.server` serving HTML) with `SecurityConfig(allow_private_ips=True)`
 
@@ -55,4 +55,16 @@ Started: Sun Apr 26 11:45:13 UTC 2026
   - For integration tests with RSS article downloads, use a `FakeArticleServer` (simple `http.server.HTTPServer` with `_ArticleHandler`) and `SecurityConfig(allow_private_ips=True)`
   - RSS archive path layout: `{archive_root}/{source_tag}/{YYYY}/{MM}/{feed-slug}-{YYYY-MM-DD}-{url-hash}.html`
   - To verify SSRF guard works, test with `allow_private_ips=False` — download to localhost will fail → `influx:archive-missing` tag
+---
+
+## 2026-04-26 - US-004
+- What was implemented: RSS web extraction fallback to feed summary when article body is below `extraction.min_web_chars` (FR-ENR-3, AC-09-J)
+- Files changed:
+  - `src/influx/sources/rss.py` — added `extract_article()` call after archive download; catches `ExtractionError`/`NetworkError` and falls back to `item.summary`; extracted text used as summary when extraction succeeds
+  - `tests/integration/test_rss_to_lithos.py` — added `TestExtractionFallbackToSummary` class with 2 tests: (1) short article body → feed summary used, (2) long article body → extracted text used
+- **Learnings for future iterations:**
+  - `extract_article()` in `extraction/article.py` does its own `guarded_fetch()` — separate from `download_archive()` — so there are two HTTP requests per RSS item (one for archive, one for extraction)
+  - `trafilatura.extract()` needs substantial HTML content (real `<article>` tags, multiple `<p>` blocks) to produce text >= `min_web_chars`; minimal test HTML will always fall back
+  - Integration tests for extraction fallback use separate `_ShortArticleHandler` and `_LongArticleHandler` HTTP handlers to control the extraction outcome
+  - The fallback is transparent: `abstract_or_summary` in the returned dict reflects whichever source was used (extracted text or feed summary)
 ---

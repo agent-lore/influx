@@ -605,3 +605,134 @@ class TestEndToEndFixtureFeed:
         )
         # Archive download failed due to SSRF guard
         assert "influx:archive-missing" in result_strict["tags"]
+
+
+# ── AC-09-J: extraction fallback to feed summary ─────────────────────
+
+
+class _ShortArticleHandler(http.server.BaseHTTPRequestHandler):
+    """Serves an intentionally short HTML page (< min_web_chars)."""
+
+    def do_GET(self) -> None:
+        body = b"<html><body><p>Short.</p></body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(  # noqa: PLR6301
+        self,
+        format: str,  # noqa: A002
+        *args: object,
+    ) -> None:
+        pass
+
+
+class _LongArticleHandler(http.server.BaseHTTPRequestHandler):
+    """Serves a substantial HTML article (>= min_web_chars after extraction)."""
+
+    _BODY = (
+        "<html><head><title>Long Article</title></head><body><article>"
+        + "<h1>A Comprehensive Study</h1>"
+        + "".join(
+            f"<p>Paragraph {i}: This is a detailed passage of meaningful "
+            f"article content that provides substantial information about "
+            f"the topic at hand. The study examines multiple facets of the "
+            f"subject matter with rigorous methodology.</p>"
+            for i in range(20)
+        )
+        + "</article></body></html>"
+    )
+
+    def do_GET(self) -> None:
+        body = self._BODY.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(  # noqa: PLR6301
+        self,
+        format: str,  # noqa: A002
+        *args: object,
+    ) -> None:
+        pass
+
+
+@pytest.fixture(scope="module")
+def short_article_server() -> Generator[FakeArticleServer, None, None]:
+    srv = FakeArticleServer.__new__(FakeArticleServer)
+    srv._srv = http.server.HTTPServer(("127.0.0.1", 0), _ShortArticleHandler)
+    srv.port = srv._srv.server_address[1]
+    srv._thread = None
+    srv.start()
+    yield srv
+    srv.stop()
+
+
+@pytest.fixture(scope="module")
+def long_article_server() -> Generator[FakeArticleServer, None, None]:
+    srv = FakeArticleServer.__new__(FakeArticleServer)
+    srv._srv = http.server.HTTPServer(("127.0.0.1", 0), _LongArticleHandler)
+    srv.port = srv._srv.server_address[1]
+    srv._thread = None
+    srv.start()
+    yield srv
+    srv.stop()
+
+
+class TestExtractionFallbackToSummary:
+    """AC-09-J: extraction below min_web_chars falls back to feed summary."""
+
+    def test_short_article_uses_feed_summary(
+        self,
+        short_article_server: FakeArticleServer,
+        archive_dir: Path,
+    ) -> None:
+        """When the extracted article body is shorter than min_web_chars,
+        the feed item's <summary> is used as the note summary."""
+        feed_summary = (
+            "This is the feed summary from the RSS entry which should be "
+            "used when web extraction fails due to short article content."
+        )
+        config = _make_config(archive_dir=archive_dir)
+        item = _make_item(
+            url=f"{short_article_server.url}/thin-article",
+            summary=feed_summary,
+        )
+
+        result = build_rss_note_item(
+            item=item,
+            profile_name="test-profile",
+            config=config,
+        )
+
+        # Feed summary should be used, not the short extracted text
+        assert result["abstract_or_summary"] == feed_summary
+        assert feed_summary in result["content"]
+
+    def test_long_article_uses_extracted_text(
+        self,
+        long_article_server: FakeArticleServer,
+        archive_dir: Path,
+    ) -> None:
+        """When article extraction succeeds (>= min_web_chars), the extracted
+        text is used instead of the feed summary."""
+        feed_summary = "SHORT FEED SUMMARY MARKER"
+        config = _make_config(archive_dir=archive_dir)
+        item = _make_item(
+            url=f"{long_article_server.url}/full-article",
+            summary=feed_summary,
+        )
+
+        result = build_rss_note_item(
+            item=item,
+            profile_name="test-profile",
+            config=config,
+        )
+
+        # Extracted text should be used, not the feed summary
+        assert result["abstract_or_summary"] != feed_summary
+        assert len(result["abstract_or_summary"]) >= config.extraction.min_web_chars

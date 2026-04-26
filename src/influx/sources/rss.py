@@ -10,7 +10,10 @@ note paths, and ``source:*`` tags all agree.
 
 ``build_rss_note_item`` constructs a complete ``ProfileItem`` dict for the
 scheduler by downloading the article HTML via the guarded HTTP client
-(FR-SRC-5 / FR-RES-4) and archiving it on disk.
+(FR-SRC-5 / FR-RES-4) and archiving it on disk.  After archiving, the
+builder attempts web article extraction via ``extract_article``; when the
+extracted body is shorter than ``extraction.min_web_chars`` (or extraction
+fails), the feed item's ``<summary>`` is used instead (FR-ENR-3, AC-09-J).
 """
 
 from __future__ import annotations
@@ -24,6 +27,8 @@ from typing import TYPE_CHECKING, Any
 
 import feedparser
 
+from influx.errors import ExtractionError, NetworkError
+from influx.extraction.article import extract_article
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.slugs import slugify_feed_name
 from influx.storage import download_archive
@@ -178,6 +183,28 @@ def build_rss_note_item(
 
     archive_path = archive_result.rel_posix_path
 
+    # ── Article text extraction with summary fallback (FR-ENR-3) ────
+    # Attempt web article extraction; fall back to the feed item's
+    # <summary> when the extracted body is below min_web_chars or
+    # extraction fails entirely (AC-09-J).
+    summary = item.summary
+    try:
+        extraction = extract_article(
+            item.url,
+            min_web_chars=config.extraction.min_web_chars,
+            strip_tags=config.extraction.strip_tags,
+            allow_private_ips=config.security.allow_private_ips,
+            max_download_bytes=config.storage.max_download_bytes,
+            timeout_seconds=config.storage.download_timeout_seconds,
+        )
+        summary = extraction.text
+    except (ExtractionError, NetworkError) as exc:
+        _log.debug(
+            "Article extraction failed for %s, using feed summary: %s",
+            item.url,
+            exc,
+        )
+
     tags: list[str] = [
         f"profile:{profile_name}",
         f"source:{item.source_tag}",
@@ -209,7 +236,7 @@ def build_rss_note_item(
         tags=tags,
         confidence=0.0,
         archive_path=archive_path,
-        summary=item.summary,
+        summary=summary,
         keywords=[],
         profile_entries=profile_entries,
     )
@@ -224,5 +251,5 @@ def build_rss_note_item(
         "confidence": 0.0,
         "reason": "",
         "path": path,
-        "abstract_or_summary": item.summary,
+        "abstract_or_summary": summary,
     }
