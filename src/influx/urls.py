@@ -1,12 +1,14 @@
-"""Canonical URL normalisation helpers (FR-MCP-4, FR-MCP-5).
+"""Canonical URL normalisation and hashing helpers (FR-MCP-4, FR-MCP-5).
 
 Reused by the note renderer and the forthcoming MCP layer (PRD 05) so
 that arXiv and other sources agree on a single canonical ``source_url``
-shape.
+shape.  The ``url_hash`` helper provides a deterministic per-URL
+disambiguator for archive filenames (PRD 09 FR-ST-1).
 """
 
 from __future__ import annotations
 
+import hashlib
 from urllib.parse import urlparse, urlunparse
 
 # Non-``utm_*`` tracking query parameters stripped during normalisation.
@@ -70,6 +72,26 @@ def normalise_url(raw: str) -> str:
     query = _filter_tracking_params(parsed.query)
 
     return urlunparse((scheme, netloc, path, "", query, parsed.fragment))
+
+
+# ── URL hash for archive filename disambiguation ────────────────────
+
+_URL_HASH_LEN = 10
+
+
+def url_hash(source_url: str) -> str:
+    """Return a 10-char hex SHA-256 digest of the normalised *source_url*.
+
+    Used as the ``{url-hash}`` segment in RSS archive filenames
+    (PRD 09 FR-ST-1) to disambiguate items from the same feed published
+    on the same date.
+
+    The hash is computed over :func:`normalise_url` output so callers
+    operating on equivalent URLs always receive the same hash.
+    """
+    canonical = normalise_url(source_url)
+    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    return digest[:_URL_HASH_LEN]
 
 
 def _filter_tracking_params(raw_query: str) -> str:
