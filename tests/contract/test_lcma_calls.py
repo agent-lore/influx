@@ -275,9 +275,7 @@ class TestRetrieveHappyPath:
             )
             assert result is not None
             assert not result.isError
-            retrieve_calls = [
-                c for c in lcma_server.calls if c[0] == "lithos_retrieve"
-            ]
+            retrieve_calls = [c for c in lcma_server.calls if c[0] == "lithos_retrieve"]
             assert len(retrieve_calls) == 1
             assert retrieve_calls[0][1] == {
                 "query": "test query",
@@ -348,9 +346,7 @@ class TestEdgeUpsertHappyPath:
             )
             assert result is not None
             assert not result.isError
-            edge_calls = [
-                c for c in lcma_server.calls if c[0] == "lithos_edge_upsert"
-            ]
+            edge_calls = [c for c in lcma_server.calls if c[0] == "lithos_edge_upsert"]
             assert len(edge_calls) == 1
             assert edge_calls[0][1]["type"] == "related_to"
         finally:

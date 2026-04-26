@@ -275,6 +275,13 @@ class TestAfterWriteEdgeWiring:
 
         config = _make_config(fake_lithos_url)
 
+        # Override lithos_write so the response carries a note_id that
+        # the run path must thread through to edge_upsert as
+        # source_note_id (per finding 1).
+        fake_lithos.write_responses.append(
+            _json.dumps({"status": "created", "note_id": "note-source-001"})
+        )
+
         # Queue a retrieve response with one high-scoring result.
         fake_lithos.retrieve_responses.append(
             _json.dumps(
@@ -328,6 +335,12 @@ class TestAfterWriteEdgeWiring:
         assert evidence["kind"] == "lithos_retrieve"
         assert evidence["score"] == 0.85
         assert evidence["receipt_id"] == "rcpt-001"
+
+        # Verify graph endpoints are wired (finding 1):
+        # source_note_id from the just-written note,
+        # target_note_id from the retrieve result.
+        assert edge_calls[0]["source_note_id"] == "note-source-001"
+        assert edge_calls[0]["target_note_id"] == "note-related-001"
 
         # Verify the result carries related_in_lithos for webhook digest.
         assert result is not None
@@ -412,10 +425,15 @@ class TestBuildsOnResolver:
 
         config = _make_config(fake_lithos_url)
 
-        # Queue a retrieve response (from after_write).
-        fake_lithos.retrieve_responses.append(
-            _json.dumps({"results": []})
+        # Override lithos_write so the response carries a note_id that
+        # the run path must thread through to edge_upsert as
+        # source_note_id (per finding 1).
+        fake_lithos.write_responses.append(
+            _json.dumps({"status": "created", "note_id": "note-builds-source"})
         )
+
+        # Queue a retrieve response (from after_write).
+        fake_lithos.retrieve_responses.append(_json.dumps({"results": []}))
 
         # Queue a cache_lookup hit for the builds_on arXiv URL.
         # First cache_lookup is the per-item dedup check (miss).
@@ -424,12 +442,14 @@ class TestBuildsOnResolver:
         )
         # Second cache_lookup is the builds_on resolver (hit).
         fake_lithos.cache_lookup_responses.append(
-            _json.dumps({
-                "hit": True,
-                "source_url": "https://arxiv.org/abs/2412.12345",
-                "note_id": "note-foonet",
-                "title": "FooNet",
-            })
+            _json.dumps(
+                {
+                    "hit": True,
+                    "source_url": "https://arxiv.org/abs/2412.12345",
+                    "note_id": "note-foonet",
+                    "title": "FooNet",
+                }
+            )
         )
 
         items = [
@@ -465,9 +485,10 @@ class TestBuildsOnResolver:
         edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")
         builds_on_edges = [c for c in edge_calls if c["type"] == "builds_on"]
         assert len(builds_on_edges) == 1
-        assert builds_on_edges[0]["evidence"] == {
-            "kind": "tier3_builds_on_extraction"
-        }
+        assert builds_on_edges[0]["evidence"] == {"kind": "tier3_builds_on_extraction"}
+        # Graph endpoints are wired end-to-end (finding 1).
+        assert builds_on_edges[0]["source_note_id"] == "note-builds-source"
+        assert builds_on_edges[0]["target_note_id"] == "note-foonet"
 
     def test_cache_miss_produces_no_builds_on_edge(
         self,
@@ -480,9 +501,7 @@ class TestBuildsOnResolver:
         config = _make_config(fake_lithos_url)
 
         # Queue a retrieve response (from after_write).
-        fake_lithos.retrieve_responses.append(
-            _json.dumps({"results": []})
-        )
+        fake_lithos.retrieve_responses.append(_json.dumps({"results": []}))
 
         # Dedup cache_lookup (miss).
         fake_lithos.cache_lookup_responses.append(

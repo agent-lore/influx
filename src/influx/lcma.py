@@ -96,11 +96,17 @@ async def after_write(
     run_task_id: str,
     profile: str,
     lcma_edge_score: float,
+    source_note_id: str = "",
 ) -> list[dict[str, Any]]:
     """Retrieve related Lithos memory and upsert ``related_to`` edges.
 
     Called after every successful canonical note write (FR-LCMA-2,
     FR-LCMA-3, AC-M2-5, AC-M2-6).
+
+    *source_note_id* is the id of the note that was just written; it is
+    passed verbatim as ``source_note_id`` to each ``edge_upsert`` so a
+    real graph edge can be created (per finding 1).  Each retrieve
+    result contributes its own ``note_id`` as ``target_note_id``.
 
     Returns a list of ``{"title": str, "score": float}`` dicts for
     high-scoring results so the webhook digest can populate
@@ -125,6 +131,7 @@ async def after_write(
             continue
 
         receipt_id = r.get("receipt_id", "")
+        target_note_id = r.get("note_id", "")
         await client.edge_upsert(
             type="related_to",
             evidence={
@@ -132,6 +139,8 @@ async def after_write(
                 "score": score,
                 "receipt_id": receipt_id,
             },
+            source_note_id=source_note_id,
+            target_note_id=target_note_id,
         )
         related.append({"title": r.get("title", ""), "score": score})
 
@@ -145,6 +154,7 @@ async def resolve_builds_on(
     *,
     client: LithosClient,
     builds_on: list[str] | None = None,
+    source_note_id: str = "",
 ) -> None:
     """Resolve Tier 3 ``builds_on`` items via ``lithos_cache_lookup``.
 
@@ -153,6 +163,11 @@ async def resolve_builds_on(
     a ``builds_on`` edge only on an exact ``source_url`` match
     (FR-LCMA-4, AC-M2-7).  Items without an arXiv ID or without a
     matching cache entry are silently skipped (AC-M2-8).
+
+    *source_note_id* is the id of the note that was just written; the
+    cache-lookup hit supplies the prior note's id as
+    ``target_note_id``.  Both are forwarded to ``edge_upsert`` so a real
+    graph edge can be created (per finding 1).
     """
     if not builds_on:
         return
@@ -181,4 +196,6 @@ async def resolve_builds_on(
         await client.edge_upsert(
             type="builds_on",
             evidence={"kind": "tier3_builds_on_extraction"},
+            source_note_id=source_note_id,
+            target_note_id=body.get("note_id", ""),
         )

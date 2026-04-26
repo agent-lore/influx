@@ -63,11 +63,17 @@ class WriteResult:
     ``"version_conflict"`` when both retries exhausted (logged + skipped),
     ``"content_too_large_skipped"`` when content_too_large exhausted
     all trimming retries (logged + counted + skipped).
+
+    *note_id* carries the Lithos note id from the write envelope on
+    successful ``created`` / ``updated`` outcomes so the LCMA layer can
+    wire it as the ``source_note_id`` on subsequent ``edge_upsert``
+    calls (PRD 08 graph wiring).
     """
 
     status: str
     source_url: str
     detail: str = ""
+    note_id: str = ""
 
 
 # ── Pure helpers ────────────────────────────────────────────────────
@@ -590,7 +596,14 @@ class LithosClient:
                 source_url=source_url,
             )
 
-        return WriteResult(status=status, source_url=source_url)
+        # ``created`` / ``updated`` (and any other success-shaped
+        # envelope) carry a ``note_id`` that LCMA needs as the
+        # ``source_note_id`` on subsequent ``edge_upsert`` calls.
+        return WriteResult(
+            status=status,
+            source_url=source_url,
+            note_id=body.get("note_id", ""),
+        )
 
     async def list_notes(
         self,
@@ -650,10 +663,7 @@ class LithosClient:
             err = getattr(exc, "error", None)
             code = getattr(err, "code", None)
             message = getattr(err, "message", None) or str(exc)
-            if (
-                code == mcp_types.METHOD_NOT_FOUND
-                or _is_unknown_tool_message(message)
-            ):
+            if code == mcp_types.METHOD_NOT_FOUND or _is_unknown_tool_message(message):
                 raise LCMAError("unknown_tool", stage=name, detail=message) from exc
             raise LCMAError("call_failed", stage=name, detail=message) from exc
 

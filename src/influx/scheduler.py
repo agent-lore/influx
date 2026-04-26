@@ -163,17 +163,17 @@ async def run_profile(
         # PRD 09.
         run_task_id: str | None = None
         if kind != RunKind.BACKFILL:
+            run_date = datetime.now(UTC).date().isoformat()
+            task_title = f"Influx run {profile} {run_date}"
             try:
                 task_result = await client.task_create(
-                    title=f"Influx run {profile} {datetime.now(UTC).date().isoformat()}",
+                    title=task_title,
                     agent="influx",
                     tags=["influx:run", f"profile:{profile}"],
                 )
             except LCMAError as exc:
                 if str(exc) == "unknown_tool":
-                    _handle_lcma_unknown_tool(
-                        exc, fallback_tool="lithos_task_create"
-                    )
+                    _handle_lcma_unknown_tool(exc, fallback_tool="lithos_task_create")
                 raise
             task_body = json.loads(
                 task_result.content[0].text  # type: ignore[union-attr]
@@ -256,6 +256,11 @@ async def run_profile(
                     # ── LCMA post-write hook (FR-LCMA-2/3, AC-M2-5/6) ──
                     related_in_lithos: list[dict[str, Any]] = []
                     if run_task_id is not None:
+                        # The just-written note's id is plumbed through
+                        # so LCMA edges carry a real source endpoint
+                        # rather than an empty string (PRD 08 graph
+                        # wiring; see finding 1).
+                        source_note_id = write_result.note_id
                         related_in_lithos = await lcma_after_write(
                             client=client,
                             title=title,
@@ -265,11 +270,13 @@ async def run_profile(
                             lcma_edge_score=profile_cfg.thresholds.lcma_edge_score
                             if profile_cfg
                             else 0.75,
+                            source_note_id=source_note_id,
                         )
                         # ── Tier 3 builds_on resolver (FR-LCMA-4, AC-M2-7/8) ──
                         await lcma_resolve_builds_on(
                             client=client,
                             builds_on=item.get("builds_on"),
+                            source_note_id=source_note_id,
                         )
 
                     ingested.append(
@@ -288,9 +295,7 @@ async def run_profile(
             result = ProfileRunResult(
                 run_date=datetime.now(UTC).date().isoformat(),
                 profile=profile,
-                stats=RunStats(
-                    sources_checked=sources_checked, ingested=len(ingested)
-                ),
+                stats=RunStats(sources_checked=sources_checked, ingested=len(ingested)),
                 items=ingested,
             )
             # Lazy import to avoid the service ↔ scheduler import cycle.

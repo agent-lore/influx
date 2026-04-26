@@ -42,7 +42,6 @@ GOLDEN_CASES: list[tuple[str, str, list[str] | None, str]] = [
         "Paper C | A | B | C",
     ),
     # (case 5 — long-title truncation — covered in TestTruncation below)
-
     # AC-08-B: whitespace collapse
     ("AC-08-B-1: newlines collapsed", "hello\n\nworld", None, "hello world"),
     ("AC-08-B-2: tabs collapsed", "hello\t\tworld", None, "hello world"),
@@ -53,7 +52,6 @@ GOLDEN_CASES: list[tuple[str, str, list[str] | None, str]] = [
         ["first\n\ncontrib", "second  contrib"],
         "Title | first contrib | second contrib",
     ),
-
     # FR-LCMA-2 step 2: first up to 3 elements, trim, skip empties.
     (
         "FR-LCMA-2-a: empty string in first slot is skipped",
@@ -68,8 +66,7 @@ GOLDEN_CASES: list[tuple[str, str, list[str] | None, str]] = [
         "Title | Real",
     ),
     (
-        "FR-LCMA-2-c: empties WITHIN first 3 dropped, not replaced "
-        "by later entries",
+        "FR-LCMA-2-c: empties WITHIN first 3 dropped, not replaced by later entries",
         "Title",
         ["", "A", "", "B", "C", "D"],
         "Title | A",
