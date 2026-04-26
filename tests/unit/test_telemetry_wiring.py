@@ -1033,3 +1033,414 @@ class TestEnrichSpansDisabled:
         mock_tier1.assert_called_once()
         mock_tier3.assert_called_once()
         assert result["title"] == "Test Paper Title"
+
+
+# ── (7) influx.lithos.write span (US-006) ───────────────────────────────
+
+
+class TestInfluxLithosWriteSpan:
+    """US-006: Lithos writes emit an ``influx.lithos.write`` span."""
+
+    async def test_lithos_write_span_created_with_attributes(self) -> None:
+        """With OTEL enabled, each ``write_note`` call in the scheduler
+        emits an ``influx.lithos.write`` span with documented attrs."""
+        tracer, collected = _make_collecting_tracer()
+        config = _make_minimal_config()
+
+        # Mock write_note to return success
+        mock_write_result = MagicMock()
+        mock_write_result.status = "created"
+        mock_write_result.note_id = "note-123"
+
+        # Mock cache lookup returning no hit
+        mock_cache_result = MagicMock()
+        mock_cache_result.content = [MagicMock(text='{"hit": false}')]
+
+        # Fake item provider returning one item
+        async def fake_provider(
+            profile: str, kind: Any, run_range: Any, prompt: str
+        ) -> list[dict[str, Any]]:
+            return [
+                {
+                    "title": "Test Note",
+                    "source_url": "https://example.com/paper",
+                    "content": "Content",
+                    "tags": ["cs.AI"],
+                    "confidence": 0.9,
+                    "path": "test/path",
+                    "score": 8,
+                }
+            ]
+
+        # Exercise the actual write span by calling run_profile with
+        # patches that exercise the write path
+        token = current_run_id.set("test-run-write")
+        try:
+            with (
+                patch("influx.scheduler.get_tracer", return_value=tracer),
+                patch(
+                    "influx.scheduler.LithosClient"
+                ) as mock_client_cls,
+                patch(
+                    "influx.scheduler.build_negative_examples_block",
+                    new_callable=AsyncMock,
+                    return_value="",
+                ),
+                patch(
+                    "influx.scheduler.repair_sweep",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "influx.scheduler.lcma_after_write",
+                    new_callable=AsyncMock,
+                    return_value=[],
+                ),
+                patch(
+                    "influx.scheduler.lcma_resolve_builds_on",
+                    new_callable=AsyncMock,
+                ),
+                patch("influx.service.post_run_webhook_hook"),
+            ):
+                mock_client = AsyncMock()
+                mock_client_cls.return_value = mock_client
+                # task_create returns a task_id
+                mock_client.task_create.return_value = MagicMock(
+                    content=[MagicMock(text='{"task_id": "task-1"}')]
+                )
+                mock_client.cache_lookup_for_item.return_value = mock_cache_result
+                mock_client.write_note.return_value = mock_write_result
+                mock_client.close = AsyncMock()
+                mock_client.task_complete = AsyncMock()
+
+                from influx.scheduler import run_profile
+
+                await run_profile(
+                    "ai-robotics",
+                    RunKind.SCHEDULED,
+                    config=config,
+                    item_provider=fake_provider,
+                )
+        finally:
+            current_run_id.reset(token)
+
+        write_spans = [s for s in collected if s.name == "influx.lithos.write"]
+        assert len(write_spans) >= 1
+        attrs = write_spans[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "ai-robotics"
+        assert "influx.run_id" in attrs
+
+    async def test_lithos_write_no_span_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With OTEL disabled, ``write_note`` still works without spans."""
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "false")
+        disabled_tracer = get_tracer(force_rebuild=True)
+        assert not disabled_tracer.enabled
+
+        config = _make_minimal_config()
+
+        mock_write_result = MagicMock()
+        mock_write_result.status = "created"
+        mock_write_result.note_id = "note-456"
+
+        mock_cache_result = MagicMock()
+        mock_cache_result.content = [MagicMock(text='{"hit": false}')]
+
+        async def fake_provider(
+            profile: str, kind: Any, run_range: Any, prompt: str
+        ) -> list[dict[str, Any]]:
+            return [
+                {
+                    "title": "Test Note",
+                    "source_url": "https://example.com/paper",
+                    "content": "Content",
+                    "tags": ["cs.AI"],
+                    "confidence": 0.9,
+                    "path": "test/path",
+                    "score": 8,
+                }
+            ]
+
+        with (
+            patch("influx.scheduler.get_tracer", return_value=disabled_tracer),
+            patch("influx.scheduler.LithosClient") as mock_client_cls,
+            patch(
+                "influx.scheduler.build_negative_examples_block",
+                new_callable=AsyncMock,
+                return_value="",
+            ),
+            patch("influx.scheduler.repair_sweep", new_callable=AsyncMock),
+            patch(
+                "influx.scheduler.lcma_after_write",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch("influx.scheduler.lcma_resolve_builds_on", new_callable=AsyncMock),
+            patch("influx.service.post_run_webhook_hook"),
+        ):
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+            mock_client.task_create.return_value = MagicMock(
+                content=[MagicMock(text='{"task_id": "task-1"}')]
+            )
+            mock_client.cache_lookup_for_item.return_value = mock_cache_result
+            mock_client.write_note.return_value = mock_write_result
+            mock_client.close = AsyncMock()
+            mock_client.task_complete = AsyncMock()
+
+            from influx.scheduler import run_profile
+
+            await run_profile(
+                "ai-robotics",
+                RunKind.SCHEDULED,
+                config=config,
+                item_provider=fake_provider,
+            )
+
+        # The write still happened
+        mock_client.write_note.assert_awaited_once()
+
+
+# ── (8) influx.lithos.retrieve span (US-006) ────────────────────────────
+
+
+class TestInfluxLithosRetrieveSpan:
+    """US-006: Lithos retrieves emit an ``influx.lithos.retrieve`` span."""
+
+    async def test_lithos_retrieve_span_created_with_attributes(self) -> None:
+        """With OTEL enabled, ``lcma.after_write`` emits an
+        ``influx.lithos.retrieve`` span with documented attrs."""
+        tracer, collected = _make_collecting_tracer()
+
+        # Mock the LithosClient
+        mock_client = AsyncMock()
+        mock_client.retrieve.return_value = MagicMock(
+            content=[MagicMock(text='{"results": []}')]
+        )
+
+        token = current_run_id.set("test-run-retrieve")
+        try:
+            with patch("influx.lcma.get_tracer", return_value=tracer):
+                from influx.lcma import after_write
+
+                await after_write(
+                    client=mock_client,
+                    title="Test Paper",
+                    contributions=["contrib 1"],
+                    run_task_id="task-1",
+                    profile="ai-robotics",
+                    lcma_edge_score=0.75,
+                    source_note_id="note-1",
+                )
+        finally:
+            current_run_id.reset(token)
+
+        retrieve_spans = [s for s in collected if s.name == "influx.lithos.retrieve"]
+        assert len(retrieve_spans) == 1
+        attrs = retrieve_spans[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "ai-robotics"
+        assert attrs.get("influx.run_id") == "test-run-retrieve"
+
+    async def test_lithos_retrieve_no_span_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With OTEL disabled, ``lcma.after_write`` still works without spans."""
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "false")
+        disabled_tracer = get_tracer(force_rebuild=True)
+        assert not disabled_tracer.enabled
+
+        mock_client = AsyncMock()
+        mock_client.retrieve.return_value = MagicMock(
+            content=[MagicMock(text='{"results": []}')]
+        )
+
+        with patch("influx.lcma.get_tracer", return_value=disabled_tracer):
+            from influx.lcma import after_write
+
+            await after_write(
+                client=mock_client,
+                title="Test Paper",
+                contributions=["contrib 1"],
+                run_task_id="task-1",
+                profile="ai-robotics",
+                lcma_edge_score=0.75,
+                source_note_id="note-1",
+            )
+
+        # Retrieve still happened
+        mock_client.retrieve.assert_awaited_once()
+
+
+# ── (9) influx.archive.download span (US-006) ───────────────────────────
+
+
+class TestInfluxArchiveDownloadSpan:
+    """US-006: archive downloads emit an ``influx.archive.download`` span."""
+
+    def test_archive_download_span_created_with_attributes(self) -> None:
+        """With OTEL enabled, ``build_rss_note_item`` emits an
+        ``influx.archive.download`` span carrying ``influx.profile``,
+        ``influx.run_id``, ``influx.source``."""
+        from influx.sources.rss import RssFeedItem, build_rss_note_item
+        from influx.storage import ArchiveResult
+
+        tracer, collected = _make_collecting_tracer()
+
+        from datetime import UTC, datetime
+
+        from influx.config import (
+            AppConfig,
+            ProfileConfig,
+            ProfileSources,
+            PromptEntryConfig,
+            PromptsConfig,
+            RssSourceEntry,
+            ScheduleConfig,
+        )
+
+        rss_entry = RssSourceEntry(
+            name="Test Blog",
+            url="https://example.com/feed.xml",
+            source_tag="blog",
+        )
+        config = AppConfig(
+            schedule=ScheduleConfig(
+                cron="0 6 * * *",
+                timezone="UTC",
+                misfire_grace_seconds=3600,
+            ),
+            profiles=[
+                ProfileConfig(
+                    name="ai-robotics",
+                    sources=ProfileSources(rss=[rss_entry]),
+                ),
+            ],
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="test"),
+                tier1_enrich=PromptEntryConfig(text="test"),
+                tier3_extract=PromptEntryConfig(text="test"),
+            ),
+        )
+
+        rss_item = RssFeedItem(
+            title="Blog Post",
+            url="https://example.com/post-1",
+            published=datetime(2024, 6, 15, tzinfo=UTC),
+            summary="Post summary",
+            source_tag="blog",
+            feed_name="Test Blog",
+        )
+
+        token = current_run_id.set("test-run-archive")
+        try:
+            with (
+                patch("influx.sources.rss.get_tracer", return_value=tracer),
+                patch(
+                    "influx.sources.rss.download_archive",
+                    return_value=ArchiveResult(
+                        ok=True,
+                        rel_posix_path="blog/2024/06/test.html",
+                        error="",
+                    ),
+                ),
+                patch(
+                    "influx.sources.rss.extract_article",
+                    return_value=MagicMock(text="Extracted text", source_tag="html"),
+                ),
+            ):
+                build_rss_note_item(
+                    item=rss_item,
+                    profile_name="ai-robotics",
+                    config=config,
+                )
+        finally:
+            current_run_id.reset(token)
+
+        archive_spans = [s for s in collected if s.name == "influx.archive.download"]
+        assert len(archive_spans) == 1
+        attrs = archive_spans[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "ai-robotics"
+        assert attrs.get("influx.run_id") == "test-run-archive"
+        assert attrs.get("influx.source") == "blog"
+
+    def test_archive_download_no_span_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With OTEL disabled, ``build_rss_note_item`` still downloads without spans."""
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "false")
+        disabled_tracer = get_tracer(force_rebuild=True)
+        assert not disabled_tracer.enabled
+
+        from datetime import UTC, datetime
+
+        from influx.config import (
+            AppConfig,
+            ProfileConfig,
+            ProfileSources,
+            PromptEntryConfig,
+            PromptsConfig,
+            RssSourceEntry,
+            ScheduleConfig,
+        )
+        from influx.sources.rss import RssFeedItem, build_rss_note_item
+        from influx.storage import ArchiveResult
+
+        rss_entry = RssSourceEntry(
+            name="Test Blog",
+            url="https://example.com/feed.xml",
+            source_tag="blog",
+        )
+        config = AppConfig(
+            schedule=ScheduleConfig(
+                cron="0 6 * * *",
+                timezone="UTC",
+                misfire_grace_seconds=3600,
+            ),
+            profiles=[
+                ProfileConfig(
+                    name="ai-robotics",
+                    sources=ProfileSources(rss=[rss_entry]),
+                ),
+            ],
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="test"),
+                tier1_enrich=PromptEntryConfig(text="test"),
+                tier3_extract=PromptEntryConfig(text="test"),
+            ),
+        )
+
+        rss_item = RssFeedItem(
+            title="Blog Post",
+            url="https://example.com/post-1",
+            published=datetime(2024, 6, 15, tzinfo=UTC),
+            summary="Post summary",
+            source_tag="blog",
+            feed_name="Test Blog",
+        )
+
+        with (
+            patch("influx.sources.rss.get_tracer", return_value=disabled_tracer),
+            patch(
+                "influx.sources.rss.download_archive",
+                return_value=ArchiveResult(
+                    ok=True,
+                    rel_posix_path="blog/2024/06/test.html",
+                    error="",
+                ),
+            ) as mock_download,
+            patch(
+                "influx.sources.rss.extract_article",
+                return_value=MagicMock(text="Extracted text", source_tag="html"),
+            ),
+        ):
+            build_rss_note_item(
+                item=rss_item,
+                profile_name="ai-robotics",
+                config=config,
+            )
+
+        # Download still happened
+        mock_download.assert_called_once()

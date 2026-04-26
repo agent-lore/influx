@@ -11,6 +11,8 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from influx.telemetry import current_run_id, get_tracer
+
 if TYPE_CHECKING:
     from influx.lithos_client import LithosClient
 
@@ -113,13 +115,21 @@ async def after_write(
     ``related_in_lithos`` (FR-NOT-6, AC-08-F).
     """
     query = compose_retrieve_query(title, contributions)
-    result = await client.retrieve(
-        query=query,
-        limit=5,
-        agent_id="influx",
-        task_id=run_task_id,
-        tags=[f"profile:{profile}"],
-    )
+    tracer = get_tracer()
+    with tracer.span(
+        "influx.lithos.retrieve",
+        attributes={
+            "influx.profile": profile,
+            "influx.run_id": current_run_id.get() or "",
+        },
+    ):
+        result = await client.retrieve(
+            query=query,
+            limit=5,
+            agent_id="influx",
+            task_id=run_task_id,
+            tags=[f"profile:{profile}"],
+        )
 
     body = json.loads(result.content[0].text)  # type: ignore[union-attr]
     results: list[dict[str, Any]] = body.get("results", [])

@@ -294,14 +294,22 @@ async def _run_profile_body(
                     # US-005: multi-profile merge — still attempt a write
                     # so that version_conflict handling merges profile tags
                     # and Profile Relevance entries from the existing note.
-                    write_result = await client.write_note(
-                        title=title,
-                        content=item.get("content", ""),
-                        path=item.get("path", ""),
-                        source_url=source_url,
-                        tags=list(item.get("tags", [])),
-                        confidence=float(item.get("confidence", 0.0)),
-                    )
+                    tracer = get_tracer()
+                    with tracer.span(
+                        "influx.lithos.write",
+                        attributes={
+                            "influx.profile": profile,
+                            "influx.run_id": current_run_id.get() or "",
+                        },
+                    ):
+                        write_result = await client.write_note(
+                            title=title,
+                            content=item.get("content", ""),
+                            path=item.get("path", ""),
+                            source_url=source_url,
+                            tags=list(item.get("tags", [])),
+                            confidence=float(item.get("confidence", 0.0)),
+                        )
                     if write_result.status in ("created", "updated"):
                         ingested.append(
                             HighlightItem(
@@ -316,14 +324,22 @@ async def _run_profile_body(
                         )
                     continue
 
-                write_result = await client.write_note(
-                    title=title,
-                    content=item.get("content", ""),
-                    path=item.get("path", ""),
-                    source_url=source_url,
-                    tags=list(item.get("tags", [])),
-                    confidence=float(item.get("confidence", 0.0)),
-                )
+                tracer = get_tracer()
+                with tracer.span(
+                    "influx.lithos.write",
+                    attributes={
+                        "influx.profile": profile,
+                        "influx.run_id": current_run_id.get() or "",
+                    },
+                ):
+                    write_result = await client.write_note(
+                        title=title,
+                        content=item.get("content", ""),
+                        path=item.get("path", ""),
+                        source_url=source_url,
+                        tags=list(item.get("tags", [])),
+                        confidence=float(item.get("confidence", 0.0)),
+                    )
                 if write_result.status in ("created", "updated"):
                     # ── LCMA post-write hook (FR-LCMA-2/3, AC-M2-5/6) ──
                     related_in_lithos: list[dict[str, Any]] = []

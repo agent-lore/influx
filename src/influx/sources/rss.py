@@ -179,19 +179,28 @@ def build_rss_note_item(
     archive_root = Path(config.storage.archive_dir)
 
     # Download and archive the article HTML (FR-SRC-5 / FR-RES-4).
-    archive_result = download_archive(
-        url=item.url,
-        archive_root=archive_root,
-        source=item.source_tag,
-        item_id=item_id,
-        published_year=pub.year,
-        published_month=pub.month,
-        ext=".html",
-        allow_private_ips=config.security.allow_private_ips,
-        max_download_bytes=config.storage.max_download_bytes,
-        timeout_seconds=config.storage.download_timeout_seconds,
-        expected_content_type="html",
-    )
+    tracer = get_tracer()
+    with tracer.span(
+        "influx.archive.download",
+        attributes={
+            "influx.profile": profile_name,
+            "influx.run_id": current_run_id.get() or "",
+            "influx.source": item.source_tag,
+        },
+    ):
+        archive_result = download_archive(
+            url=item.url,
+            archive_root=archive_root,
+            source=item.source_tag,
+            item_id=item_id,
+            published_year=pub.year,
+            published_month=pub.month,
+            ext=".html",
+            allow_private_ips=config.security.allow_private_ips,
+            max_download_bytes=config.storage.max_download_bytes,
+            timeout_seconds=config.storage.download_timeout_seconds,
+            expected_content_type="html",
+        )
 
     archive_path = archive_result.rel_posix_path
 
