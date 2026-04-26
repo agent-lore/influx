@@ -35,6 +35,7 @@ from influx.http_client import guarded_fetch as _guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.slugs import slugify_feed_name
 from influx.storage import download_archive
+from influx.telemetry import current_run_id, get_tracer
 from influx.urls import normalise_url, url_hash
 
 if TYPE_CHECKING:
@@ -302,17 +303,28 @@ def make_rss_item_provider(
         if profile_cfg is None:
             return ()
 
-        results: list[dict[str, Any]] = []
-        for feed_entry in profile_cfg.sources.rss:
-            items = await _fetch_rss_feed(feed_entry, cache)
-            for item in items:
-                results.append(
-                    build_rss_note_item(
-                        item=item,
-                        profile_name=profile,
-                        config=config,
+        # ── Telemetry: influx.fetch.rss span (FR-OBS-4) ──
+        _tracer = get_tracer()
+        with _tracer.span(
+            "influx.fetch.rss",
+            attributes={
+                "influx.profile": profile,
+                "influx.run_id": current_run_id.get() or "",
+                "influx.source": "rss",
+            },
+        ) as fetch_span:
+            results: list[dict[str, Any]] = []
+            for feed_entry in profile_cfg.sources.rss:
+                items = await _fetch_rss_feed(feed_entry, cache)
+                for item in items:
+                    results.append(
+                        build_rss_note_item(
+                            item=item,
+                            profile_name=profile,
+                            config=config,
+                        )
                     )
-                )
+            fetch_span.set_attribute("influx.item_count", len(results))
 
         return results
 

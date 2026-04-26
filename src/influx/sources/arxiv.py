@@ -793,18 +793,29 @@ def make_arxiv_item_provider(
                 current = current + timedelta(days=1)
             return collected
 
-        try:
-            if cache is not None:
-                items = await cache.get_or_fetch(cache_key, _do_fetch)
-            else:
-                items = await _do_fetch()
-        except NetworkError:
-            _log.warning(
-                "arxiv fetch failed for profile %r; yielding zero items",
-                profile,
-                exc_info=True,
-            )
-            return ()
+        # ── Telemetry: influx.fetch.arxiv span (FR-OBS-4) ──
+        _tracer = get_tracer()
+        with _tracer.span(
+            "influx.fetch.arxiv",
+            attributes={
+                "influx.profile": profile,
+                "influx.run_id": current_run_id.get() or "",
+                "influx.source": "arxiv",
+            },
+        ) as fetch_span:
+            try:
+                if cache is not None:
+                    items = await cache.get_or_fetch(cache_key, _do_fetch)
+                else:
+                    items = await _do_fetch()
+            except NetworkError:
+                _log.warning(
+                    "arxiv fetch failed for profile %r; yielding zero items",
+                    profile,
+                    exc_info=True,
+                )
+                return ()
+            fetch_span.set_attribute("influx.item_count", len(items))
 
         # Batched LLM filter takes precedence as the production default.
         # The per-item ``scorer`` seam stays available for tests that

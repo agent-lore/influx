@@ -16,6 +16,7 @@ Started: Sun Apr 26 17:50:45 UTC 2026
 - `current_run_id` ContextVar in `telemetry.py` — set by `run_profile()`, read by downstream span sites (filter, fetchers) for `influx.run_id` attribute
 - `ArxivItem` fields: `arxiv_id`, `title`, `abstract`, `published` (datetime), `categories` — no `authors`, `updated`, `pdf_url`
 - `fetch_arxiv` is synchronous — mock with `MagicMock`, not `AsyncMock`
+- Fetch/storage spans belong at the provider level (inside `make_*_item_provider`) where `profile` is available, not in raw fetch functions
 
 ---
 
@@ -58,4 +59,17 @@ Started: Sun Apr 26 17:50:45 UTC 2026
   - When testing `run_profile()` span wiring, patch `_run_profile_body` as `AsyncMock(return_value=None)` to skip Lithos interactions.
   - `fetch_arxiv` is synchronous — always use `MagicMock`, not `AsyncMock`, when mocking it.
   - `ArxivItem` is a frozen dataclass with only 5 fields: `arxiv_id`, `title`, `abstract`, `published` (datetime), `categories`.
+---
+
+## 2026-04-26 - US-004
+- Wired telemetry spans into source fetchers: `influx.fetch.arxiv` and `influx.fetch.rss`
+- Files changed:
+  - `src/influx/sources/arxiv.py` — wrapped fetch+cache block in `make_arxiv_item_provider` with `influx.fetch.arxiv` span; sets `influx.item_count` after fetch completes
+  - `src/influx/sources/rss.py` — added telemetry imports; wrapped RSS feed loop in `make_rss_item_provider` with `influx.fetch.rss` span; sets `influx.item_count` after all feeds processed
+  - `tests/unit/test_telemetry_wiring.py` — 4 new tests (11 total): fetch.arxiv span + attributes, fetch.rss span + attributes, OTEL-disabled regression for both
+- **Learnings for future iterations:**
+  - Fetch spans are best placed at the provider level (inside `make_*_item_provider`) where `profile` is available, not inside the raw `fetch_arxiv()`/`_fetch_rss_feed()` functions which lack profile context
+  - `influx.item_count` must be set after the fetch completes (via `fetch_span.set_attribute()`) since the count isn't known at span creation
+  - RSS imports must be in alphabetical order by module path — `influx.telemetry` sorts after `influx.storage`
+  - `_fetch_rss_feed` is async — use `AsyncMock` when patching it in tests
 ---

@@ -412,3 +412,295 @@ class TestOtelDisabledNoSpans:
                 await fake_scorer(items, "test", "prompt")
 
         assert scorer_called
+
+
+# ── (4) influx.fetch.arxiv span with documented attributes (US-004) ──────
+
+
+class TestInfluxFetchArxivSpan:
+    """US-004: the arXiv fetch emits an ``influx.fetch.arxiv`` span."""
+
+    async def test_fetch_arxiv_span_created_with_attributes(self) -> None:
+        """With OTEL enabled, the arXiv provider emits an ``influx.fetch.arxiv``
+        span carrying ``influx.profile``, ``influx.run_id``, ``influx.source``,
+        ``influx.item_count``."""
+        from datetime import UTC, datetime
+
+        from influx.sources.arxiv import (
+            ArxivItem,
+            ArxivScoreResult,
+            make_arxiv_item_provider,
+        )
+
+        tracer, collected = _make_collecting_tracer()
+        config = _make_minimal_config()
+
+        test_items = [
+            ArxivItem(
+                arxiv_id="2401.00001",
+                title="Test Paper",
+                abstract="Abstract text",
+                published=datetime(2024, 1, 1, tzinfo=UTC),
+                categories=["cs.AI"],
+            ),
+            ArxivItem(
+                arxiv_id="2401.00002",
+                title="Test Paper 2",
+                abstract="Abstract text 2",
+                published=datetime(2024, 1, 2, tzinfo=UTC),
+                categories=["cs.RO"],
+            ),
+        ]
+
+        # Deterministic scorer to avoid filter_scorer interactions
+        def simple_scorer(item: Any, profile: str) -> ArxivScoreResult:
+            return ArxivScoreResult(score=5, confidence=0.8, reason="test")
+
+        token = current_run_id.set("test-run-fetch-arxiv")
+        try:
+            provider = make_arxiv_item_provider(config, scorer=simple_scorer)
+
+            with (
+                patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch(
+                    "influx.sources.arxiv.fetch_arxiv",
+                    return_value=test_items,
+                ),
+                patch("influx.sources.arxiv.build_arxiv_note_item", return_value={
+                    "title": "t", "source_url": "u", "content": "c",
+                    "tags": [], "score": 5, "confidence": 0.8,
+                }),
+            ):
+                result = await provider(
+                    "ai-robotics", RunKind.SCHEDULED, None, "prompt"
+                )
+                list(result)
+        finally:
+            current_run_id.reset(token)
+
+        fetch_spans = [s for s in collected if s.name == "influx.fetch.arxiv"]
+        assert len(fetch_spans) == 1
+        attrs = fetch_spans[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "ai-robotics"
+        assert attrs.get("influx.run_id") == "test-run-fetch-arxiv"
+        assert attrs.get("influx.source") == "arxiv"
+        assert attrs.get("influx.item_count") == 2
+
+    async def test_fetch_arxiv_no_span_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With OTEL disabled, the arXiv fetch creates no spans (AC-10-A)."""
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "false")
+        disabled_tracer = get_tracer(force_rebuild=True)
+        assert not disabled_tracer.enabled
+
+        from datetime import UTC, datetime
+
+        from influx.sources.arxiv import (
+            ArxivItem,
+            ArxivScoreResult,
+            make_arxiv_item_provider,
+        )
+
+        config = _make_minimal_config()
+
+        test_items = [
+            ArxivItem(
+                arxiv_id="2401.00001",
+                title="Test Paper",
+                abstract="Abstract",
+                published=datetime(2024, 1, 1, tzinfo=UTC),
+                categories=["cs.AI"],
+            ),
+        ]
+
+        def simple_scorer(item: Any, profile: str) -> ArxivScoreResult:
+            return ArxivScoreResult(score=5, confidence=0.8, reason="test")
+
+        provider = make_arxiv_item_provider(config, scorer=simple_scorer)
+
+        with (
+            patch("influx.sources.arxiv.get_tracer", return_value=disabled_tracer),
+            patch("influx.sources.arxiv.fetch_arxiv", return_value=test_items),
+            patch("influx.sources.arxiv.build_arxiv_note_item", return_value={
+                "title": "t", "source_url": "u", "content": "c",
+                "tags": [], "score": 5, "confidence": 0.8,
+            }),
+        ):
+            result = await provider(
+                "ai-robotics", RunKind.SCHEDULED, None, "prompt"
+            )
+            items = list(result)
+            # The fetch still works — items are returned
+            assert len(items) == 1
+
+
+# ── (5) influx.fetch.rss span with documented attributes (US-004) ────────
+
+
+class TestInfluxFetchRssSpan:
+    """US-004: the RSS fetch emits an ``influx.fetch.rss`` span."""
+
+    async def test_fetch_rss_span_created_with_attributes(self) -> None:
+        """With OTEL enabled, the RSS provider emits an ``influx.fetch.rss``
+        span carrying ``influx.profile``, ``influx.run_id``, ``influx.source``,
+        ``influx.item_count``."""
+        from influx.config import (
+            AppConfig,
+            ProfileConfig,
+            ProfileSources,
+            PromptEntryConfig,
+            PromptsConfig,
+            RssSourceEntry,
+            ScheduleConfig,
+        )
+        from influx.sources.rss import RssFeedItem, make_rss_item_provider
+
+        tracer, collected = _make_collecting_tracer()
+
+        rss_entry = RssSourceEntry(
+            name="Test Blog",
+            url="https://example.com/feed.xml",
+            source_tag="blog",
+        )
+        config = AppConfig(
+            schedule=ScheduleConfig(
+                cron="0 6 * * *",
+                timezone="UTC",
+                misfire_grace_seconds=3600,
+            ),
+            profiles=[
+                ProfileConfig(
+                    name="ai-robotics",
+                    sources=ProfileSources(rss=[rss_entry]),
+                ),
+            ],
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="test"),
+                tier1_enrich=PromptEntryConfig(text="test"),
+                tier3_extract=PromptEntryConfig(text="test"),
+            ),
+        )
+
+        from datetime import UTC, datetime
+
+        test_items = [
+            RssFeedItem(
+                title="Blog Post 1",
+                url="https://example.com/post-1",
+                published=datetime(2024, 1, 1, tzinfo=UTC),
+                summary="Summary 1",
+                source_tag="blog",
+                feed_name="Test Blog",
+            ),
+        ]
+
+        token = current_run_id.set("test-run-fetch-rss")
+        try:
+            provider = make_rss_item_provider(config)
+
+            with (
+                patch("influx.sources.rss.get_tracer", return_value=tracer),
+                patch(
+                    "influx.sources.rss._fetch_rss_feed",
+                    new_callable=AsyncMock,
+                    return_value=test_items,
+                ),
+                patch("influx.sources.rss.build_rss_note_item", return_value={
+                    "title": "t", "source_url": "u", "content": "c",
+                    "tags": [], "score": 0, "confidence": 0.0,
+                }),
+            ):
+                result = await provider(
+                    "ai-robotics", RunKind.SCHEDULED, None, "prompt"
+                )
+                list(result)
+        finally:
+            current_run_id.reset(token)
+
+        fetch_spans = [s for s in collected if s.name == "influx.fetch.rss"]
+        assert len(fetch_spans) == 1
+        attrs = fetch_spans[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "ai-robotics"
+        assert attrs.get("influx.run_id") == "test-run-fetch-rss"
+        assert attrs.get("influx.source") == "rss"
+        assert attrs.get("influx.item_count") == 1
+
+    async def test_fetch_rss_no_span_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With OTEL disabled, the RSS fetch creates no spans (AC-10-A)."""
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "false")
+        disabled_tracer = get_tracer(force_rebuild=True)
+        assert not disabled_tracer.enabled
+
+        from influx.config import (
+            AppConfig,
+            ProfileConfig,
+            ProfileSources,
+            PromptEntryConfig,
+            PromptsConfig,
+            RssSourceEntry,
+            ScheduleConfig,
+        )
+        from influx.sources.rss import RssFeedItem, make_rss_item_provider
+
+        rss_entry = RssSourceEntry(
+            name="Test Blog",
+            url="https://example.com/feed.xml",
+            source_tag="blog",
+        )
+        config = AppConfig(
+            schedule=ScheduleConfig(
+                cron="0 6 * * *",
+                timezone="UTC",
+                misfire_grace_seconds=3600,
+            ),
+            profiles=[
+                ProfileConfig(
+                    name="ai-robotics",
+                    sources=ProfileSources(rss=[rss_entry]),
+                ),
+            ],
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="test"),
+                tier1_enrich=PromptEntryConfig(text="test"),
+                tier3_extract=PromptEntryConfig(text="test"),
+            ),
+        )
+
+        from datetime import UTC, datetime
+
+        test_items = [
+            RssFeedItem(
+                title="Blog Post 1",
+                url="https://example.com/post-1",
+                published=datetime(2024, 1, 1, tzinfo=UTC),
+                summary="Summary 1",
+                source_tag="blog",
+                feed_name="Test Blog",
+            ),
+        ]
+
+        provider = make_rss_item_provider(config)
+
+        with (
+            patch("influx.sources.rss.get_tracer", return_value=disabled_tracer),
+            patch(
+                "influx.sources.rss._fetch_rss_feed",
+                new_callable=AsyncMock,
+                return_value=test_items,
+            ),
+            patch("influx.sources.rss.build_rss_note_item", return_value={
+                "title": "t", "source_url": "u", "content": "c",
+                "tags": [], "score": 0, "confidence": 0.0,
+            }),
+        ):
+            result = await provider(
+                "ai-robotics", RunKind.SCHEDULED, None, "prompt"
+            )
+            items = list(result)
+            # The fetch still works — items are returned
+            assert len(items) == 1
