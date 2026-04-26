@@ -81,9 +81,10 @@ class TestJobRegistration:
             sched.stop()
 
     async def test_job_settings_max_instances_coalesce_misfire(self) -> None:
-        """Tick dispatcher allows overlapping instances so tick N+1 is not
-        blocked by a slow tick N; same-profile non-overlap stays enforced
-        by the coordinator (review finding)."""
+        """The cron-registered callable is the thin dispatcher, not the
+        fan-out itself.  The dispatcher returns immediately, so APScheduler
+        never gates a slow tick; same-profile non-overlap is enforced
+        solely by the coordinator (review finding)."""
         config = _make_config(profiles=["alpha"], misfire_grace_seconds=7200)
         coord = Coordinator()
         sched = InfluxScheduler(config, coord)
@@ -91,7 +92,8 @@ class TestJobRegistration:
         try:
             job = sched.jobs[0]
             assert job.id == "influx-tick"
-            assert job.max_instances >= 2
+            # Cron fires the thin dispatcher, NOT the fan-out body.
+            assert job.func is sched._cron_dispatch
             assert job.coalesce is True
             assert job.misfire_grace_time == 7200
         finally:
@@ -239,6 +241,69 @@ class TestTickOverlapDoesNotBlockUnrelatedProfiles:
 
         assert coord.is_busy("alpha") is False
         assert coord.is_busy("beta") is False
+
+    async def test_cron_dispatch_returns_immediately_and_tracks_task(
+        self,
+    ) -> None:
+        """``_cron_dispatch`` is a thin dispatcher: it spawns the fan-out
+        task on ``active_tasks`` and returns.  Even with many overlapping
+        ticks, no APScheduler instance slot is held for the fan-out — so
+        only the coordinator gates same-profile non-overlap (review finding).
+        """
+        config = _make_config(profiles=["alpha", "beta", "gamma"])
+        coord = Coordinator()
+        active_tasks: set[asyncio.Task[Any]] = set()
+        sched = InfluxScheduler(config, coord, active_tasks=active_tasks)
+
+        # Pre-acquire alpha externally so EVERY tick's alpha sub-task
+        # must be skipped via ProfileBusyError.  This proves the
+        # coordinator — not APScheduler — is the gate: if APScheduler
+        # were limiting overlap (e.g. ``max_instances`` saturating),
+        # tick 3+ would not even reach the coordinator and beta/gamma
+        # in those ticks would never run.
+        assert await coord.try_acquire("alpha") is True
+
+        started: list[str] = []
+
+        async def fast_run(
+            profile: str, kind: Any, run_range: Any = None, **_: Any
+        ) -> None:
+            started.append(profile)
+
+        try:
+            with patch("influx.scheduler.run_profile", side_effect=fast_run):
+                # Fire FIVE overlapping ticks back-to-back.  The dispatcher
+                # must return synchronously each time without waiting on
+                # the fan-out.  If APScheduler were the long-running
+                # overlap gate, tick 3+ would never make it past dispatch.
+                tick_tasks: list[asyncio.Task[None]] = []
+                for _ in range(5):
+                    tick_tasks.append(await sched._cron_dispatch())
+
+                # Five fan-out tasks were spawned and tracked on
+                # active_tasks — i.e. the dispatcher created each task
+                # and registered it without ever blocking on the fan-out.
+                assert len(tick_tasks) == 5
+                assert set(tick_tasks) == active_tasks
+
+                # Drain so each tick's fan-out can run to completion.
+                await asyncio.wait_for(
+                    asyncio.gather(*tick_tasks), timeout=2.0
+                )
+
+            # Beta and gamma ran on EVERY tick because the coordinator,
+            # not APScheduler, decides what runs; alpha was skipped on
+            # every tick because the external hold blocks the lock.
+            assert started.count("alpha") == 0
+            assert started.count("beta") == 5
+            assert started.count("gamma") == 5
+            # All fan-out tasks finished and unregistered from active_tasks.
+            assert active_tasks == set()
+            # alpha lock is still held by the external pre-acquire.
+            assert coord.is_busy("alpha") is True
+        finally:
+            coord.release("alpha")
+        assert coord.is_busy("alpha") is False
 
     async def test_per_tick_factory_isolates_fetch_cache_across_ticks(
         self,

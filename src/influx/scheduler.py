@@ -2,10 +2,13 @@
 
 Configures an in-process APScheduler that registers a single
 ``influx-tick`` dispatcher job (``coalesce=True``,
-``misfire_grace_time=schedule.misfire_grace_seconds``,
-``max_instances`` > 1 so an in-flight tick does not block later
-ticks).  Each tick fans out to every configured profile while
-same-profile non-overlap is enforced by the
+``misfire_grace_time=schedule.misfire_grace_seconds``).  The cron-fired
+callable is a *thin dispatcher* that snapshots a fresh per-tick
+provider/cache, spawns the real fan-out as a background ``asyncio``
+task on ``active_tasks``, and returns immediately so APScheduler's
+instance slot is never held for the duration of the fan-out.  This
+keeps APScheduler off the same-profile non-overlap path entirely —
+that contract is enforced solely by the
 :class:`~influx.coordinator.Coordinator` (FR-SCHED-2).
 
 Each fire routes through :func:`run_profile`, which executes one
@@ -67,11 +70,11 @@ ItemProvider = Callable[
 ItemProviderFactory = Callable[[], tuple[ItemProvider, Any]]
 
 
-# Number of concurrent ``influx-tick`` dispatcher instances APScheduler is
-# allowed to run.  Set high enough that a slow tick cannot block unrelated
-# profiles from a later tick — same-profile non-overlap is enforced by the
-# coordinator, not by ``max_instances``.
-_TICK_MAX_INSTANCES = 10
+# The cron-registered callable is a thin dispatcher that returns
+# immediately after spawning the fan-out as a background task, so
+# APScheduler's ``max_instances`` is never the gate on a slow tick.
+# Same-profile non-overlap is enforced by the coordinator alone.
+_TICK_MAX_INSTANCES = 1
 
 
 async def default_item_provider(
@@ -396,10 +399,12 @@ class InfluxScheduler:
     """In-process APScheduler wrapper for the ``influx-tick`` dispatcher.
 
     Registers a single dispatcher job with ``coalesce=True`` and
-    ``misfire_grace_time`` from the schedule config.  ``max_instances``
-    is intentionally above 1 so that a slow profile in tick N does not
-    block unrelated profiles from running in tick N+1 — same-profile
-    non-overlap is enforced by the shared
+    ``misfire_grace_time`` from the schedule config.  The cron-fired
+    callable (:meth:`_cron_dispatch`) is a thin dispatcher that
+    snapshots a fresh per-tick provider/cache, spawns the real fan-out
+    as a background task on ``active_tasks``, and returns immediately
+    so APScheduler is never the gate on a slow tick.  Same-profile
+    non-overlap is enforced solely by the shared
     :class:`~influx.coordinator.Coordinator`, which is consulted before
     each call to :func:`run_profile`.
     """
@@ -436,13 +441,13 @@ class InfluxScheduler:
         # around each profile fire (legacy single-shared-cache path —
         # used by tests that pre-build a provider with a shared cache).
         self._fetch_cache = fetch_cache
-        # Optional per-tick factory.  When set, ``_fire_tick`` calls the
-        # factory once per cron tick to obtain a fresh
+        # Optional per-tick factory.  When set, ``_cron_dispatch`` calls
+        # the factory once per cron tick to obtain a fresh
         # ``(item_provider, fetch_cache)`` pair, so cron tick N+1 starts
         # with a clean dedup scope even when tick N is still running.
-        # This lets ``max_instances`` be > 1 without leaking fetched data
-        # across ticks.  Same-profile non-overlap remains enforced by the
-        # coordinator, not by ``max_instances``.
+        # The dispatcher returns immediately so APScheduler's
+        # ``max_instances`` is never the gate; same-profile non-overlap
+        # is enforced solely by the coordinator.
         self._item_provider_factory = item_provider_factory
 
     @property
@@ -453,12 +458,13 @@ class InfluxScheduler:
     def start(self) -> None:
         """Register a single tick-dispatcher job that fans out to all profiles.
 
-        Registers one ``influx-tick`` job that brackets per-tick fetch-cache
-        scope around the fan-out.  ``max_instances`` is set above 1 so a
-        slow profile from tick N does not block unrelated profiles in
-        tick N+1 — same-profile non-overlap is enforced by the
-        :class:`~influx.coordinator.Coordinator`, not by APScheduler's
-        instance cap (review finding).  When an
+        The registered callable, :meth:`_cron_dispatch`, returns as soon
+        as it has spawned the fan-out as a background task on
+        ``active_tasks``.  Because APScheduler's instance slot is held
+        only for the duration of that microsecond-scale dispatch — not
+        for the duration of the fan-out — APScheduler is never the gate
+        on a slow tick.  Same-profile non-overlap is enforced solely by
+        the :class:`~influx.coordinator.Coordinator`.  When an
         ``item_provider_factory`` is wired, each tick allocates its own
         fresh fetch cache so cross-tick fetches are not deduplicated.
         """
@@ -468,7 +474,7 @@ class InfluxScheduler:
                 timezone=self._config.schedule.timezone,
             )
             self._scheduler.add_job(
-                self._fire_tick,
+                self._cron_dispatch,
                 trigger=trigger,
                 id="influx-tick",
                 max_instances=_TICK_MAX_INSTANCES,
@@ -502,47 +508,73 @@ class InfluxScheduler:
         """
         self._scheduler.shutdown(wait=wait)
 
-    async def _fire_tick(self) -> None:
-        """Single-tick dispatcher: bracket fetch-cache scope, fan out profiles.
+    async def _cron_dispatch(self) -> asyncio.Task[None]:
+        """Cron entrypoint — spawn the fan-out task and return immediately.
 
-        Registers the dispatch task on ``active_tasks`` (if provided) so
-        ``InfluxService.stop`` can await it within
-        ``schedule.shutdown_grace_seconds`` (US-008).  When an
-        ``item_provider_factory`` is wired, allocates a fresh
-        ``(provider, fetch_cache)`` pair for this tick so cross-tick
-        fetches are not deduplicated and tick N+1 starts with a clean
-        cache even when tick N is still running.  Otherwise falls back
-        to the legacy shared cache path for tests that pre-build a
-        provider+cache pair.
-
-        Per-source fetches within a single tick are deduplicated across
-        profiles for that tick's fan-out (R-8, AC-09-D).
+        APScheduler invokes this at every cron fire.  The dispatcher
+        snapshots a fresh per-tick ``(provider, cache)`` pair, spawns
+        :meth:`_fire_tick` as a background task, registers it on
+        ``active_tasks`` (if provided) so :meth:`InfluxService.stop` can
+        await it within ``schedule.shutdown_grace_seconds`` (US-008),
+        and returns.  APScheduler's instance slot is held only for the
+        duration of this microsecond-scale dispatch, not for the
+        fan-out itself, so a slow profile in tick N never blocks tick
+        N+M from being dispatched (review finding).  Same-profile
+        non-overlap is enforced by the coordinator.
         """
-        if self._active_tasks is not None:
-            current = asyncio.current_task()
-            if current is not None:
-                self._active_tasks.add(current)
-                current.add_done_callback(self._active_tasks.discard)
-
         if self._item_provider_factory is not None:
             tick_provider, tick_cache = self._item_provider_factory()
         else:
             tick_provider = self._item_provider
             tick_cache = self._fetch_cache
 
-        if tick_cache is not None:
-            tick_cache.begin_fire()
+        task = asyncio.create_task(
+            self._fire_tick(provider=tick_provider, cache=tick_cache),
+            name="influx-tick-fanout",
+        )
+        if self._active_tasks is not None:
+            self._active_tasks.add(task)
+            task.add_done_callback(self._active_tasks.discard)
+        return task
+
+    async def _fire_tick(
+        self,
+        *,
+        provider: ItemProvider | None = None,
+        cache: Any | None = None,
+    ) -> None:
+        """Single-tick fan-out: bracket fetch-cache scope, fan out profiles.
+
+        When called via :meth:`_cron_dispatch`, ``provider`` and
+        ``cache`` are the per-tick snapshot from the dispatcher.  When
+        called directly (e.g. by tests or by the legacy in-process
+        path), ``provider``/``cache`` default to the scheduler's
+        configured values — a per-tick factory is preferred over a
+        shared cache so cross-tick fetches are not deduplicated.
+
+        Per-source fetches within a single tick are deduplicated across
+        profiles for that tick's fan-out (R-8, AC-09-D).
+        """
+        if provider is None and self._item_provider_factory is not None:
+            provider, cache = self._item_provider_factory()
+        if provider is None:
+            provider = self._item_provider
+        if cache is None:
+            cache = self._fetch_cache
+
+        if cache is not None:
+            cache.begin_fire()
         try:
             await asyncio.gather(
                 *(
-                    self._fire_profile(profile.name, item_provider=tick_provider)
+                    self._fire_profile(profile.name, item_provider=provider)
                     for profile in self._config.profiles
                 ),
                 return_exceptions=True,
             )
         finally:
-            if tick_cache is not None:
-                tick_cache.end_fire()
+            if cache is not None:
+                cache.end_fire()
 
     async def _fire_profile(
         self,

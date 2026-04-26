@@ -297,11 +297,13 @@ class TestInfluxService:
                 raise
 
         with patch("influx.scheduler.run_profile", long_run_profile):
-            # Directly invoke _fire_tick to simulate a scheduler fire
+            # Directly invoke _cron_dispatch to simulate a scheduler fire
             # — avoids waiting for cron while still exercising the real
-            # tick-dispatcher path that registers the task on
-            # active_tasks (review finding 1).
-            fire_task = asyncio.get_event_loop().create_task(svc.scheduler._fire_tick())
+            # tick-dispatcher path that registers the fan-out task on
+            # active_tasks (review finding 1).  ``_cron_dispatch`` returns
+            # the spawned background task; that task is what shutdown
+            # must await within the grace window.
+            fire_task = await svc.scheduler._cron_dispatch()
             await fired.wait()
 
             # Task must be tracked so shutdown can await it.
