@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from influx.config import StorageConfig
+from influx.config import NotificationsConfig, StorageConfig
 from influx.errors import NetworkError
 
 __all__ = ["ContentTypeFamily", "FetchResult", "guarded_fetch", "guarded_post_json"]
@@ -268,7 +268,7 @@ def guarded_post_json(
     payload: dict[str, object],
     *,
     allow_private_ips: bool = False,
-    timeout_seconds: int = 5,
+    timeout_seconds: int | None = None,
 ) -> int:
     """POST *payload* as JSON to *url* with scheme and SSRF guards.
 
@@ -277,13 +277,16 @@ def guarded_post_json(
     or connection failures.  No retry logic — callers handle retries if
     needed (FR-NOT-1).
 
-    The default ``timeout_seconds`` (5s) matches the
-    ``[notifications].timeout_seconds`` config default — webhook
-    notifications, the only caller, override this from
-    ``NotificationsConfig``.
+    ``timeout_seconds`` defaults to ``None``; when omitted it is resolved
+    from the pydantic :class:`~influx.config.NotificationsConfig` field
+    default so the only place this tunable lives is config-parsing code
+    (AC-X-1).  Webhook callers pass the loaded config value explicitly.
     """
     _validate_scheme(url)
     _ssrf_check(url, allow_private_ips=allow_private_ips)
+
+    if timeout_seconds is None:
+        timeout_seconds = NotificationsConfig().timeout_seconds
 
     timeout = httpx.Timeout(
         connect=timeout_seconds,

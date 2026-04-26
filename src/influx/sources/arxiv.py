@@ -31,6 +31,7 @@ from influx.config import (
     ArxivSourceConfig,
     ProfileThresholds,
     ResilienceConfig,
+    StorageConfig,
 )
 from influx.coordinator import RunKind
 from influx.enrich import tier1_enrich, tier3_extract
@@ -331,6 +332,8 @@ def fetch_arxiv(
     resilience: ResilienceConfig,
     now: datetime | None = None,
     backfill_range: BackfillRange | None = None,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
 ) -> list[ArxivItem]:
     """Fetch and filter arXiv items for the given config.
 
@@ -349,6 +352,15 @@ def fetch_arxiv(
         by the explicit range bounds.  The pacing budget for backfills
         is enforced by ``ResilienceConfig.arxiv_request_min_interval_seconds``
         (FR-BF-3) and applied by the caller around each fetch.
+    max_download_bytes:
+        Maximum response body size in bytes for the underlying
+        ``guarded_fetch``.  ``None`` resolves to the
+        :class:`~influx.config.StorageConfig` field default so the only
+        place this tunable lives is config-parsing code (AC-X-1).
+    timeout_seconds:
+        Connect + read timeout in seconds for the underlying
+        ``guarded_fetch``.  ``None`` resolves to the
+        :class:`~influx.config.StorageConfig` field default (AC-X-1).
 
     Returns
     -------
@@ -364,6 +376,8 @@ def fetch_arxiv(
     body = _fetch_with_retry(
         url=url,
         resilience=resilience,
+        max_download_bytes=max_download_bytes,
+        timeout_seconds=timeout_seconds,
     )
 
     items = _parse_atom(body)
@@ -395,8 +409,23 @@ def _fetch_with_retry(
     *,
     url: str,
     resilience: ResilienceConfig,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
 ) -> bytes:
-    """Fetch *url* with 429 backoff and exponential retry (FR-RES-1/2)."""
+    """Fetch *url* with 429 backoff and exponential retry (FR-RES-1/2).
+
+    ``max_download_bytes`` and ``timeout_seconds`` default to ``None``;
+    when omitted they are resolved from the pydantic
+    :class:`~influx.config.StorageConfig` field defaults so the only
+    place these tunable defaults live is config-parsing code (AC-X-1).
+    """
+    if max_download_bytes is None or timeout_seconds is None:
+        _storage_defaults = StorageConfig()
+        if max_download_bytes is None:
+            max_download_bytes = _storage_defaults.max_download_bytes
+        if timeout_seconds is None:
+            timeout_seconds = _storage_defaults.download_timeout_seconds
+
     max_retries = resilience.max_retries
     backoff_base = resilience.backoff_base_seconds
     backoff_429 = resilience.arxiv_429_backoff_seconds
@@ -409,7 +438,11 @@ def _fetch_with_retry(
             # (429 backoff, 5xx retry) runs first. Non-XML 429/5xx
             # responses would otherwise be raised as content-type errors
             # before reaching the rate-limit branch (FR-RES-2).
-            result = guarded_fetch(url)
+            result = guarded_fetch(
+                url,
+                max_download_bytes=max_download_bytes,
+                timeout_seconds=timeout_seconds,
+            )
         except NetworkError as exc:
             last_error = exc
             if attempt < max_retries:
@@ -787,6 +820,8 @@ def make_arxiv_item_provider(
                     arxiv_config=profile_cfg.sources.arxiv,
                     resilience=config.resilience,
                     backfill_range=backfill_range,
+                    max_download_bytes=config.storage.max_download_bytes,
+                    timeout_seconds=config.storage.download_timeout_seconds,
                 )
 
             # Per-day fetch with pacing.  ``per_day_max`` widens
@@ -818,6 +853,8 @@ def make_arxiv_item_provider(
                         arxiv_config=per_day_arxiv_cfg,
                         resilience=config.resilience,
                         backfill_range=day_range,
+                        max_download_bytes=config.storage.max_download_bytes,
+                        timeout_seconds=config.storage.download_timeout_seconds,
                     )
                 except NetworkError:
                     _log.warning(

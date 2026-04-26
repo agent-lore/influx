@@ -594,3 +594,25 @@ class TestFetchRetry:
                 arxiv_config=cfg,
                 resilience=_default_resilience(),
             )
+
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_storage_tunables_threaded_to_guarded_fetch(
+        self, mock_fetch: MagicMock
+    ) -> None:
+        """Review finding 1: ``fetch_arxiv`` forwards
+        ``max_download_bytes`` / ``timeout_seconds`` to ``guarded_fetch``
+        so the loaded ``[storage]`` config actually shapes outbound
+        download safety on the arXiv API path (US-011 AC-X-1)."""
+        body = _load_fixture("empty_feed.atom")
+        mock_fetch.return_value = _make_fetch_result(body)
+
+        cfg = ArxivSourceConfig(categories=["cs.AI"])
+        fetch_arxiv(
+            arxiv_config=cfg,
+            resilience=_default_resilience(),
+            max_download_bytes=4321,
+            timeout_seconds=42,
+        )
+        kwargs = mock_fetch.call_args.kwargs
+        assert kwargs.get("max_download_bytes") == 4321
+        assert kwargs.get("timeout_seconds") == 42

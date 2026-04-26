@@ -22,7 +22,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from influx.config import AppConfig
+from influx.config import AppConfig, ProfileThresholds
 from influx.coordinator import Coordinator, RunKind
 from influx.errors import ConfigError
 from influx.filter import make_default_arxiv_filter_scorer
@@ -325,7 +325,15 @@ def post_run_webhook_hook(
         (p for p in config.profiles if p.name == result.profile),
         None,
     )
-    threshold = profile_cfg.thresholds.notify_immediate if profile_cfg else 8
+    # Fall back to the pydantic ``ProfileThresholds`` field default so the
+    # only place this tunable's default lives is config-parsing code
+    # (AC-X-1).  In practice ``profile_cfg`` is always present because the
+    # caller posts run results for known profiles.
+    threshold = (
+        profile_cfg.thresholds.notify_immediate
+        if profile_cfg
+        else ProfileThresholds().notify_immediate
+    )
 
     digest = build_digest(result, notify_immediate_threshold=threshold)
     send_digest(

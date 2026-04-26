@@ -181,6 +181,15 @@ _CHECKED_MODULES: list[str] = [
     "extraction/html.py",
     "extraction/pdf.py",
     "extraction/article.py",
+    # Helper / business modules that thread tunables through HTTP /
+    # notification call sites: hardcoded numeric defaults here would
+    # silently override the loaded config and bypass AC-X-1 (review
+    # finding 2 / US-011).
+    "http_client.py",
+    "notifications.py",
+    "service.py",
+    "sources/arxiv.py",
+    "sources/rss.py",
 ]
 
 

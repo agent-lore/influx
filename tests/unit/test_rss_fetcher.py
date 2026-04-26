@@ -5,6 +5,9 @@ from __future__ import annotations
 from datetime import UTC
 from pathlib import Path
 from typing import Any, Literal
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from influx.config import RssSourceEntry
 from influx.sources.rss import RssFeedItem, parse_feed
@@ -221,3 +224,45 @@ class TestPublishedDateUtc:
 
         # Day MUST be 23, not 22 — regression guard for finding 1.
         assert (published.year, published.month, published.day) == (2026, 4, 23)
+
+
+# ── Storage tunables threaded through (review finding 1, AC-X-1) ─────
+
+
+class TestStorageTunablesThreaded:
+    """``_fetch_rss_feed`` forwards storage tunables to ``guarded_fetch``.
+
+    Regression guard for review finding 1: the RSS feed fetch path must
+    forward ``config.storage.max_download_bytes`` and
+    ``config.storage.download_timeout_seconds`` so the loaded
+    ``influx.toml`` actually shapes outbound download safety on the RSS
+    feed-bytes path (US-011 AC-X-1).
+    """
+
+    @patch("influx.sources.rss._guarded_fetch")
+    @pytest.mark.asyncio
+    async def test_fetch_rss_feed_threads_storage_tunables(
+        self, mock_fetch: MagicMock
+    ) -> None:
+        from influx.http_client import FetchResult
+        from influx.sources.rss import _fetch_rss_feed
+
+        mock_fetch.return_value = FetchResult(
+            body=b"<rss/>",
+            status_code=200,
+            content_type="application/rss+xml",
+            final_url="https://example.com/feed.xml",
+        )
+
+        feed_entry = _make_feed_entry(
+            name="x", url="https://example.com/feed.xml", source_tag="rss"
+        )
+        await _fetch_rss_feed(
+            feed_entry,
+            cache=None,
+            max_download_bytes=4321,
+            timeout_seconds=42,
+        )
+        kwargs = mock_fetch.call_args.kwargs
+        assert kwargs.get("max_download_bytes") == 4321
+        assert kwargs.get("timeout_seconds") == 42

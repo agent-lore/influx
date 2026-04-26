@@ -161,22 +161,31 @@ def send_digest(
     digest: dict[str, Any],
     *,
     webhook_url: str,
-    timeout_seconds: int = 5,
+    timeout_seconds: int | None = None,
     allow_private_ips: bool = False,
 ) -> None:
     """POST *digest* JSON to *webhook_url* via the guarded HTTP client.
 
     - When *webhook_url* is empty, silently returns (FR-NOT-5, AC-05-J).
     - Uses the SSRF guard from PRD 02 (FR-NOT-1).
-    - Timeout is read from ``notifications.timeout_seconds`` in config
-      (default 5s per existing schema); no retry on failure (FR-NOT-1).
+    - Timeout is read from ``notifications.timeout_seconds`` in config;
+      no retry on failure (FR-NOT-1).
+    - ``timeout_seconds`` defaults to ``None``; when omitted it is
+      resolved from the pydantic
+      :class:`~influx.config.NotificationsConfig` field default so the
+      only place this tunable lives is config-parsing code (AC-X-1).
+      Production callers pass the loaded config value explicitly.
     - Failures (timeout, 5xx, network errors) are logged but do NOT
       raise — the caller is not interrupted.
     """
     if not webhook_url:
         return
 
+    from influx.config import NotificationsConfig
     from influx.http_client import guarded_post_json
+
+    if timeout_seconds is None:
+        timeout_seconds = NotificationsConfig().timeout_seconds
 
     try:
         status = guarded_post_json(

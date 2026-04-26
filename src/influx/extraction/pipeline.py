@@ -59,6 +59,7 @@ def extract_arxiv_text(
         fall back to abstract-only (``text:abstract-only``).
     """
     extraction_cfg = config.extraction
+    storage_cfg = config.storage
     html_url = f"https://arxiv.org/html/{arxiv_id}"
     pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
@@ -68,6 +69,8 @@ def extract_arxiv_text(
             html_url,
             min_html_chars=extraction_cfg.min_html_chars,
             strip_tags=extraction_cfg.strip_tags,
+            max_download_bytes=storage_cfg.max_download_bytes,
+            timeout_seconds=storage_cfg.download_timeout_seconds,
         )
         return ArxivExtractionResult(text=result.text, source_tag="text:html")
     except (ExtractionError, NetworkError) as exc:
@@ -75,7 +78,11 @@ def extract_arxiv_text(
 
     # ── Step 2: Fall back to PDF extraction ───────────────────────
     try:
-        fetch_result = guarded_fetch(pdf_url)
+        fetch_result = guarded_fetch(
+            pdf_url,
+            max_download_bytes=storage_cfg.max_download_bytes,
+            timeout_seconds=storage_cfg.download_timeout_seconds,
+        )
         pdf_result = extract_pdf(fetch_result.body, source_url=pdf_url)
         return ArxivExtractionResult(text=pdf_result.text, source_tag="text:pdf")
     except (ExtractionError, NetworkError) as exc:

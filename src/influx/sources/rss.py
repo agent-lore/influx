@@ -324,7 +324,12 @@ def make_rss_item_provider(
         ) as fetch_span:
             results: list[dict[str, Any]] = []
             for feed_entry in profile_cfg.sources.rss:
-                items = await _fetch_rss_feed(feed_entry, cache)
+                items = await _fetch_rss_feed(
+                    feed_entry,
+                    cache,
+                    max_download_bytes=config.storage.max_download_bytes,
+                    timeout_seconds=config.storage.download_timeout_seconds,
+                )
                 for item in items:
                     results.append(
                         build_rss_note_item(
@@ -343,6 +348,9 @@ def make_rss_item_provider(
 async def _fetch_rss_feed(
     feed_entry: RssSourceEntry,
     cache: FetchCache | None,
+    *,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
 ) -> list[RssFeedItem]:
     """Fetch raw feed bytes, then parse-and-stamp per *feed_entry*.
 
@@ -360,7 +368,11 @@ async def _fetch_rss_feed(
 
     async def _fetch_bytes() -> bytes | None:
         try:
-            result = _guarded_fetch(feed_entry.url)
+            result = _guarded_fetch(
+                feed_entry.url,
+                max_download_bytes=max_download_bytes,
+                timeout_seconds=timeout_seconds,
+            )
         except NetworkError:
             _log.warning(
                 "RSS feed fetch failed for %r; yielding zero items",

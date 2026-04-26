@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from influx.config import AppConfig, ExtractionConfig
+from influx.config import AppConfig, ExtractionConfig, StorageConfig
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.html import ExtractionResult
 from influx.extraction.pdf import PdfExtractionResult
@@ -23,6 +23,7 @@ def _make_config(
     min_html_chars: int = 1000,
     min_web_chars: int = 500,
     strip_tags: list[str] | None = None,
+    storage: StorageConfig | None = None,
 ) -> AppConfig:
     """Build a minimal AppConfig with extraction tunables."""
     from influx.config import (
@@ -51,6 +52,7 @@ def _make_config(
         ),
         security=SecurityConfig(allow_private_ips=True),
         extraction=extraction,
+        storage=storage or StorageConfig(),
     )
 
 
@@ -159,8 +161,14 @@ class TestPDFFallback:
 
         extract_arxiv_text("2601.12345", config)
 
+        # The pipeline threads the loaded config's storage tunables
+        # (review finding 1) so ``guarded_fetch`` receives the configured
+        # ``max_download_bytes`` / ``timeout_seconds`` from
+        # ``config.storage`` rather than the function-default fallback.
         mock_fetch.assert_called_once_with(  # type: ignore[union-attr]
-            "https://arxiv.org/pdf/2601.12345.pdf"
+            "https://arxiv.org/pdf/2601.12345.pdf",
+            max_download_bytes=config.storage.max_download_bytes,
+            timeout_seconds=config.storage.download_timeout_seconds,
         )
 
     @patch("influx.extraction.pipeline.guarded_fetch")
@@ -260,3 +268,69 @@ class TestBothFail:
             extract_arxiv_text("2601.12345", config)
 
         assert exc_info.value.stage == "cascade"
+
+
+# ── Storage tunables threaded through (review finding 1, AC-X-1) ─────
+
+
+class TestStorageTunablesThreaded:
+    """Storage tunables from ``config.storage`` reach ``guarded_fetch``.
+
+    Regression guard for review finding 1: ``extract_arxiv_text`` must
+    forward ``config.storage.max_download_bytes`` and
+    ``config.storage.download_timeout_seconds`` to both the HTML and PDF
+    fetch paths so the loaded ``influx.toml`` actually shapes outbound
+    download safety on the arXiv extraction cascade (US-011 AC-X-1).
+    """
+
+    @patch("influx.extraction.pipeline.extract_html")
+    def test_html_path_threads_storage_tunables(self, mock_html: object) -> None:
+        mock_html.return_value = ExtractionResult(  # type: ignore[union-attr]
+            text="A" * 1500, source="html"
+        )
+        custom_storage = StorageConfig(
+            max_download_bytes=1234,
+            download_timeout_seconds=17,
+        )
+        config = _make_config(storage=custom_storage)
+
+        extract_arxiv_text("2601.12345", config)
+
+        call_kwargs = mock_html.call_args[1]  # type: ignore[union-attr]
+        assert call_kwargs["max_download_bytes"] == 1234
+        assert call_kwargs["timeout_seconds"] == 17
+
+    @patch("influx.extraction.pipeline.guarded_fetch")
+    @patch("influx.extraction.pipeline.extract_pdf")
+    @patch("influx.extraction.pipeline.extract_html")
+    def test_pdf_path_threads_storage_tunables(
+        self,
+        mock_html: object,
+        mock_pdf: object,
+        mock_fetch: object,
+    ) -> None:
+        mock_html.side_effect = ExtractionError(  # type: ignore[union-attr]
+            "html fail", url="x", stage="extract"
+        )
+        mock_fetch.return_value = FetchResult(  # type: ignore[union-attr]
+            body=b"pdf",
+            status_code=200,
+            content_type="application/pdf",
+            final_url="https://arxiv.org/pdf/2601.12345.pdf",
+        )
+        mock_pdf.return_value = PdfExtractionResult(  # type: ignore[union-attr]
+            text="text", source="pdf"
+        )
+        custom_storage = StorageConfig(
+            max_download_bytes=4321,
+            download_timeout_seconds=42,
+        )
+        config = _make_config(storage=custom_storage)
+
+        extract_arxiv_text("2601.12345", config)
+
+        mock_fetch.assert_called_once_with(  # type: ignore[union-attr]
+            "https://arxiv.org/pdf/2601.12345.pdf",
+            max_download_bytes=4321,
+            timeout_seconds=42,
+        )
