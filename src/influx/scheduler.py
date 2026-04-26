@@ -41,6 +41,8 @@ from influx.lcma import after_write as lcma_after_write
 from influx.lcma import resolve_builds_on as lcma_resolve_builds_on
 from influx.lithos_client import LithosClient
 from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+from influx.rejection_rate import on_run_complete as rejection_rate_on_run_complete
+from influx.rejection_rate import record_filter_result
 from influx.repair import SweepWriteError
 from influx.repair import sweep as repair_sweep
 from influx.telemetry import current_run_id, get_tracer
@@ -276,6 +278,7 @@ async def _run_profile_body(
             for item in items:
                 sources_checked += 1
                 title = item["title"]
+                record_filter_result(profile, title, item.get("tags", []))
                 source_url = item["source_url"]
                 cache_result = await client.cache_lookup_for_item(
                     title=title,
@@ -386,6 +389,16 @@ async def _run_profile_body(
                 stats=RunStats(sources_checked=sources_checked, ingested=len(ingested)),
                 items=ingested,
             )
+
+            # 6. Rejection-rate logging (FR-OBS-5, AC-M4-4/5, AC-10-D).
+            await rejection_rate_on_run_complete(
+                profile,
+                config=config,
+                client=client,
+                sources_checked=sources_checked,
+                ingested=len(ingested),
+            )
+
             # Lazy import to avoid the service ↔ scheduler import cycle.
             from influx.service import post_run_webhook_hook
 

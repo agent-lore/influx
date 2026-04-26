@@ -112,7 +112,7 @@
         "All existing tests still pass"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -131,7 +131,7 @@
         "All existing tests still pass"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -153,7 +153,7 @@
         "All existing tests still pass"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

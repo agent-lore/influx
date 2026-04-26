@@ -2,6 +2,10 @@
 Started: Sun Apr 26 17:50:45 UTC 2026
 
 ## Codebase Patterns
+- Rejection-rate module: `src/influx/rejection_rate.py` — in-memory run counter + tag store; `reset()` for test isolation
+- `record_filter_result()` is called per item in `_run_profile_body()` — records tags from provider output
+- `on_run_complete()` emits AC-M4-4 stats every run + rejection-rate log at cadence boundary
+- `fetch_rejection_titles()` in `feedback.py` queries Lithos for `influx:rejected:<profile>` tags — reused by rejection_rate module
 - OTEL package imports: use `opentelemetry.sdk.trace` and `opentelemetry.trace` (not `opentelemetry.api` or `opentelemetry.sdk`)
 - No `InMemorySpanExporter` in the installed OTEL SDK version — use a custom `_CollectingExporter(SpanExporter)` for test span capture
 - Config already has `TelemetryConfig` model and env overrides for `INFLUX_OTEL_ENABLED` and `INFLUX_OTEL_CONSOLE_FALLBACK` in `config.py`
@@ -87,4 +91,55 @@ Started: Sun Apr 26 17:50:45 UTC 2026
   - `Tier1Enrichment` requires fields: `contributions`, `method`, `result`, `relevance` — not `summary`/`keywords` as might be guessed
   - `Tier3Extraction` requires `claims` field (list[str], min 1, max 10) — not `methodology`/`key_findings`/`limitations`
   - `influx.item_count` is 1 for per-item enrichment spans (unlike fetch/filter spans which carry batch counts)
+- `post_run_webhook_hook` is lazily imported inside `_run_profile_body` via `from influx.service import ...` — patch as `influx.service.post_run_webhook_hook`, not `influx.scheduler.post_run_webhook_hook`
+- `lithos.write` spans go in `scheduler.py` around `client.write_note()` calls (two call sites: cache-hit merge + no-cache-hit)
+- `lithos.retrieve` span goes in `lcma.py` around `client.retrieve()` in `after_write()`
+- `archive.download` span goes in `rss.py` around `download_archive()` in `build_rss_note_item()` where `profile_name` is available
+- Integration OTEL tests: patch `get_tracer` in ALL 4 modules (scheduler, arxiv, rss, lcma); use `filter_scorer` (not `scorer`) to trigger `influx.filter` span; don't mock `lcma_after_write` to get `influx.lithos.retrieve` span
+---
+
+## 2026-04-26 - US-006
+- Wired telemetry spans for `influx.lithos.write`, `influx.lithos.retrieve`, and `influx.archive.download`
+- Files changed:
+  - `src/influx/scheduler.py` — wrapped both `write_note()` call sites in `influx.lithos.write` spans with `influx.profile`, `influx.run_id` attributes
+  - `src/influx/lcma.py` — added telemetry imports; wrapped `client.retrieve()` in `after_write()` with `influx.lithos.retrieve` span with `influx.profile`, `influx.run_id` attributes
+  - `src/influx/sources/rss.py` — wrapped `download_archive()` in `build_rss_note_item()` with `influx.archive.download` span with `influx.profile`, `influx.run_id`, `influx.source` attributes
+  - `tests/unit/test_telemetry_wiring.py` — 6 new tests (22 total): lithos.write span + disabled, lithos.retrieve span + disabled, archive.download span + disabled
+- **Learnings for future iterations:**
+  - `post_run_webhook_hook` is lazily imported in `_run_profile_body` — must be patched as `influx.service.post_run_webhook_hook`
+  - The scheduler has two `write_note` call sites in the per-item loop: one for cache-hit multi-profile merge, one for no-cache-hit first write
+  - `influx.archive.download` only fires for RSS items (arXiv uses `extract_arxiv_text` wrapped in tier2 span)
+  - The `lcma.py` module previously had no telemetry imports — added `from influx.telemetry import current_run_id, get_tracer`
+---
+
+## 2026-04-26 - US-007
+- Created `tests/integration/test_otel_spans.py` with in-memory collecting exporter
+- Two integration scenarios:
+  - **Scenario A (arXiv pipeline via `run_profile`)**: exercises `influx.run`, `influx.fetch.arxiv`, `influx.filter`, `influx.enrich.tier1/2/3`, `influx.lithos.write`, `influx.lithos.retrieve` — 8 spans
+  - **Scenario B (RSS provider)**: exercises `influx.fetch.rss`, `influx.archive.download` — 2 spans
+- Union assertion confirms all 10 FR-OBS-4 spans present with documented attribute keys
+- Per-span attribute value spot-checks (profile, run_type, source, item_count)
+- Disabled regression guard: OTEL disabled produces zero exported spans (AC-M4-2 / AC-10-A)
+- Files changed:
+  - `tests/integration/test_otel_spans.py` — new file: 3 tests across 2 classes
+- **Learnings for future iterations:**
+  - Integration test must patch `get_tracer` in ALL 4 modules: `influx.scheduler`, `influx.sources.arxiv`, `influx.sources.rss`, `influx.lcma`
+  - DO NOT mock `lcma_after_write` if you want the `influx.lithos.retrieve` span — let it run with a mock client that returns `{"results": []}`
+  - `builds_on=["b1"]` safely no-ops in `lcma_resolve_builds_on` since "b1" doesn't match the arXiv regex
+  - For the filter span, use `filter_scorer` (batched) not `scorer` (per-item) — only the batched path creates the `influx.filter` span
+---
+
+## 2026-04-26 - US-008
+- Implemented per-profile rejection-rate logging cadence (FR-OBS-5, AC-M4-4/5, AC-10-D)
+- Files changed:
+  - `src/influx/rejection_rate.py` — new module: in-memory per-profile run counter + filter-result tag store, cadence-based structured JSON rejection-rate log emission, per-run filtered/ingested stats log (AC-M4-4)
+  - `src/influx/scheduler.py` — imported `record_filter_result` and `on_run_complete`; wired `record_filter_result()` into per-item loop; wired `on_run_complete()` after result build
+  - `tests/unit/test_rejection_rate_logging.py` — 9 tests: cadence at 3 (runs 3/6/9), cadence at 5 (negative + positive), per-profile isolation, JSON structure with per-tag rates, zero-rejection rates, tag store clearing, per-run stats every run
+- **Learnings for future iterations:**
+  - `rejection_rate.py` uses `defaultdict(list)` for tag store and plain `dict` for counters — `reset()` clears both for test isolation
+  - Per-tag rejection rate formula: count(items with tag that are in rejected_titles set) / count(total items with tag) — operates on in-memory tag store accumulated across runs between cadence emissions
+  - Tag store is cleared per-profile after each emission window — ensures rates reflect only the window since last emission
+  - `fetch_rejection_titles()` from `feedback.py` is reused for fetching user-rejected items from Lithos
+  - AC-M4-4 stats (`influx.run.stats` event) are emitted every run regardless of cadence — separate from rejection-rate logs
+  - The `on_run_complete()` call is placed after `ProfileRunResult` build but before webhook hook in `_run_profile_body()`
 ---
