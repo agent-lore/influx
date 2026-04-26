@@ -31,7 +31,7 @@
         "The hash is derived from `normalise_url(source_url)` so callers operating on equivalent URLs receive the same hash"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -49,7 +49,7 @@
         "Determinism path-computation test (AC-09-C): hashing the same normalised URL `https://feed-x.example/post-a` twice yields the same `{url-hash}` and therefore the same archive filename component, verified at the helper / path-builder level without requiring a second end-to-end ingest"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

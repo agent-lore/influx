@@ -1,4 +1,4 @@
-"""RSS/Atom feed parser using ``feedparser`` (PRD 09 FR-SRC-4).
+"""RSS/Atom feed parser and note builder (PRD 09 FR-SRC-4, FR-SRC-5).
 
 Parses RSS 2.0 and Atom feeds, yielding per-item records that carry the
 feed's configured ``source_tag`` verbatim.  Each parsed item includes
@@ -7,6 +7,10 @@ feed's configured ``source_tag`` verbatim.  Each parsed item includes
 The parser does not infer or override ``source_tag`` — it flows through
 from the feed configuration unchanged so that downstream archive layout,
 note paths, and ``source:*`` tags all agree.
+
+``build_rss_note_item`` constructs a complete ``ProfileItem`` dict for the
+scheduler by downloading the article HTML via the guarded HTTP client
+(FR-SRC-5 / FR-RES-4) and archiving it on disk.
 """
 
 from __future__ import annotations
@@ -14,16 +18,23 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from time import mktime
 from typing import TYPE_CHECKING, Any
 
 import feedparser
 
+from influx.notes import ProfileRelevanceEntry, render_note
+from influx.slugs import slugify_feed_name
+from influx.storage import download_archive
+from influx.urls import normalise_url, url_hash
+
 if TYPE_CHECKING:
-    from influx.config import RssSourceEntry
+    from influx.config import AppConfig, RssSourceEntry
 
 __all__ = [
     "RssFeedItem",
+    "build_rss_note_item",
     "parse_feed",
 ]
 
@@ -108,3 +119,110 @@ def _parse_published(entry: Any) -> datetime:
                 continue
 
     return datetime.now(UTC)
+
+
+# ── Note item builder (PRD 09 US-003) ──────────────────────────────
+
+
+def build_rss_note_item(
+    *,
+    item: RssFeedItem,
+    profile_name: str,
+    config: AppConfig,
+) -> dict[str, Any]:
+    """Build a complete ``ProfileItem`` dict for an RSS feed item.
+
+    Downloads the article HTML via the guarded HTTP client (FR-SRC-5),
+    archives it on disk under the PRD 09 archive layout, and renders a
+    canonical note with the ``source:*`` tag and note path matching the
+    feed's ``source_tag``.
+
+    Parameters
+    ----------
+    item:
+        Parsed RSS/Atom feed item.
+    profile_name:
+        Profile name for the ``profile:*`` tag.
+    config:
+        Loaded :class:`~influx.config.AppConfig`.
+
+    Returns
+    -------
+    dict[str, Any]
+        Ready-to-yield ``ProfileItem`` dict.
+    """
+    feed_slug = slugify_feed_name(item.feed_name)
+    hash_val = url_hash(item.url)
+    pub = item.published
+
+    # item_id matches PRD 09 FR-ST-1:
+    # {feed-slug}-{YYYY-MM-DD}-{url-hash}
+    item_id = f"{feed_slug}-{pub.year:04d}-{pub.month:02d}-{pub.day:02d}-{hash_val}"
+
+    archive_root = Path(config.storage.archive_dir)
+
+    # Download and archive the article HTML (FR-SRC-5 / FR-RES-4).
+    archive_result = download_archive(
+        url=item.url,
+        archive_root=archive_root,
+        source=item.source_tag,
+        item_id=item_id,
+        published_year=pub.year,
+        published_month=pub.month,
+        ext=".html",
+        allow_private_ips=config.security.allow_private_ips,
+        max_download_bytes=config.storage.max_download_bytes,
+        timeout_seconds=config.storage.download_timeout_seconds,
+        expected_content_type="html",
+    )
+
+    archive_path = archive_result.rel_posix_path
+
+    tags: list[str] = [
+        f"profile:{profile_name}",
+        f"source:{item.source_tag}",
+        f"feed-slug:{feed_slug}",
+        "ingested-by:influx",
+        "schema:v1",
+    ]
+
+    if not archive_result.ok:
+        tags.append("influx:archive-missing")
+        tags.append("influx:repair-needed")
+
+    # Note storage path: articles/{source_tag}/{YYYY}/{MM} (FR-NOTE-2)
+    path = f"articles/{item.source_tag}/{pub.year}/{pub.month:02d}"
+
+    source_url = normalise_url(item.url)
+
+    profile_entries = [
+        ProfileRelevanceEntry(
+            profile_name=profile_name,
+            score=0,
+            reason="",
+        ),
+    ]
+
+    content = render_note(
+        title=item.title,
+        source_url=source_url,
+        tags=tags,
+        confidence=0.0,
+        archive_path=archive_path,
+        summary=item.summary,
+        keywords=[],
+        profile_entries=profile_entries,
+    )
+
+    return {
+        "id": f"rss-{feed_slug}-{hash_val}",
+        "title": item.title,
+        "source_url": source_url,
+        "content": content,
+        "tags": tags,
+        "score": 0,
+        "confidence": 0.0,
+        "reason": "",
+        "path": path,
+        "abstract_or_summary": item.summary,
+    }

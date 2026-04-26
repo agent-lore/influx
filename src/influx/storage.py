@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from influx.errors import InfluxError, NetworkError
-from influx.http_client import guarded_fetch
+from influx.http_client import ContentTypeFamily, guarded_fetch
 from influx.slugs import is_valid_slug
 
 __all__ = [
@@ -143,6 +143,7 @@ def download_archive(
     allow_private_ips: bool = False,
     max_download_bytes: int = 52_428_800,
     timeout_seconds: int = 30,
+    expected_content_type: ContentTypeFamily = "pdf",
 ) -> ArchiveResult:
     """Download a file via the guarded HTTP client and archive it.
 
@@ -170,7 +171,7 @@ def download_archive(
             allow_private_ips=allow_private_ips,
             max_download_bytes=max_download_bytes,
             timeout_seconds=timeout_seconds,
-            expected_content_type="pdf",
+            expected_content_type=expected_content_type,
         )
     except NetworkError as exc:
         _log.warning(

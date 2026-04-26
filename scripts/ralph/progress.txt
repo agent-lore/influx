@@ -9,6 +9,12 @@ Started: Sun Apr 26 11:45:13 UTC 2026
 - Test fixtures live under `tests/fixtures/<source>/*.xml`
 - Config schema already has `RssSourceEntry` and `ProfileSources.rss` from prior PRDs
 - `slugify_feed_name()` in `src/influx/slugs.py` for FR-ST-2 slug generation
+- `url_hash(source_url)` in `src/influx/urls.py` returns 10-char hex SHA-256 of normalised URL for archive filename disambiguation
+- RSS archive `item_id` for `build_archive_path()` = `f"{feed_slug}-{YYYY-MM-DD}-{url_hash}"`
+- `download_archive()` in `storage.py` accepts `expected_content_type` param (default `"pdf"`, pass `"html"` for RSS)
+- `build_rss_note_item()` in `sources/rss.py` builds complete `ProfileItem` dict with archive download + note rendering
+- RSS note path = `articles/{source_tag}/{YYYY}/{MM}`, tags include `source:{source_tag}`, archive under `{source_tag}/{YYYY}/{MM}/`
+- Integration tests for RSS use `FakeArticleServer` (simple `http.server` serving HTML) with `SecurityConfig(allow_private_ips=True)`
 
 ---
 
@@ -24,4 +30,29 @@ Started: Sun Apr 26 11:45:13 UTC 2026
   - feedparser's `.get()` returns typed unions that pyright checks strictly — always wrap with `str()` for string fields
   - RssSourceEntry.source_tag is `Literal["rss", "blog"]` not `str` — test helpers need matching type annotations
   - The existing config schema already validates RSS feeds; no config changes needed for the parser itself
+---
+
+## 2026-04-26 - US-002
+- What was implemented: `url_hash()` function in `src/influx/urls.py` — computes first 10 hex chars of SHA-256 over `normalise_url(source_url)` for archive filename disambiguation
+- Files changed:
+  - `src/influx/urls.py` — added `url_hash()` function and `_URL_HASH_LEN` constant
+  - `tests/unit/test_archive_url_hash.py` — 8 tests: determinism (same URL twice, equivalent URLs, trailing slash), collision (different paths, same-feed-same-date, different hosts, different query params), hex format validation
+- **Learnings for future iterations:**
+  - `url_hash()` normalises via `normalise_url()` before hashing, so tracking params and case differences don't affect the hash
+  - `build_archive_path()` in `storage.py` takes `item_id` as a string — for RSS, compose it as `f"{feed_slug}-{YYYY-MM-DD}-{url_hash}"` before passing
+  - ruff enforces import ordering: `hashlib` (stdlib) must come after `from __future__` with no blank line separating stdlib imports from each other
+---
+
+## 2026-04-26 - US-003
+- What was implemented: RSS archive layout and note-path integration end-to-end
+- Files changed:
+  - `src/influx/storage.py` — added `expected_content_type` param to `download_archive()` (typed as `ContentTypeFamily`, default `"pdf"`)
+  - `src/influx/sources/rss.py` — added `build_rss_note_item()` function: downloads article HTML via guarded HTTP client, archives on disk at PRD 09 layout, renders canonical note with correct `source:*` tag and storage path
+  - `tests/fixtures/rss/collision_atom.xml` — fixture with two items on same date for collision testing
+  - `tests/integration/test_rss_to_lithos.py` — 11 integration tests covering: source tag agreement (rss/blog), archive layout on disk, collision (two items same date → distinct files), determinism (same URL → same hash), end-to-end from Atom and RSS 2.0 fixtures, SSRF guard verification
+- **Learnings for future iterations:**
+  - `download_archive()` `expected_content_type` must use `ContentTypeFamily` Literal type (from `http_client.py`), not bare `str` — pyright will reject `str`
+  - For integration tests with RSS article downloads, use a `FakeArticleServer` (simple `http.server.HTTPServer` with `_ArticleHandler`) and `SecurityConfig(allow_private_ips=True)`
+  - RSS archive path layout: `{archive_root}/{source_tag}/{YYYY}/{MM}/{feed-slug}-{YYYY-MM-DD}-{url-hash}.html`
+  - To verify SSRF guard works, test with `allow_private_ips=False` — download to localhost will fail → `influx:archive-missing` tag
 ---
