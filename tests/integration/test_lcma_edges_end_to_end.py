@@ -181,12 +181,12 @@ class TestTaskBracketing:
         assert complete_calls[0]["task_id"] == "task-001"
         assert complete_calls[0]["outcome"] == "success"
 
-    def test_backfill_run_does_not_bracket(
+    def test_backfill_run_brackets_with_backfill_tag(
         self,
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
     ) -> None:
-        """Backfill run does NOT call task_create or task_complete (PRD 08 §4)."""
+        """Backfill run brackets with influx:backfill tag (FR-BF-5, AC-09-F)."""
         config = _make_config(fake_lithos_url)
 
         asyncio.run(
@@ -200,8 +200,11 @@ class TestTaskBracketing:
         create_calls = _calls_by_tool(fake_lithos.calls, "lithos_task_create")
         complete_calls = _calls_by_tool(fake_lithos.calls, "lithos_task_complete")
 
-        assert len(create_calls) == 0
-        assert len(complete_calls) == 0
+        assert len(create_calls) == 1
+        assert "influx:backfill" in create_calls[0]["tags"]
+        assert "influx:run" not in create_calls[0]["tags"]
+        assert len(complete_calls) == 1
+        assert complete_calls[0]["outcome"] == "success"
 
     def test_task_complete_called_on_error(
         self,

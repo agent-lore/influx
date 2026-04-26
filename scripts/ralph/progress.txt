@@ -22,6 +22,7 @@ Started: Sun Apr 26 11:45:13 UTC 2026
 - `run_backfill()` in `backfill.py` is the canonical entry point for backfill runs — wraps `run_profile(kind=BACKFILL)` with proper `run_range`
 - FR-BF-2: backfill cache-hit skip is in `run_profile`'s cache-hit branch — `if kind == RunKind.BACKFILL: continue` before the write attempt
 - CLI subprocess tests need `--confirm` flag (not `INFLUX_TEST_BACKFILL_ESTIMATE` env var) because the estimator runs in the server process, not the CLI subprocess
+- All run kinds (scheduled, manual, backfill) create `lithos_task_create` tasks; tag is `influx:backfill` for backfill, `influx:run` otherwise — `_NoopClient` mocks in scheduler tests must include `task_create`/`task_complete`
 
 ---
 
@@ -151,4 +152,17 @@ Started: Sun Apr 26 11:45:13 UTC 2026
   - FR-BF-2 cache-hit skip is implemented as an early `continue` in the cache-hit branch of `run_profile` — only applies to `kind == RunKind.BACKFILL`; manual/scheduled runs still write on cache hit for multi-profile merge (US-005)
   - CLI subprocess tests (`test_cli_http.py`) need `--confirm` when the real estimator produces >1000 items — the env var `INFLUX_TEST_BACKFILL_ESTIMATE` only works in the server process, not the CLI subprocess
   - `validate_backfill_range()` raises `BackfillRangeError` for invalid range inputs — CLI catches this and exits with `EXIT_USAGE` (64)
+---
+
+## 2026-04-26 - US-010
+- What was implemented: Propagate `kind="backfill"` through task tagging — backfills now create `lithos_task_create` tasks tagged `influx:backfill` (not `influx:run`), with integration tests for AC-09-F (task tag), AC-09-G (no webhook), AC-09-H (no repair sweep), and FR-BF-5 non-backfill regression
+- Files changed:
+  - `src/influx/scheduler.py` — removed `if kind != RunKind.BACKFILL` gate around task creation; all runs now create tasks with `task_tag` computed from `kind` (`influx:backfill` vs `influx:run`)
+  - `tests/integration/test_backfill_arxiv.py` — added `TestBackfillTaskTagging` class with 2 tests: backfill creates task with `influx:backfill` tag (AC-09-F), non-backfill creates task with `influx:run` tag (FR-BF-5 regression)
+  - `tests/integration/test_lcma_edges_end_to_end.py` — updated `test_backfill_run_does_not_bracket` → `test_backfill_run_brackets_with_backfill_tag` to verify correct task tagging
+  - `tests/unit/test_scheduler.py` — added `task_create`/`task_complete` methods to `_NoopClient` in the backfill repair-latch test
+- **Learnings for future iterations:**
+  - Task creation in `scheduler.py` uses a single code path for all run kinds; `task_tag` is selected by `kind == RunKind.BACKFILL` ternary — no branching around the `task_create` call
+  - When adding new `_NoopClient` mocks in scheduler tests, always include `task_create` and `task_complete` methods since all run kinds now bracket with tasks
+  - Webhook gate (AC-09-G) and repair sweep gate (AC-09-H) were already correctly gated by `kind` from US-009 — only task creation needed the code change
 ---

@@ -1,4 +1,4 @@
-"""Integration tests for the backfill execution flow (US-009).
+"""Integration tests for the backfill execution flow (US-009, US-010).
 
 Exercises ``backfill --profile X --days 7`` against a fake arXiv fixture
 through the real ``run_profile(kind=BACKFILL)`` path, verifying:
@@ -10,6 +10,10 @@ through the real ``run_profile(kind=BACKFILL)`` path, verifying:
 - FR-BF-3: arXiv pacing is honoured (verified structurally — the
   arXiv fetcher's retry loop already enforces it).
 - FR-BF-1: both range forms (--days N and --from/--to) are accepted.
+- AC-09-F: backfill creates a Lithos task tagged ``influx:backfill``.
+- AC-09-G: backfill does NOT POST a webhook.
+- AC-09-H: backfill does NOT invoke the repair sweep.
+- FR-BF-5: non-backfill runs create tasks tagged ``influx:run``.
 """
 
 from __future__ import annotations
@@ -490,3 +494,100 @@ class TestNonBackfillCacheHitStillWrites:
         # Manual runs STILL write on cache hit (US-005 merge semantics).
         write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         assert len(write_calls) == 2
+
+
+# ── Test: backfill task tagging (AC-09-F, FR-BF-5) ──────────────────
+
+
+class TestBackfillTaskTagging:
+    """AC-09-F / FR-BF-5: backfill tasks tagged ``influx:backfill``."""
+
+    def test_backfill_creates_task_with_influx_backfill_tag(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """AC-09-F: backfill creates a Lithos task with tag influx:backfill."""
+        config = _make_config(lithos_url=fake_lithos_url)
+        fetch_cache = FetchCache()
+        provider = make_item_provider(
+            config,
+            fetch_cache=fetch_cache,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        # Queue Lithos: feedback (no repair sweep for backfill)
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+
+        with patch(
+            "influx.sources.arxiv.fetch_arxiv",
+            return_value=list(_FIXTURE_ARXIV_ITEMS),
+        ):
+            result = asyncio.run(
+                run_backfill(
+                    PROFILE,
+                    run_range={"days": 7},
+                    config=config,
+                    item_provider=provider,
+                )
+            )
+
+        assert result is not None
+
+        # Verify task_create was called with influx:backfill tag.
+        task_calls = [
+            c for c in fake_lithos.calls if c[0] == "lithos_task_create"
+        ]
+        assert len(task_calls) == 1
+        tags = task_calls[0][1]["tags"]
+        assert "influx:backfill" in tags
+        assert f"profile:{PROFILE}" in tags
+        assert "influx:run" not in tags
+
+        # Verify task_complete was also called.
+        complete_calls = [
+            c for c in fake_lithos.calls if c[0] == "lithos_task_complete"
+        ]
+        assert len(complete_calls) == 1
+        assert complete_calls[0][1]["outcome"] == "success"
+
+    def test_nonbackfill_creates_task_with_influx_run_tag(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """FR-BF-5 regression: manual/scheduled runs still tagged influx:run."""
+        config = _make_config(lithos_url=fake_lithos_url)
+        fetch_cache = FetchCache()
+        provider = make_item_provider(
+            config,
+            fetch_cache=fetch_cache,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        # Queue Lithos: repair sweep + feedback
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+
+        with patch(
+            "influx.sources.arxiv.fetch_arxiv",
+            return_value=list(_FIXTURE_ARXIV_ITEMS),
+        ):
+            asyncio.run(
+                run_profile(
+                    PROFILE,
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=provider,
+                )
+            )
+
+        # Verify task_create was called with influx:run tag.
+        task_calls = [
+            c for c in fake_lithos.calls if c[0] == "lithos_task_create"
+        ]
+        assert len(task_calls) == 1
+        tags = task_calls[0][1]["tags"]
+        assert "influx:run" in tags
+        assert f"profile:{PROFILE}" in tags
+        assert "influx:backfill" not in tags

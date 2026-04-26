@@ -157,28 +157,29 @@ async def run_profile(
 
     client = LithosClient(url=config.lithos.url, transport=config.lithos.transport)
     try:
-        # ── LCMA task bracketing (FR-LCMA-5, AC-M2-10) ────────────
-        # For non-backfill runs, create a Lithos task that brackets the
-        # entire per-profile run.  Backfill task tagging is deferred to
-        # PRD 09.
+        # ── LCMA task bracketing (FR-LCMA-5, FR-BF-5, AC-M2-10) ──
+        # Every run creates a Lithos task that brackets the per-profile
+        # run.  The task tag depends on ``kind``:
+        #   - scheduled / manual → ``influx:run``
+        #   - backfill           → ``influx:backfill``
         run_task_id: str | None = None
-        if kind != RunKind.BACKFILL:
-            run_date = datetime.now(UTC).date().isoformat()
-            task_title = f"Influx run {profile} {run_date}"
-            try:
-                task_result = await client.task_create(
-                    title=task_title,
-                    agent="influx",
-                    tags=["influx:run", f"profile:{profile}"],
-                )
-            except LCMAError as exc:
-                if str(exc) == "unknown_tool":
-                    _handle_lcma_unknown_tool(exc, fallback_tool="lithos_task_create")
-                raise
-            task_body = json.loads(
-                task_result.content[0].text  # type: ignore[union-attr]
+        task_tag = "influx:backfill" if kind == RunKind.BACKFILL else "influx:run"
+        run_date = datetime.now(UTC).date().isoformat()
+        task_title = f"Influx run {profile} {run_date}"
+        try:
+            task_result = await client.task_create(
+                title=task_title,
+                agent="influx",
+                tags=[task_tag, f"profile:{profile}"],
             )
-            run_task_id = task_body["task_id"]
+        except LCMAError as exc:
+            if str(exc) == "unknown_tool":
+                _handle_lcma_unknown_tool(exc, fallback_tool="lithos_task_create")
+            raise
+        task_body = json.loads(
+            task_result.content[0].text  # type: ignore[union-attr]
+        )
+        run_task_id = task_body["task_id"]
 
         outcome = "success"
         body_failed = False

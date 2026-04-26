@@ -159,7 +159,7 @@
         "Non-backfill regression test confirms that scheduled and manual runs continue to create `lithos_task_create` calls tagged `influx:run` rather than `influx:backfill`, so that the run-kind correctly selects between the two task tags (FR-BF-5)"
       ],
       "priority": 10,
-      "passes": false,
+      "passes": true,
       "notes": ""
     }
   ],

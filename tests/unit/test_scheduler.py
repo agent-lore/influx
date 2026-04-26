@@ -401,6 +401,20 @@ class TestSweepWriteErrorMarksReadinessDegraded:
         probe_loop = _FakeProbeLoop()
 
         class _NoopClient:
+            async def task_create(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                txt = _json.dumps({"task_id": "noop-task"})
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(type="text", text=txt),
+                    ],
+                )
+
+            async def task_complete(self, **kwargs: Any) -> Any: ...
+
             async def close(self) -> None: ...
 
         async def _empty_neg_block(*args: Any, **kwargs: Any) -> str:
