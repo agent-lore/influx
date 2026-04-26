@@ -471,10 +471,17 @@ class TestInfluxFetchArxivSpan:
                     "influx.sources.arxiv.fetch_arxiv",
                     return_value=test_items,
                 ),
-                patch("influx.sources.arxiv.build_arxiv_note_item", return_value={
-                    "title": "t", "source_url": "u", "content": "c",
-                    "tags": [], "score": 5, "confidence": 0.8,
-                }),
+                patch(
+                    "influx.sources.arxiv.build_arxiv_note_item",
+                    return_value={
+                        "title": "t",
+                        "source_url": "u",
+                        "content": "c",
+                        "tags": [],
+                        "score": 5,
+                        "confidence": 0.8,
+                    },
+                ),
             ):
                 result = await provider(
                     "ai-robotics", RunKind.SCHEDULED, None, "prompt"
@@ -528,14 +535,19 @@ class TestInfluxFetchArxivSpan:
         with (
             patch("influx.sources.arxiv.get_tracer", return_value=disabled_tracer),
             patch("influx.sources.arxiv.fetch_arxiv", return_value=test_items),
-            patch("influx.sources.arxiv.build_arxiv_note_item", return_value={
-                "title": "t", "source_url": "u", "content": "c",
-                "tags": [], "score": 5, "confidence": 0.8,
-            }),
+            patch(
+                "influx.sources.arxiv.build_arxiv_note_item",
+                return_value={
+                    "title": "t",
+                    "source_url": "u",
+                    "content": "c",
+                    "tags": [],
+                    "score": 5,
+                    "confidence": 0.8,
+                },
+            ),
         ):
-            result = await provider(
-                "ai-robotics", RunKind.SCHEDULED, None, "prompt"
-            )
+            result = await provider("ai-robotics", RunKind.SCHEDULED, None, "prompt")
             items = list(result)
             # The fetch still works — items are returned
             assert len(items) == 1
@@ -612,10 +624,17 @@ class TestInfluxFetchRssSpan:
                     new_callable=AsyncMock,
                     return_value=test_items,
                 ),
-                patch("influx.sources.rss.build_rss_note_item", return_value={
-                    "title": "t", "source_url": "u", "content": "c",
-                    "tags": [], "score": 0, "confidence": 0.0,
-                }),
+                patch(
+                    "influx.sources.rss.build_rss_note_item",
+                    return_value={
+                        "title": "t",
+                        "source_url": "u",
+                        "content": "c",
+                        "tags": [],
+                        "score": 0,
+                        "confidence": 0.0,
+                    },
+                ),
             ):
                 result = await provider(
                     "ai-robotics", RunKind.SCHEDULED, None, "prompt"
@@ -698,14 +717,19 @@ class TestInfluxFetchRssSpan:
                 new_callable=AsyncMock,
                 return_value=test_items,
             ),
-            patch("influx.sources.rss.build_rss_note_item", return_value={
-                "title": "t", "source_url": "u", "content": "c",
-                "tags": [], "score": 0, "confidence": 0.0,
-            }),
+            patch(
+                "influx.sources.rss.build_rss_note_item",
+                return_value={
+                    "title": "t",
+                    "source_url": "u",
+                    "content": "c",
+                    "tags": [],
+                    "score": 0,
+                    "confidence": 0.0,
+                },
+            ),
         ):
-            result = await provider(
-                "ai-robotics", RunKind.SCHEDULED, None, "prompt"
-            )
+            result = await provider("ai-robotics", RunKind.SCHEDULED, None, "prompt")
             items = list(result)
             # The fetch still works — items are returned
             assert len(items) == 1
@@ -1083,9 +1107,7 @@ class TestInfluxLithosWriteSpan:
         try:
             with (
                 patch("influx.scheduler.get_tracer", return_value=tracer),
-                patch(
-                    "influx.scheduler.LithosClient"
-                ) as mock_client_cls,
+                patch("influx.scheduler.LithosClient") as mock_client_cls,
                 patch(
                     "influx.scheduler.build_negative_examples_block",
                     new_callable=AsyncMock,

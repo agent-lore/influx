@@ -62,7 +62,7 @@ async def _simulate_run(
     ingested: int = 5,
 ) -> None:
     """Simulate a run: record filter results then call on_run_complete."""
-    for title, tags in (items or []):
+    for title, tags in items or []:
         record_filter_result(profile, title, tags)
     await on_run_complete(
         profile,
@@ -138,9 +138,7 @@ class TestCadenceAtFive:
             assert not rejection_logs, f"Unexpected emission at run {run_num}"
 
     @pytest.mark.asyncio
-    async def test_emitted_at_threshold(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    async def test_emitted_at_threshold(self, caplog: pytest.LogCaptureFixture) -> None:
         config = _make_config(recalibrate_after_runs=5)
         client = _make_client()
         sample_items = [("Paper X", ["cat:cs.RO"])]
@@ -178,9 +176,7 @@ class TestPerProfileIsolation:
     """Two profiles emit at independent cadences."""
 
     @pytest.mark.asyncio
-    async def test_independent_counters(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    async def test_independent_counters(self, caplog: pytest.LogCaptureFixture) -> None:
         config = _make_config(recalibrate_after_runs=3)
         client = _make_client()
         items_a = [("Alpha Paper", ["cat:cs.AI"])]
@@ -371,9 +367,7 @@ class TestPerRunStructuredLog:
             )
 
         stats_logs = [
-            r
-            for r in caplog.records
-            if '"event": "influx.run.stats"' in r.getMessage()
+            r for r in caplog.records if '"event": "influx.run.stats"' in r.getMessage()
         ]
         assert len(stats_logs) == 1
         payload = json.loads(stats_logs[0].getMessage())

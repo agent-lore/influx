@@ -1062,3 +1062,45 @@ class TestTagDerivationInvariants:
         )
 
         assert result["tags"].count("influx:repair-needed") == 1
+
+
+class TestFilterTagsPropagation:
+    """LLM filter-result tags carried through the ``ProfileItem`` dict.
+
+    Distinct from persisted note / provenance tags — ``filter_tags`` is
+    what scheduler.record_filter_result() consumes for FR-OBS-5
+    rejection-rate computation (US-008).
+    """
+
+    @patch("influx.sources.arxiv.extract_arxiv_text")
+    def test_filter_tags_passed_through(self, mock_extract: object) -> None:
+        mock_extract.return_value = ArxivExtractionResult(  # type: ignore[union-attr]
+            text="text", source_tag="text:html"
+        )
+        config = _make_config(full_text=100, relevance=100, deep_extract=100)
+
+        result = build_arxiv_note_item(
+            item=_make_item(),
+            score=5,
+            confidence=0.5,
+            reason="R",
+            profile_name="ai-robotics",
+            config=config,
+            filter_tags=["topic:robotics", "topic:ai"],
+        )
+
+        assert result["filter_tags"] == ["topic:robotics", "topic:ai"]
+        # Filter-result tags are not mixed into persisted note tags.
+        assert "topic:robotics" not in result["tags"]
+
+    def test_filter_tags_default_empty(self) -> None:
+        config = _make_config(full_text=100, relevance=100, deep_extract=100)
+        result = build_arxiv_note_item(
+            item=_make_item(),
+            score=1,
+            confidence=0.1,
+            reason="R",
+            profile_name="ai-robotics",
+            config=config,
+        )
+        assert result["filter_tags"] == []

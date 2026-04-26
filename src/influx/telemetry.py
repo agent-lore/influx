@@ -90,6 +90,11 @@ class SpanWrapper:
                 self._span.set_attribute(k, v)
 
 
+# Module-level no-op SpanWrapper reused across every disabled span call so
+# the disabled body never instantiates a wrapper per invocation (AC-10-A).
+_NOOP_SPAN_WRAPPER = SpanWrapper(_NOOP_SPAN)
+
+
 class InfluxTracer:
     """Tracer that wraps OTEL or falls back to no-op.
 
@@ -118,10 +123,11 @@ class InfluxTracer:
     ) -> Iterator[SpanWrapper]:
         """Start a span as a context manager.
 
-        When disabled, yields a no-op wrapper immediately (no OTEL calls).
+        When disabled, yields a shared module-level no-op wrapper —
+        no SpanWrapper instantiation, no OTEL calls (AC-10-A).
         """
         if not self._enabled:
-            yield SpanWrapper(_NOOP_SPAN)
+            yield _NOOP_SPAN_WRAPPER
             return
 
         # OTEL is enabled — delegate to the real tracer

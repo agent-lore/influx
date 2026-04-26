@@ -197,6 +197,7 @@ def make_default_arxiv_filter_scorer(
                 score=r.score,
                 confidence=1.0,
                 reason=r.reason,
+                filter_tags=tuple(r.tags),
             )
             for r in response.results
         }

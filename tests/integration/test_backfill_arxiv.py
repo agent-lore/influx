@@ -952,9 +952,7 @@ class TestBackfillEndpointEndToEnd:
         # Hold the profile lock to simulate a concurrent scheduled run.
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(
-                app.state.coordinator.try_acquire(PROFILE)
-            )
+            loop.run_until_complete(app.state.coordinator.try_acquire(PROFILE))
             try:
                 with TestClient(app) as client:
                     resp = client.post(

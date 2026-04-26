@@ -114,18 +114,20 @@ def _full_config() -> Any:
 
 
 # Full FR-OBS-4 span list (PRD §6 / §9).
-FR_OBS_4_SPANS = frozenset({
-    "influx.run",
-    "influx.fetch.arxiv",
-    "influx.fetch.rss",
-    "influx.filter",
-    "influx.enrich.tier1",
-    "influx.enrich.tier2",
-    "influx.enrich.tier3",
-    "influx.lithos.write",
-    "influx.lithos.retrieve",
-    "influx.archive.download",
-})
+FR_OBS_4_SPANS = frozenset(
+    {
+        "influx.run",
+        "influx.fetch.arxiv",
+        "influx.fetch.rss",
+        "influx.filter",
+        "influx.enrich.tier1",
+        "influx.enrich.tier2",
+        "influx.enrich.tier3",
+        "influx.lithos.write",
+        "influx.lithos.retrieve",
+        "influx.archive.download",
+    }
+)
 
 # Expected attribute keys per span from FR-OBS-4.
 EXPECTED_ATTRS: dict[str, set[str]] = {
@@ -213,9 +215,7 @@ async def _run_arxiv_scenario(
             for item in items
         }
 
-    arxiv_provider = make_arxiv_item_provider(
-        config, filter_scorer=fake_filter_scorer
-    )
+    arxiv_provider = make_arxiv_item_provider(config, filter_scorer=fake_filter_scorer)
 
     mock_client = _mock_lithos_client()
 
@@ -342,8 +342,7 @@ class TestFROBS4FullSpanSet:
         span_names = {s.name for s in collected}
         missing = FR_OBS_4_SPANS - span_names
         assert not missing, (
-            f"Missing FR-OBS-4 spans: {sorted(missing)}. "
-            f"Got: {sorted(span_names)}"
+            f"Missing FR-OBS-4 spans: {sorted(missing)}. Got: {sorted(span_names)}"
         )
 
         # ── Per-span attribute assertions ──
@@ -391,9 +390,7 @@ class TestFROBS4FullSpanSet:
 
         # influx.enrich.tier1/2/3 each carry item_count=1
         for tier in ("tier1", "tier2", "tier3"):
-            tier_spans = [
-                s for s in collected if s.name == f"influx.enrich.{tier}"
-            ]
+            tier_spans = [s for s in collected if s.name == f"influx.enrich.{tier}"]
             assert len(tier_spans) == 1, f"Expected 1 influx.enrich.{tier} span"
             tier_attrs = dict(tier_spans[0].attributes or {})
             assert tier_attrs["influx.item_count"] == 1
@@ -468,9 +465,7 @@ class TestOtelDisabledZeroSpans:
             ),
             patch(
                 "influx.sources.arxiv.tier3_extract",
-                return_value=Tier3Extraction(
-                    claims=["claim1"], builds_on=["b1"]
-                ),
+                return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
             ),
             # Scheduler infrastructure
             patch("influx.scheduler.LithosClient", return_value=mock_client),

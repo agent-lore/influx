@@ -59,9 +59,7 @@ class TestACX1ConfigDriven:
             f"Missing sections: {expected_sections - set(raw.keys())}"
         )
 
-    def test_config_roundtrip_picks_up_modified_tunables(
-        self, tmp_path: Path
-    ) -> None:
+    def test_config_roundtrip_picks_up_modified_tunables(self, tmp_path: Path) -> None:
         """Modified tunables in TOML are reflected in loaded config."""
         toml_text = """\
 [influx]
@@ -205,9 +203,7 @@ class TestACX1NoStrayConstants:
             if not re.match(r"^[_A-Z]", line):
                 continue
             for tunable in _TUNABLE_NAMES:
-                pattern = re.compile(
-                    rf"\b{re.escape(tunable)}\s*=\s*\d", re.IGNORECASE
-                )
+                pattern = re.compile(rf"\b{re.escape(tunable)}\s*=\s*\d", re.IGNORECASE)
                 if pattern.search(stripped):
                     pytest.fail(
                         f"{module}:{i}: hardcoded tunable "
@@ -223,9 +219,7 @@ class TestACX1NoStrayConstants:
 class TestACX2ProviderSwap:
     """Provider swap works without code change via config."""
 
-    def test_extract_slot_resolves_to_configured_provider(
-        self, tmp_path: Path
-    ) -> None:
+    def test_extract_slot_resolves_to_configured_provider(self, tmp_path: Path) -> None:
         """Changing [models.extract].provider switches the resolved provider."""
         base_toml = """\
 [providers.provider_a]
@@ -277,9 +271,7 @@ text = "x {{title}} {{full_text}}"
             "https://b.example.com/v1"
         )
 
-    def test_call_json_model_resolves_provider_at_runtime(
-        self, tmp_path: Path
-    ) -> None:
+    def test_call_json_model_resolves_provider_at_runtime(self, tmp_path: Path) -> None:
         """_call_json_model resolves the provider from config at call time."""
         from influx.enrich import _call_json_model
         from influx.errors import LCMAError
@@ -358,11 +350,11 @@ _LITHOS_TOOLS: dict[str, dict[str, str]] = {
     },
     "lithos_task_create": {
         "happy": "TestTaskCreateHappyPath::test_task_create_reaches_server",
-        "error": "LCMA unknown_tool contract (same mechanism as retrieve)",
+        "error": "TestTaskCreateUnknownTool::test_task_create_unknown_tool",
     },
     "lithos_task_complete": {
         "happy": "TestTaskCompleteHappyPath::test_task_complete_reaches_server",
-        "error": "LCMA unknown_tool contract (same mechanism as retrieve)",
+        "error": "TestTaskCompleteUnknownTool::test_task_complete_unknown_tool",
     },
 }
 
@@ -387,9 +379,7 @@ class TestACX6LithosContractTests:
         all_code = lithos_tests + lcma_tests
 
         for tool_name in _LITHOS_TOOLS:
-            assert tool_name in all_code, (
-                f"No contract test found for {tool_name}"
-            )
+            assert tool_name in all_code, f"No contract test found for {tool_name}"
 
     def test_lithos_client_happy_path_tests_exist(self) -> None:
         """test_lithos_client.py contains happy-path test classes."""
@@ -431,6 +421,8 @@ class TestACX6LithosContractTests:
         for cls in [
             "TestRetrieveUnknownTool",
             "TestEdgeUpsertUnknownTool",
+            "TestTaskCreateUnknownTool",
+            "TestTaskCompleteUnknownTool",
         ]:
             assert cls in code, f"Missing LCMA error test class {cls}"
 
@@ -454,9 +446,10 @@ _PURE_MODULE_TESTS: dict[str, str] = {
 class TestACX6PureModuleCoverage:
     """Pure-module coverage >= 80% (master PRD section 18.2).
 
-    Coverage is measured via ``pytest --cov`` as a quality-check step.
-    These tests verify the prerequisite: each pure module has a
-    corresponding test file with meaningful test functions.
+    Each pure module must have a corresponding test file *and* its
+    line-coverage must reach the 80% threshold. We measure coverage via
+    a sub-pytest invocation that runs ``pytest --cov`` against the
+    listed pure modules and parses the resulting JSON report.
     """
 
     @pytest.mark.parametrize(
@@ -464,9 +457,7 @@ class TestACX6PureModuleCoverage:
         list(_PURE_MODULE_TESTS.items()),
         ids=list(_PURE_MODULE_TESTS.keys()),
     )
-    def test_pure_module_has_unit_tests(
-        self, module: str, test_file: str
-    ) -> None:
+    def test_pure_module_has_unit_tests(self, module: str, test_file: str) -> None:
         """Each pure module has a corresponding unit test file."""
         test_path = _ROOT / "tests" / "unit" / test_file
         assert test_path.exists(), (
@@ -478,6 +469,111 @@ class TestACX6PureModuleCoverage:
         assert test_count >= 2, (
             f"{test_file} has only {test_count} test(s); "
             "expected >= 2 for meaningful pure-module coverage"
+        )
+
+    def test_pure_modules_meet_80_percent_coverage(self, tmp_path: Path) -> None:
+        """Pure-module coverage actually measures >= 80% per module.
+
+        Spawns a clean child process (``python -m coverage run -m
+        pytest``) so ``coverage`` traces from import time, then parses
+        the resulting JSON report. Each pure module's covered-line
+        ratio must be >= 0.80 (master PRD §18.2 / AC-X-6).
+        """
+        import json
+        import os
+        import subprocess
+        import sys
+
+        # Avoid recursive coverage measurement.
+        if os.environ.get("INFLUX_PURE_COVERAGE_RUNNING") == "1":
+            pytest.skip("inner coverage run; outer test is the gate")
+
+        data_file = tmp_path / ".coverage"
+        json_report = tmp_path / "coverage.json"
+        cov_cfg = tmp_path / ".coveragerc"
+        # ``coverage`` accepts dotted module names in ``source`` and
+        # uses Python's import machinery to discover them — using file
+        # paths (e.g. ``src/influx/config.py``) silently produces no
+        # data with this layout, so dotted names are required.
+        module_names = [
+            "influx." + Path(m).with_suffix("").as_posix().replace("/", ".")
+            for m in _PURE_MODULE_TESTS
+        ]
+        sources = "\n    ".join(module_names)
+        cov_cfg.write_text(
+            f"[run]\ndata_file = {data_file}\nbranch = False\nsource =\n    {sources}\n"
+        )
+
+        test_paths = [
+            str(_ROOT / "tests" / "unit" / t) for t in _PURE_MODULE_TESTS.values()
+        ]
+        env = {
+            **os.environ,
+            "INFLUX_PURE_COVERAGE_RUNNING": "1",
+            "COVERAGE_RCFILE": str(cov_cfg),
+        }
+        run_cmd = [
+            sys.executable,
+            "-m",
+            "coverage",
+            "run",
+            f"--rcfile={cov_cfg}",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--no-cov",
+            *test_paths,
+        ]
+        result = subprocess.run(
+            run_cmd, cwd=_ROOT, env=env, capture_output=True, text=True, timeout=180
+        )
+        assert result.returncode == 0, (
+            "pure-module coverage subrun failed:\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert data_file.exists(), (
+            "coverage data file was not produced — "
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+        json_cmd = [
+            sys.executable,
+            "-m",
+            "coverage",
+            "json",
+            f"--rcfile={cov_cfg}",
+            "-o",
+            str(json_report),
+        ]
+        json_result = subprocess.run(
+            json_cmd, cwd=_ROOT, env=env, capture_output=True, text=True, timeout=60
+        )
+        assert json_result.returncode == 0, (
+            f"coverage json failed:\nstdout:\n{json_result.stdout}\n"
+            f"stderr:\n{json_result.stderr}"
+        )
+
+        data = json.loads(json_report.read_text())
+        files = data.get("files", {})
+        normalised = {
+            Path(p).resolve().as_posix(): v["summary"]["percent_covered"]
+            for p, v in files.items()
+        }
+
+        below: list[str] = []
+        for module in _PURE_MODULE_TESTS:
+            module_path = (_SRC / module).resolve().as_posix()
+            pct = normalised.get(module_path)
+            assert pct is not None, (
+                f"No coverage entry for pure module {module}; "
+                f"keys: {sorted(normalised)}"
+            )
+            if pct < 80.0:
+                below.append(f"{module}: {pct:.1f}%")
+        assert not below, (
+            "Pure-module coverage below 80% threshold (AC-X-6): " + ", ".join(below)
         )
 
 
@@ -528,3 +624,51 @@ class TestValidateConfig:
                 f"Model slot {slot_name!r} references provider "
                 f"{slot.provider!r} which is not defined in [providers]"
             )
+
+    def test_validate_config_cli_full_pipeline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``python -m influx validate-config`` exercises the full v0.7
+        validation pipeline: config schema + prompt vars + JSON-mode
+        dry-call + SSE dry-connect — verified against
+        ``influx.example.toml`` with mocked HTTP/LithosClient endpoints
+        so the test stays deterministic and offline (US-011 Definition
+        of Done item)."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from influx.main import _cmd_validate_config
+
+        # Point at a copy of the example config so the load path matches
+        # the user-facing CLI surface exactly.
+        cfg_src = (_ROOT / "influx.example.toml").read_text()
+        cfg_path = tmp_path / "influx.toml"
+        cfg_path.write_text(cfg_src)
+        monkeypatch.setenv("INFLUX_CONFIG", str(cfg_path))
+
+        # Provide test-only API keys so config loading + JSON-mode dry
+        # call have credentials they can route into the auth header.
+        monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+
+        # Stub the JSON-mode dry-call: any [models.*] slot with
+        # ``json_mode=true`` will POST to /chat/completions during
+        # validation. Return 200 OK so the CLI accepts the slot.
+        ok_response = MagicMock()
+        ok_response.status_code = 200
+        ok_response.json = MagicMock(return_value={"choices": []})
+
+        # Stub the LithosClient SSE dry-connect: ``_ensure_connected``
+        # is what the CLI invokes; mocking it sidesteps a real MCP
+        # handshake while still exercising the validate-config branch.
+        fake_client = MagicMock()
+        fake_client._ensure_connected = AsyncMock(return_value=None)
+        fake_client.close = AsyncMock(return_value=None)
+
+        with (
+            patch("httpx.post", return_value=ok_response),
+            patch("influx.lithos_client.LithosClient", return_value=fake_client),
+        ):
+            # The CLI calls ``sys.exit`` only on failure paths; success
+            # falls through. Any non-zero exit indicates a regression in
+            # the validate-config pipeline.
+            _cmd_validate_config()

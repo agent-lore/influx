@@ -278,7 +278,13 @@ async def _run_profile_body(
             for item in items:
                 sources_checked += 1
                 title = item["title"]
-                record_filter_result(profile, title, item.get("tags", []))
+                # Use the LLM filter-result tags (FR-FLT-3 ``FilterResult.tags``)
+                # for rejection-rate computation per FR-OBS-5 / US-008 — distinct
+                # from the persisted note / provenance tags later attached to the
+                # note. The provider populates ``filter_tags``; sources without an
+                # LLM filter step (e.g. RSS) leave it absent and contribute no
+                # filter-tag entries to the rejection-rate map.
+                record_filter_result(profile, title, item.get("filter_tags", []))
                 source_url = item["source_url"]
                 cache_result = await client.cache_lookup_for_item(
                     title=title,
@@ -652,9 +658,7 @@ class InfluxScheduler:
         a per-tick provider built by the dispatcher can be passed
         through without mutating ``self``.
         """
-        provider = (
-            item_provider if item_provider is not None else self._item_provider
-        )
+        provider = item_provider if item_provider is not None else self._item_provider
         try:
             async with self._coordinator.hold(profile_name):
                 await run_profile(

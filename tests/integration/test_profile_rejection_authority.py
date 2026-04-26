@@ -123,9 +123,7 @@ def _make_items_for_profile(profile: str) -> list[dict[str, Any]]:
     ]
     score = 8 if profile == PROFILE_A else 7
     reason = (
-        "Relevant to AI robotics."
-        if profile == PROFILE_A
-        else "Relevant to web tech."
+        "Relevant to AI robotics." if profile == PROFILE_A else "Relevant to web tech."
     )
     content = _render_item_content(
         profile_name=profile, score=score, reason=reason, tags=tags
@@ -244,6 +242,7 @@ def clear_fakes(fake_lithos: FakeLithosServer) -> None:
 
 # ── Existing note with influx:rejected:ai-robotics ──────────────────
 
+
 def _existing_rejected_note_tags() -> list[str]:
     """Tags for the existing note where profile-A is rejected."""
     return [
@@ -323,9 +322,7 @@ class TestRejectionAuthorityIngest:
         )
         # write (cache-hit path) → version_conflict
         fake_lithos.write_responses.append(
-            json.dumps(
-                {"status": "version_conflict", "note_id": "note-rejected-001"}
-            )
+            json.dumps({"status": "version_conflict", "note_id": "note-rejected-001"})
         )
         # read (version_conflict retry) → existing note with rejection tag
         fake_lithos.read_responses.append(
@@ -395,9 +392,7 @@ class TestRejectionAuthorityIngest:
         )
         # write (cache-hit path) → version_conflict
         fake_lithos.write_responses.append(
-            json.dumps(
-                {"status": "version_conflict", "note_id": "note-rejected-001"}
-            )
+            json.dumps({"status": "version_conflict", "note_id": "note-rejected-001"})
         )
         # read (version_conflict retry) → note as left by Profile A's run
         fake_lithos.read_responses.append(
@@ -444,9 +439,7 @@ class TestRejectionAuthorityIngest:
         entries_b = parse_profile_relevance(parsed_b)
         by_name_b = {e.profile_name: e for e in entries_b}
 
-        assert PROFILE_B in by_name_b, (
-            "Profile B relevance entry must be present"
-        )
+        assert PROFILE_B in by_name_b, "Profile B relevance entry must be present"
         assert by_name_b[PROFILE_B].score == 7
         assert PROFILE_A in by_name_b, (
             "Rejected profile's old relevance entry must be preserved"

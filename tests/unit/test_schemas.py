@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from influx.schemas import FilterResponse, FilterResult
+from influx.schemas import (
+    FilterResponse,
+    FilterResult,
+    Tier1Enrichment,
+    Tier3Extraction,
+)
 
 
 class TestFilterResultPositive:
@@ -106,3 +111,80 @@ class TestFilterResponseNegative:
         }
         with pytest.raises(ValidationError):
             FilterResponse.model_validate(payload)
+
+
+class TestTier1Enrichment:
+    """Tier-1 enrichment schema validation (FR-ENR-4)."""
+
+    def test_minimal_valid(self) -> None:
+        t = Tier1Enrichment(
+            contributions=["c1"],
+            method="m",
+            result="r",
+            relevance="rel",
+        )
+        assert t.contributions == ["c1"]
+
+    def test_max_contributions(self) -> None:
+        t = Tier1Enrichment(
+            contributions=["a", "b", "c", "d", "e", "f"],
+            method="m",
+            result="r",
+            relevance="rel",
+        )
+        assert len(t.contributions) == 6
+
+    def test_too_many_contributions(self) -> None:
+        with pytest.raises(ValidationError):
+            Tier1Enrichment(
+                contributions=["a"] * 7, method="m", result="r", relevance="rel"
+            )
+
+    def test_empty_contributions(self) -> None:
+        with pytest.raises(ValidationError):
+            Tier1Enrichment(contributions=[], method="m", result="r", relevance="rel")
+
+
+class TestTier3Extraction:
+    """Tier-3 deep extraction schema validation (FR-ENR-5)."""
+
+    def test_minimal_valid(self) -> None:
+        t = Tier3Extraction(claims=["claim1"])
+        assert t.claims == ["claim1"]
+        assert t.datasets == []
+        assert t.builds_on == []
+
+    def test_full_payload(self) -> None:
+        t = Tier3Extraction(
+            claims=["c1", "c2"],
+            datasets=["d1"],
+            builds_on=["b1"],
+            open_questions=["o1"],
+            potential_connections=["p1"],
+        )
+        assert t.builds_on == ["b1"]
+
+    def test_trim_and_truncate_long_strings(self) -> None:
+        long_text = "x" * 800
+        t = Tier3Extraction(claims=[long_text])
+        assert len(t.claims[0]) == 500
+
+    def test_whitespace_trimmed(self) -> None:
+        t = Tier3Extraction(claims=["  hello  "])
+        assert t.claims == ["hello"]
+
+    def test_empty_after_trim_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            Tier3Extraction(claims=["   "])
+
+    def test_too_many_claims(self) -> None:
+        with pytest.raises(ValidationError):
+            Tier3Extraction(claims=[f"c{i}" for i in range(11)])
+
+    def test_no_claims_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            Tier3Extraction(claims=[])
+
+    def test_too_many_datasets(self) -> None:
+        with pytest.raises(ValidationError):
+            Tier3Extraction(claims=["c"], datasets=[f"d{i}" for i in range(11)])

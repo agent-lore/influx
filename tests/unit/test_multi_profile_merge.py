@@ -521,9 +521,7 @@ class TestSingleProfileRunPreservesOthers:
         )
 
         # Tags are union-merged
-        merged_tags = merge_tags(
-            existing_tags=existing_tags, new_tags=new_tags
-        )
+        merged_tags = merge_tags(existing_tags=existing_tags, new_tags=new_tags)
         assert f"profile:{PROFILE_A}" in merged_tags
         assert f"profile:{PROFILE_B}" in merged_tags
 

@@ -100,11 +100,19 @@ class ArxivScoreResult:
     enrichment on ``score >= thresholds.relevance``, and Tier 3
     extraction on ``score >= thresholds.deep_extract``).  Returning
     ``None`` from the scorer means "drop this item entirely".
+
+    ``filter_tags`` carries the LLM filter-result tags attached to this
+    candidate (FR-FLT-3 ``FilterResult.tags``).  These are the tags the
+    filter prompt itself emits — distinct from the persisted note /
+    provenance tags the source builder later attaches — and are what
+    rejection-rate logging (FR-OBS-5, US-008) consumes when computing
+    per-tag rejection rates.
     """
 
     score: int
     confidence: float
     reason: str
+    filter_tags: tuple[str, ...] = ()
 
 
 # A scorer maps each fetched arXiv item + the active profile name to a
@@ -494,6 +502,7 @@ def build_arxiv_note_item(
     profile_name: str,
     config: AppConfig,
     thresholds: ProfileThresholds | None = None,
+    filter_tags: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build a complete ``ProfileItem`` dict for the scheduler.
 
@@ -672,6 +681,7 @@ def build_arxiv_note_item(
         "source_url": source_url,
         "content": content,
         "tags": tags,
+        "filter_tags": list(filter_tags) if filter_tags is not None else [],
         "score": score,
         "confidence": confidence,
         "reason": reason,
@@ -875,9 +885,7 @@ def make_arxiv_item_provider(
                 },
             ):
                 try:
-                    batch_scores = await filter_scorer(
-                        items, profile, filter_prompt
-                    )
+                    batch_scores = await filter_scorer(items, profile, filter_prompt)
                 except FilterScorerError:
                     _log.warning(
                         "filter_scorer failed for profile %r; "
@@ -926,6 +934,7 @@ def make_arxiv_item_provider(
                     reason=score_result.reason,
                     profile_name=profile,
                     config=config,
+                    filter_tags=score_result.filter_tags,
                 )
             )
 

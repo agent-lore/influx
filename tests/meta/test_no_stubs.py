@@ -106,9 +106,8 @@ class TestNoStubMarkers:
                 f"  {path}:{line_no} [{marker}] {text}"
                 for path, line_no, marker, text in violations
             ]
-            msg = (
-                f"Found {len(violations)} leftover seam marker(s):\n"
-                + "\n".join(lines)
+            msg = f"Found {len(violations)} leftover seam marker(s):\n" + "\n".join(
+                lines
             )
             pytest.fail(msg)
 

@@ -480,6 +480,40 @@ class TestEdgeUpsertUnknownTool:
             await client.close()
 
 
+class TestTaskCreateUnknownTool:
+    """``LithosClient.task_create`` raises ``LCMAError("unknown_tool")``
+    when the server does not support the tool (AC-X-6 error envelope)."""
+
+    async def test_task_create_unknown_tool(self, minimal_url: str) -> None:
+        client = LithosClient(url=minimal_url)
+        try:
+            with pytest.raises(LCMAError, match="unknown_tool"):
+                await client.task_create(
+                    title="Influx run ai-robotics",
+                    agent="influx",
+                    tags=["influx:run", "profile:ai-robotics"],
+                )
+        finally:
+            await client.close()
+
+
+class TestTaskCompleteUnknownTool:
+    """``LithosClient.task_complete`` raises ``LCMAError("unknown_tool")``
+    when the server does not support the tool (AC-X-6 error envelope)."""
+
+    async def test_task_complete_unknown_tool(self, minimal_url: str) -> None:
+        client = LithosClient(url=minimal_url)
+        try:
+            with pytest.raises(LCMAError, match="unknown_tool"):
+                await client.task_complete(
+                    task_id="task-001",
+                    agent="influx",
+                    outcome="success",
+                )
+        finally:
+            await client.close()
+
+
 # ── Non-unknown-tool failure ─────────────────────────────────────
 
 

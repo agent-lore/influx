@@ -84,13 +84,15 @@ async def on_run_complete(
     # ── AC-M4-4: per-run filtered + ingested structured log ──
     filtered = sources_checked - ingested
     logger.info(
-        json.dumps({
-            "event": "influx.run.stats",
-            "profile": profile,
-            "filtered": filtered,
-            "ingested": ingested,
-            "sources_checked": sources_checked,
-        }),
+        json.dumps(
+            {
+                "event": "influx.run.stats",
+                "profile": profile,
+                "filtered": filtered,
+                "ingested": ingested,
+                "sources_checked": sources_checked,
+            }
+        ),
     )
 
     # ── Per-profile run counter ──
@@ -123,12 +125,14 @@ async def _emit_rejection_rates(
     tag_store = _filter_result_tags.get(profile, [])
     if not tag_store:
         logger.info(
-            json.dumps({
-                "event": "influx.rejection_rate",
-                "profile": profile,
-                "rejection_rates": {},
-                "note": "no filter results recorded since last emission",
-            }),
+            json.dumps(
+                {
+                    "event": "influx.rejection_rate",
+                    "profile": profile,
+                    "rejection_rates": {},
+                    "note": "no filter results recorded since last emission",
+                }
+            ),
         )
         return
 
@@ -167,11 +171,13 @@ async def _emit_rejection_rates(
         rejection_rates[tag] = round(rejected / total, 4) if total > 0 else 0.0
 
     logger.info(
-        json.dumps({
-            "event": "influx.rejection_rate",
-            "profile": profile,
-            "rejection_rates": rejection_rates,
-        }),
+        json.dumps(
+            {
+                "event": "influx.rejection_rate",
+                "profile": profile,
+                "rejection_rates": rejection_rates,
+            }
+        ),
     )
 
 

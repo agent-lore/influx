@@ -73,9 +73,7 @@ def validate_backfill_range(
             "Supply exactly one of --days or (--from, --to), not both"
         )
     if not has_days and not has_range:
-        raise BackfillRangeError(
-            "Supply exactly one of --days or (--from, --to)"
-        )
+        raise BackfillRangeError("Supply exactly one of --days or (--from, --to)")
     if has_range and (date_from is None or date_to is None):
         raise BackfillRangeError(
             "Both --from and --to are required when using date range"

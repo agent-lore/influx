@@ -63,11 +63,7 @@ class FetchCache:
             return False
         value = self._store[key]
         if isinstance(value, asyncio.Future):
-            return (
-                value.done()
-                and not value.cancelled()
-                and value.exception() is None
-            )
+            return value.done() and not value.cancelled() and value.exception() is None
         return True
 
     def get(self, key: str) -> Any:
@@ -195,9 +191,7 @@ def make_item_provider(
         arxiv_items = list(
             await arxiv_provider(profile, kind, run_range, filter_prompt)
         )
-        rss_items = list(
-            await rss_provider(profile, kind, run_range, filter_prompt)
-        )
+        rss_items = list(await rss_provider(profile, kind, run_range, filter_prompt))
         return arxiv_items + rss_items
 
     return provider

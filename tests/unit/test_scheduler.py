@@ -291,9 +291,7 @@ class TestTickOverlapDoesNotBlockUnrelatedProfiles:
                 assert set(tick_tasks) == active_tasks
 
                 # Drain so each tick's fan-out can run to completion.
-                await asyncio.wait_for(
-                    asyncio.gather(*tick_tasks), timeout=2.0
-                )
+                await asyncio.wait_for(asyncio.gather(*tick_tasks), timeout=2.0)
 
             # Beta and gamma ran on EVERY tick because the coordinator,
             # not APScheduler, decides what runs; alpha was skipped on

@@ -417,9 +417,7 @@ class TestDedupSkip:
         )
         # US-005: cache hit still triggers a write; server returns duplicate
         # for same-profile re-write (content unchanged).
-        fake_lithos.write_responses.append(
-            json.dumps({"status": "duplicate"})
-        )
+        fake_lithos.write_responses.append(json.dumps({"status": "duplicate"}))
 
         # --- Second run: item is cached (cache hit → write → duplicate). ---
         app2 = _make_app(config, items=items)

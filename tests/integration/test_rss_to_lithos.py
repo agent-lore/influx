@@ -261,9 +261,9 @@ class TestArchiveNotePathAgreement:
         # Verify layout: archive_root/source_tag/YYYY/MM/filename.html
         rel = archive_files[0].relative_to(archive_dir)
         parts = rel.parts
-        assert parts[0] == "rss"      # source_tag
-        assert parts[1] == "2026"     # YYYY
-        assert parts[2] == "04"       # MM
+        assert parts[0] == "rss"  # source_tag
+        assert parts[1] == "2026"  # YYYY
+        assert parts[2] == "04"  # MM
         assert parts[3].endswith(".html")
 
         # Filename contains feed slug, date, and url-hash

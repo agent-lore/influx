@@ -32,7 +32,8 @@ except ImportError:
     _has_otel = False
 
 _needs_otel = pytest.mark.skipif(
-    not _has_otel, reason="opentelemetry SDK not installed",
+    not _has_otel,
+    reason="opentelemetry SDK not installed",
 )
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -59,9 +60,7 @@ class TestOtelOffByDefault:
         tracer = get_tracer(force_rebuild=True)
         assert not tracer.enabled
 
-    def test_span_is_noop_when_env_unset(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_span_is_noop_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _rebuild_tracer(monkeypatch, None)
         tracer = get_tracer(force_rebuild=True)
         with tracer.span("influx.run") as s:
@@ -76,27 +75,37 @@ class TestOtelOffByDefault:
 class TestOtelExplicitlyDisabled:
     """FR-OBS-2: wrapper is a no-op when INFLUX_OTEL_ENABLED=false."""
 
-    def test_tracer_disabled_when_false(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_tracer_disabled_when_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _rebuild_tracer(monkeypatch, "false")
         tracer = get_tracer(force_rebuild=True)
         assert not tracer.enabled
 
-    def test_tracer_disabled_when_zero(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_tracer_disabled_when_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _rebuild_tracer(monkeypatch, "0")
         tracer = get_tracer(force_rebuild=True)
         assert not tracer.enabled
 
-    def test_span_is_noop_when_disabled(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_span_is_noop_when_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _rebuild_tracer(monkeypatch, "false")
         tracer = get_tracer(force_rebuild=True)
         with tracer.span("influx.filter", attributes={"influx.profile": "p"}) as s:
             s.set_attribute("influx.item_count", 10)
+
+    def test_disabled_span_does_not_allocate_per_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-10-A: disabled body must not instantiate a wrapper per span."""
+        _rebuild_tracer(monkeypatch, "false")
+        tracer = get_tracer(force_rebuild=True)
+
+        with tracer.span("influx.run") as a:
+            pass
+        with tracer.span("influx.filter") as b:
+            pass
+
+        # Both invocations yield the SAME shared no-op wrapper object —
+        # proves the disabled path performs no per-span allocation.
+        assert a is b
 
 
 # ── (3) Enabled when INFLUX_OTEL_ENABLED=true + packages installed ─────
@@ -106,16 +115,12 @@ class TestOtelExplicitlyDisabled:
 class TestOtelEnabled:
     """Wrapper creates real spans when OTEL is enabled and packages are present."""
 
-    def test_tracer_enabled_when_true(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_tracer_enabled_when_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _rebuild_tracer(monkeypatch, "true")
         tracer = get_tracer(force_rebuild=True)
         assert tracer.enabled
 
-    def test_tracer_enabled_when_one(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_tracer_enabled_when_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _rebuild_tracer(monkeypatch, "1")
         tracer = get_tracer(force_rebuild=True)
         assert tracer.enabled
@@ -175,9 +180,7 @@ class TestOtelPackagesAbsent:
         _rebuild_tracer(monkeypatch, "true")
 
         # Simulate missing packages by stubbing imports
-        otel_modules = [
-            k for k in sys.modules if k.startswith("opentelemetry")
-        ]
+        otel_modules = [k for k in sys.modules if k.startswith("opentelemetry")]
         saved = {k: sys.modules[k] for k in otel_modules}
 
         try:
@@ -213,9 +216,7 @@ class TestOtelPackagesAbsent:
         """With OTEL disabled and packages absent, still a no-op."""
         _rebuild_tracer(monkeypatch, "false")
 
-        otel_modules = [
-            k for k in sys.modules if k.startswith("opentelemetry")
-        ]
+        otel_modules = [k for k in sys.modules if k.startswith("opentelemetry")]
         saved = {k: sys.modules[k] for k in otel_modules}
 
         try:
@@ -262,9 +263,7 @@ class TestNoOpNeverRaises:
             s.set_attribute("bool_attr", True)
             s.set_attributes({"multi_a": 1, "multi_b": "two"})
 
-    def test_noop_nested_spans(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_noop_nested_spans(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _rebuild_tracer(monkeypatch, None)
         tracer = get_tracer(force_rebuild=True)
 
@@ -370,11 +369,13 @@ class TestEnabledSpanAttributes:
     def test_set_attributes_batch(self) -> None:
         tracer, collected = _make_collecting_tracer()
         with tracer.span("influx.filter") as s:
-            s.set_attributes({
-                "influx.profile": "robotics",
-                "influx.run_id": "r-99",
-                "influx.item_count": 25,
-            })
+            s.set_attributes(
+                {
+                    "influx.profile": "robotics",
+                    "influx.run_id": "r-99",
+                    "influx.item_count": 25,
+                }
+            )
         attrs = collected[0].attributes
         assert attrs is not None
         assert attrs.get("influx.profile") == "robotics"
@@ -413,16 +414,16 @@ class TestConsoleFallback:
 
         buf = io.StringIO()
         provider = TracerProvider()
-        provider.add_span_processor(
-            SimpleSpanProcessor(ConsoleSpanExporter(out=buf))
-        )
+        provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter(out=buf)))
 
         tracer = InfluxTracer(
-            enabled=True, tracer=provider.get_tracer("influx-test"),
+            enabled=True,
+            tracer=provider.get_tracer("influx-test"),
         )
 
         with tracer.span(
-            "influx.run", attributes={"influx.profile": "test"},
+            "influx.run",
+            attributes={"influx.profile": "test"},
         ):
             pass
 
@@ -499,11 +500,13 @@ class TestAC10ARegressionGuard:
 
         # Tracer is disabled even though we have a real OTEL provider
         disabled_tracer = InfluxTracer(
-            enabled=False, tracer=provider.get_tracer("test"),
+            enabled=False,
+            tracer=provider.get_tracer("test"),
         )
 
         with disabled_tracer.span(
-            "influx.run", attributes={"influx.profile": "ai"},
+            "influx.run",
+            attributes={"influx.profile": "ai"},
         ) as s:
             s.set_attribute("influx.item_count", 42)
 

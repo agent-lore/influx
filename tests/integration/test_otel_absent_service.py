@@ -9,25 +9,30 @@ import or wrapper no-op.
 from __future__ import annotations
 
 import builtins
-import contextlib
 import sys
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from influx.config import (
     AppConfig,
+    FeedbackConfig,
     LithosConfig,
+    NotificationsConfig,
     ProfileConfig,
     PromptEntryConfig,
     PromptsConfig,
     ScheduleConfig,
+    SecurityConfig,
 )
 from influx.coordinator import Coordinator, RunKind
 from influx.http_api import router
+from influx.notifications import ProfileRunResult
 from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler, ProfileItem, run_profile
+from tests.contract.test_lithos_client import FakeLithosServer
 
 
 def _make_config(lithos_url: str = "") -> AppConfig:
@@ -42,14 +47,42 @@ def _make_config(lithos_url: str = "") -> AppConfig:
             tier1_enrich=PromptEntryConfig(text="test"),
             tier3_extract=PromptEntryConfig(text="test"),
         ),
+        notifications=NotificationsConfig(webhook_url="", timeout_seconds=5),
+        security=SecurityConfig(allow_private_ips=True),
+        feedback=FeedbackConfig(negative_examples_per_profile=20),
     )
+
+
+@pytest.fixture(scope="module")
+def fake_lithos_mcp() -> Generator[FakeLithosServer, None, None]:
+    """Module-scoped fully-functional fake Lithos MCP server."""
+    server = FakeLithosServer()
+    server.start()
+    yield server
+    server.stop()
+
+
+@pytest.fixture(scope="module")
+def fake_lithos_mcp_url(fake_lithos_mcp: FakeLithosServer) -> str:
+    return f"http://127.0.0.1:{fake_lithos_mcp.port}/sse"
+
+
+@pytest.fixture(autouse=True)
+def _clear_fakes(fake_lithos_mcp: FakeLithosServer) -> None:
+    fake_lithos_mcp.calls.clear()
+    fake_lithos_mcp.write_responses.clear()
+    fake_lithos_mcp.read_responses.clear()
+    fake_lithos_mcp.cache_lookup_responses.clear()
+    fake_lithos_mcp.list_responses.clear()
 
 
 class TestServiceWithOtelAbsent:
     """AC-M4-3: service operates normally when OTEL packages are absent."""
 
     @pytest.fixture(autouse=True)
-    def _stub_otel_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _stub_otel_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> Generator[None, None, None]:
         """Simulate OTEL packages being absent via import-stubbing."""
         monkeypatch.delenv("INFLUX_OTEL_ENABLED", raising=False)
 
@@ -61,9 +94,7 @@ class TestServiceWithOtelAbsent:
 
         _real_import = builtins.__import__
 
-        def _blocked_import(
-            name: str, *args: object, **kwargs: object
-        ) -> object:
+        def _blocked_import(name: str, *args: Any, **kwargs: Any) -> Any:
             if name.startswith("opentelemetry"):
                 raise ImportError(f"Simulated missing: {name}")
             return _real_import(name, *args, **kwargs)
@@ -75,7 +106,7 @@ class TestServiceWithOtelAbsent:
 
         get_tracer(force_rebuild=True)
 
-        yield  # type: ignore[misc]
+        yield
 
         # Restore OTEL modules after test
         for k, v in saved.items():
@@ -121,17 +152,19 @@ class TestServiceWithOtelAbsent:
 
     async def test_run_completes_with_otel_absent(
         self,
-        fake_lithos_sse_url: str,
+        fake_lithos_mcp_url: str,
     ) -> None:
-        """A representative run completes when OTEL packages are absent.
+        """A representative run completes successfully when OTEL is absent.
 
-        Uses a no-op item provider so the run exercises the full
-        run_profile lifecycle (feedback + filter + write loop) without
-        requiring a real LLM or Lithos connection that returns valid data.
+        Uses a fully-functional fake Lithos MCP server so the run
+        exercises the entire ``run_profile`` lifecycle (task bracketing,
+        feedback ingestion, item provider invocation, post-run webhook)
+        and returns a ``ProfileRunResult`` — proving the service-level
+        AC-M4-3 contract: start + serve + complete a run.
         """
-        config = _make_config(lithos_url=fake_lithos_sse_url)
+        config = _make_config(lithos_url=fake_lithos_mcp_url)
 
-        async def _noop_provider(
+        async def _empty_provider(
             profile: str,
             kind: RunKind,
             run_range: dict[str, str | int] | None,
@@ -140,23 +173,20 @@ class TestServiceWithOtelAbsent:
             del profile, kind, run_range, filter_prompt
             return ()
 
-        # run_profile with no Lithos will raise because the fake SSE
-        # endpoint is not a real MCP server. The key assertion is that
-        # the telemetry wrapper does not interfere — the run gets past
-        # service init and enters the run body. We catch the expected
-        # Lithos connection error to prove the run lifecycle was entered.
-        # run_profile will fail on the fake SSE endpoint (not a real MCP
-        # server), but the key assertion is that telemetry does not
-        # interfere — the run enters its body without import errors.
-        with contextlib.suppress(Exception):
-            await run_profile(
-                "ai-robotics",
-                RunKind.SCHEDULED,
-                config=config,
-                item_provider=_noop_provider,
-            )
+        result = await run_profile(
+            "ai-robotics",
+            RunKind.SCHEDULED,
+            config=config,
+            item_provider=_empty_provider,
+        )
 
-        # Verify telemetry is still a no-op after the run attempt
+        # The run completes and returns a ProfileRunResult.
+        assert isinstance(result, ProfileRunResult)
+        assert result.profile == "ai-robotics"
+        assert result.stats.sources_checked == 0
+        assert result.stats.ingested == 0
+
+        # Verify telemetry remained a no-op throughout the run.
         from influx.telemetry import get_tracer
 
         tracer = get_tracer()

@@ -123,9 +123,7 @@ def _make_items_for_profile(profile: str) -> list[dict[str, Any]]:
     ]
     score = 8 if profile == PROFILE_A else 7
     reason = (
-        "Relevant to AI robotics."
-        if profile == PROFILE_A
-        else "Relevant to web tech."
+        "Relevant to AI robotics." if profile == PROFILE_A else "Relevant to web tech."
     )
     content = _render_item_content(
         profile_name=profile, score=score, reason=reason, tags=tags

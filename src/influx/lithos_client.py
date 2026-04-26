@@ -195,7 +195,7 @@ def _replace_profile_relevance_section(
 
     if next_h2 != -1:
         # Replace up to but not including the next ## heading's newline
-        return content[:pr_idx] + replacement + "\n" + content[next_h2 + 1:]
+        return content[:pr_idx] + replacement + "\n" + content[next_h2 + 1 :]
     else:
         # Profile Relevance is the last section — replace to end
         return content[:pr_idx] + replacement
