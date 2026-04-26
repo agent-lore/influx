@@ -74,8 +74,13 @@ class ProbeState:
     lcma_unknown_tool_failure_detail: str = ""
 
     def _has_run(self) -> bool:
-        """Return ``True`` once at least one probe cycle has completed."""
-        return self.lithos.timestamp > 0.0 or self.llm_credentials.timestamp > 0.0
+        """Return ``True`` once at least one probe cycle has completed.
+
+        ``0.0`` is the unset sentinel; ``time.monotonic()`` is implementation-
+        defined and may return small or negative values on freshly-booted
+        hosts, so we test inequality against the sentinel rather than ``> 0``.
+        """
+        return self.lithos.timestamp != 0.0 or self.llm_credentials.timestamp != 0.0
 
     def is_stale(self, now: float | None = None) -> bool:
         """Return ``True`` when any cached probe result is older than ``max_age``.
@@ -91,7 +96,7 @@ class ProbeState:
         t = time.monotonic() if now is None else now
         cutoff = t - self.max_age
         for result in (self.lithos, self.llm_credentials):
-            if result.timestamp > 0.0 and result.timestamp < cutoff:
+            if result.timestamp != 0.0 and result.timestamp < cutoff:
                 return True
         return False
 
