@@ -31,6 +31,26 @@ from influx.notes import merge_tags as _canonical_merge_tags
 
 __all__ = ["LithosClient", "WriteResult"]
 
+# Substrings that indicate the MCP server is reporting an unsupported /
+# unregistered tool (vs. a runtime error inside a registered tool).
+# FastMCP returns "Unknown tool: <name>"; lowlevel JSON-RPC uses
+# "Method not found".  Match case-insensitively to be robust against
+# minor server-side wording differences.
+_UNKNOWN_TOOL_MARKERS: tuple[str, ...] = (
+    "unknown tool",
+    "method not found",
+    "tool not found",
+    "no such tool",
+)
+
+
+def _is_unknown_tool_message(message: str | None) -> bool:
+    """Return ``True`` when *message* indicates an unsupported tool."""
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _UNKNOWN_TOOL_MARKERS)
+
 
 @dataclasses.dataclass(frozen=True)
 class WriteResult:
@@ -612,16 +632,40 @@ class LithosClient:
     ) -> mcp_types.CallToolResult:
         """Call an LCMA tool, translating unknown-tool failures.
 
-        Raises ``LCMAError("unknown_tool")`` when the connected Lithos
-        deployment does not support the requested tool (FR-LCMA-6).
+        Translates *only* genuine unsupported-tool failures into
+        ``LCMAError("unknown_tool", stage=name)`` (FR-LCMA-6).  Other
+        MCP failures — invalid params, internal tool exceptions, output
+        validation errors — are surfaced as
+        ``LCMAError("call_failed", stage=name, detail=…)`` so callers
+        can distinguish deployment misconfiguration from ordinary
+        per-call failures and so the US-007 abort/degraded-readiness
+        path is reserved for the former.
+
+        Both error variants carry ``stage=name`` so operators can see
+        which LCMA tool failed.
         """
         try:
             result = await self.call_tool(name, arguments)
         except McpError as exc:
-            # MCP server returns JSON-RPC error for unregistered tools.
-            raise LCMAError("unknown_tool") from exc
+            err = getattr(exc, "error", None)
+            code = getattr(err, "code", None)
+            message = getattr(err, "message", None) or str(exc)
+            if (
+                code == mcp_types.METHOD_NOT_FOUND
+                or _is_unknown_tool_message(message)
+            ):
+                raise LCMAError("unknown_tool", stage=name, detail=message) from exc
+            raise LCMAError("call_failed", stage=name, detail=message) from exc
+
         if result.isError:
-            raise LCMAError("unknown_tool")
+            text = ""
+            try:
+                text = result.content[0].text  # type: ignore[union-attr]
+            except (IndexError, AttributeError):
+                text = ""
+            if _is_unknown_tool_message(text):
+                raise LCMAError("unknown_tool", stage=name, detail=text)
+            raise LCMAError("call_failed", stage=name, detail=text)
         return result
 
     async def retrieve(

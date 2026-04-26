@@ -125,3 +125,15 @@ Started: Sun Apr 26 06:31:01 UTC 2026
   - `task_complete` still fires in `finally` block even when `LCMAError("unknown_tool")` aborts the run — it records `outcome="error"`
   - `clear_lithos` autouse fixture in integration tests resets `raise_on_retrieve = False` to avoid cross-test contamination
 ---
+
+## 2026-04-26 - US-008
+- Extended webhook digest unit tests with positive and negative `related_in_lithos` cases (AC-08-F)
+- Added `test_related_in_lithos_populated_from_retrieve` — verifies highlight carries `{"title", "score"}` entries from high-scoring retrieve results
+- Renamed `test_related_in_lithos_always_empty` → `test_related_in_lithos_empty_when_no_results` — verifies empty list when no high-scoring results
+- Updated `_make_item` helper to accept optional `related_in_lithos` parameter
+- Files changed: `tests/unit/test_webhook_digest.py` (modified)
+- **Learnings for future iterations:**
+  - The `related_in_lithos` plumbing was fully wired in US-005: `HighlightItem` dataclass field, `scheduler.py` populates from `lcma_after_write()`, `to_dict()` serializes. US-008 only needed test coverage.
+  - `HighlightItem` is frozen — `related_in_lithos` must be set at construction time (passed to `__init__`)
+  - The `_make_item` test helper defaults `related_in_lithos=[]` — pass explicit values for positive test cases
+---

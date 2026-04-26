@@ -19,7 +19,7 @@
         "Additional test asserts that elements which are empty after trimming are skipped, per FR-LCMA-2 step 2 (the first up to 3 `contributions` are taken in original list order, each `.strip()`-ed, and any element that is empty after trimming is skipped)"
       ],
       "priority": 1,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
@@ -35,7 +35,7 @@
         "Unit tests live in `tests/unit/test_builds_on_arxiv_id_extraction.py` covering: (1) prefix + parenthesised arXiv ID, (2) bare `arXiv:<id>` with no prefix, (3) item with no arXiv ID returns no match, (4) prefix with trailing whitespace is trimmed"
       ],
       "priority": 2,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
@@ -52,7 +52,7 @@
         "`validate-config` (PRD 05) remains unchanged — no startup probe is added (FR-LCMA-1)"
       ],
       "priority": 3,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
@@ -67,7 +67,7 @@
         "Integration test verifies that a profile run produces exactly one `lithos_task_create` and one `lithos_task_complete` in the fake-Lithos recorder. The `lithos_task_create` call carries `tags=[\"influx:run\", f\"profile:{profile}\"]` (and `agent=\"influx\"`); the `lithos_task_complete` call carries the matching `task_id`, `agent=\"influx\"`, and an `outcome` value (per the `lithos_task_complete(task_id, agent, outcome?)` contract — `tags` are NOT passed to complete)"
       ],
       "priority": 4,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
@@ -86,7 +86,7 @@
         "Integration test also asserts that a result with `score = 0.5` does NOT produce an edge"
       ],
       "priority": 5,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
@@ -104,7 +104,7 @@
         "Integration tests in `tests/integration/test_lcma_edges_end_to_end.py` extend coverage with: (1) Tier 3 `builds_on=[\"FooNet (arXiv:2412.12345)\"]` with a fake-Lithos cache hit on the arXiv URL → one `lithos_edge_upsert(type=\"builds_on\")` with the expected evidence, (2) same input with a fake-Lithos miss → zero `builds_on` edges"
       ],
       "priority": 6,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
@@ -119,7 +119,7 @@
         "Tests in `tests/integration/test_lcma_edges_end_to_end.py` cover the mid-run `lithos_retrieve` unknown-tool abort path (AC-08-E): a fake Lithos that returns `unknown_tool` for `lithos_retrieve` after the first note write asserts (1) the run aborts, (2) the prior `lithos_write` call remains visible in the fake-Lithos recorder (i.e. the already-written note remains in Lithos), (3) no `lithos_edge_upsert` calls are recorded for that run, (4) readiness reports degraded"
       ],
       "priority": 7,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
@@ -134,7 +134,7 @@
         "No new external dependency is added"
       ],
       "priority": 8,
-      "passes": true,
+      "passes": false,
       "notes": ""
     }
   ],

@@ -43,6 +43,11 @@ class FakeLCMAServer:
         self.edge_upsert_responses: list[str] = []
         self.task_create_responses: list[str] = []
         self.task_complete_responses: list[str] = []
+        # Per-tool error queues (FIFO) — when populated, the next call
+        # raises ``RuntimeError(<msg>)`` instead of returning a response.
+        # Used to simulate runtime errors that should NOT be classified
+        # as ``unknown_tool``.
+        self.retrieve_errors: list[str] = []
         self._register_tools()
 
     def _register_tools(self) -> None:
@@ -51,6 +56,7 @@ class FakeLCMAServer:
         edge_upsert_responses = self.edge_upsert_responses
         task_create_responses = self.task_create_responses
         task_complete_responses = self.task_complete_responses
+        retrieve_errors = self.retrieve_errors
 
         @self._mcp.tool(name="lithos_agent_register")
         async def lithos_agent_register(
@@ -81,6 +87,8 @@ class FakeLCMAServer:
                     },
                 )
             )
+            if retrieve_errors:
+                raise RuntimeError(retrieve_errors.pop(0))
             if retrieve_responses:
                 return retrieve_responses.pop(0)
             return json.dumps({"results": []})
@@ -228,6 +236,7 @@ def clear_lcma_calls(lcma_server: FakeLCMAServer) -> None:
     lcma_server.edge_upsert_responses.clear()
     lcma_server.task_create_responses.clear()
     lcma_server.task_complete_responses.clear()
+    lcma_server.retrieve_errors.clear()
 
 
 @pytest.fixture(scope="module")
@@ -473,6 +482,53 @@ class TestEdgeUpsertUnknownTool:
                 )
         finally:
             await client.close()
+
+
+# ── Non-unknown-tool failure ─────────────────────────────────────
+
+
+class TestLcmaNonUnknownToolFailure:
+    """Genuine runtime failures on a *registered* LCMA tool must NOT be
+    misclassified as ``unknown_tool``.
+
+    Only true unsupported-tool errors should hit the US-007 abort /
+    degraded-readiness path; ordinary per-call failures (invalid input,
+    internal tool exceptions, etc.) must surface distinctly so callers
+    can preserve normal error handling.
+    """
+
+    async def test_retrieve_runtime_error_not_unknown_tool(
+        self,
+        lcma_url: str,
+        lcma_server: FakeLCMAServer,
+        clear_lcma_calls: None,
+    ) -> None:
+        # Queue up a runtime exception inside the lithos_retrieve tool
+        # — i.e. the tool IS registered and reachable, but its handler
+        # blew up.  The wrapper must surface this as a non-unknown_tool
+        # LCMAError so US-007's abort/degraded-readiness path is not
+        # mistakenly triggered.
+        lcma_server.retrieve_errors.append("simulated internal failure")
+
+        client = LithosClient(url=lcma_url)
+        try:
+            with pytest.raises(LCMAError) as excinfo:
+                await client.retrieve(
+                    query="test",
+                    limit=5,
+                    agent_id="influx",
+                    task_id="t-1",
+                    tags=[],
+                )
+        finally:
+            await client.close()
+
+        # Must NOT be classified as unknown_tool — that path is reserved
+        # for the deployment-misconfiguration case.
+        assert str(excinfo.value) != "unknown_tool"
+        # Tool / stage context is preserved so operators can diagnose
+        # which LCMA call failed.
+        assert excinfo.value.stage == "lithos_retrieve"
 
 
 # ── cache_lookup non-regression ───────────────────────────────────

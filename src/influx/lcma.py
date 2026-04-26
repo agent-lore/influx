@@ -36,23 +36,22 @@ def compose_retrieve_query(
     """Compose a deterministic ``lithos_retrieve`` query string (FR-LCMA-2).
 
     1. Start with *title*.
-    2. Append up to 3 non-empty (after ``.strip()``) *contributions*
-       in original list order, joined with ``" | "``.
-    3. Collapse internal whitespace runs to a single space.
-    4. Truncate to 500 characters (simple slice, no word re-wrap).
+    2. Take the first up to 3 *contributions* in original list order,
+       trim each, and skip any that are empty after trimming. Empty
+       elements within those first three are dropped, NOT replaced by
+       later non-empty entries (FR-LCMA-2 step 2).
+    3. Join the surviving parts with ``" | "``.
+    4. Collapse internal whitespace runs to a single space.
+    5. Truncate to 500 characters (simple slice, no word re-wrap).
     """
     parts: list[str] = [title]
 
     if contributions is not None:
-        count = 0
-        for c in contributions:
+        for c in contributions[:_MAX_CONTRIBUTIONS]:
             stripped = c.strip()
             if not stripped:
                 continue
             parts.append(stripped)
-            count += 1
-            if count >= _MAX_CONTRIBUTIONS:
-                break
 
     composed = " | ".join(parts)
     composed = _WHITESPACE_RE.sub(" ", composed)
