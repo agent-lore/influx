@@ -23,6 +23,18 @@ import pytest
 
 from influx.telemetry import InfluxTracer, SpanWrapper, get_tracer
 
+_has_otel = pytest.importorskip is not None  # always True, used as a marker below
+try:
+    import opentelemetry.sdk.trace  # noqa: F401
+
+    _has_otel = True
+except ImportError:
+    _has_otel = False
+
+_needs_otel = pytest.mark.skipif(
+    not _has_otel, reason="opentelemetry SDK not installed",
+)
+
 # ── Helpers ────────────────────────────────────────────────────────────
 
 
@@ -90,6 +102,7 @@ class TestOtelExplicitlyDisabled:
 # ── (3) Enabled when INFLUX_OTEL_ENABLED=true + packages installed ─────
 
 
+@_needs_otel
 class TestOtelEnabled:
     """Wrapper creates real spans when OTEL is enabled and packages are present."""
 
@@ -300,6 +313,7 @@ def _make_collecting_tracer() -> tuple[InfluxTracer, list]:
     return tracer, collected
 
 
+@_needs_otel
 class TestEnabledSpanCreation:
     """US-002: enabled wrapper creates spans with the given name."""
 
@@ -332,6 +346,7 @@ class TestEnabledSpanCreation:
 # ── (7) Enabled wrapper sets attributes on spans (US-002) ──────────────
 
 
+@_needs_otel
 class TestEnabledSpanAttributes:
     """US-002: enabled wrapper sets attributes on the underlying OTEL span."""
 
@@ -382,6 +397,7 @@ class TestEnabledSpanAttributes:
 # ── (8) Console fallback emits spans to stdout (US-002, FR-OBS-3) ──────
 
 
+@_needs_otel
 class TestConsoleFallback:
     """US-002 / FR-OBS-3: console fallback prints spans to stdout."""
 
@@ -455,6 +471,7 @@ class TestConsoleFallback:
 # ── (9) AC-10-A regression guard: no span when disabled + pkgs installed ─
 
 
+@_needs_otel
 class TestAC10ARegressionGuard:
     """AC-10-A: with OTEL disabled, no span created even if packages installed."""
 

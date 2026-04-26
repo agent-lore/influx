@@ -170,7 +170,7 @@
         "Full test suite passes"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": "Implementation guidance (non-binding): if the meta-test fails, listing the offending file paths and line numbers makes diagnosis easier."
     },
     {
@@ -186,7 +186,7 @@
         "All existing tests still pass"
       ],
       "priority": 10,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -204,7 +204,7 @@
         "Typecheck passes"
       ],
       "priority": 11,
-      "passes": false,
+      "passes": true,
       "notes": ""
     }
   ]

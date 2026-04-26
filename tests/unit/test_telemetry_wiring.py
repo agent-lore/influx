@@ -16,6 +16,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytest.importorskip(
+    "opentelemetry.sdk.trace",
+    reason="OTEL SDK required for span wiring tests",
+)
+
 from influx.coordinator import RunKind
 from influx.telemetry import InfluxTracer, current_run_id, get_tracer
 

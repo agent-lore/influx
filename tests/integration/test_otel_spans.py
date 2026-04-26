@@ -17,6 +17,13 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+pytest.importorskip(
+    "opentelemetry.sdk.trace",
+    reason="OTEL SDK required for span integration tests",
+)
+
 from influx.coordinator import RunKind
 from influx.telemetry import InfluxTracer, current_run_id
 
