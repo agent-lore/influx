@@ -13,11 +13,13 @@ from influx.errors import NetworkError
 from influx.http_client import FetchResult
 from influx.sources.arxiv import (
     ArxivItem,
+    BackfillRange,
     _extract_arxiv_id,
     _filter_by_lookback,
     _parse_atom,
     build_query_url,
     fetch_arxiv,
+    resolve_backfill_range,
 )
 
 _FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "arxiv"
@@ -70,6 +72,51 @@ class TestBuildQueryUrl:
     def test_max_results_from_config(self) -> None:
         url = build_query_url(categories=["cs.CL"], max_results=42)
         assert "max_results=42" in url
+
+    def test_backfill_range_adds_submitted_date_clause(self) -> None:
+        """Finding 1: ``backfill --days N`` must constrain the URL."""
+        from datetime import date
+
+        rng = BackfillRange(
+            date_from=date(2026, 4, 20),
+            date_to=date(2026, 4, 27),
+        )
+        url = build_query_url(
+            categories=["cs.AI"],
+            max_results=200,
+            backfill_range=rng,
+        )
+        # AND-clause restricts the query to the requested window so a
+        # backfill actually fetches historical items.
+        assert "submittedDate:[202604200000+TO+202604272359]" in url
+        assert "(cat:cs.AI)+AND+submittedDate" in url
+
+
+# ── Backfill range resolver ────────────────────────────────────────
+
+
+class TestResolveBackfillRange:
+    def test_none_yields_none(self) -> None:
+        assert resolve_backfill_range(None) is None
+
+    def test_days_form(self) -> None:
+        from datetime import timedelta
+
+        now = datetime(2026, 4, 27, 12, 0, 0, tzinfo=UTC)
+        rng = resolve_backfill_range({"days": 7}, now=now)
+        assert rng is not None
+        assert rng.date_to == now.date()
+        assert rng.date_from == now.date() - timedelta(days=7)
+        assert rng.days == 7
+
+    def test_from_to_form(self) -> None:
+        from datetime import date
+
+        rng = resolve_backfill_range({"from": "2026-04-01", "to": "2026-04-08"})
+        assert rng is not None
+        assert rng.date_from == date(2026, 4, 1)
+        assert rng.date_to == date(2026, 4, 8)
+        assert rng.days == 7
 
 
 # ── Atom parsing ───────────────────────────────────────────────────

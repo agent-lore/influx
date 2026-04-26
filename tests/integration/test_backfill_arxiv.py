@@ -38,6 +38,7 @@ from influx.config import (
     ProfileThresholds,
     PromptEntryConfig,
     PromptsConfig,
+    ResilienceConfig,
     ScheduleConfig,
     SecurityConfig,
 )
@@ -76,7 +77,11 @@ _FIXTURE_ARXIV_ITEMS = [
 # ── Helpers ────────────────���─────────────────────────────────────────
 
 
-def _make_config(lithos_url: str) -> AppConfig:
+def _make_config(
+    lithos_url: str,
+    *,
+    arxiv_min_interval: int = 0,
+) -> AppConfig:
     return AppConfig(
         lithos=LithosConfig(url=lithos_url),
         schedule=ScheduleConfig(cron="0 6 * * *", timezone="UTC"),
@@ -115,6 +120,12 @@ def _make_config(lithos_url: str) -> AppConfig:
         notifications=NotificationsConfig(webhook_url="", timeout_seconds=5),
         security=SecurityConfig(allow_private_ips=True),
         feedback=FeedbackConfig(negative_examples_per_profile=20),
+        # Default to 0 pacing for the existing fast tests; the
+        # finding-1 regression tests construct their own config and
+        # override this when they assert pacing semantics.
+        resilience=ResilienceConfig(
+            arxiv_request_min_interval_seconds=arxiv_min_interval,
+        ),
     )
 
 
@@ -591,3 +602,162 @@ class TestBackfillTaskTagging:
         assert "influx:run" in tags
         assert f"profile:{PROFILE}" in tags
         assert "influx:backfill" not in tags
+
+
+# ── Finding 1: backfill range threading + pacing ────────────────────
+
+
+class TestBackfillRangePropagation:
+    """Finding 1 regression: backfill range and pacing must reach the fetcher.
+
+    The ``backfill --days N`` flow has to actually request items from the
+    historical window and apply ``arxiv_request_min_interval_seconds``
+    spacing — otherwise it behaves like an ordinary scheduled run.
+    """
+
+    def test_backfill_range_threaded_into_fetch_arxiv(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """``backfill --days 7`` must pass a concrete BackfillRange to fetch_arxiv."""
+        from influx.sources.arxiv import BackfillRange
+
+        config = _make_config(lithos_url=fake_lithos_url, arxiv_min_interval=3)
+        fetch_cache = FetchCache()
+        provider = make_item_provider(
+            config,
+            fetch_cache=fetch_cache,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        # Queue Lithos: feedback (no repair sweep for backfill)
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+
+        captured_kwargs: dict[str, Any] = {}
+
+        def capturing_fetch(**kwargs: Any) -> list[ArxivItem]:
+            captured_kwargs.update(kwargs)
+            return list(_FIXTURE_ARXIV_ITEMS)
+
+        with (
+            patch(
+                "influx.sources.arxiv.fetch_arxiv",
+                side_effect=capturing_fetch,
+            ),
+            patch("influx.sources.arxiv._sleep") as mock_sleep,
+        ):
+            asyncio.run(
+                run_backfill(
+                    PROFILE,
+                    run_range={"days": 7},
+                    config=config,
+                    item_provider=provider,
+                )
+            )
+
+        # Backfill range must be propagated.
+        backfill_range = captured_kwargs.get("backfill_range")
+        assert backfill_range is not None
+        assert isinstance(backfill_range, BackfillRange)
+        assert backfill_range.days == 7
+
+        # Pacing sleep called with arxiv_request_min_interval_seconds.
+        assert mock_sleep.called
+        sleep_arg = mock_sleep.call_args[0][0]
+        assert sleep_arg == float(
+            config.resilience.arxiv_request_min_interval_seconds
+        )
+
+    def test_backfill_from_to_threaded_into_fetch_arxiv(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """The ``--from``/``--to`` form propagates exact bounds to fetch_arxiv."""
+        from datetime import date
+
+        from influx.sources.arxiv import BackfillRange
+
+        config = _make_config(lithos_url=fake_lithos_url)
+        fetch_cache = FetchCache()
+        provider = make_item_provider(
+            config,
+            fetch_cache=fetch_cache,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+
+        captured_kwargs: dict[str, Any] = {}
+
+        def capturing_fetch(**kwargs: Any) -> list[ArxivItem]:
+            captured_kwargs.update(kwargs)
+            return list(_FIXTURE_ARXIV_ITEMS)
+
+        with (
+            patch(
+                "influx.sources.arxiv.fetch_arxiv",
+                side_effect=capturing_fetch,
+            ),
+            patch("influx.sources.arxiv._sleep"),
+        ):
+            asyncio.run(
+                run_backfill(
+                    PROFILE,
+                    run_range={"from": "2026-04-20", "to": "2026-04-27"},
+                    config=config,
+                    item_provider=provider,
+                )
+            )
+
+        backfill_range = captured_kwargs.get("backfill_range")
+        assert isinstance(backfill_range, BackfillRange)
+        assert backfill_range.date_from == date(2026, 4, 20)
+        assert backfill_range.date_to == date(2026, 4, 27)
+
+    def test_nonbackfill_does_not_pass_range_or_pace(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Scheduled / manual runs must NOT set ``backfill_range`` and
+        must NOT incur the per-fetch pacing sleep that backfill needs.
+        """
+        config = _make_config(lithos_url=fake_lithos_url)
+        fetch_cache = FetchCache()
+        provider = make_item_provider(
+            config,
+            fetch_cache=fetch_cache,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        # Queue Lithos: repair sweep + feedback for the manual run.
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+
+        captured_kwargs: dict[str, Any] = {}
+
+        def capturing_fetch(**kwargs: Any) -> list[ArxivItem]:
+            captured_kwargs.update(kwargs)
+            return list(_FIXTURE_ARXIV_ITEMS)
+
+        with (
+            patch(
+                "influx.sources.arxiv.fetch_arxiv",
+                side_effect=capturing_fetch,
+            ),
+            patch("influx.sources.arxiv._sleep") as mock_sleep,
+        ):
+            asyncio.run(
+                run_profile(
+                    PROFILE,
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=provider,
+                )
+            )
+
+        # Manual run: no backfill_range, no pacing sleep.
+        assert captured_kwargs.get("backfill_range") is None
+        mock_sleep.assert_not_called()

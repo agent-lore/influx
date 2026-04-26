@@ -491,13 +491,219 @@ class TestRssFetchDedup:
             )
 
         # The RSS _feed_ should be fetched exactly once (by Profile A).
-        # Profile B reuses cached parsed items from the FetchCache.
+        # Profile B reuses the cached raw feed bytes from the FetchCache.
         # The feed fetch is the very first guarded_fetch call for
         # Profile A.  Subsequent calls are archive + extraction.
         # For Profile B the feed is cached, so only archive + extraction
-        # calls are made.  We verify the cache has the feed key.
-        assert fetch_cache.has("rss:https://shared-blog.example/feed.xml")
+        # calls are made.  We verify the cache has the feed-bytes key.
+        assert fetch_cache.has("rss-bytes:https://shared-blog.example/feed.xml")
 
         # Both profiles should have written items.
         write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         assert len(write_calls) >= 2
+
+    def test_shared_url_with_distinct_metadata_does_not_leak(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Finding 3 regression: same feed URL with different
+        ``source_tag`` / ``feed_name`` per profile preserves each
+        profile's metadata verbatim — the dedup cache must not stamp
+        items from the second profile with the first profile's tag.
+        """
+        from influx.http_client import FetchResult
+        from influx.sources.rss import _fetch_rss_feed
+
+        feed_a = RssSourceEntry(
+            name="feed-a",
+            url="https://shared-feed.example/atom.xml",
+            source_tag="rss",
+        )
+        feed_b = RssSourceEntry(
+            name="feed-b",
+            url="https://shared-feed.example/atom.xml",
+            source_tag="blog",
+        )
+
+        # Minimal RSS 2.0 feed fixture.
+        rss_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<rss version="2.0"><channel>'
+            "<title>Shared Feed</title>"
+            "<item>"
+            "<title>Some Post</title>"
+            "<link>https://shared-feed.example/post-1</link>"
+            "<description>Hello.</description>"
+            "<pubDate>Sat, 25 Apr 2026 00:00:00 GMT</pubDate>"
+            "</item>"
+            "</channel></rss>"
+        )
+
+        fetch_count = 0
+
+        def counting_guarded_fetch(url: str, **kwargs: Any) -> FetchResult:
+            nonlocal fetch_count
+            fetch_count += 1
+            return FetchResult(
+                body=rss_xml.encode(),
+                status_code=200,
+                content_type="application/rss+xml",
+                final_url=url,
+            )
+
+        cache = FetchCache()
+        with patch(
+            "influx.sources.rss._guarded_fetch",
+            side_effect=counting_guarded_fetch,
+        ):
+            items_a = asyncio.run(_fetch_rss_feed(feed_a, cache))
+            items_b = asyncio.run(_fetch_rss_feed(feed_b, cache))
+
+        # Network fetch only happens once (dedup works).
+        assert fetch_count == 1
+
+        # Each consumer's items carry that consumer's metadata verbatim.
+        assert len(items_a) == 1 and len(items_b) == 1
+        assert items_a[0].source_tag == "rss"
+        assert items_a[0].feed_name == "feed-a"
+        assert items_b[0].source_tag == "blog"
+        assert items_b[0].feed_name == "feed-b"
+
+
+# ── Finding 2 regressions: concurrent dedup + scope reset ────────────
+
+
+class TestFetchCacheConcurrencyAndScope:
+    """Finding 2 regressions: concurrent dedup and per-fire scope reset."""
+
+    def test_concurrent_callers_share_one_fetch(self) -> None:
+        """Two concurrent ``get_or_fetch`` calls produce only one factory
+        invocation — the second caller awaits the first call's Future.
+        """
+        cache = FetchCache()
+        factory_calls = 0
+        gate = asyncio.Event()
+
+        async def slow_factory() -> str:
+            nonlocal factory_calls
+            factory_calls += 1
+            await gate.wait()
+            return "value"
+
+        async def runner() -> tuple[str, str]:
+            task_a = asyncio.create_task(cache.get_or_fetch("k", slow_factory))
+            task_b = asyncio.create_task(cache.get_or_fetch("k", slow_factory))
+            # Yield once so both tasks have entered get_or_fetch.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            gate.set()
+            return await asyncio.gather(task_a, task_b)
+
+        a, b = asyncio.run(runner())
+        assert a == "value"
+        assert b == "value"
+        # Critical: only ONE factory invocation.
+        assert factory_calls == 1
+
+    def test_end_fire_clears_cached_entries(self) -> None:
+        """A fresh fire after ``end_fire`` does not see the prior fire's
+        cached values, so cron tick N+1 cannot reuse stale data from
+        cron tick N.
+        """
+        cache = FetchCache()
+        cache.begin_fire()
+        cache.put("arxiv:cs.AI", ["fixture-item"])
+        assert cache.has("arxiv:cs.AI")
+        cache.end_fire()
+
+        # New fire — cache is fresh.
+        cache.begin_fire()
+        assert not cache.has("arxiv:cs.AI")
+        cache.end_fire()
+
+    def test_concurrent_fires_share_within_one_window(self) -> None:
+        """Two concurrent ``begin_fire`` calls share the same cache
+        contents until both ``end_fire`` calls land — the cache is only
+        cleared when the active-fire reference count returns to zero.
+        """
+        cache = FetchCache()
+        cache.begin_fire()
+        cache.put("arxiv:cs.AI", ["fixture-item"])
+        # Second concurrent fire enters; cache MUST be preserved.
+        cache.begin_fire()
+        assert cache.has("arxiv:cs.AI")
+        # First fire ends; cache still preserved while second is active.
+        cache.end_fire()
+        assert cache.has("arxiv:cs.AI")
+        # Last fire ends; cache is cleared.
+        cache.end_fire()
+        assert not cache.has("arxiv:cs.AI")
+
+    def test_concurrent_profiles_dedup_shared_arxiv_fetch(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """AC-09-D under concurrency: gather two profile runs and assert
+        the shared category is fetched exactly once even when both
+        profiles enter the provider at the same time.
+        """
+        config = _make_config(lithos_url=fake_lithos_url)
+        fetch_cache = FetchCache()
+        fetch_count = 0
+
+        def counting_fetch(**kwargs: Any) -> list[ArxivItem]:
+            nonlocal fetch_count
+            fetch_count += 1
+            return list(_FIXTURE_ARXIV_ITEMS)
+
+        provider = make_item_provider(
+            config,
+            fetch_cache=fetch_cache,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        # Repair sweep + feedback for each of two profiles.
+        for _ in range(4):
+            fake_lithos.list_responses.append(json.dumps({"items": []}))
+        # Allow up to two cache-hit responses (Profile B may see A's write).
+        for _ in range(4):
+            fake_lithos.cache_lookup_responses.append(
+                json.dumps({"hit": False, "stale_exists": False})
+            )
+
+        async def both_concurrently() -> None:
+            # Bracket with begin_fire/end_fire so the test exercises the
+            # per-fire scope semantics that production wires through the
+            # scheduler's ``_fire_profile`` helper.
+            fetch_cache.begin_fire()
+            fetch_cache.begin_fire()
+            try:
+                await asyncio.gather(
+                    run_profile(
+                        PROFILE_A,
+                        RunKind.MANUAL,
+                        config=config,
+                        item_provider=provider,
+                    ),
+                    run_profile(
+                        PROFILE_B,
+                        RunKind.MANUAL,
+                        config=config,
+                        item_provider=provider,
+                    ),
+                )
+            finally:
+                fetch_cache.end_fire()
+                fetch_cache.end_fire()
+
+        with patch(
+            "influx.sources.arxiv.fetch_arxiv",
+            side_effect=counting_fetch,
+        ):
+            asyncio.run(both_concurrently())
+
+        # Critical: exactly one fetch even though two profiles ran
+        # concurrently.
+        assert fetch_count == 1, f"Expected 1 fetch, got {fetch_count}"

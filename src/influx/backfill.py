@@ -9,8 +9,13 @@ in ``run_profile`` when ``kind == RunKind.BACKFILL`` — the write
 attempt is elided entirely so that large backfills avoid redundant
 network traffic.
 
-ArXiv pacing (FR-BF-3): honoured by the arXiv fetcher's retry
-loop and the global rate limiter; no extra wiring needed here.
+ArXiv pacing (FR-BF-3): the arXiv item provider sleeps for
+``ResilienceConfig.arxiv_request_min_interval_seconds`` before each
+backfill fetch when ``kind == RunKind.BACKFILL`` so a multi-day
+backfill does not burst against the arXiv API.  The provider also
+threads the resolved :class:`~influx.sources.arxiv.BackfillRange`
+into ``fetch_arxiv``, replacing the standard lookback window with
+the requested historical bounds.
 
 Same-profile serialisation (AC-M3-7): enforced by the coordinator
 — ``POST /backfills`` acquires the profile lock before launching

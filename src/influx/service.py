@@ -160,6 +160,7 @@ def create_app(
         active_tasks=active_tasks,
         probe_loop=probe_loop,
         item_provider=item_provider,
+        fetch_cache=fetch_cache,
     )
 
     app.state.config = config
@@ -168,6 +169,7 @@ def create_app(
     app.state.probe_loop = probe_loop
     app.state.active_tasks = active_tasks
     app.state.item_provider = item_provider
+    app.state.fetch_cache = fetch_cache
 
     return app
 

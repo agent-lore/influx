@@ -395,6 +395,7 @@ class InfluxScheduler:
         *,
         item_provider: ItemProvider | None = None,
         probe_loop: Any | None = None,
+        fetch_cache: Any | None = None,
     ) -> None:
         self._config = config
         self._coordinator = coordinator
@@ -413,6 +414,10 @@ class InfluxScheduler:
         # (SweepWriteError) flip a readiness latch so ``/ready`` reports
         # degraded per US-011 (§5.4 failure mode 1).
         self._probe_loop = probe_loop
+        # Optional ``FetchCache`` whose per-fire scope is bracketed
+        # around each profile fire so cached fetches do not leak across
+        # cron ticks (review finding 2).
+        self._fetch_cache = fetch_cache
 
     @property
     def jobs(self) -> list[Any]:
@@ -472,12 +477,20 @@ class InfluxScheduler:
         (if provided) so ``InfluxService.stop`` can await this fire
         within ``schedule.shutdown_grace_seconds`` instead of cancelling
         it immediately (US-008 bounded graceful-shutdown contract).
+
+        Brackets the call with ``FetchCache.begin_fire`` /
+        ``end_fire`` so per-source dedup is scoped to the cron tick:
+        the first concurrent fire clears any stale entries from a prior
+        tick, and the cache is wiped again once the last in-flight fire
+        completes (review finding 2).
         """
         if self._active_tasks is not None:
             current = asyncio.current_task()
             if current is not None:
                 self._active_tasks.add(current)
                 current.add_done_callback(self._active_tasks.discard)
+        if self._fetch_cache is not None:
+            self._fetch_cache.begin_fire()
         try:
             async with self._coordinator.hold(profile_name):
                 await run_profile(
@@ -492,3 +505,6 @@ class InfluxScheduler:
                 "Scheduled fire for %r skipped — profile already busy",
                 profile_name,
             )
+        finally:
+            if self._fetch_cache is not None:
+                self._fetch_cache.end_fire()

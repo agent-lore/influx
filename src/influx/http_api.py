@@ -175,6 +175,7 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
                 config=config,
                 item_provider=getattr(request.app.state, "item_provider", None),
                 probe_loop=getattr(request.app.state, "probe_loop", None),
+                fetch_cache=getattr(request.app.state, "fetch_cache", None),
             ),
         )
 
@@ -211,6 +212,7 @@ async def _run_and_release(
     config: Any = None,
     item_provider: Any = None,
     probe_loop: Any = None,
+    fetch_cache: Any = None,
 ) -> None:
     """Run ``run_profile`` and release the coordinator lock afterward.
 
@@ -218,6 +220,8 @@ async def _run_and_release(
     are logged and swallowed so that the manual-run lock is released
     cleanly and the service stays alive (FR-HTTP-4 + AC-M1-11).
     """
+    if fetch_cache is not None:
+        fetch_cache.begin_fire()
     try:
         try:
             await run_profile(
@@ -238,6 +242,8 @@ async def _run_and_release(
             )
     finally:
         coordinator.release(profile)
+        if fetch_cache is not None:
+            fetch_cache.end_fire()
 
 
 async def _backfill_and_release(
@@ -248,6 +254,7 @@ async def _backfill_and_release(
     config: Any = None,
     item_provider: Any = None,
     probe_loop: Any = None,
+    fetch_cache: Any = None,
 ) -> None:
     """Run ``backfill.run_backfill`` and release the coordinator lock afterward.
 
@@ -257,6 +264,8 @@ async def _backfill_and_release(
     """
     from influx.backfill import run_backfill
 
+    if fetch_cache is not None:
+        fetch_cache.begin_fire()
     try:
         try:
             await run_backfill(
@@ -276,6 +285,8 @@ async def _backfill_and_release(
             )
     finally:
         coordinator.release(profile)
+        if fetch_cache is not None:
+            fetch_cache.end_fire()
 
 
 def _spawn_tracked_task(
@@ -483,6 +494,7 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
                 config=config,
                 item_provider=getattr(request.app.state, "item_provider", None),
                 probe_loop=getattr(request.app.state, "probe_loop", None),
+                fetch_cache=getattr(request.app.state, "fetch_cache", None),
             ),
         )
 

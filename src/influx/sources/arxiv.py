@@ -23,7 +23,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from influx.config import (
@@ -49,10 +49,12 @@ __all__ = [
     "ArxivItem",
     "ArxivScorer",
     "ArxivScoreResult",
+    "BackfillRange",
     "build_arxiv_note_item",
     "build_query_url",
     "fetch_arxiv",
     "make_arxiv_item_provider",
+    "resolve_backfill_range",
 ]
 
 _log = logging.getLogger(__name__)
@@ -125,6 +127,55 @@ ArxivFilterScorer = Callable[
 ]
 
 
+# ── Backfill range ─────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class BackfillRange:
+    """Resolved backfill date range with absolute UTC bounds.
+
+    Either constructed directly with ``date_from`` / ``date_to`` (the
+    explicit ``--from`` / ``--to`` form) or via :func:`resolve_backfill_range`
+    which converts the ``--days N`` form into a concrete window relative
+    to *now*.
+    """
+
+    date_from: date
+    date_to: date
+
+    @property
+    def days(self) -> int:
+        """Number of days covered by this range (inclusive lower bound)."""
+        return max((self.date_to - self.date_from).days, 0)
+
+
+def resolve_backfill_range(
+    run_range: dict[str, str | int] | None,
+    *,
+    now: datetime | None = None,
+) -> BackfillRange | None:
+    """Convert a ``run_range`` dict into a concrete :class:`BackfillRange`.
+
+    Returns ``None`` when *run_range* is ``None`` (i.e. scheduled / manual
+    runs).  Otherwise resolves either the ``--days N`` form (today minus
+    *N* days through today) or the explicit ``--from`` / ``--to`` form.
+    """
+    if run_range is None:
+        return None
+    if "days" in run_range:
+        days = int(run_range["days"])
+        ref = now if now is not None else datetime.now(UTC)
+        date_to = ref.date()
+        date_from = date_to - timedelta(days=days)
+        return BackfillRange(date_from=date_from, date_to=date_to)
+    if "from" in run_range and "to" in run_range:
+        return BackfillRange(
+            date_from=date.fromisoformat(str(run_range["from"])),
+            date_to=date.fromisoformat(str(run_range["to"])),
+        )
+    return None
+
+
 # ── Query URL construction ─────────────────────────────────────────
 
 
@@ -132,14 +183,27 @@ def build_query_url(
     *,
     categories: list[str],
     max_results: int,
+    backfill_range: BackfillRange | None = None,
 ) -> str:
     """Build the arXiv API query URL per FR-SRC-1.
 
     Constructs ``search_query`` as an OR-joined expression
     (``cat:X+OR+cat:Y+...``), ``sortBy=submittedDate``,
     ``sortOrder=descending``, and ``max_results`` from the profile.
+
+    When *backfill_range* is provided, an additional
+    ``+AND+submittedDate:[YYYYMMDDHHMM+TO+YYYYMMDDHHMM]`` clause restricts
+    results to items submitted within the requested window so that
+    ``backfill --days N`` actually fetches historical items rather than
+    the current feed window (FR-BF-1).
     """
     cat_expr = "+OR+".join(f"cat:{c}" for c in categories)
+    if backfill_range is not None:
+        from_stamp = backfill_range.date_from.strftime("%Y%m%d") + "0000"
+        to_stamp = backfill_range.date_to.strftime("%Y%m%d") + "2359"
+        cat_expr = (
+            f"({cat_expr})+AND+submittedDate:[{from_stamp}+TO+{to_stamp}]"
+        )
     return (
         f"{_ARXIV_API_URL}"
         f"?search_query={cat_expr}"
@@ -245,6 +309,7 @@ def fetch_arxiv(
     arxiv_config: ArxivSourceConfig,
     resilience: ResilienceConfig,
     now: datetime | None = None,
+    backfill_range: BackfillRange | None = None,
 ) -> list[ArxivItem]:
     """Fetch and filter arXiv items for the given config.
 
@@ -256,6 +321,13 @@ def fetch_arxiv(
         The ``resilience`` section for retry/backoff settings.
     now:
         Override for the current time (for testing date filtering).
+    backfill_range:
+        Optional historical date range.  When supplied, the query URL
+        is constrained to ``submittedDate`` within the range (FR-BF-1)
+        and the standard ``lookback_days`` lower-bound filter is replaced
+        by the explicit range bounds.  The pacing budget for backfills
+        is enforced by ``ResilienceConfig.arxiv_request_min_interval_seconds``
+        (FR-BF-3) and applied by the caller around each fetch.
 
     Returns
     -------
@@ -265,6 +337,7 @@ def fetch_arxiv(
     url = build_query_url(
         categories=arxiv_config.categories,
         max_results=arxiv_config.max_results_per_category,
+        backfill_range=backfill_range,
     )
 
     body = _fetch_with_retry(
@@ -273,6 +346,21 @@ def fetch_arxiv(
     )
 
     items = _parse_atom(body)
+    if backfill_range is not None:
+        # Server-side ``submittedDate`` already constrains the window;
+        # apply the same bounds client-side as a defense-in-depth check
+        # against off-by-one timezone drift (FR-BF-1).
+        from_dt = datetime.combine(
+            backfill_range.date_from,
+            datetime.min.time(),
+            tzinfo=UTC,
+        )
+        to_dt = datetime.combine(
+            backfill_range.date_to,
+            datetime.max.time(),
+            tzinfo=UTC,
+        )
+        return [it for it in items if from_dt <= it.published <= to_dt]
     return _filter_by_lookback(
         items,
         arxiv_config.lookback_days,
@@ -603,8 +691,6 @@ def make_arxiv_item_provider(
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
     ) -> Iterable[dict[str, Any]]:
-        del kind, run_range
-
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
         if profile_cfg is None:
             return ()
@@ -612,28 +698,48 @@ def make_arxiv_item_provider(
             return ()
 
         # ── Cached fetch (R-8 dedup) ─────────────────────────────
+        # Backfill runs build a date-bounded query so the requested
+        # historical window is honoured (FR-BF-1).  The cache key
+        # includes the bounded URL so that two profiles requesting the
+        # same window dedup, but distinct windows do not collide.
         arxiv_cfg = profile_cfg.sources.arxiv
+        backfill_range = (
+            resolve_backfill_range(run_range)
+            if kind == RunKind.BACKFILL
+            else None
+        )
         cache_key = "arxiv:" + build_query_url(
             categories=arxiv_cfg.categories,
             max_results=arxiv_cfg.max_results_per_category,
+            backfill_range=backfill_range,
         )
-        if cache is not None and cache.has(cache_key):
-            items = cache.get(cache_key)
-        else:
-            try:
-                items = fetch_arxiv(
-                    arxiv_config=profile_cfg.sources.arxiv,
-                    resilience=config.resilience,
-                )
-            except NetworkError:
-                _log.warning(
-                    "arxiv fetch failed for profile %r; yielding zero items",
-                    profile,
-                    exc_info=True,
-                )
-                return ()
+
+        async def _do_fetch() -> list[ArxivItem]:
+            # FR-BF-3: enforce ``arxiv_request_min_interval_seconds`` of
+            # spacing on backfills so a multi-day backfill does not burst
+            # against the arXiv API.  Scheduled / manual runs make a
+            # single fetch per category set, so pacing is irrelevant
+            # there.
+            if kind == RunKind.BACKFILL:
+                _sleep(float(config.resilience.arxiv_request_min_interval_seconds))
+            return fetch_arxiv(
+                arxiv_config=profile_cfg.sources.arxiv,
+                resilience=config.resilience,
+                backfill_range=backfill_range,
+            )
+
+        try:
             if cache is not None:
-                cache.put(cache_key, items)
+                items = await cache.get_or_fetch(cache_key, _do_fetch)
+            else:
+                items = await _do_fetch()
+        except NetworkError:
+            _log.warning(
+                "arxiv fetch failed for profile %r; yielding zero items",
+                profile,
+                exc_info=True,
+            )
+            return ()
 
         # Batched LLM filter takes precedence as the production default.
         # The per-item ``scorer`` seam stays available for tests that

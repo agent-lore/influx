@@ -298,7 +298,7 @@ def make_rss_item_provider(
 
         results: list[dict[str, Any]] = []
         for feed_entry in profile_cfg.sources.rss:
-            items = _fetch_rss_feed(feed_entry, cache)
+            items = await _fetch_rss_feed(feed_entry, cache)
             for item in items:
                 results.append(
                     build_rss_note_item(
@@ -313,26 +313,42 @@ def make_rss_item_provider(
     return provider
 
 
-def _fetch_rss_feed(
+async def _fetch_rss_feed(
     feed_entry: RssSourceEntry,
     cache: FetchCache | None,
 ) -> list[RssFeedItem]:
-    """Fetch and parse an RSS feed, using cache for dedup."""
-    cache_key = f"rss:{feed_entry.url}"
-    if cache is not None and cache.has(cache_key):
-        return cache.get(cache_key)  # type: ignore[return-value]
+    """Fetch raw feed bytes, then parse-and-stamp per *feed_entry*.
 
-    try:
-        result = _guarded_fetch(feed_entry.url)
-        items = parse_feed(result.body, feed_entry)
-    except NetworkError:
-        _log.warning(
-            "RSS feed fetch failed for %r; yielding zero items",
-            feed_entry.name,
-            exc_info=True,
-        )
-        items = []
+    The cache is keyed on the feed URL but stores **only** the raw
+    response bytes — never the parsed :class:`RssFeedItem` list.  This
+    matters because each parsed item embeds the caller's ``source_tag``
+    and ``feed_name``: caching the parsed list would let a second profile
+    that configured the same URL with different metadata receive items
+    stamped with the FIRST profile's metadata, routing them to the wrong
+    bucket / archive path (review finding 3).  Re-parsing per call keeps
+    the network savings of dedup while preserving the FR-SRC-4 rule that
+    each item inherits its feed's configured ``source_tag`` verbatim.
+    """
+    cache_key = f"rss-bytes:{feed_entry.url}"
+
+    async def _fetch_bytes() -> bytes | None:
+        try:
+            result = _guarded_fetch(feed_entry.url)
+        except NetworkError:
+            _log.warning(
+                "RSS feed fetch failed for %r; yielding zero items",
+                feed_entry.name,
+                exc_info=True,
+            )
+            return None
+        return result.body
 
     if cache is not None:
-        cache.put(cache_key, items)
-    return items
+        body = await cache.get_or_fetch(cache_key, _fetch_bytes)
+    else:
+        body = await _fetch_bytes()
+
+    if body is None:
+        return []
+
+    return parse_feed(body, feed_entry)
