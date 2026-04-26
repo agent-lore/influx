@@ -704,3 +704,332 @@ class TestInfluxFetchRssSpan:
             items = list(result)
             # The fetch still works — items are returned
             assert len(items) == 1
+
+
+# ── (6) influx.enrich.tier1/tier2/tier3 spans (US-005) ─────────────
+
+
+def _make_enrich_config() -> Any:
+    """Build an AppConfig with thresholds that trigger all three tiers."""
+    from influx.config import (
+        AppConfig,
+        ExtractionConfig,
+        LithosConfig,
+        ProfileConfig,
+        ProfileThresholds,
+        PromptEntryConfig,
+        PromptsConfig,
+        ScheduleConfig,
+        SecurityConfig,
+    )
+
+    return AppConfig(
+        lithos=LithosConfig(url="http://localhost:0/sse"),
+        schedule=ScheduleConfig(cron="0 6 * * *", timezone="UTC"),
+        profiles=[
+            ProfileConfig(
+                name="ai-robotics",
+                description="AI and robotics research",
+                thresholds=ProfileThresholds(
+                    relevance=5,
+                    full_text=6,
+                    deep_extract=7,
+                ),
+            ),
+        ],
+        providers={},
+        prompts=PromptsConfig(
+            filter=PromptEntryConfig(text="x"),
+            tier1_enrich=PromptEntryConfig(text="{title} {abstract} {profile_summary}"),
+            tier3_extract=PromptEntryConfig(text="{title} {full_text}"),
+        ),
+        security=SecurityConfig(allow_private_ips=True),
+        extraction=ExtractionConfig(),
+    )
+
+
+def _make_test_arxiv_item() -> Any:
+    from datetime import UTC, datetime
+
+    from influx.sources.arxiv import ArxivItem
+
+    return ArxivItem(
+        arxiv_id="2601.12345",
+        title="Test Paper Title",
+        abstract="This is the abstract.",
+        published=datetime(2026, 4, 25, tzinfo=UTC),
+        categories=["cs.AI"],
+    )
+
+
+class TestInfluxEnrichTier1Span:
+    """US-005: Tier 1 enrichment emits an ``influx.enrich.tier1`` span."""
+
+    def test_tier1_span_created_with_attributes(self) -> None:
+        """With OTEL enabled, ``build_arxiv_note_item`` emits an
+        ``influx.enrich.tier1`` span carrying ``influx.profile``,
+        ``influx.run_id``, ``influx.item_count``."""
+        from influx.extraction.pipeline import ArxivExtractionResult
+        from influx.schemas import Tier1Enrichment
+        from influx.sources.arxiv import build_arxiv_note_item
+
+        tracer, collected = _make_collecting_tracer()
+        config = _make_enrich_config()
+        item = _make_test_arxiv_item()
+
+        token = current_run_id.set("test-run-enrich-tier1")
+        try:
+            with (
+                patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch(
+                    "influx.sources.arxiv.extract_arxiv_text",
+                    return_value=ArxivExtractionResult(
+                        text="Full text here", source_tag="text:html"
+                    ),
+                ),
+                patch(
+                    "influx.sources.arxiv.tier1_enrich",
+                    return_value=Tier1Enrichment(
+                        contributions=["c1"],
+                        method="m",
+                        result="r",
+                        relevance="rel",
+                    ),
+                ),
+                patch(
+                    "influx.sources.arxiv.tier3_extract",
+                    return_value=MagicMock(builds_on=["b"]),
+                ),
+            ):
+                build_arxiv_note_item(
+                    item=item,
+                    score=9,
+                    confidence=0.95,
+                    reason="relevant",
+                    profile_name="ai-robotics",
+                    config=config,
+                )
+        finally:
+            current_run_id.reset(token)
+
+        tier1_spans = [s for s in collected if s.name == "influx.enrich.tier1"]
+        assert len(tier1_spans) == 1
+        attrs = tier1_spans[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "ai-robotics"
+        assert attrs.get("influx.run_id") == "test-run-enrich-tier1"
+        assert attrs.get("influx.item_count") == 1
+
+
+class TestInfluxEnrichTier2Span:
+    """US-005: Tier 2 (extraction) emits an ``influx.enrich.tier2`` span."""
+
+    def test_tier2_span_created_with_attributes(self) -> None:
+        """With OTEL enabled, ``build_arxiv_note_item`` emits an
+        ``influx.enrich.tier2`` span when score >= full_text threshold."""
+        from influx.extraction.pipeline import ArxivExtractionResult
+        from influx.sources.arxiv import build_arxiv_note_item
+
+        tracer, collected = _make_collecting_tracer()
+        config = _make_enrich_config()
+        item = _make_test_arxiv_item()
+
+        token = current_run_id.set("test-run-enrich-tier2")
+        try:
+            with (
+                patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch(
+                    "influx.sources.arxiv.extract_arxiv_text",
+                    return_value=ArxivExtractionResult(
+                        text="Full text here", source_tag="text:html"
+                    ),
+                ),
+                patch(
+                    "influx.sources.arxiv.tier1_enrich",
+                    return_value=MagicMock(contributions=["c"]),
+                ),
+            ):
+                build_arxiv_note_item(
+                    item=item,
+                    score=6,
+                    confidence=0.8,
+                    reason="ok",
+                    profile_name="ai-robotics",
+                    config=config,
+                )
+        finally:
+            current_run_id.reset(token)
+
+        tier2_spans = [s for s in collected if s.name == "influx.enrich.tier2"]
+        assert len(tier2_spans) == 1
+        attrs = tier2_spans[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "ai-robotics"
+        assert attrs.get("influx.run_id") == "test-run-enrich-tier2"
+        assert attrs.get("influx.item_count") == 1
+
+
+class TestInfluxEnrichTier3Span:
+    """US-005: Tier 3 deep extraction emits an ``influx.enrich.tier3`` span."""
+
+    def test_tier3_span_created_with_attributes(self) -> None:
+        """With OTEL enabled, ``build_arxiv_note_item`` emits an
+        ``influx.enrich.tier3`` span when score >= deep_extract and
+        extraction succeeded."""
+        from influx.extraction.pipeline import ArxivExtractionResult
+        from influx.schemas import Tier3Extraction
+        from influx.sources.arxiv import build_arxiv_note_item
+
+        tracer, collected = _make_collecting_tracer()
+        config = _make_enrich_config()
+        item = _make_test_arxiv_item()
+
+        token = current_run_id.set("test-run-enrich-tier3")
+        try:
+            with (
+                patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch(
+                    "influx.sources.arxiv.extract_arxiv_text",
+                    return_value=ArxivExtractionResult(
+                        text="Full text here", source_tag="text:html"
+                    ),
+                ),
+                patch(
+                    "influx.sources.arxiv.tier1_enrich",
+                    return_value=MagicMock(contributions=["c"]),
+                ),
+                patch(
+                    "influx.sources.arxiv.tier3_extract",
+                    return_value=Tier3Extraction(
+                        claims=["claim1"],
+                        builds_on=["b1"],
+                    ),
+                ),
+            ):
+                build_arxiv_note_item(
+                    item=item,
+                    score=9,
+                    confidence=0.95,
+                    reason="very relevant",
+                    profile_name="ai-robotics",
+                    config=config,
+                )
+        finally:
+            current_run_id.reset(token)
+
+        tier3_spans = [s for s in collected if s.name == "influx.enrich.tier3"]
+        assert len(tier3_spans) == 1
+        attrs = tier3_spans[0].attributes
+        assert attrs is not None
+        assert attrs.get("influx.profile") == "ai-robotics"
+        assert attrs.get("influx.run_id") == "test-run-enrich-tier3"
+        assert attrs.get("influx.item_count") == 1
+
+
+class TestEnrichSpansAllThreeTiers:
+    """US-005: all three tier spans appear in a single high-score build call."""
+
+    def test_all_three_tier_spans_present(self) -> None:
+        """A score above all thresholds produces tier1, tier2, and tier3 spans."""
+        from influx.extraction.pipeline import ArxivExtractionResult
+        from influx.schemas import Tier1Enrichment, Tier3Extraction
+        from influx.sources.arxiv import build_arxiv_note_item
+
+        tracer, collected = _make_collecting_tracer()
+        config = _make_enrich_config()
+        item = _make_test_arxiv_item()
+
+        token = current_run_id.set("test-run-all-tiers")
+        try:
+            with (
+                patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch(
+                    "influx.sources.arxiv.extract_arxiv_text",
+                    return_value=ArxivExtractionResult(
+                        text="Full text", source_tag="text:html"
+                    ),
+                ),
+                patch(
+                    "influx.sources.arxiv.tier1_enrich",
+                    return_value=Tier1Enrichment(
+                        contributions=["c"], method="m", result="r", relevance="rel"
+                    ),
+                ),
+                patch(
+                    "influx.sources.arxiv.tier3_extract",
+                    return_value=Tier3Extraction(
+                        claims=["claim"],
+                        builds_on=["b"],
+                    ),
+                ),
+            ):
+                build_arxiv_note_item(
+                    item=item,
+                    score=10,
+                    confidence=1.0,
+                    reason="top",
+                    profile_name="ai-robotics",
+                    config=config,
+                )
+        finally:
+            current_run_id.reset(token)
+
+        span_names = {s.name for s in collected}
+        assert "influx.enrich.tier1" in span_names
+        assert "influx.enrich.tier2" in span_names
+        assert "influx.enrich.tier3" in span_names
+
+
+class TestEnrichSpansDisabled:
+    """AC-10-A regression: enrichment produces no spans when OTEL is disabled."""
+
+    def test_no_enrich_spans_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With OTEL disabled, ``build_arxiv_note_item`` creates no spans."""
+        monkeypatch.setenv("INFLUX_OTEL_ENABLED", "false")
+        disabled_tracer = get_tracer(force_rebuild=True)
+        assert not disabled_tracer.enabled
+
+        from influx.extraction.pipeline import ArxivExtractionResult
+        from influx.schemas import Tier1Enrichment, Tier3Extraction
+        from influx.sources.arxiv import build_arxiv_note_item
+
+        config = _make_enrich_config()
+        item = _make_test_arxiv_item()
+
+        with (
+            patch("influx.sources.arxiv.get_tracer", return_value=disabled_tracer),
+            patch(
+                "influx.sources.arxiv.extract_arxiv_text",
+                return_value=ArxivExtractionResult(
+                    text="Full text", source_tag="text:html"
+                ),
+            ),
+            patch(
+                "influx.sources.arxiv.tier1_enrich",
+                return_value=Tier1Enrichment(
+                    contributions=["c"], method="m", result="r", relevance="rel"
+                ),
+            ) as mock_tier1,
+            patch(
+                "influx.sources.arxiv.tier3_extract",
+                return_value=Tier3Extraction(
+                    claims=["claim"],
+                    builds_on=["b"],
+                ),
+            ) as mock_tier3,
+        ):
+            result = build_arxiv_note_item(
+                item=item,
+                score=10,
+                confidence=1.0,
+                reason="top",
+                profile_name="ai-robotics",
+                config=config,
+            )
+
+        # Enrichment still runs — just no spans
+        mock_tier1.assert_called_once()
+        mock_tier3.assert_called_once()
+        assert result["title"] == "Test Paper Title"

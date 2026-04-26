@@ -17,6 +17,9 @@ Started: Sun Apr 26 17:50:45 UTC 2026
 - `ArxivItem` fields: `arxiv_id`, `title`, `abstract`, `published` (datetime), `categories` — no `authors`, `updated`, `pdf_url`
 - `fetch_arxiv` is synchronous — mock with `MagicMock`, not `AsyncMock`
 - Fetch/storage spans belong at the provider level (inside `make_*_item_provider`) where `profile` is available, not in raw fetch functions
+- Enrichment tier spans belong in `build_arxiv_note_item` where `profile_name` is available — `influx.item_count` is 1 for per-item enrichment
+- `Tier1Enrichment` fields: `contributions` (list[str]), `method`, `result`, `relevance` — no `summary`/`keywords`
+- `Tier3Extraction` fields: `claims` (list[str] min 1), `datasets`, `builds_on`, `open_questions`, `potential_connections` — no `methodology`/`key_findings`/`limitations`
 
 ---
 
@@ -72,4 +75,16 @@ Started: Sun Apr 26 17:50:45 UTC 2026
   - `influx.item_count` must be set after the fetch completes (via `fetch_span.set_attribute()`) since the count isn't known at span creation
   - RSS imports must be in alphabetical order by module path — `influx.telemetry` sorts after `influx.storage`
   - `_fetch_rss_feed` is async — use `AsyncMock` when patching it in tests
+---
+
+## 2026-04-26 - US-005
+- Wired telemetry spans for enrichment tier1/tier2/tier3 into `build_arxiv_note_item`
+- Files changed:
+  - `src/influx/sources/arxiv.py` — wrapped `extract_arxiv_text()` call in `influx.enrich.tier2` span, `tier1_enrich()` call in `influx.enrich.tier1` span, `tier3_extract()` call in `influx.enrich.tier3` span; all using `get_tracer()` wrapper with `influx.profile`, `influx.run_id`, `influx.item_count` attributes
+  - `tests/unit/test_telemetry_wiring.py` — 5 new tests (16 total): tier1 span + attributes, tier2 span + attributes, tier3 span + attributes, all-three-tiers combined test, OTEL-disabled regression (AC-10-A)
+- **Learnings for future iterations:**
+  - All three enrichment tiers are called within `build_arxiv_note_item` — this is the natural instrumentation site since `profile_name` is available there
+  - `Tier1Enrichment` requires fields: `contributions`, `method`, `result`, `relevance` — not `summary`/`keywords` as might be guessed
+  - `Tier3Extraction` requires `claims` field (list[str], min 1, max 10) — not `methodology`/`key_findings`/`limitations`
+  - `influx.item_count` is 1 for per-item enrichment spans (unlike fetch/filter spans which carry batch counts)
 ---

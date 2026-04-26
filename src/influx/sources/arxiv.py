@@ -548,13 +548,23 @@ def build_arxiv_note_item(
     repair_needed = False
 
     if score >= thresholds.full_text:
-        try:
-            result = extract_arxiv_text(item.arxiv_id, config)
-            extracted_text = result.text
-            text_tag = result.source_tag
-        except ExtractionError:
-            # Both HTML and PDF failed — abstract-only + repair-needed.
-            repair_needed = True
+        # ── Telemetry: influx.enrich.tier2 span (FR-OBS-4) ──
+        _tracer = get_tracer()
+        with _tracer.span(
+            "influx.enrich.tier2",
+            attributes={
+                "influx.profile": profile_name,
+                "influx.run_id": current_run_id.get() or "",
+                "influx.item_count": 1,
+            },
+        ):
+            try:
+                result = extract_arxiv_text(item.arxiv_id, config)
+                extracted_text = result.text
+                text_tag = result.source_tag
+            except ExtractionError:
+                # Both HTML and PDF failed — abstract-only + repair-needed.
+                repair_needed = True
 
     tags.append(text_tag)
 
@@ -571,30 +581,50 @@ def build_arxiv_note_item(
     tier1_result: Tier1Enrichment | None = None
     tier1_attempted = score >= thresholds.relevance
     if tier1_attempted:
-        profile_summary = profile_cfg.description if profile_cfg else ""
-        try:
-            tier1_result = tier1_enrich(
-                title=item.title,
-                abstract=item.abstract,
-                profile_summary=profile_summary,
-                config=config,
-            )
-        except LCMAError:
-            _log.warning("Tier 1 enrichment failed for %s", item.arxiv_id)
-            repair_needed = True
+        # ── Telemetry: influx.enrich.tier1 span (FR-OBS-4) ──
+        _tracer = get_tracer()
+        with _tracer.span(
+            "influx.enrich.tier1",
+            attributes={
+                "influx.profile": profile_name,
+                "influx.run_id": current_run_id.get() or "",
+                "influx.item_count": 1,
+            },
+        ):
+            profile_summary = profile_cfg.description if profile_cfg else ""
+            try:
+                tier1_result = tier1_enrich(
+                    title=item.title,
+                    abstract=item.abstract,
+                    profile_summary=profile_summary,
+                    config=config,
+                )
+            except LCMAError:
+                _log.warning("Tier 1 enrichment failed for %s", item.arxiv_id)
+                repair_needed = True
 
     # ── Tier 3 deep extraction (FR-ENR-5) ─────────────────────────
     tier3_result: Tier3Extraction | None = None
     if score >= thresholds.deep_extract and extracted_text is not None:
-        try:
-            tier3_result = tier3_extract(
-                title=item.title,
-                full_text=extracted_text,
-                config=config,
-            )
-        except LCMAError:
-            _log.warning("Tier 3 extraction failed for %s", item.arxiv_id)
-            repair_needed = True
+        # ── Telemetry: influx.enrich.tier3 span (FR-OBS-4) ──
+        _tracer = get_tracer()
+        with _tracer.span(
+            "influx.enrich.tier3",
+            attributes={
+                "influx.profile": profile_name,
+                "influx.run_id": current_run_id.get() or "",
+                "influx.item_count": 1,
+            },
+        ):
+            try:
+                tier3_result = tier3_extract(
+                    title=item.title,
+                    full_text=extracted_text,
+                    config=config,
+                )
+            except LCMAError:
+                _log.warning("Tier 3 extraction failed for %s", item.arxiv_id)
+                repair_needed = True
 
     # influx:deep-extracted iff all four Tier 3 sections exist.
     if tier3_result is not None:

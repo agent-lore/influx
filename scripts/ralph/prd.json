@@ -93,7 +93,7 @@
         "All existing tests still pass"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
