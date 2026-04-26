@@ -146,6 +146,10 @@ def create_app(
     # behaviour from US-014/US-015.
     if arxiv_scorer is None and arxiv_filter_scorer is None:
         arxiv_filter_scorer = make_default_arxiv_filter_scorer(config)
+
+    # HTTP-triggered runs (POST /runs, POST /backfills) keep using a
+    # single shared cache held on ``app.state``; each request brackets
+    # its own ``begin_fire``/``end_fire`` scope on it.
     fetch_cache = FetchCache()
     item_provider: Any = make_item_provider(
         config,
@@ -154,6 +158,21 @@ def create_app(
         arxiv_filter_scorer=arxiv_filter_scorer,
     )
 
+    # Scheduled ticks use a per-tick factory so cron tick N+1 starts
+    # with a fresh dedup scope even if tick N is still running.  Without
+    # this, a slow profile in tick N would either block tick N+1
+    # entirely or leak its fetched data into tick N+1's cache (review
+    # finding).  Same-profile non-overlap is enforced by the coordinator.
+    def _scheduled_tick_provider_factory() -> tuple[Any, FetchCache]:
+        cache = FetchCache()
+        provider = make_item_provider(
+            config,
+            fetch_cache=cache,
+            arxiv_scorer=arxiv_scorer,
+            arxiv_filter_scorer=arxiv_filter_scorer,
+        )
+        return provider, cache
+
     scheduler = InfluxScheduler(
         config,
         coordinator,
@@ -161,6 +180,7 @@ def create_app(
         probe_loop=probe_loop,
         item_provider=item_provider,
         fetch_cache=fetch_cache,
+        item_provider_factory=_scheduled_tick_provider_factory,
     )
 
     app.state.config = config

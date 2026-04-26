@@ -81,7 +81,9 @@ class TestJobRegistration:
             sched.stop()
 
     async def test_job_settings_max_instances_coalesce_misfire(self) -> None:
-        """Jobs use max_instances=1, coalesce=True, misfire from config."""
+        """Tick dispatcher allows overlapping instances so tick N+1 is not
+        blocked by a slow tick N; same-profile non-overlap stays enforced
+        by the coordinator (review finding)."""
         config = _make_config(profiles=["alpha"], misfire_grace_seconds=7200)
         coord = Coordinator()
         sched = InfluxScheduler(config, coord)
@@ -89,7 +91,7 @@ class TestJobRegistration:
         try:
             job = sched.jobs[0]
             assert job.id == "influx-tick"
-            assert job.max_instances == 1
+            assert job.max_instances >= 2
             assert job.coalesce is True
             assert job.misfire_grace_time == 7200
         finally:
@@ -177,6 +179,121 @@ class TestSchedulerLockIntegration:
             await sched._fire_profile("alpha")
 
         assert coord.is_busy("alpha") is False
+
+
+# ── Tick-overlap regression (review finding) ──────────────────────
+
+
+class TestTickOverlapDoesNotBlockUnrelatedProfiles:
+    """A slow profile in tick N must not block unrelated profiles in
+    tick N+1.  Same-profile non-overlap is enforced by the coordinator,
+    not by APScheduler's ``max_instances`` cap.
+    """
+
+    async def test_tick2_runs_profile_b_while_tick1_alpha_blocks(self) -> None:
+        config = _make_config(profiles=["alpha", "beta"])
+        coord = Coordinator()
+        sched = InfluxScheduler(config, coord)
+
+        started: list[str] = []
+        alpha_block = asyncio.Event()
+        beta_done = asyncio.Event()
+
+        async def slow_run(
+            profile: str, kind: Any, run_range: Any = None, **_: Any
+        ) -> None:
+            started.append(profile)
+            if profile == "alpha":
+                # alpha from tick1 stays in flight until released.
+                await alpha_block.wait()
+            else:
+                # beta finishes promptly so tick2 can re-run it.
+                beta_done.set()
+
+        with patch("influx.scheduler.run_profile", side_effect=slow_run):
+            tick1 = asyncio.create_task(sched._fire_tick())
+            # Wait for tick1's beta to actually finish (so its lock is free)
+            # while tick1's alpha remains stuck.
+            await asyncio.wait_for(beta_done.wait(), timeout=1.0)
+            assert coord.is_busy("alpha") is True
+            assert coord.is_busy("beta") is False
+
+            # Tick2 fires while tick1's alpha is still running.
+            tick2 = asyncio.create_task(sched._fire_tick())
+            # Drain pending callbacks so tick2's fan-out can dispatch.
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+            # tick2's beta must have run; tick2's alpha must have been
+            # skipped (lock held by tick1).
+            assert started.count("beta") == 2
+            assert started.count("alpha") == 1
+            assert coord.is_busy("alpha") is True
+
+            # Tick2 has nothing left to do (alpha skipped, beta done).
+            await asyncio.wait_for(tick2, timeout=1.0)
+
+            # Release alpha so tick1 can finish.
+            alpha_block.set()
+            await asyncio.wait_for(tick1, timeout=1.0)
+
+        assert coord.is_busy("alpha") is False
+        assert coord.is_busy("beta") is False
+
+    async def test_per_tick_factory_isolates_fetch_cache_across_ticks(
+        self,
+    ) -> None:
+        """Each tick gets a fresh fetch cache from the factory, so cron
+        tick N+1's begin_fire scope does not see tick N's data even when
+        the dispatcher runs concurrently."""
+        config = _make_config(profiles=["alpha"])
+        coord = Coordinator()
+
+        class _CountingCache:
+            def __init__(self) -> None:
+                self.begin_count = 0
+                self.end_count = 0
+
+            def begin_fire(self) -> None:
+                self.begin_count += 1
+
+            def end_fire(self) -> None:
+                self.end_count += 1
+
+        produced_caches: list[_CountingCache] = []
+
+        async def noop_provider(
+            profile: str, kind: Any, run_range: Any, filter_prompt: str
+        ) -> list[Any]:
+            del profile, kind, run_range, filter_prompt
+            return []
+
+        def factory() -> tuple[Any, _CountingCache]:
+            cache = _CountingCache()
+            produced_caches.append(cache)
+            return noop_provider, cache
+
+        sched = InfluxScheduler(
+            config,
+            coord,
+            item_provider_factory=factory,
+        )
+
+        async def fake_run(
+            profile: str, kind: Any, run_range: Any = None, **_: Any
+        ) -> None:
+            del profile, kind, run_range
+
+        with patch("influx.scheduler.run_profile", side_effect=fake_run):
+            await sched._fire_tick()
+            await sched._fire_tick()
+
+        # Two ticks → two distinct caches, each begun + ended exactly once.
+        assert len(produced_caches) == 2
+        assert produced_caches[0] is not produced_caches[1]
+        for cache in produced_caches:
+            assert cache.begin_count == 1
+            assert cache.end_count == 1
 
 
 # ── Cross-profile parallelism (AC-M3-1) ────────────────────────────

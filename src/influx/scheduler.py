@@ -1,9 +1,12 @@
 """APScheduler setup with per-job limits and the ``run_profile`` hook.
 
-Configures an in-process APScheduler that registers one cron job per
-profile from the loaded config, with ``max_instances=1``,
-``coalesce=True``, and ``misfire_grace_time=schedule.misfire_grace_seconds``
-(FR-SCHED-2).
+Configures an in-process APScheduler that registers a single
+``influx-tick`` dispatcher job (``coalesce=True``,
+``misfire_grace_time=schedule.misfire_grace_seconds``,
+``max_instances`` > 1 so an in-flight tick does not block later
+ticks).  Each tick fans out to every configured profile while
+same-profile non-overlap is enforced by the
+:class:`~influx.coordinator.Coordinator` (FR-SCHED-2).
 
 Each fire routes through :func:`run_profile`, which executes one
 ingestion cycle: feedback ingestion → per-item dedup lookup →
@@ -57,6 +60,18 @@ ItemProvider = Callable[
     [str, RunKind, dict[str, str | int] | None, str],
     Awaitable[Iterable[ProfileItem]],
 ]
+# Per-tick factory: returns a fresh ``(item_provider, fetch_cache)`` pair so
+# each cron fire has its own dedup scope and cron tick N+1 cannot see cron
+# tick N's data.  ``FetchCache`` is typed as ``Any`` to avoid an import
+# cycle with ``influx.sources``.
+ItemProviderFactory = Callable[[], tuple[ItemProvider, Any]]
+
+
+# Number of concurrent ``influx-tick`` dispatcher instances APScheduler is
+# allowed to run.  Set high enough that a slow tick cannot block unrelated
+# profiles from a later tick — same-profile non-overlap is enforced by the
+# coordinator, not by ``max_instances``.
+_TICK_MAX_INSTANCES = 10
 
 
 async def default_item_provider(
@@ -378,13 +393,15 @@ async def run_profile(
 
 
 class InfluxScheduler:
-    """In-process APScheduler wrapper for per-profile cron jobs.
+    """In-process APScheduler wrapper for the ``influx-tick`` dispatcher.
 
-    Registers one job per profile with ``max_instances=1``,
-    ``coalesce=True``, and ``misfire_grace_time`` from the schedule
-    config.  Each fire acquires the per-profile lock through the
-    shared :class:`~influx.coordinator.Coordinator` before calling
-    :func:`run_profile`.
+    Registers a single dispatcher job with ``coalesce=True`` and
+    ``misfire_grace_time`` from the schedule config.  ``max_instances``
+    is intentionally above 1 so that a slow profile in tick N does not
+    block unrelated profiles from running in tick N+1 — same-profile
+    non-overlap is enforced by the shared
+    :class:`~influx.coordinator.Coordinator`, which is consulted before
+    each call to :func:`run_profile`.
     """
 
     def __init__(
@@ -396,6 +413,7 @@ class InfluxScheduler:
         item_provider: ItemProvider | None = None,
         probe_loop: Any | None = None,
         fetch_cache: Any | None = None,
+        item_provider_factory: ItemProviderFactory | None = None,
     ) -> None:
         self._config = config
         self._coordinator = coordinator
@@ -415,9 +433,17 @@ class InfluxScheduler:
         # degraded per US-011 (§5.4 failure mode 1).
         self._probe_loop = probe_loop
         # Optional ``FetchCache`` whose per-fire scope is bracketed
-        # around each profile fire so cached fetches do not leak across
-        # cron ticks (review finding 2).
+        # around each profile fire (legacy single-shared-cache path —
+        # used by tests that pre-build a provider with a shared cache).
         self._fetch_cache = fetch_cache
+        # Optional per-tick factory.  When set, ``_fire_tick`` calls the
+        # factory once per cron tick to obtain a fresh
+        # ``(item_provider, fetch_cache)`` pair, so cron tick N+1 starts
+        # with a clean dedup scope even when tick N is still running.
+        # This lets ``max_instances`` be > 1 without leaking fetched data
+        # across ticks.  Same-profile non-overlap remains enforced by the
+        # coordinator, not by ``max_instances``.
+        self._item_provider_factory = item_provider_factory
 
     @property
     def jobs(self) -> list[Any]:
@@ -427,14 +453,14 @@ class InfluxScheduler:
     def start(self) -> None:
         """Register a single tick-dispatcher job that fans out to all profiles.
 
-        Replaces the previous per-profile job registration with one
-        ``influx-tick`` job that brackets a single
-        :meth:`FetchCache.begin_fire` / :meth:`FetchCache.end_fire` around
-        the entire fan-out (review finding 1).  This guarantees that all
-        profiles firing for a single cron tick share the same cache
-        scope — so two profiles both subscribed to ``cs.AI`` fetch
-        ``cs.AI`` exactly once for the run, even when one profile
-        finishes before the other starts.
+        Registers one ``influx-tick`` job that brackets per-tick fetch-cache
+        scope around the fan-out.  ``max_instances`` is set above 1 so a
+        slow profile from tick N does not block unrelated profiles in
+        tick N+1 — same-profile non-overlap is enforced by the
+        :class:`~influx.coordinator.Coordinator`, not by APScheduler's
+        instance cap (review finding).  When an
+        ``item_provider_factory`` is wired, each tick allocates its own
+        fresh fetch cache so cross-tick fetches are not deduplicated.
         """
         if self._config.profiles:
             trigger = CronTrigger.from_crontab(
@@ -445,7 +471,7 @@ class InfluxScheduler:
                 self._fire_tick,
                 trigger=trigger,
                 id="influx-tick",
-                max_instances=1,
+                max_instances=_TICK_MAX_INSTANCES,
                 coalesce=True,
                 misfire_grace_time=self._config.schedule.misfire_grace_seconds,
             )
@@ -481,32 +507,49 @@ class InfluxScheduler:
 
         Registers the dispatch task on ``active_tasks`` (if provided) so
         ``InfluxService.stop`` can await it within
-        ``schedule.shutdown_grace_seconds`` (US-008).  Calls
-        :meth:`FetchCache.begin_fire` / :meth:`FetchCache.end_fire` once
-        around the whole fan-out so per-source fetches are deduplicated
-        across all profiles for the cron tick (review finding 1, R-8,
-        AC-09-D).
+        ``schedule.shutdown_grace_seconds`` (US-008).  When an
+        ``item_provider_factory`` is wired, allocates a fresh
+        ``(provider, fetch_cache)`` pair for this tick so cross-tick
+        fetches are not deduplicated and tick N+1 starts with a clean
+        cache even when tick N is still running.  Otherwise falls back
+        to the legacy shared cache path for tests that pre-build a
+        provider+cache pair.
+
+        Per-source fetches within a single tick are deduplicated across
+        profiles for that tick's fan-out (R-8, AC-09-D).
         """
         if self._active_tasks is not None:
             current = asyncio.current_task()
             if current is not None:
                 self._active_tasks.add(current)
                 current.add_done_callback(self._active_tasks.discard)
-        if self._fetch_cache is not None:
-            self._fetch_cache.begin_fire()
+
+        if self._item_provider_factory is not None:
+            tick_provider, tick_cache = self._item_provider_factory()
+        else:
+            tick_provider = self._item_provider
+            tick_cache = self._fetch_cache
+
+        if tick_cache is not None:
+            tick_cache.begin_fire()
         try:
             await asyncio.gather(
                 *(
-                    self._fire_profile(profile.name)
+                    self._fire_profile(profile.name, item_provider=tick_provider)
                     for profile in self._config.profiles
                 ),
                 return_exceptions=True,
             )
         finally:
-            if self._fetch_cache is not None:
-                self._fetch_cache.end_fire()
+            if tick_cache is not None:
+                tick_cache.end_fire()
 
-    async def _fire_profile(self, profile_name: str) -> None:
+    async def _fire_profile(
+        self,
+        profile_name: str,
+        *,
+        item_provider: ItemProvider | None = None,
+    ) -> None:
         """Per-profile fire: acquire lock, call ``run_profile``, release.
 
         A same-profile lock conflict is logged and swallowed so that
@@ -514,18 +557,25 @@ class InfluxScheduler:
 
         The fetch-cache scope is bracketed by the parent
         :meth:`_fire_tick` dispatcher so all profiles within one cron
-        tick share the same dedup window (review finding 1).  Tests
-        that invoke ``_fire_profile`` directly intentionally do NOT
-        bracket the cache here — they exercise the per-profile lock /
-        coordinator behaviour without per-tick fan-out.
+        tick share the same dedup window.  Tests that invoke
+        ``_fire_profile`` directly intentionally do NOT bracket the
+        cache here — they exercise the per-profile lock / coordinator
+        behaviour without per-tick fan-out.
+
+        ``item_provider`` overrides the scheduler-level default so that
+        a per-tick provider built by the dispatcher can be passed
+        through without mutating ``self``.
         """
+        provider = (
+            item_provider if item_provider is not None else self._item_provider
+        )
         try:
             async with self._coordinator.hold(profile_name):
                 await run_profile(
                     profile_name,
                     RunKind.SCHEDULED,
                     config=self._config,
-                    item_provider=self._item_provider,
+                    item_provider=provider,
                     probe_loop=self._probe_loop,
                 )
         except ProfileBusyError:
