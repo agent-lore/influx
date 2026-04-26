@@ -93,7 +93,11 @@ class TestJobRegistration:
             job = sched.jobs[0]
             assert job.id == "influx-tick"
             # Cron fires the thin dispatcher, NOT the fan-out body.
-            assert job.func is sched._cron_dispatch
+            # Bound-method identity is not stable across attribute access
+            # (each access creates a fresh bound method), so verify the
+            # underlying function and bound instance instead of using `is`.
+            assert job.func.__self__ is sched
+            assert job.func.__func__ is InfluxScheduler._cron_dispatch
             assert job.coalesce is True
             assert job.misfire_grace_time == 7200
         finally:
