@@ -29,6 +29,7 @@ from apscheduler.triggers.cron import CronTrigger
 from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.feedback import build_negative_examples_block
+from influx.lcma import after_write as lcma_after_write
 from influx.lithos_client import LithosClient
 from influx.notifications import HighlightItem, ProfileRunResult, RunStats
 from influx.repair import SweepWriteError
@@ -215,6 +216,20 @@ async def run_profile(
                     confidence=float(item.get("confidence", 0.0)),
                 )
                 if write_result.status in ("created", "updated"):
+                    # ── LCMA post-write hook (FR-LCMA-2/3, AC-M2-5/6) ──
+                    related_in_lithos: list[dict[str, Any]] = []
+                    if run_task_id is not None:
+                        related_in_lithos = await lcma_after_write(
+                            client=client,
+                            title=title,
+                            contributions=item.get("contributions"),
+                            run_task_id=run_task_id,
+                            profile=profile,
+                            lcma_edge_score=profile_cfg.thresholds.lcma_edge_score
+                            if profile_cfg
+                            else 0.75,
+                        )
+
                     ingested.append(
                         HighlightItem(
                             id=item.get("id", f"note-{len(ingested) + 1}"),
@@ -223,6 +238,7 @@ async def run_profile(
                             tags=list(item.get("tags", [])),
                             reason=item.get("reason", ""),
                             url=source_url,
+                            related_in_lithos=related_in_lithos,
                         )
                     )
 

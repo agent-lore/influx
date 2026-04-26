@@ -234,3 +234,160 @@ class TestTaskBracketing:
         assert len(complete_calls) == 1
         assert complete_calls[0]["task_id"] == "task-001"
         assert complete_calls[0]["outcome"] == "error"
+
+
+# ── Helpers: item provider for edge tests ─────────────────────────
+
+
+def _single_item_provider(
+    items: list[dict[str, Any]],
+) -> Any:
+    """Return an item provider that yields the given items once."""
+
+    async def _provider(
+        profile: str,
+        kind: RunKind,
+        run_range: Any,
+        filter_prompt: str,
+    ) -> list[dict[str, Any]]:
+        del profile, kind, run_range, filter_prompt
+        return items
+
+    return _provider
+
+
+# ── US-005: after_write retrieve + related_to edge wiring ─────────
+
+
+class TestAfterWriteEdgeWiring:
+    """Post-write LCMA hook calls retrieve + upserts related_to edges (AC-M2-5/6)."""
+
+    def test_high_score_result_produces_edge(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """score >= 0.75 → one lithos_edge_upsert(type=related_to)."""
+        import json as _json
+
+        config = _make_config(fake_lithos_url)
+
+        # Queue a retrieve response with one high-scoring result.
+        fake_lithos.retrieve_responses.append(
+            _json.dumps(
+                {
+                    "results": [
+                        {
+                            "title": "Related Paper A",
+                            "score": 0.85,
+                            "receipt_id": "rcpt-001",
+                            "note_id": "note-related-001",
+                        }
+                    ]
+                }
+            )
+        )
+
+        items = [
+            {
+                "title": "New Robotics Paper",
+                "source_url": "https://arxiv.org/abs/2601.00001",
+                "content": "# Summary\nRobotics paper.",
+                "tags": ["profile:ai-robotics", "source:arxiv"],
+                "confidence": 0.9,
+                "score": 9,
+            }
+        ]
+
+        result = asyncio.run(
+            run_profile(
+                "ai-robotics",
+                RunKind.MANUAL,
+                config=config,
+                item_provider=_single_item_provider(items),
+            )
+        )
+
+        # Verify lithos_retrieve was called with correct args (AC-M2-5).
+        retrieve_calls = _calls_by_tool(fake_lithos.calls, "lithos_retrieve")
+        assert len(retrieve_calls) == 1
+        assert retrieve_calls[0]["agent_id"] == "influx"
+        assert retrieve_calls[0]["task_id"] == "task-001"
+        assert retrieve_calls[0]["tags"] == ["profile:ai-robotics"]
+        assert retrieve_calls[0]["limit"] == 5
+        assert "New Robotics Paper" in retrieve_calls[0]["query"]
+
+        # Verify lithos_edge_upsert was called with correct evidence (AC-M2-6).
+        edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")
+        assert len(edge_calls) == 1
+        assert edge_calls[0]["type"] == "related_to"
+        evidence = edge_calls[0]["evidence"]
+        assert evidence["kind"] == "lithos_retrieve"
+        assert evidence["score"] == 0.85
+        assert evidence["receipt_id"] == "rcpt-001"
+
+        # Verify the result carries related_in_lithos for webhook digest.
+        assert result is not None
+        assert len(result.items) == 1
+        assert len(result.items[0].related_in_lithos) == 1
+        assert result.items[0].related_in_lithos[0]["title"] == "Related Paper A"
+        assert result.items[0].related_in_lithos[0]["score"] == 0.85
+
+    def test_low_score_result_produces_no_edge(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Retrieve result with score < 0.75 → NO lithos_edge_upsert."""
+        import json as _json
+
+        config = _make_config(fake_lithos_url)
+
+        # Queue a retrieve response with one low-scoring result.
+        fake_lithos.retrieve_responses.append(
+            _json.dumps(
+                {
+                    "results": [
+                        {
+                            "title": "Weakly Related Paper",
+                            "score": 0.5,
+                            "receipt_id": "rcpt-002",
+                            "note_id": "note-weak-001",
+                        }
+                    ]
+                }
+            )
+        )
+
+        items = [
+            {
+                "title": "Another Paper",
+                "source_url": "https://arxiv.org/abs/2601.00002",
+                "content": "# Summary\nAnother paper.",
+                "tags": ["profile:ai-robotics", "source:arxiv"],
+                "confidence": 0.8,
+                "score": 8,
+            }
+        ]
+
+        result = asyncio.run(
+            run_profile(
+                "ai-robotics",
+                RunKind.MANUAL,
+                config=config,
+                item_provider=_single_item_provider(items),
+            )
+        )
+
+        # Retrieve was called.
+        retrieve_calls = _calls_by_tool(fake_lithos.calls, "lithos_retrieve")
+        assert len(retrieve_calls) == 1
+
+        # No edge upserted for low-scoring result.
+        edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")
+        assert len(edge_calls) == 0
+
+        # related_in_lithos is empty for the highlight.
+        assert result is not None
+        assert len(result.items) == 1
+        assert result.items[0].related_in_lithos == []

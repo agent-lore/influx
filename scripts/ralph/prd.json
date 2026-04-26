@@ -86,7 +86,7 @@
         "Integration test also asserts that a result with `score = 0.5` does NOT produce an edge"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
