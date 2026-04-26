@@ -7,8 +7,8 @@ fresh probes per request (FR-HTTP-7).
 ``POST /runs`` accepts manual run requests with coordinator-based
 overlap protection (FR-HTTP-4, FR-SCHED-3).
 
-``POST /backfills`` accepts backfill requests with a stub estimator
-and confirm-required flow (FR-HTTP-5).
+``POST /backfills`` accepts backfill requests with a naive estimator
+and confirm-required flow (FR-HTTP-5, FR-BF-6).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import asyncio
 import os
 import uuid
 from collections.abc import Coroutine
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request
@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 import influx
+from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.scheduler import run_profile
 
@@ -61,7 +62,6 @@ async def status(request: Request) -> JSONResponse:
     Returns a JSON body satisfying the §14.4 status contract of
     ``docs/REQUIREMENTS.md``.
     """
-    from influx.config import AppConfig
     from influx.probes import ProbeLoop
     from influx.scheduler import InfluxScheduler
 
@@ -140,8 +140,6 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
     Multi-profile (``all_profiles``) fan-out of ``run_profile()``
     execution is deferred to PRD 09.
     """
-    from influx.config import AppConfig
-
     coordinator: Coordinator = request.app.state.coordinator
     config: AppConfig = request.app.state.config
 
@@ -268,28 +266,47 @@ def _spawn_tracked_task(
 
 # ── POST /backfills ────────────────────────────────────────────────
 
-# Stub backfill estimator — returns 0 by default.  PRD 09 replaces
-# the body with the naive ``days × categories × avg_results`` formula.
-# Override ``_backfill_estimate_override`` in tests to force a value > 1000.
+# Override ``_backfill_estimate_override`` in tests to force a specific
+# estimate value (monkeypatch), or export ``INFLUX_TEST_BACKFILL_ESTIMATE``
+# for subprocess-based CLI tests (AC-M3-8).
 _backfill_estimate_override: int | None = None
+
+
+def _compute_days(
+    days: int | None,
+    date_from: str | None,
+    date_to: str | None,
+) -> int:
+    """Return the number of days for the backfill range.
+
+    Either ``days`` is provided directly (``--days N``), or
+    ``date_from``/``date_to`` are provided (``--from/--to``).
+    For the date-range form, returns ``(to - from).days``.
+    """
+    if days is not None:
+        return days
+    assert date_from is not None and date_to is not None
+    d_from = date.fromisoformat(date_from)
+    d_to = date.fromisoformat(date_to)
+    return max((d_to - d_from).days, 0)
 
 
 def estimate_backfill_items(
     profile: str,
+    config: AppConfig,
+    *,
     days: int | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> int:
     """Return the estimated number of items a backfill would produce.
 
-    This is a **constant stub** in PRD 03.  By default it returns ``0``.
-    Set :data:`_backfill_estimate_override` to force a specific value
-    for same-process testing (monkeypatch), or export the env var
-    ``INFLUX_TEST_BACKFILL_ESTIMATE=<int>`` to force the value when the
-    server runs in a subprocess (end-to-end CLI tests for AC-M3-8).
+    Uses the naive formula ``days × len(categories) × max_results_per_category``
+    (Q-3, FR-BF-6).
 
-    PRD 09 replaces the body with the ``days × categories × avg_results``
-    formula.
+    Test overrides:
+    - Set :data:`_backfill_estimate_override` (monkeypatch) to force a value.
+    - Export ``INFLUX_TEST_BACKFILL_ESTIMATE=<int>`` for subprocess tests.
     """
     env_override = os.environ.get("INFLUX_TEST_BACKFILL_ESTIMATE")
     if env_override is not None:
@@ -299,7 +316,21 @@ def estimate_backfill_items(
             pass
     if _backfill_estimate_override is not None:
         return _backfill_estimate_override
-    return 0
+
+    n_days = _compute_days(days, date_from, date_to)
+
+    profile_cfg = next(
+        (p for p in config.profiles if p.name == profile),
+        None,
+    )
+    if profile_cfg is None:
+        return 0
+
+    arxiv = profile_cfg.sources.arxiv
+    n_categories = len(arxiv.categories)
+    max_results = arxiv.max_results_per_category
+
+    return n_days * n_categories * max_results
 
 
 class BackfillRequest(BaseModel):
@@ -340,17 +371,16 @@ class BackfillRequest(BaseModel):
 
 @router.post("/backfills")
 async def post_backfills(body: BackfillRequest, request: Request) -> JSONResponse:
-    """Accept a backfill request (FR-HTTP-5).
+    """Accept a backfill request (FR-HTTP-5, FR-BF-6).
 
-    Uses a stub estimator (replaced by PRD 09).  When the estimate
-    exceeds 1000 and ``confirm`` is not truthy, returns ``400`` with
-    ``reason="confirm_required"`` so the CLI can reprompt the operator.
+    Uses the naive estimator ``days × categories × max_results`` (Q-3).
+    When the estimate exceeds 1000 and ``confirm`` is not truthy, returns
+    ``400`` with ``reason="confirm_required"`` so the CLI can reprompt
+    the operator.
 
     Backfills go through the same coordinator as scheduled and manual
     runs, ensuring non-overlap for the same profile (AC-M3-7).
     """
-    from influx.config import AppConfig
-
     coordinator: Coordinator = request.app.state.coordinator
     config: AppConfig = request.app.state.config
 
@@ -369,9 +399,10 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
     # Determine scope label.
     scope = body.profile if body.profile is not None else "all"
 
-    # Check the stub estimator for confirm-required flow.
+    # Naive estimator: days × categories × max_results (Q-3, FR-BF-6).
     estimated = estimate_backfill_items(
-        profile=scope,
+        scope,
+        config,
         days=body.days,
         date_from=body.date_from,
         date_to=body.date_to,

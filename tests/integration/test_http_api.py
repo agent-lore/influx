@@ -382,7 +382,7 @@ class TestPostBackfills:
         """Single-profile backfill with days returns 202."""
         resp = client.post(
             "/backfills",
-            json={"profile": "ai-robotics", "days": 7},
+            json={"profile": "ai-robotics", "days": 7, "confirm": True},
         )
         assert resp.status_code == 202
         body = resp.json()
@@ -400,6 +400,7 @@ class TestPostBackfills:
                 "profile": "ai-robotics",
                 "from": "2026-01-01",
                 "to": "2026-01-31",
+                "confirm": True,
             },
         )
         assert resp.status_code == 202
@@ -480,7 +481,7 @@ class TestPostBackfills:
             with TestClient(app_with_state) as tc:
                 resp = tc.post(
                     "/backfills",
-                    json={"profile": "ai-robotics", "days": 7},
+                    json={"profile": "ai-robotics", "days": 7, "confirm": True},
                 )
             assert resp.status_code == 409
             assert resp.json()["reason"] == "profile_busy"
@@ -557,7 +558,7 @@ class TestBackfillSchedulerOverlap:
             with TestClient(app_with_state) as tc:
                 resp = tc.post(
                     "/backfills",
-                    json={"profile": "ai-robotics", "days": 7},
+                    json={"profile": "ai-robotics", "days": 7, "confirm": True},
                 )
             assert resp.status_code == 409
             assert resp.json()["reason"] == "profile_busy"
@@ -575,7 +576,7 @@ class TestBackfillSchedulerOverlap:
             with TestClient(app_with_state) as tc:
                 resp = tc.post(
                     "/backfills",
-                    json={"profile": "web-tech", "days": 7},
+                    json={"profile": "web-tech", "days": 7, "confirm": True},
                 )
             assert resp.status_code == 202
         finally:

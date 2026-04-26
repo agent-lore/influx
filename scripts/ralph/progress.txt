@@ -17,6 +17,8 @@ Started: Sun Apr 26 11:45:13 UTC 2026
 - Integration tests for RSS use `FakeArticleServer` (simple `http.server` serving HTML) with `SecurityConfig(allow_private_ips=True)`
 - Rejection authority enforced at 3 layers: `merge_tags()`, `merge_profile_relevance_union()`, and `build_negative_examples_block()` — all respect `influx:rejected:<profile>` tags
 - To capture filter_prompt in tests, use a capturing item_provider that records `filter_prompt` per profile
+- `estimate_backfill_items(profile, config, *, days=, date_from=, date_to=)` — real naive estimator using `days × categories × max_results`; test overrides via `_backfill_estimate_override` (monkeypatch) or `INFLUX_TEST_BACKFILL_ESTIMATE` (env var)
+- Tests that POST `/backfills` with default config must pass `"confirm": True` unless testing the confirm gate itself (default config yields >1000 items)
 
 ---
 
@@ -115,4 +117,19 @@ Started: Sun Apr 26 11:45:13 UTC 2026
   - RSS `make_rss_item_provider()` returns empty for profiles without RSS feeds configured — backward compatible with existing arXiv-only tests
   - Integration tests use `asyncio.run()` (not `asyncio.get_event_loop().run_until_complete()`) for test reliability across test modules
   - The combined provider signature matches `ItemProvider` type: `async (profile, kind, run_range, filter_prompt) -> Iterable[dict]`
+---
+
+## 2026-04-26 - US-008
+- What was implemented: Real /backfills HTTP handler with naive estimator replacing PRD 03's stub (FR-BF-6, Q-3, AC-09-E, AC-09-I)
+- Files changed:
+  - `src/influx/http_api.py` — replaced stub `estimate_backfill_items()` with real formula: `days × len(categories) × max_results_per_category`; added `_compute_days()` helper for `--from/--to` date range form; moved `AppConfig` import to module-level
+  - `tests/unit/test_backfill_estimator.py` — new file: 13 tests across 2 classes (TestEstimatorMath: 7 tests for formula math; TestConfirmRequiredGate: 6 tests for HTTP-level confirm gate)
+  - `tests/integration/test_http_api.py` — added `"confirm": True` to 5 existing tests that aren't testing the confirm gate, so they pass the now-real estimator
+  - `tests/integration/test_backfill_exclusion.py` — added `"confirm": True` to backfill request for same reason
+- **Learnings for future iterations:**
+  - The estimator formula `days × len(categories) × max_results_per_category` uses arXiv config only — RSS feeds don't contribute to the naive estimate
+  - `_backfill_estimate_override` (monkeypatch) and `INFLUX_TEST_BACKFILL_ESTIMATE` (env var for subprocess tests) still work as test overrides, taking priority over the real formula
+  - For `--from/--to` date range, days = `(to_date - from_date).days` (not inclusive); `--days N` uses N directly
+  - Existing tests that POST `/backfills` with default config (6 categories × 200 max = 1200/day) need `"confirm": True` since 7 days → 8400 items > 1000 threshold
+  - `estimate_backfill_items()` now takes `config: AppConfig` as second positional arg — any future callers must pass it
 ---

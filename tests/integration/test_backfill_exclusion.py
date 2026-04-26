@@ -177,7 +177,7 @@ class TestBackfillExclusion:
             with TestClient(app) as tc:
                 resp = tc.post(
                     "/backfills",
-                    json={"profile": "ai-robotics", "days": 7},
+                    json={"profile": "ai-robotics", "days": 7, "confirm": True},
                 )
                 assert resp.status_code == 202
                 _wait_for_idle(app.state.coordinator, "ai-robotics")

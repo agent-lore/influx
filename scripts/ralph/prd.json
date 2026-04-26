@@ -125,7 +125,7 @@
         "Unit tests in `tests/unit/test_backfill_estimator.py` cover: an estimate of 35 items accepted without confirm (AC-09-E); an estimate of 1500 items rejected with `reason=\"confirm_required\"` and a populated `estimated_items` (AC-09-I); resubmission with `confirm=true` accepted (AC-09-I); estimator math with multiple categories"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
