@@ -265,6 +265,30 @@ class TestSweepWriteErrorMarksReadinessDegraded:
         class _NoopClient:
             async def close(self) -> None: ...
 
+            async def task_create(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                txt = _json.dumps({"task_id": "noop-task"})
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(type="text", text=txt),
+                    ],
+                )
+
+            async def task_complete(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                txt = _json.dumps({"status": "completed"})
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(type="text", text=txt),
+                    ],
+                )
+
         with (
             patch("influx.scheduler.repair_sweep", side_effect=_failing_sweep),
             patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
@@ -308,6 +332,30 @@ class TestSweepWriteErrorMarksReadinessDegraded:
             async def cache_lookup_for_item(self, **kwargs: Any) -> Any:
                 # Should not be called — empty provider.
                 raise AssertionError("unexpected cache lookup")
+
+            async def task_create(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                txt = _json.dumps({"task_id": "noop-task"})
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(type="text", text=txt),
+                    ],
+                )
+
+            async def task_complete(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                txt = _json.dumps({"status": "completed"})
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(type="text", text=txt),
+                    ],
+                )
 
         # Patch build_negative_examples_block to a no-op so the run can
         # complete cleanly with the empty default item provider.
@@ -411,6 +459,30 @@ class TestScheduledFireInvokesRepairSweep:
 
         class _NoopClient:
             async def close(self) -> None: ...
+
+            async def task_create(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                txt = _json.dumps({"task_id": "noop-task"})
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(type="text", text=txt),
+                    ],
+                )
+
+            async def task_complete(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                txt = _json.dumps({"status": "completed"})
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(type="text", text=txt),
+                    ],
+                )
 
         with (
             patch("influx.scheduler.repair_sweep", side_effect=spy_sweep),

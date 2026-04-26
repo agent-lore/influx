@@ -127,99 +127,136 @@ async def run_profile(
 
     client = LithosClient(url=config.lithos.url, transport=config.lithos.transport)
     try:
-        # 0. Repair sweep — durable retry for failed enrichment (PRD 06 §5.1).
-        #    Runs for scheduled and manual runs only; backfills skip (FR-REP-2).
+        # ── LCMA task bracketing (FR-LCMA-5, AC-M2-10) ────────────
+        # For non-backfill runs, create a Lithos task that brackets the
+        # entire per-profile run.  Backfill task tagging is deferred to
+        # PRD 09.
+        run_task_id: str | None = None
         if kind != RunKind.BACKFILL:
-            try:
-                await repair_sweep(profile, client=client, config=config)
-            except SweepWriteError:
-                # §5.4 failure mode 1: terminal write failure aborts the
-                # run AND degrades readiness (US-011).
-                if probe_loop is not None and hasattr(
-                    probe_loop, "mark_repair_write_failure"
-                ):
-                    probe_loop.mark_repair_write_failure(profile=profile)
-                raise
-            else:
-                # Successful sweep clears the readiness latch.
-                if probe_loop is not None and hasattr(
-                    probe_loop, "clear_repair_write_failure"
-                ):
-                    probe_loop.clear_repair_write_failure()
+            task_result = await client.task_create(
+                title=f"Influx run {profile} {datetime.now(UTC).date().isoformat()}",
+                agent="influx",
+                tags=["influx:run", f"profile:{profile}"],
+            )
+            task_body = json.loads(
+                task_result.content[0].text  # type: ignore[union-attr]
+            )
+            run_task_id = task_body["task_id"]
 
-        # 1. Feedback ingestion → negative examples block (FR-FB-1..3, AC-05-H).
-        neg_block = await build_negative_examples_block(
-            client,
-            profile=profile,
-            limit=config.feedback.negative_examples_per_profile,
-        )
-
-        # 2. Compose filter prompt for this run (consumed by PRD 04 LLM filter).
-        prompt_text = config.prompts.filter.text or ""
+        outcome = "success"
         try:
-            filter_prompt = prompt_text.format(
-                profile_description=(
-                    profile_cfg.description if profile_cfg else profile
-                ),
-                negative_examples=neg_block,
-                min_score_in_results=config.filter.min_score_in_results,
-            )
-        except (KeyError, IndexError):
-            filter_prompt = prompt_text
+            # 0. Repair sweep — durable retry for failed enrichment (PRD 06 §5.1).
+            #    Runs for scheduled and manual runs only; backfills skip (FR-REP-2).
+            if kind != RunKind.BACKFILL:
+                try:
+                    await repair_sweep(profile, client=client, config=config)
+                except SweepWriteError:
+                    # §5.4 failure mode 1: terminal write failure aborts the
+                    # run AND degrades readiness (US-011).
+                    if probe_loop is not None and hasattr(
+                        probe_loop, "mark_repair_write_failure"
+                    ):
+                        probe_loop.mark_repair_write_failure(profile=profile)
+                    raise
+                else:
+                    # Successful sweep clears the readiness latch.
+                    if probe_loop is not None and hasattr(
+                        probe_loop, "clear_repair_write_failure"
+                    ):
+                        probe_loop.clear_repair_write_failure()
 
-        # 3. Source acquisition (PRD 04 plugs in arXiv + RSS).
-        items = await provider(profile, kind, run_range, filter_prompt)
+            # 1. Feedback ingestion → negative examples block (FR-FB-1..3, AC-05-H).
+            neg_block = await build_negative_examples_block(
+                client,
+                profile=profile,
+                limit=config.feedback.negative_examples_per_profile,
+            )
 
-        # 4. Per-item: cache_lookup → write_note.
-        ingested: list[HighlightItem] = []
-        sources_checked = 0
-        for item in items:
-            sources_checked += 1
-            title = item["title"]
-            source_url = item["source_url"]
-            cache_result = await client.cache_lookup_for_item(
-                title=title,
-                source_url=source_url,
-                abstract_or_summary=item.get("abstract_or_summary"),
-            )
-            cache_body = json.loads(
-                cache_result.content[0].text  # type: ignore[union-attr]
-            )
-            if cache_body.get("hit"):
-                continue
-
-            write_result = await client.write_note(
-                title=title,
-                content=item.get("content", ""),
-                path=item.get("path", ""),
-                source_url=source_url,
-                tags=list(item.get("tags", [])),
-                confidence=float(item.get("confidence", 0.0)),
-            )
-            if write_result.status in ("created", "updated"):
-                ingested.append(
-                    HighlightItem(
-                        id=item.get("id", f"note-{len(ingested) + 1}"),
-                        title=title,
-                        score=int(item.get("score", 0)),
-                        tags=list(item.get("tags", [])),
-                        reason=item.get("reason", ""),
-                        url=source_url,
-                    )
+            # 2. Compose filter prompt for this run (consumed by PRD 04 LLM filter).
+            prompt_text = config.prompts.filter.text or ""
+            try:
+                filter_prompt = prompt_text.format(
+                    profile_description=(
+                        profile_cfg.description if profile_cfg else profile
+                    ),
+                    negative_examples=neg_block,
+                    min_score_in_results=config.filter.min_score_in_results,
                 )
+            except (KeyError, IndexError):
+                filter_prompt = prompt_text
 
-        # 5. Build result + fire post-run webhook hook (FR-NOT-1..6, AC-05-I).
-        result = ProfileRunResult(
-            run_date=datetime.now(UTC).date().isoformat(),
-            profile=profile,
-            stats=RunStats(sources_checked=sources_checked, ingested=len(ingested)),
-            items=ingested,
-        )
-        # Lazy import to avoid the service ↔ scheduler import cycle.
-        from influx.service import post_run_webhook_hook
+            # 3. Source acquisition (PRD 04 plugs in arXiv + RSS).
+            items = await provider(profile, kind, run_range, filter_prompt)
 
-        post_run_webhook_hook(result, config, kind=kind)
-        return result
+            # 4. Per-item: cache_lookup → write_note.
+            ingested: list[HighlightItem] = []
+            sources_checked = 0
+            for item in items:
+                sources_checked += 1
+                title = item["title"]
+                source_url = item["source_url"]
+                cache_result = await client.cache_lookup_for_item(
+                    title=title,
+                    source_url=source_url,
+                    abstract_or_summary=item.get("abstract_or_summary"),
+                )
+                cache_body = json.loads(
+                    cache_result.content[0].text  # type: ignore[union-attr]
+                )
+                if cache_body.get("hit"):
+                    continue
+
+                write_result = await client.write_note(
+                    title=title,
+                    content=item.get("content", ""),
+                    path=item.get("path", ""),
+                    source_url=source_url,
+                    tags=list(item.get("tags", [])),
+                    confidence=float(item.get("confidence", 0.0)),
+                )
+                if write_result.status in ("created", "updated"):
+                    ingested.append(
+                        HighlightItem(
+                            id=item.get("id", f"note-{len(ingested) + 1}"),
+                            title=title,
+                            score=int(item.get("score", 0)),
+                            tags=list(item.get("tags", [])),
+                            reason=item.get("reason", ""),
+                            url=source_url,
+                        )
+                    )
+
+            # 5. Build result + fire post-run webhook hook (FR-NOT-1..6, AC-05-I).
+            result = ProfileRunResult(
+                run_date=datetime.now(UTC).date().isoformat(),
+                profile=profile,
+                stats=RunStats(
+                    sources_checked=sources_checked, ingested=len(ingested)
+                ),
+                items=ingested,
+            )
+            # Lazy import to avoid the service ↔ scheduler import cycle.
+            from influx.service import post_run_webhook_hook
+
+            post_run_webhook_hook(result, config, kind=kind)
+            return result
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            if run_task_id is not None:
+                try:
+                    await client.task_complete(
+                        task_id=run_task_id,
+                        agent="influx",
+                        outcome=outcome,
+                    )
+                except Exception:
+                    logger.warning(
+                        "lithos_task_complete failed for profile %r",
+                        profile,
+                        exc_info=True,
+                    )
     finally:
         await client.close()
 

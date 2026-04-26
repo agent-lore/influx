@@ -12,6 +12,9 @@ Started: Sun Apr 26 06:31:01 UTC 2026
 - Tier3 `builds_on` items and Tier1 `contributions` are defined in `src/influx/schemas.py` (Tier3Extraction, Tier1Enrichment)
 - Tests organized under `tests/unit/`, `tests/contract/`, `tests/integration/`
 - Project uses `from __future__ import annotations` consistently
+- `FakeLithosServer` in `tests/contract/test_lithos_client.py` has all LCMA tools (retrieve, edge_upsert, task_create, task_complete) with FIFO response queues — use it for integration tests
+- `_NoopClient` stubs in unit tests that call `run_profile` with non-backfill RunKind must provide `task_create()` and `task_complete()` methods that return valid `CallToolResult`
+- `run_task_id` is available in `run_profile()` scope after task_create — downstream stories (US-005, US-006) can access it for after_write hooks
 
 ---
 
@@ -51,4 +54,20 @@ Started: Sun Apr 26 06:31:01 UTC 2026
   - `edge_upsert` uses explicit keyword params (`type`, `evidence`, `source_note_id`, `target_note_id`)
   - `task_complete` has optional `outcome` parameter
   - The `cache_lookup` contract (FR-MCP-3, R-7) is non-regressed — still requires both `query` and `source_url`
+---
+
+## 2026-04-26 - US-004
+- Bracketed each per-profile run with `lithos_task_create` / `lithos_task_complete` in `run_profile()` in `src/influx/scheduler.py`
+- `task_create` called at start for non-backfill runs; `task_complete` called in `finally` block with `outcome="success"` or `outcome="error"`
+- `run_task_id` captured from `task_create` response for downstream LCMA processing (US-005, US-006)
+- Added LCMA tools (retrieve, edge_upsert, task_create, task_complete) to `FakeLithosServer` in `tests/contract/test_lithos_client.py`
+- Created `tests/integration/test_lcma_edges_end_to_end.py` with 4 tests: manual run, scheduled run, backfill exclusion, error outcome
+- Updated 3 `_NoopClient` stubs in `tests/unit/test_scheduler.py` to include `task_create`/`task_complete` methods
+- Files changed: `src/influx/scheduler.py` (modified), `tests/contract/test_lithos_client.py` (modified), `tests/unit/test_scheduler.py` (modified), `tests/integration/test_lcma_edges_end_to_end.py` (new)
+- **Learnings for future iterations:**
+  - `task_create` returns `{"task_id": "..."}` — parse with `json.loads(result.content[0].text)`
+  - Task bracketing only applies to RunKind.SCHEDULED and RunKind.MANUAL, not BACKFILL (PRD 08 §4)
+  - `task_complete` takes `task_id`, `agent`, and optional `outcome` — does NOT take `tags`
+  - The `run_task_id` variable is in scope throughout the run body, ready for US-005/US-006 after_write hooks
+  - When `task_complete` itself fails, log a warning but don't mask the original exception
 ---

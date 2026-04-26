@@ -51,14 +51,25 @@ class FakeLithosServer:
         self.cache_lookup_responses: list[str] = []
         # Queue of override responses for lithos_list (FIFO).
         self.list_responses: list[str] = []
+        # LCMA tool response queues (PRD 08).
+        self.retrieve_responses: list[str] = []
+        self.edge_upsert_responses: list[str] = []
+        self.task_create_responses: list[str] = []
+        self.task_complete_responses: list[str] = []
         self._register_tools()
 
     def _register_tools(self) -> None:
+        import json as _json
+
         calls = self.calls
         write_responses = self.write_responses
         read_responses = self.read_responses
         cache_lookup_responses = self.cache_lookup_responses
         list_responses = self.list_responses
+        retrieve_responses = self.retrieve_responses
+        edge_upsert_responses = self.edge_upsert_responses
+        task_create_responses = self.task_create_responses
+        task_complete_responses = self.task_complete_responses
 
         @self._mcp.tool(name="lithos_ping")
         async def lithos_ping() -> str:
@@ -167,6 +178,86 @@ class FakeLithosServer:
                     }
                 )
             return json.dumps({"items": []})
+
+        # ── LCMA tools (PRD 08) ──────────────────────────────────────
+
+        @self._mcp.tool(name="lithos_retrieve")
+        async def lithos_retrieve(
+            query: str = "",
+            limit: int = 5,
+            agent_id: str = "",
+            task_id: str = "",
+            tags: list[str] | None = None,
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_retrieve",
+                    {
+                        "query": query,
+                        "limit": limit,
+                        "agent_id": agent_id,
+                        "task_id": task_id,
+                        "tags": tags or [],
+                    },
+                )
+            )
+            if retrieve_responses:
+                return retrieve_responses.pop(0)
+            return _json.dumps({"results": []})
+
+        @self._mcp.tool(name="lithos_edge_upsert")
+        async def lithos_edge_upsert(
+            type: str = "",
+            source_note_id: str = "",
+            target_note_id: str = "",
+            evidence: dict[str, Any] | None = None,
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_edge_upsert",
+                    {
+                        "type": type,
+                        "source_note_id": source_note_id,
+                        "target_note_id": target_note_id,
+                        "evidence": evidence,
+                    },
+                )
+            )
+            if edge_upsert_responses:
+                return edge_upsert_responses.pop(0)
+            return _json.dumps({"status": "ok"})
+
+        @self._mcp.tool(name="lithos_task_create")
+        async def lithos_task_create(
+            title: str = "",
+            agent: str = "",
+            tags: list[str] | None = None,
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_task_create",
+                    {"title": title, "agent": agent, "tags": tags or []},
+                )
+            )
+            if task_create_responses:
+                return task_create_responses.pop(0)
+            return _json.dumps({"task_id": "task-001"})
+
+        @self._mcp.tool(name="lithos_task_complete")
+        async def lithos_task_complete(
+            task_id: str = "",
+            agent: str = "",
+            outcome: str | None = None,
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_task_complete",
+                    {"task_id": task_id, "agent": agent, "outcome": outcome},
+                )
+            )
+            if task_complete_responses:
+                return task_complete_responses.pop(0)
+            return _json.dumps({"status": "completed"})
 
     def start(self) -> None:
         app = self._mcp.sse_app()

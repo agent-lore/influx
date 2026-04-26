@@ -67,7 +67,7 @@
         "Integration test verifies that a profile run produces exactly one `lithos_task_create` and one `lithos_task_complete` in the fake-Lithos recorder. The `lithos_task_create` call carries `tags=[\"influx:run\", f\"profile:{profile}\"]` (and `agent=\"influx\"`); the `lithos_task_complete` call carries the matching `task_id`, `agent=\"influx\"`, and an `outcome` value (per the `lithos_task_complete(task_id, agent, outcome?)` contract — `tags` are NOT passed to complete)"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
