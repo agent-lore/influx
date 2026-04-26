@@ -108,7 +108,7 @@
         "Integration test asserts that with two profiles both subscribed to `cs.AI`, `cs.AI` is fetched exactly once for the run and its items are delivered to both profiles (AC-09-D)"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

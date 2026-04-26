@@ -99,3 +99,20 @@ Started: Sun Apr 26 11:45:13 UTC 2026
   - To test NEGATIVE EXAMPLES in filter prompt, use a capturing item_provider that records `filter_prompt` per profile; queue lithos_list response with rejected titles
   - The feedback `lithos_list` call is per-profile (`influx:rejected:<profile>`), so one profile's rejections don't leak into another profile's filter prompt
 ---
+
+## 2026-04-26 - US-007
+- What was implemented: Per-source fetch deduplication across profiles in a single scheduled fire (R-8 mitigation, AC-09-D)
+- Files changed:
+  - `src/influx/sources/__init__.py` — added `FetchCache` class (per-fire dedup cache with `has`/`get`/`put` API) and `make_item_provider()` combined provider that delegates to arXiv + RSS sub-providers with a shared cache
+  - `src/influx/sources/arxiv.py` — modified `make_arxiv_item_provider()` to accept `fetch_cache` parameter; arXiv fetches keyed by `arxiv:{query_url}` and cached after first fetch
+  - `src/influx/sources/rss.py` — added `make_rss_item_provider()` and `_fetch_rss_feed()` helper; RSS feed fetches keyed by `rss:{feed_url}` and cached after first fetch
+  - `src/influx/service.py` — switched from direct `make_arxiv_item_provider` to `make_item_provider` with shared `FetchCache`
+  - `tests/integration/test_fetch_dedup.py` — 3 integration tests: shared arXiv category fetched once (AC-09-D), different categories fetched separately, shared RSS feed fetched once
+- **Learnings for future iterations:**
+  - Cache key strategy: `arxiv:{query_url}` for arXiv (from `build_query_url()`), `rss:{feed_url}` for RSS — both include the full URL so different params produce different keys
+  - `FetchCache` uses `has()`/`get()` pattern (not sentinel-based) to avoid cross-module sentinel identity issues when multiple modules define their own `_MISSING = object()`
+  - `make_item_provider()` is the single entry point for all item provision — delegates to arXiv and RSS sub-providers, each receiving the same `FetchCache` instance
+  - RSS `make_rss_item_provider()` returns empty for profiles without RSS feeds configured — backward compatible with existing arXiv-only tests
+  - Integration tests use `asyncio.run()` (not `asyncio.get_event_loop().run_until_complete()`) for test reliability across test modules
+  - The combined provider signature matches `ItemProvider` type: `async (profile, kind, run_range, filter_prompt) -> Iterable[dict]`
+---
