@@ -884,16 +884,27 @@ def make_arxiv_item_provider(
                     "influx.item_count": len(items),
                 },
             ):
-                try:
-                    batch_scores = await filter_scorer(items, profile, filter_prompt)
-                except FilterScorerError:
-                    _log.warning(
-                        "filter_scorer failed for profile %r; "
-                        "falling back to abstract-only ingestion for entire batch",
-                        profile,
-                        exc_info=True,
-                    )
-                    filter_failed = True
+                # ``filter.batch_size`` caps how many candidates are sent
+                # to the LLM filter in a single request so the configured
+                # tunable actually shapes runtime behaviour (AC-X-1).
+                batch_size = max(int(config.filter.batch_size), 1)
+                for chunk_start in range(0, len(items), batch_size):
+                    chunk = items[chunk_start : chunk_start + batch_size]
+                    try:
+                        chunk_scores = await filter_scorer(
+                            chunk, profile, filter_prompt
+                        )
+                    except FilterScorerError:
+                        _log.warning(
+                            "filter_scorer failed for profile %r; "
+                            "falling back to abstract-only ingestion for "
+                            "entire batch",
+                            profile,
+                            exc_info=True,
+                        )
+                        filter_failed = True
+                        break
+                    batch_scores.update(chunk_scores)
 
         results: list[dict[str, Any]] = []
         for arxiv_item in items:

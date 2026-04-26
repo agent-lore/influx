@@ -722,3 +722,80 @@ class TestScheduledFireInvokesRepairSweep:
             await sched._fire_profile("alpha")
 
         assert observed_kind == [RunKind.SCHEDULED]
+
+
+# ── AC-X-1: filter tunables actually shape behaviour ─────────────────
+
+
+class TestNegativeExampleMaxTitleCharsWired:
+    """``filter.negative_example_max_title_chars`` is threaded into
+    ``build_negative_examples_block`` so the configured tunable
+    actually shapes the rendered negative-examples block (AC-X-1)."""
+
+    async def test_max_title_chars_passed_to_feedback_helper(self) -> None:
+        from influx.config import FilterTuningConfig
+
+        config = _make_config(profiles=["alpha"])
+        # Replace the default filter tuning with a non-default value
+        # so a test failure here can only be explained by scheduler
+        # threading the configured value through.
+        config = config.model_copy(
+            update={
+                "filter": FilterTuningConfig(negative_example_max_title_chars=42),
+            }
+        )
+
+        captured_kwargs: list[dict[str, Any]] = []
+
+        async def fake_neg_block(*args: Any, **kwargs: Any) -> str:
+            captured_kwargs.append(kwargs)
+            return ""
+
+        class _NoopClient:
+            async def close(self) -> None: ...
+
+            async def task_create(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                txt = _json.dumps({"task_id": "noop-task"})
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(type="text", text=txt),
+                    ],
+                )
+
+            async def task_complete(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                txt = _json.dumps({"status": "completed"})
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(type="text", text=txt),
+                    ],
+                )
+
+        async def _ok_sweep(*args: Any, **kwargs: Any) -> list[Any]:
+            return []
+
+        with (
+            patch("influx.scheduler.repair_sweep", side_effect=_ok_sweep),
+            patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch(
+                "influx.scheduler.build_negative_examples_block",
+                side_effect=fake_neg_block,
+            ),
+            patch("influx.service.post_run_webhook_hook"),
+        ):
+            await run_profile(
+                "alpha",
+                RunKind.SCHEDULED,
+                config=config,
+                item_provider=None,
+            )
+
+        assert captured_kwargs, "build_negative_examples_block was not called"
+        assert captured_kwargs[0]["max_title_chars"] == 42

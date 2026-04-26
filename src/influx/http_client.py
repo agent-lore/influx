@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from influx.config import StorageConfig
 from influx.errors import NetworkError
 
 __all__ = ["ContentTypeFamily", "FetchResult", "guarded_fetch", "guarded_post_json"]
@@ -153,8 +154,8 @@ def guarded_fetch(
     url: str,
     *,
     allow_private_ips: bool = False,
-    max_download_bytes: int = 52_428_800,
-    timeout_seconds: int = 30,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
     expected_content_type: ContentTypeFamily | None = None,
 ) -> FetchResult:
     """Fetch *url* with scheme, SSRF, size, timeout, and content-type guards.
@@ -164,9 +165,21 @@ def guarded_fetch(
 
     Returns a :class:`FetchResult` on success.  Raises
     :class:`~influx.errors.NetworkError` when any guard is violated.
+
+    ``max_download_bytes`` and ``timeout_seconds`` default to ``None``;
+    when omitted they are resolved from the pydantic
+    :class:`~influx.config.StorageConfig` field defaults so the only
+    place these tunables live is config-parsing code (AC-X-1).
     """
     _validate_scheme(url)
     _ssrf_check(url, allow_private_ips=allow_private_ips)
+
+    if max_download_bytes is None or timeout_seconds is None:
+        _storage_defaults = StorageConfig()
+        if max_download_bytes is None:
+            max_download_bytes = _storage_defaults.max_download_bytes
+        if timeout_seconds is None:
+            timeout_seconds = _storage_defaults.download_timeout_seconds
 
     timeout = httpx.Timeout(
         connect=timeout_seconds,
@@ -263,6 +276,11 @@ def guarded_post_json(
     :class:`~influx.errors.NetworkError` on guard violations, timeouts,
     or connection failures.  No retry logic — callers handle retries if
     needed (FR-NOT-1).
+
+    The default ``timeout_seconds`` (5s) matches the
+    ``[notifications].timeout_seconds`` config default — webhook
+    notifications, the only caller, override this from
+    ``NotificationsConfig``.
     """
     _validate_scheme(url)
     _ssrf_check(url, allow_private_ips=allow_private_ips)

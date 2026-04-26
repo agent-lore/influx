@@ -13,6 +13,7 @@ Asserts:
 
 from __future__ import annotations
 
+import ast
 import re
 import tomllib
 from pathlib import Path
@@ -163,6 +164,7 @@ _TUNABLE_NAMES: frozenset[str] = frozenset(
         "lithos_write_conflict_max_retries",
         "max_download_bytes",
         "download_timeout_seconds",
+        "timeout_seconds",
         "request_timeout",
         "negative_examples_per_profile",
         "recalibrate_after_runs",
@@ -180,6 +182,33 @@ _CHECKED_MODULES: list[str] = [
     "extraction/pdf.py",
     "extraction/article.py",
 ]
+
+
+def _iter_function_defaults(
+    tree: ast.AST,
+) -> list[tuple[int, str, ast.expr]]:
+    """Yield ``(lineno, arg_name, default_node)`` for every function default.
+
+    Walks every ``FunctionDef`` / ``AsyncFunctionDef`` and pairs each
+    default expression with the parameter it applies to (positional,
+    positional-only, and keyword-only).  Used by AC-X-1 part 2 to catch
+    hardcoded tunable defaults that live in function signatures rather
+    than module-level assignments.
+    """
+    pairs: list[tuple[int, str, ast.expr]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        args = node.args
+        positional = list(args.posonlyargs) + list(args.args)
+        if args.defaults:
+            offset = len(positional) - len(args.defaults)
+            for arg, default in zip(positional[offset:], args.defaults, strict=True):
+                pairs.append((default.lineno, arg.arg, default))
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+            if default is not None:
+                pairs.append((default.lineno, arg.arg, default))
+    return pairs
 
 
 class TestACX1NoStrayConstants:
@@ -209,6 +238,41 @@ class TestACX1NoStrayConstants:
                         f"{module}:{i}: hardcoded tunable "
                         f"'{tunable}' found: {line.strip()}"
                     )
+
+    @pytest.mark.parametrize("module", _CHECKED_MODULES)
+    def test_no_tunable_function_default_constants(self, module: str) -> None:
+        """Tunable params do not carry hardcoded numeric defaults.
+
+        Inspects the AST of each business-logic module and asserts that
+        no ``FunctionDef`` / ``AsyncFunctionDef`` carries a numeric
+        literal default for any parameter whose name matches a
+        ``_TUNABLE_NAMES`` entry. ``None`` defaults are permitted — the
+        function body resolves them from the pydantic config defaults
+        in ``influx.config`` at call time, so the only place a tunable
+        default lives is config-parsing code (AC-X-1).
+        """
+        path = _SRC / module
+        if not path.exists():
+            pytest.skip(f"{module} does not exist")
+
+        tree = ast.parse(path.read_text(), filename=str(path))
+        violations: list[str] = []
+        for lineno, arg_name, default in _iter_function_defaults(tree):
+            if arg_name not in _TUNABLE_NAMES:
+                continue
+            if isinstance(default, ast.Constant) and isinstance(
+                default.value, (int, float)
+            ):
+                violations.append(
+                    f"{module}:{lineno}: parameter "
+                    f"{arg_name!r} has hardcoded numeric default "
+                    f"{default.value!r}"
+                )
+        if violations:
+            pytest.fail(
+                "Hardcoded tunable defaults in function signatures "
+                "(AC-X-1):\n  " + "\n  ".join(violations)
+            )
 
 
 # ======================================================================
@@ -432,14 +496,19 @@ class TestACX6LithosContractTests:
 # ======================================================================
 
 # Pure modules per master PRD section 18.2: config, URL, path, schemas,
-# prompts, slug.  Mapped to their corresponding unit test files.
-_PURE_MODULE_TESTS: dict[str, str] = {
-    "config.py": "test_config.py",
-    "urls.py": "test_url_normalisation.py",
-    "slugs.py": "test_slugs.py",
-    "schemas.py": "test_schemas.py",
-    "prompts.py": "test_prompts.py",
-    "dedup.py": "test_dedup_query.py",
+# prompts, slug.  Mapped to one or more corresponding unit test files.
+# The "path" pure module is the archive-path logic in ``storage.py``
+# (``build_archive_path`` plus path-safety helpers); ``storage.py`` also
+# carries the thin ``download_archive`` IO wrapper, so coverage for that
+# module is driven by ``test_archive_path.py`` and
+# ``test_archive_download.py`` together.
+_PURE_MODULE_TESTS: dict[str, tuple[str, ...]] = {
+    "config.py": ("test_config.py",),
+    "urls.py": ("test_url_normalisation.py",),
+    "storage.py": ("test_archive_path.py", "test_archive_download.py"),
+    "slugs.py": ("test_slugs.py",),
+    "schemas.py": ("test_schemas.py",),
+    "prompts.py": ("test_prompts.py",),
 }
 
 
@@ -453,21 +522,25 @@ class TestACX6PureModuleCoverage:
     """
 
     @pytest.mark.parametrize(
-        "module,test_file",
+        "module,test_files",
         list(_PURE_MODULE_TESTS.items()),
         ids=list(_PURE_MODULE_TESTS.keys()),
     )
-    def test_pure_module_has_unit_tests(self, module: str, test_file: str) -> None:
-        """Each pure module has a corresponding unit test file."""
-        test_path = _ROOT / "tests" / "unit" / test_file
-        assert test_path.exists(), (
-            f"Missing unit test file for pure module {module}: "
-            f"expected tests/unit/{test_file}"
-        )
-        content = test_path.read_text()
-        test_count = len(re.findall(r"\bdef test_", content))
-        assert test_count >= 2, (
-            f"{test_file} has only {test_count} test(s); "
+    def test_pure_module_has_unit_tests(
+        self, module: str, test_files: tuple[str, ...]
+    ) -> None:
+        """Each pure module has at least one corresponding unit test file."""
+        total_tests = 0
+        for test_file in test_files:
+            test_path = _ROOT / "tests" / "unit" / test_file
+            assert test_path.exists(), (
+                f"Missing unit test file for pure module {module}: "
+                f"expected tests/unit/{test_file}"
+            )
+            content = test_path.read_text()
+            total_tests += len(re.findall(r"\bdef test_", content))
+        assert total_tests >= 2, (
+            f"{test_files!r} has only {total_tests} test(s); "
             "expected >= 2 for meaningful pure-module coverage"
         )
 
@@ -505,7 +578,9 @@ class TestACX6PureModuleCoverage:
         )
 
         test_paths = [
-            str(_ROOT / "tests" / "unit" / t) for t in _PURE_MODULE_TESTS.values()
+            str(_ROOT / "tests" / "unit" / t)
+            for files in _PURE_MODULE_TESTS.values()
+            for t in files
         ]
         env = {
             **os.environ,

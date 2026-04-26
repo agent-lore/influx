@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from influx.config import StorageConfig
 from influx.errors import InfluxError, NetworkError
 from influx.http_client import ContentTypeFamily, guarded_fetch
 from influx.slugs import is_valid_slug
@@ -141,8 +142,8 @@ def download_archive(
     published_month: int,
     ext: str = ".pdf",
     allow_private_ips: bool = False,
-    max_download_bytes: int = 52_428_800,
-    timeout_seconds: int = 30,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
     expected_content_type: ContentTypeFamily = "pdf",
 ) -> ArchiveResult:
     """Download a file via the guarded HTTP client and archive it.
@@ -154,7 +155,19 @@ def download_archive(
     Returns an :class:`ArchiveResult` indicating success or failure.
     On any archive-step failure the result signals the caller to render
     the note with an empty ``## Archive`` body + failure tags (FR-ST-4).
+
+    ``max_download_bytes`` and ``timeout_seconds`` default to ``None``;
+    when omitted they are resolved from the pydantic
+    :class:`~influx.config.StorageConfig` field defaults so the only
+    place these tunable defaults live is config-parsing code (AC-X-1).
     """
+    if max_download_bytes is None or timeout_seconds is None:
+        _storage_defaults = StorageConfig()
+        if max_download_bytes is None:
+            max_download_bytes = _storage_defaults.max_download_bytes
+        if timeout_seconds is None:
+            timeout_seconds = _storage_defaults.download_timeout_seconds
+
     # Path construction first — reject unsafe IDs before any download
     fs_path, rel_posix = build_archive_path(
         archive_root=archive_root,

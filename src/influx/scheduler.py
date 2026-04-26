@@ -254,6 +254,7 @@ async def _run_profile_body(
                 client,
                 profile=profile,
                 limit=config.feedback.negative_examples_per_profile,
+                max_title_chars=config.filter.negative_example_max_title_chars,
             )
 
             # 2. Compose filter prompt for this run (consumed by PRD 04 LLM filter).

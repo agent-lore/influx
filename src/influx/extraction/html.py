@@ -13,6 +13,7 @@ from typing import Literal
 
 import trafilatura
 
+from influx.config import ExtractionConfig, StorageConfig
 from influx.errors import ExtractionError
 from influx.http_client import guarded_fetch
 
@@ -46,11 +47,11 @@ def _strip_tags(html: str, tags: list[str]) -> str:
 def extract_html(
     url: str,
     *,
-    min_html_chars: int = 1000,
+    min_html_chars: int | None = None,
     strip_tags: list[str] | None = None,
     allow_private_ips: bool = False,
-    max_download_bytes: int = 52_428_800,
-    timeout_seconds: int = 30,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
 ) -> ExtractionResult:
     """Fetch *url* and extract article text from the HTML body.
 
@@ -61,16 +62,21 @@ def extract_html(
     min_html_chars:
         Minimum character count for the extracted text.  Below this
         threshold an ``ExtractionError`` is raised so the caller can
-        fall through to the next extraction tier.
+        fall through to the next extraction tier.  When ``None``, the
+        default is resolved from
+        :class:`~influx.config.ExtractionConfig` so the only place this
+        tunable lives is config-parsing code (AC-X-1).
     strip_tags:
         HTML tag names whose elements are stripped before extraction.
-        Defaults to ``["script", "iframe", "object", "embed"]``.
+        Defaults to :class:`~influx.config.ExtractionConfig.strip_tags`.
     allow_private_ips:
         Passed through to the guarded HTTP client.
     max_download_bytes:
-        Maximum response body size in bytes.
+        Maximum response body size in bytes.  ``None`` resolves to the
+        :class:`~influx.config.StorageConfig` default (AC-X-1).
     timeout_seconds:
-        Connect + read timeout in seconds.
+        Connect + read timeout in seconds.  ``None`` resolves to the
+        :class:`~influx.config.StorageConfig` default (AC-X-1).
 
     Returns
     -------
@@ -84,8 +90,18 @@ def extract_html(
     NetworkError
         When the HTTP fetch fails (propagated from guarded_fetch).
     """
-    if strip_tags is None:
-        strip_tags = ["script", "iframe", "object", "embed"]
+    if min_html_chars is None or strip_tags is None:
+        _extraction_defaults = ExtractionConfig()
+        if min_html_chars is None:
+            min_html_chars = _extraction_defaults.min_html_chars
+        if strip_tags is None:
+            strip_tags = list(_extraction_defaults.strip_tags)
+    if max_download_bytes is None or timeout_seconds is None:
+        _storage_defaults = StorageConfig()
+        if max_download_bytes is None:
+            max_download_bytes = _storage_defaults.max_download_bytes
+        if timeout_seconds is None:
+            timeout_seconds = _storage_defaults.download_timeout_seconds
 
     result = guarded_fetch(
         url,
