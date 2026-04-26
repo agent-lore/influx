@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from influx.notifications import (
     HighlightItem,
     ProfileRunResult,
@@ -18,6 +20,7 @@ def _make_item(
     tags: list[str] | None = None,
     reason: str = "Highly relevant to embodied AI",
     url: str = "https://arxiv.org/abs/2603.12939",
+    related_in_lithos: list[dict[str, Any]] | None = None,
 ) -> HighlightItem:
     """Build a sample item for digest tests."""
     return HighlightItem(
@@ -27,7 +30,7 @@ def _make_item(
         tags=tags if tags is not None else ["robot-memory", "embodied-ai"],
         reason=reason,
         url=url,
-        related_in_lithos=[],
+        related_in_lithos=related_in_lithos if related_in_lithos is not None else [],
     )
 
 
@@ -119,8 +122,8 @@ class TestNonZeroIngestDigest:
         assert h["url"] == "https://arxiv.org/abs/2603.12939"
         assert h["related_in_lithos"] == []
 
-    def test_related_in_lithos_always_empty(self) -> None:
-        """FR-NOT-6: related_in_lithos is [] until PRD 08."""
+    def test_related_in_lithos_empty_when_no_results(self) -> None:
+        """AC-08-F: related_in_lithos is [] when no results."""
         result = ProfileRunResult(
             run_date="2026-03-16",
             profile="ai-robotics",
@@ -130,6 +133,47 @@ class TestNonZeroIngestDigest:
         digest = build_digest(result, notify_immediate_threshold=1)
         for h in digest["highlights"]:
             assert h["related_in_lithos"] == []
+
+    def test_related_in_lithos_populated_from_retrieve(self) -> None:
+        """AC-08-F: related_in_lithos carries title + score."""
+        related = [
+            {"title": "Neural Architecture Search Survey", "score": 0.92},
+            {"title": "Meta-Learning for Few-Shot Tasks", "score": 0.81},
+        ]
+        result = ProfileRunResult(
+            run_date="2026-04-26",
+            profile="ml-research",
+            stats=RunStats(sources_checked=20, ingested=2),
+            items=[
+                _make_item(
+                    id="high",
+                    score=10,
+                    url="https://arxiv.org/abs/2603.99999",
+                    related_in_lithos=related,
+                ),
+                _make_item(
+                    id="low",
+                    score=5,
+                    url="https://arxiv.org/abs/2603.88888",
+                    related_in_lithos=[],
+                ),
+            ],
+        )
+        digest = build_digest(result, notify_immediate_threshold=8)
+
+        # Only the high-score item is in highlights
+        assert len(digest["highlights"]) == 1
+        h = digest["highlights"][0]
+        assert h["id"] == "high"
+        assert len(h["related_in_lithos"]) == 2
+        assert h["related_in_lithos"][0] == {
+            "title": "Neural Architecture Search Survey",
+            "score": 0.92,
+        }
+        assert h["related_in_lithos"][1] == {
+            "title": "Meta-Learning for Few-Shot Tasks",
+            "score": 0.81,
+        }
 
     def test_all_ingested_includes_all_items(self) -> None:
         """all_ingested includes every item regardless of score."""
