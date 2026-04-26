@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from influx.config import (
     AppConfig,
@@ -40,6 +40,9 @@ from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import Tier1Enrichment, Tier3Extraction
+
+if TYPE_CHECKING:
+    from influx.sources import FetchCache
 
 __all__ = [
     "ArxivFilterScorer",
@@ -554,6 +557,7 @@ def make_arxiv_item_provider(
     *,
     scorer: ArxivScorer | None = None,
     filter_scorer: ArxivFilterScorer | None = None,
+    fetch_cache: FetchCache | None = None,
 ) -> Any:
     """Build the production-default ``item_provider`` for arXiv profiles.
 
@@ -582,7 +586,16 @@ def make_arxiv_item_provider(
     score ``0`` (abstract-only, no extraction or enrichment) so a
     misconfigured deployment still produces notes — it does NOT
     fabricate a score equal to ``thresholds.full_text``.
+
+    Parameters
+    ----------
+    fetch_cache:
+        Optional shared :class:`~influx.sources.FetchCache` for
+        per-fire dedup (R-8).  When two profiles build the same
+        arXiv query URL the fetch is executed once and the result
+        shared.
     """
+    cache = fetch_cache
 
     async def provider(
         profile: str,
@@ -598,18 +611,29 @@ def make_arxiv_item_provider(
         if not profile_cfg.sources.arxiv.enabled:
             return ()
 
-        try:
-            items = fetch_arxiv(
-                arxiv_config=profile_cfg.sources.arxiv,
-                resilience=config.resilience,
-            )
-        except NetworkError:
-            _log.warning(
-                "arxiv fetch failed for profile %r; yielding zero items",
-                profile,
-                exc_info=True,
-            )
-            return ()
+        # ── Cached fetch (R-8 dedup) ─────────────────────────────
+        arxiv_cfg = profile_cfg.sources.arxiv
+        cache_key = "arxiv:" + build_query_url(
+            categories=arxiv_cfg.categories,
+            max_results=arxiv_cfg.max_results_per_category,
+        )
+        if cache is not None and cache.has(cache_key):
+            items = cache.get(cache_key)
+        else:
+            try:
+                items = fetch_arxiv(
+                    arxiv_config=profile_cfg.sources.arxiv,
+                    resilience=config.resilience,
+                )
+            except NetworkError:
+                _log.warning(
+                    "arxiv fetch failed for profile %r; yielding zero items",
+                    profile,
+                    exc_info=True,
+                )
+                return ()
+            if cache is not None:
+                cache.put(cache_key, items)
 
         # Batched LLM filter takes precedence as the production default.
         # The per-item ``scorer`` seam stays available for tests that

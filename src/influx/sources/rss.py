@@ -19,6 +19,7 @@ fails), the feed item's ``<summary>`` is used instead (FR-ENR-3, AC-09-J).
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,8 +28,10 @@ from typing import TYPE_CHECKING, Any
 
 import feedparser
 
+from influx.coordinator import RunKind
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article
+from influx.http_client import guarded_fetch as _guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.slugs import slugify_feed_name
 from influx.storage import download_archive
@@ -36,10 +39,12 @@ from influx.urls import normalise_url, url_hash
 
 if TYPE_CHECKING:
     from influx.config import AppConfig, RssSourceEntry
+    from influx.sources import FetchCache
 
 __all__ = [
     "RssFeedItem",
     "build_rss_note_item",
+    "make_rss_item_provider",
     "parse_feed",
 ]
 
@@ -253,3 +258,81 @@ def build_rss_note_item(
         "path": path,
         "abstract_or_summary": summary,
     }
+
+
+# ── Production-default RSS item provider ────────────────────────────
+
+
+def make_rss_item_provider(
+    config: AppConfig,
+    *,
+    fetch_cache: FetchCache | None = None,
+) -> Any:
+    """Build the item provider for RSS feed profiles.
+
+    Fetches each RSS feed configured for the profile, parses items,
+    and maps each through :func:`build_rss_note_item`.
+
+    Parameters
+    ----------
+    config:
+        Loaded :class:`~influx.config.AppConfig`.
+    fetch_cache:
+        Optional shared :class:`~influx.sources.FetchCache` for
+        per-fire dedup (R-8).  When two profiles share the same RSS
+        feed URL the feed is fetched once and the result shared.
+    """
+    cache = fetch_cache
+
+    async def provider(
+        profile: str,
+        kind: RunKind,
+        run_range: dict[str, str | int] | None,
+        filter_prompt: str,
+    ) -> Iterable[dict[str, Any]]:
+        del kind, run_range, filter_prompt
+
+        profile_cfg = next((p for p in config.profiles if p.name == profile), None)
+        if profile_cfg is None:
+            return ()
+
+        results: list[dict[str, Any]] = []
+        for feed_entry in profile_cfg.sources.rss:
+            items = _fetch_rss_feed(feed_entry, cache)
+            for item in items:
+                results.append(
+                    build_rss_note_item(
+                        item=item,
+                        profile_name=profile,
+                        config=config,
+                    )
+                )
+
+        return results
+
+    return provider
+
+
+def _fetch_rss_feed(
+    feed_entry: RssSourceEntry,
+    cache: FetchCache | None,
+) -> list[RssFeedItem]:
+    """Fetch and parse an RSS feed, using cache for dedup."""
+    cache_key = f"rss:{feed_entry.url}"
+    if cache is not None and cache.has(cache_key):
+        return cache.get(cache_key)  # type: ignore[return-value]
+
+    try:
+        result = _guarded_fetch(feed_entry.url)
+        items = parse_feed(result.body, feed_entry)
+    except NetworkError:
+        _log.warning(
+            "RSS feed fetch failed for %r; yielding zero items",
+            feed_entry.name,
+            exc_info=True,
+        )
+        items = []
+
+    if cache is not None:
+        cache.put(cache_key, items)
+    return items

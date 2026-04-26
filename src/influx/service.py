@@ -30,10 +30,10 @@ from influx.http_api import router
 from influx.notifications import ProfileRunResult, build_digest, send_digest
 from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler
+from influx.sources import FetchCache, make_item_provider
 from influx.sources.arxiv import (
     ArxivFilterScorer,
     ArxivScorer,
-    make_arxiv_item_provider,
 )
 
 __all__ = [
@@ -138,20 +138,20 @@ def create_app(
     active_tasks: set[asyncio.Task[Any]] = set()
     probe_loop = ProbeLoop(config, interval=30.0)
 
-    # Production default item provider — drives arXiv fetch +
-    # extraction cascade via ``run_profile`` for any profile that has
-    # ``[profiles.sources.arxiv].enabled = true``.  When no per-item
-    # ``arxiv_scorer`` override is supplied, the batched LLM filter
-    # default is installed so the production ``InfluxService`` /
-    # ``serve`` path actually drives the score-gated extraction +
-    # enrichment behaviour from US-014/US-015 instead of writing every
-    # item abstract-only.
+    # Production default item provider — drives arXiv + RSS fetch with
+    # shared FetchCache for per-fire dedup (R-8 mitigation, AC-09-D).
+    # When no per-item ``arxiv_scorer`` override is supplied, the batched
+    # LLM filter default is installed so the production ``InfluxService``
+    # / ``serve`` path drives the score-gated extraction + enrichment
+    # behaviour from US-014/US-015.
     if arxiv_scorer is None and arxiv_filter_scorer is None:
         arxiv_filter_scorer = make_default_arxiv_filter_scorer(config)
-    item_provider: Any = make_arxiv_item_provider(
+    fetch_cache = FetchCache()
+    item_provider: Any = make_item_provider(
         config,
-        scorer=arxiv_scorer,
-        filter_scorer=arxiv_filter_scorer,
+        fetch_cache=fetch_cache,
+        arxiv_scorer=arxiv_scorer,
+        arxiv_filter_scorer=arxiv_filter_scorer,
     )
 
     scheduler = InfluxScheduler(
