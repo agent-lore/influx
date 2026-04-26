@@ -14,7 +14,12 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from influx.lithos_client import LithosClient
 
-__all__ = ["after_write", "compose_retrieve_query", "extract_arxiv_ref"]
+__all__ = [
+    "after_write",
+    "compose_retrieve_query",
+    "extract_arxiv_ref",
+    "resolve_builds_on",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -132,3 +137,49 @@ async def after_write(
         related.append({"title": r.get("title", ""), "score": score})
 
     return related
+
+
+# ── Tier 3 builds_on resolver (FR-LCMA-4, AC-M2-7/8) ────────────
+
+
+async def resolve_builds_on(
+    *,
+    client: LithosClient,
+    builds_on: list[str] | None = None,
+) -> None:
+    """Resolve Tier 3 ``builds_on`` items via ``lithos_cache_lookup``.
+
+    For each item with a recognisable arXiv ID, calls
+    ``lithos_cache_lookup(query=prior_title, source_url=…)`` and upserts
+    a ``builds_on`` edge only on an exact ``source_url`` match
+    (FR-LCMA-4, AC-M2-7).  Items without an arXiv ID or without a
+    matching cache entry are silently skipped (AC-M2-8).
+    """
+    if not builds_on:
+        return
+
+    for item in builds_on:
+        ref = extract_arxiv_ref(item)
+        if ref is None:
+            continue
+
+        prior_title, arxiv_id = ref
+        source_url = f"https://arxiv.org/abs/{arxiv_id}"
+
+        result = await client.cache_lookup(
+            query=prior_title,
+            source_url=source_url,
+        )
+
+        body = json.loads(result.content[0].text)  # type: ignore[union-attr]
+        if not body.get("hit"):
+            continue
+
+        # Exact source_url match required — no fuzzy matching (AC-M2-8).
+        if body.get("source_url") != source_url:
+            continue
+
+        await client.edge_upsert(
+            type="builds_on",
+            evidence={"kind": "tier3_builds_on_extraction"},
+        )

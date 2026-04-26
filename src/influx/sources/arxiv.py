@@ -541,6 +541,8 @@ def build_arxiv_note_item(
         "reason": reason,
         "path": path,
         "abstract_or_summary": item.abstract,
+        "contributions": tier1_result.contributions if tier1_result else None,
+        "builds_on": list(tier3_result.builds_on) if tier3_result else None,
     }
 
 

@@ -30,6 +30,7 @@ from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.feedback import build_negative_examples_block
 from influx.lcma import after_write as lcma_after_write
+from influx.lcma import resolve_builds_on as lcma_resolve_builds_on
 from influx.lithos_client import LithosClient
 from influx.notifications import HighlightItem, ProfileRunResult, RunStats
 from influx.repair import SweepWriteError
@@ -228,6 +229,11 @@ async def run_profile(
                             lcma_edge_score=profile_cfg.thresholds.lcma_edge_score
                             if profile_cfg
                             else 0.75,
+                        )
+                        # ── Tier 3 builds_on resolver (FR-LCMA-4, AC-M2-7/8) ──
+                        await lcma_resolve_builds_on(
+                            client=client,
+                            builds_on=item.get("builds_on"),
                         )
 
                     ingested.append(

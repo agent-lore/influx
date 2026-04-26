@@ -391,3 +391,128 @@ class TestAfterWriteEdgeWiring:
         assert result is not None
         assert len(result.items) == 1
         assert result.items[0].related_in_lithos == []
+
+
+# ── US-006: Tier 3 builds_on resolver ────────────────────────────
+
+
+class TestBuildsOnResolver:
+    """Tier 3 builds_on items resolved via lithos_cache_lookup (AC-M2-7/8)."""
+
+    def test_cache_hit_produces_builds_on_edge(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Cache hit on arXiv URL → one lithos_edge_upsert(type=builds_on)."""
+        import json as _json
+
+        config = _make_config(fake_lithos_url)
+
+        # Queue a retrieve response (from after_write).
+        fake_lithos.retrieve_responses.append(
+            _json.dumps({"results": []})
+        )
+
+        # Queue a cache_lookup hit for the builds_on arXiv URL.
+        # First cache_lookup is the per-item dedup check (miss).
+        fake_lithos.cache_lookup_responses.append(
+            _json.dumps({"hit": False, "stale_exists": False})
+        )
+        # Second cache_lookup is the builds_on resolver (hit).
+        fake_lithos.cache_lookup_responses.append(
+            _json.dumps({
+                "hit": True,
+                "source_url": "https://arxiv.org/abs/2412.12345",
+                "note_id": "note-foonet",
+                "title": "FooNet",
+            })
+        )
+
+        items = [
+            {
+                "title": "Paper That Builds On FooNet",
+                "source_url": "https://arxiv.org/abs/2601.00010",
+                "content": "# Summary\nExtends FooNet.",
+                "tags": ["profile:ai-robotics", "source:arxiv"],
+                "confidence": 0.9,
+                "score": 9,
+                "builds_on": ["FooNet (arXiv:2412.12345)"],
+            }
+        ]
+
+        asyncio.run(
+            run_profile(
+                "ai-robotics",
+                RunKind.MANUAL,
+                config=config,
+                item_provider=_single_item_provider(items),
+            )
+        )
+
+        # Verify cache_lookup was called with correct args (FR-MCP-3, R-7).
+        cache_calls = _calls_by_tool(fake_lithos.calls, "lithos_cache_lookup")
+        # One for dedup + one for builds_on.
+        assert len(cache_calls) == 2
+        builds_on_lookup = cache_calls[1]
+        assert builds_on_lookup["query"] == "FooNet"
+        assert builds_on_lookup["source_url"] == "https://arxiv.org/abs/2412.12345"
+
+        # Verify lithos_edge_upsert(type=builds_on) was called (AC-M2-7).
+        edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")
+        builds_on_edges = [c for c in edge_calls if c["type"] == "builds_on"]
+        assert len(builds_on_edges) == 1
+        assert builds_on_edges[0]["evidence"] == {
+            "kind": "tier3_builds_on_extraction"
+        }
+
+    def test_cache_miss_produces_no_builds_on_edge(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Cache miss on arXiv URL → zero builds_on edges (AC-M2-8)."""
+        import json as _json
+
+        config = _make_config(fake_lithos_url)
+
+        # Queue a retrieve response (from after_write).
+        fake_lithos.retrieve_responses.append(
+            _json.dumps({"results": []})
+        )
+
+        # Dedup cache_lookup (miss).
+        fake_lithos.cache_lookup_responses.append(
+            _json.dumps({"hit": False, "stale_exists": False})
+        )
+        # builds_on cache_lookup (also miss — default response).
+
+        items = [
+            {
+                "title": "Paper With Unknown Reference",
+                "source_url": "https://arxiv.org/abs/2601.00011",
+                "content": "# Summary\nReferences unknown work.",
+                "tags": ["profile:ai-robotics", "source:arxiv"],
+                "confidence": 0.8,
+                "score": 8,
+                "builds_on": ["FooNet (arXiv:2412.99999)"],
+            }
+        ]
+
+        asyncio.run(
+            run_profile(
+                "ai-robotics",
+                RunKind.MANUAL,
+                config=config,
+                item_provider=_single_item_provider(items),
+            )
+        )
+
+        # builds_on cache_lookup was called.
+        cache_calls = _calls_by_tool(fake_lithos.calls, "lithos_cache_lookup")
+        assert len(cache_calls) == 2
+
+        # No builds_on edges upserted.
+        edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")
+        builds_on_edges = [c for c in edge_calls if c["type"] == "builds_on"]
+        assert len(builds_on_edges) == 0

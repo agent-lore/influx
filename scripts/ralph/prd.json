@@ -104,7 +104,7 @@
         "Integration tests in `tests/integration/test_lcma_edges_end_to_end.py` extend coverage with: (1) Tier 3 `builds_on=[\"FooNet (arXiv:2412.12345)\"]` with a fake-Lithos cache hit on the arXiv URL → one `lithos_edge_upsert(type=\"builds_on\")` with the expected evidence, (2) same input with a fake-Lithos miss → zero `builds_on` edges"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
