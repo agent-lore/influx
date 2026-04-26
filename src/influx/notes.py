@@ -37,6 +37,7 @@ __all__ = [
     "ParsedSection",
     "ProfileRelevanceEntry",
     "build_profile_relevance_for_rewrite",
+    "merge_profile_relevance_union",
     "merge_tags",
     "parse_archive_path",
     "parse_note",
@@ -766,6 +767,62 @@ def build_profile_relevance_for_rewrite(
     # Rejected profiles keep old entries
     for entry in old_entries:
         if entry.profile_name in rejected and entry.profile_name not in seen:
+            result.append(entry)
+            seen.add(entry.profile_name)
+
+    return result
+
+
+def merge_profile_relevance_union(
+    *,
+    old_entries: list[ProfileRelevanceEntry],
+    new_entries: list[ProfileRelevanceEntry],
+    tags: list[str],
+) -> list[ProfileRelevanceEntry]:
+    """Union-merge profile relevance entries for multi-profile merging (FR-NOTE-6).
+
+    Unlike :func:`build_profile_relevance_for_rewrite` — which drops
+    old entries for non-rejected, non-new profiles (correct for
+    single-profile rewrites and repair sweeps) — this function
+    preserves old entries for ALL profiles not superseded by new
+    entries, enabling multi-profile tag merging on shared notes.
+
+    Rejected profiles (``influx:rejected:<profile>`` in *tags*) always
+    keep their old entries; new entries for rejected profiles are
+    dropped.
+
+    Parameters
+    ----------
+    old_entries:
+        Entries from the previously existing note.
+    new_entries:
+        Entries from the incoming write (typically one profile).
+    tags:
+        The final merged tag list (used to detect rejection guards).
+
+    Returns
+    -------
+    list[ProfileRelevanceEntry]
+        The merged entries to render.
+    """
+    rejected = {
+        t[len("influx:rejected:") :] for t in tags if t.startswith("influx:rejected:")
+    }
+
+    result: list[ProfileRelevanceEntry] = []
+    seen: set[str] = set()
+
+    # Non-rejected profiles use new entries
+    for entry in new_entries:
+        if entry.profile_name not in rejected:
+            result.append(entry)
+            seen.add(entry.profile_name)
+
+    # ALL old entries for profiles not yet in result (union semantics):
+    # - Rejected profiles: keep old entry (rejection authority)
+    # - Non-current profiles: keep old entry (multi-profile preservation)
+    for entry in old_entries:
+        if entry.profile_name not in seen:
             result.append(entry)
             seen.add(entry.profile_name)
 

@@ -381,7 +381,13 @@ class TestDedupSkip:
         fake_lithos_url: str,
         fake_webhook: FakeWebhookServer,
     ) -> None:
-        """AC-M1-9: second run → cache_lookup returns hit → no write."""
+        """AC-M1-9: second run → cache hit → write returns duplicate → not ingested.
+
+        US-005 changed cache-hit behaviour: a write is still attempted
+        (to support multi-profile merge via version_conflict), but the
+        server returns ``duplicate`` for an identical re-write, which is
+        not counted as ingested.
+        """
         config = _make_config(
             lithos_url=fake_lithos_url,
             webhook_url=fake_webhook.url,
@@ -409,8 +415,13 @@ class TestDedupSkip:
         fake_lithos.cache_lookup_responses.append(
             json.dumps({"hit": True, "stale_exists": False})
         )
+        # US-005: cache hit still triggers a write; server returns duplicate
+        # for same-profile re-write (content unchanged).
+        fake_lithos.write_responses.append(
+            json.dumps({"status": "duplicate"})
+        )
 
-        # --- Second run: item is cached (cache hit → skip). ---
+        # --- Second run: item is cached (cache hit → write → duplicate). ---
         app2 = _make_app(config, items=items)
 
         with TestClient(app2) as tc:
@@ -421,11 +432,12 @@ class TestDedupSkip:
         lookup_calls = [c for c in fake_lithos.calls if c[0] == "lithos_cache_lookup"]
         assert len(lookup_calls) >= 1
 
-        # No lithos_write — item was skipped.
+        # US-005: write IS attempted on cache hit (multi-profile merge support),
+        # but server returns duplicate → not counted as ingested.
         second_write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-        assert len(second_write_calls) == 0
+        assert len(second_write_calls) == 1
 
-        # Webhook digest shows zero ingested.
+        # Webhook digest shows zero ingested (duplicate ≠ ingested).
         assert len(fake_webhook.received) == 1
         assert fake_webhook.received[0]["stats"]["ingested"] == 0
 

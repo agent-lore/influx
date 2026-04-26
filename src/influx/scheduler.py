@@ -242,6 +242,29 @@ async def run_profile(
                     cache_result.content[0].text  # type: ignore[union-attr]
                 )
                 if cache_body.get("hit"):
+                    # US-005: multi-profile merge — still attempt a write
+                    # so that version_conflict handling merges profile tags
+                    # and Profile Relevance entries from the existing note.
+                    write_result = await client.write_note(
+                        title=title,
+                        content=item.get("content", ""),
+                        path=item.get("path", ""),
+                        source_url=source_url,
+                        tags=list(item.get("tags", [])),
+                        confidence=float(item.get("confidence", 0.0)),
+                    )
+                    if write_result.status in ("created", "updated"):
+                        ingested.append(
+                            HighlightItem(
+                                id=item.get("id", f"note-{len(ingested) + 1}"),
+                                title=title,
+                                score=int(item.get("score", 0)),
+                                tags=list(item.get("tags", [])),
+                                reason=item.get("reason", ""),
+                                url=source_url,
+                                related_in_lithos=[],
+                            )
+                        )
                     continue
 
                 write_result = await client.write_note(

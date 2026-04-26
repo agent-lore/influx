@@ -1,7 +1,7 @@
 {
-  "project": "Influx v1 — PRD 09: RSS Fetcher + Multi-Profile Orchestration + Backfill",
+  "project": "Influx v1 \u2014 PRD 09: RSS Fetcher + Multi-Profile Orchestration + Backfill",
   "branchName": "ralph/rss-multiprofile-backfill",
-  "description": "Extends the arXiv-only single-profile pipeline along three independent axes: (S-11) an RSS/Atom fetcher in `src/influx/sources/rss.py` using `feedparser`, with per-feed `source_tag` (`rss` or `blog`) flowing into the canonical `source:*` tag and the archive bucket layout `/archive/<feed.source_tag>/{YYYY}/{MM}/{feed-slug}-{YYYY-MM-DD}-{url-hash}.html` where `{url-hash}` is the first 10 hex chars of SHA-256(normalised `source_url`); (S-12) multi-profile orchestration with `profile:*` tag union-merging on shared notes, per-profile `## Profile Relevance` bullet merging by profile name, per-profile rejection authority preserved on the ingest path (`influx:rejected:<profile>` blocks re-adding `profile:<profile>` even when the source matches that profile again), cross-profile parallelism with same-profile strict serial (already enforced by PRD 03's coordinator), and per-source fetch deduplication across profiles within a single scheduled fire (R-8); (S-13) a real `POST /backfills` handler in `src/influx/http_api.py` replacing PRD 03's stub estimator, with naive cost estimate `days × len(categories) × max_results_per_category` (Q-3), a `--confirm` gate triggered by `estimated_items > 1000` (FR-BF-6), `lithos_task_create(tags=[\"influx:backfill\", ...])` task tagging, no webhook POST (FR-NOT-4), and no repair sweep (FR-REP-2) — both gates already exist from PRDs 05/06 but this PRD ensures `kind=\"backfill\"` is correctly propagated from the API down. After this PRD, the v1 product is functionally complete; PRD 10 adds OTEL spans/metrics and rejection-rate logging.",
+  "description": "Extends the arXiv-only single-profile pipeline along three independent axes: (S-11) an RSS/Atom fetcher in `src/influx/sources/rss.py` using `feedparser`, with per-feed `source_tag` (`rss` or `blog`) flowing into the canonical `source:*` tag and the archive bucket layout `/archive/<feed.source_tag>/{YYYY}/{MM}/{feed-slug}-{YYYY-MM-DD}-{url-hash}.html` where `{url-hash}` is the first 10 hex chars of SHA-256(normalised `source_url`); (S-12) multi-profile orchestration with `profile:*` tag union-merging on shared notes, per-profile `## Profile Relevance` bullet merging by profile name, per-profile rejection authority preserved on the ingest path (`influx:rejected:<profile>` blocks re-adding `profile:<profile>` even when the source matches that profile again), cross-profile parallelism with same-profile strict serial (already enforced by PRD 03's coordinator), and per-source fetch deduplication across profiles within a single scheduled fire (R-8); (S-13) a real `POST /backfills` handler in `src/influx/http_api.py` replacing PRD 03's stub estimator, with naive cost estimate `days \u00d7 len(categories) \u00d7 max_results_per_category` (Q-3), a `--confirm` gate triggered by `estimated_items > 1000` (FR-BF-6), `lithos_task_create(tags=[\"influx:backfill\", ...])` task tagging, no webhook POST (FR-NOT-4), and no repair sweep (FR-REP-2) \u2014 both gates already exist from PRDs 05/06 but this PRD ensures `kind=\"backfill\"` is correctly propagated from the API down. After this PRD, the v1 product is functionally complete; PRD 10 adds OTEL spans/metrics and rejection-rate logging.",
   "userStories": [
     {
       "id": "US-001",
@@ -79,7 +79,7 @@
         "Negative test asserts that running one profile alone does NOT remove or rewrite an existing `profile:<other-profile>` tag or its `## Profile Relevance` entry on a shared note (e.g. running `web-tech` alone preserves an existing `profile:ai-robotics` tag and bullet)"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -89,7 +89,7 @@
       "acceptanceCriteria": [
         "When a note already has `influx:rejected:profile-a`, the ingest path MUST NOT re-add `profile:profile-a` even if the source matches that profile again (AC-M3-6)",
         "When a note already has `influx:rejected:profile-a`, the ingest path MUST NOT refresh that profile's `## Profile Relevance` entry",
-        "If `profile-b` separately scores the same item ≥ `relevance` in the same run, `profile:profile-b` IS added on the same note, and the rejection on `profile-a` is preserved (AC-09-K)",
+        "If `profile-b` separately scores the same item \u2265 `relevance` in the same run, `profile:profile-b` IS added on the same note, and the rejection on `profile-a` is preserved (AC-09-K)",
         "In a multi-profile run, when an Influx-authored note carries `influx:rejected:<profile>`, that note's title appears in the next run's filter prompt under the `NEGATIVE EXAMPLES` block for that profile (AC-M3-5), exercised end-to-end via an integration test",
         "Integration test `tests/integration/test_profile_rejection_authority.py` drives a two-profile run where one profile is rejected and the other is not, asserting the rejection-authority post-condition: `influx:rejected:<rejected-profile>` present, `profile:<rejected-profile>` absent, `profile:<accepted-profile>` present"
       ],
@@ -117,7 +117,7 @@
       "description": "As the `/backfills` HTTP API, I want a real estimator and `confirm_required` gate so that backfills exceeding 1000 estimated items require explicit confirmation, replacing PRD 03's stub estimator (FR-BF-6, AC-M3-8, AC-09-E, AC-09-I).",
       "acceptanceCriteria": [
         "Replace the PRD 03 stub `/backfills` handler in `src/influx/http_api.py` with a real implementation",
-        "The estimator computes `estimated_items = days × len(categories) × max_results_per_category` (Q-3)",
+        "The estimator computes `estimated_items = days \u00d7 len(categories) \u00d7 max_results_per_category` (Q-3)",
         "The handler supports both backfill range forms required by FR-BF-1 (a number-of-days form and an explicit from/to date form)",
         "When `estimated_items > 1000` and `confirm` is not set, the handler returns `reason=\"confirm_required\"` with the `estimated_items` field populated (FR-BF-6, AC-M3-8)",
         "When `estimated_items <= 1000`, the request is accepted without `confirm`",
@@ -134,7 +134,7 @@
       "description": "As an operator running `python -m influx backfill`, I want the CLI to handle estimate responses, confirm prompting, and full execution against arXiv so that `backfill --profile X --days 7` completes without overlapping a scheduled run for the same profile (AC-M3-7, FR-BF-1, FR-BF-2, FR-BF-3).",
       "acceptanceCriteria": [
         "Finalise the `backfill` subcommand in the project's CLI entrypoint: supports `--days N` or `--from YYYY-MM-DD --to YYYY-MM-DD` as a mutually exclusive range form (FR-BF-1)",
-        "On `reason=\"confirm_required\"` from the API, the CLI surfaces `estimated_items` to the user and only submits `confirm=true` after explicit user acknowledgement — whether via a follow-up invocation with `--confirm` or an equivalent acknowledged retry flow (FR-BF-6)",
+        "On `reason=\"confirm_required\"` from the API, the CLI surfaces `estimated_items` to the user and only submits `confirm=true` after explicit user acknowledgement \u2014 whether via a follow-up invocation with `--confirm` or an equivalent acknowledged retry flow (FR-BF-6)",
         "Items already ingested (per `lithos_cache_lookup`) are skipped during the backfill run (FR-BF-2)",
         "Backfill honours arXiv pacing / request spacing (FR-BF-3); the run respects the ~30s-per-day-of-backfill-per-profile budget",
         "A backfill for profile `X` does not overlap with a scheduled run for the same profile; same-profile serialisation is enforced by PRD 03's coordinator (AC-M3-7)",
@@ -155,7 +155,7 @@
         "The backfill code path does not invoke `lithos_list(tags=[\"influx:repair-needed\", ...])` (FR-REP-2); the existing PRD 06 repair-sweep gate is exercised end-to-end with `kind=\"backfill\"` (AC-09-H)",
         "Integration assertion in `tests/integration/test_backfill_arxiv.py` verifies the created Lithos task carries the tag `influx:backfill` and NOT `influx:run` (AC-09-F)",
         "Integration assertion verifies that no webhook HTTP call was issued during the backfill (AC-09-G)",
-        "Integration assertion verifies that the repair sweep was not invoked during the backfill — i.e. no `lithos_list(tags=[\"influx:repair-needed\", ...])` call recorded (AC-09-H)",
+        "Integration assertion verifies that the repair sweep was not invoked during the backfill \u2014 i.e. no `lithos_list(tags=[\"influx:repair-needed\", ...])` call recorded (AC-09-H)",
         "Non-backfill regression test confirms that scheduled and manual runs continue to create `lithos_task_create` calls tagged `influx:run` rather than `influx:backfill`, so that the run-kind correctly selects between the two task tags (FR-BF-5)"
       ],
       "priority": 10,
@@ -164,12 +164,12 @@
     }
   ],
   "definitionOfDone": [
-    "All AC-M3-1 through AC-M3-8 (master PRD §7.3) are demonstrably exercised by tests",
-    "All AC-09-A through AC-09-K (PRD 09 §8 new-for-this-PRD) are demonstrably exercised by tests",
+    "All AC-M3-1 through AC-M3-8 (master PRD \u00a77.3) are demonstrably exercised by tests",
+    "All AC-09-A through AC-09-K (PRD 09 \u00a78 new-for-this-PRD) are demonstrably exercised by tests",
     "No remaining stubs in the codebase except OTEL spans/metrics (PRD 10) and per-tag rejection-rate logging (PRD 10)",
     "The `run_profile` hook left by PRD 03 is a single well-typed function that handles arXiv + RSS + scheduled + manual + backfill cases",
     "`uv run pytest tests/unit/test_rss_fetcher.py tests/unit/test_archive_url_hash.py tests/unit/test_multi_profile_merge.py tests/unit/test_backfill_estimator.py tests/integration/test_rss_to_lithos.py tests/integration/test_multi_profile_shared_source.py tests/integration/test_backfill_arxiv.py tests/integration/test_profile_rejection_authority.py` all pass",
-    "Coverage on `src/influx/sources/rss.py`, `src/influx/backfill.py`, and the multi-profile orchestration code paths in `src/influx/service.py` is ≥ 80%",
+    "Coverage on `src/influx/sources/rss.py`, `src/influx/backfill.py`, and the multi-profile orchestration code paths in `src/influx/service.py` is \u2265 80%",
     "`uv run ruff check src tests` passes with zero violations on changed files",
     "`uv run pyright` passes (project-wide typecheck green)",
     "Backfill `kind=\"backfill\"` is correctly propagated from the `/backfills` API down to task tagging, webhook gate, and repair-sweep gate"

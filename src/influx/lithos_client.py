@@ -27,7 +27,19 @@ from mcp.shared.exceptions import McpError
 
 from influx.dedup import compose_dedup_query
 from influx.errors import ConfigError, LCMAError, LithosError
-from influx.notes import merge_tags as _canonical_merge_tags
+from influx.notes import (
+    NoteParseError,
+    ProfileRelevanceEntry,
+    merge_profile_relevance_union,
+    parse_note,
+    parse_profile_relevance,
+)
+from influx.notes import (
+    _render_profile_relevance_body as _render_pr_body,
+)
+from influx.notes import (
+    merge_tags as _canonical_merge_tags,
+)
 
 __all__ = ["LithosClient", "WriteResult"]
 
@@ -122,6 +134,71 @@ def _preserve_user_notes(existing_content: str, new_content: str) -> str:
     new_idx = new_content.find(_USER_NOTES_MARKER)
     base = new_content[:new_idx].rstrip() if new_idx != -1 else new_content.rstrip()
     return base + "\n\n" + user_notes_block
+
+
+_PROFILE_RELEVANCE_MARKER = "## Profile Relevance"
+
+
+def _merge_profile_relevance_in_content(
+    existing_content: str,
+    new_content: str,
+    merged_tags: list[str],
+) -> str:
+    """Merge ``## Profile Relevance`` sections from two note contents.
+
+    Parses Profile Relevance entries from both *existing_content* and
+    *new_content*, union-merges them (preserving old entries for profiles
+    not in the new set), and replaces the ``## Profile Relevance``
+    section in *new_content* with the merged result.
+
+    Falls back to *new_content* unchanged when either note cannot be
+    parsed (e.g. non-canonical format).
+    """
+    try:
+        existing_parsed = parse_note(existing_content)
+        new_parsed = parse_note(new_content)
+    except NoteParseError:
+        return new_content
+
+    old_entries = parse_profile_relevance(existing_parsed)
+    new_entries = parse_profile_relevance(new_parsed)
+
+    if not old_entries:
+        return new_content  # Nothing to merge from existing
+
+    merged_entries = merge_profile_relevance_union(
+        old_entries=old_entries,
+        new_entries=new_entries,
+        tags=merged_tags,
+    )
+
+    # Replace the ## Profile Relevance section in new_content
+    return _replace_profile_relevance_section(new_content, merged_entries)
+
+
+def _replace_profile_relevance_section(
+    content: str,
+    entries: list[ProfileRelevanceEntry],
+) -> str:
+    """Replace the ``## Profile Relevance`` section body in *content*."""
+    pr_idx = content.find(_PROFILE_RELEVANCE_MARKER)
+    if pr_idx == -1:
+        return content
+
+    # Find the end of the Profile Relevance section: the next ## heading
+    after_heading = pr_idx + len(_PROFILE_RELEVANCE_MARKER)
+    next_h2 = content.find("\n## ", after_heading)
+
+    pr_body = _render_pr_body(entries)
+    marker = _PROFILE_RELEVANCE_MARKER
+    replacement = f"{marker}\n{pr_body}\n" if pr_body else f"{marker}\n"
+
+    if next_h2 != -1:
+        # Replace up to but not including the next ## heading's newline
+        return content[:pr_idx] + replacement + "\n" + content[next_h2 + 1:]
+    else:
+        # Profile Relevance is the last section — replace to end
+        return content[:pr_idx] + replacement
 
 
 _TIER2_MARKER = "## Full Text"
@@ -417,12 +494,16 @@ class LithosClient:
         source_url: str,
         original_tags: list[str],
     ) -> WriteResult:
-        """Re-read, merge tags + user notes, retry once (AC-05-E)."""
+        """Re-read, merge tags + notes + Profile Relevance (AC-05-E)."""
         existing = await self.read_note(note_id=note_id)
         existing_tags: list[str] = existing.get("tags", [])
         merged_tags = _merge_tags(existing_tags, original_tags)
         existing_content: str = existing.get("content", "")
         merged_content = _preserve_user_notes(existing_content, args["content"])
+        # Multi-profile merge: union-merge Profile Relevance entries (FR-NOTE-6)
+        merged_content = _merge_profile_relevance_in_content(
+            existing_content, merged_content, merged_tags
+        )
         retry_args = {
             **args,
             "tags": merged_tags,
