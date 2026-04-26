@@ -18,12 +18,12 @@ fails), the feed item's ``<summary>`` is used instead (FR-ENR-3, AC-09-J).
 
 from __future__ import annotations
 
+import calendar
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from time import mktime
 from typing import TYPE_CHECKING, Any
 
 import feedparser
@@ -117,6 +117,12 @@ def parse_feed(
 def _parse_published(entry: Any) -> datetime:
     """Extract published datetime from a feed entry.
 
+    Feedparser returns time tuples in UTC, so the conversion uses
+    :func:`calendar.timegm` (UTC) rather than :func:`time.mktime` (local
+    time).  Using ``mktime`` would shift entries authored near midnight
+    UTC by the host's UTC offset, sending them to the wrong
+    ``{YYYY-MM-DD}`` archive segment / note path bucket.
+
     Falls back to ``updated_parsed`` and then ``datetime.now(UTC)`` when
     the entry lacks a parseable date.
     """
@@ -124,7 +130,7 @@ def _parse_published(entry: Any) -> datetime:
         parsed = entry.get(attr)
         if parsed is not None:
             try:
-                return datetime.fromtimestamp(mktime(parsed), tz=UTC)
+                return datetime.fromtimestamp(calendar.timegm(parsed), tz=UTC)
             except (TypeError, ValueError, OverflowError):
                 continue
 

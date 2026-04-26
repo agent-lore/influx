@@ -727,18 +727,70 @@ def make_arxiv_item_provider(
         )
 
         async def _do_fetch() -> list[ArxivItem]:
-            # FR-BF-3: enforce ``arxiv_request_min_interval_seconds`` of
-            # spacing on backfills so a multi-day backfill does not burst
-            # against the arXiv API.  Scheduled / manual runs make a
-            # single fetch per category set, so pacing is irrelevant
-            # there.
-            if kind == RunKind.BACKFILL:
-                _sleep(float(config.resilience.arxiv_request_min_interval_seconds))
-            return fetch_arxiv(
-                arxiv_config=profile_cfg.sources.arxiv,
-                resilience=config.resilience,
-                backfill_range=backfill_range,
+            # FR-BF-3 / review finding 2: multi-day backfills MUST split
+            # into per-day windows so the run actually realizes the
+            # ``days × len(categories) × max_results_per_category``
+            # contract.  A single OR-joined query with ``max_results=N``
+            # returns at most N items total across all days/categories,
+            # so a 7-day backfill against ``cs.AI`` with
+            # ``max_results_per_category=10`` would only fetch 10 items
+            # — not 70.  Splitting per day also means
+            # ``arxiv_request_min_interval_seconds`` is applied between
+            # each request (not just one sleep up front), giving the
+            # required ~30s-per-day-of-backfill pacing budget.
+            #
+            # Scheduled / manual runs make a single fetch per category
+            # set, so pacing is irrelevant there.
+            if kind != RunKind.BACKFILL or backfill_range is None:
+                return fetch_arxiv(
+                    arxiv_config=profile_cfg.sources.arxiv,
+                    resilience=config.resilience,
+                    backfill_range=backfill_range,
+                )
+
+            # Per-day fetch with pacing.  ``per_day_max`` widens
+            # ``max_results`` so the OR-joined query can return up to
+            # ``len(categories) * max_results_per_category`` items for
+            # one day, matching the estimator contract (Q-3 / FR-BF-6).
+            n_categories = max(len(arxiv_cfg.categories), 1)
+            per_day_max = arxiv_cfg.max_results_per_category * n_categories
+            per_day_arxiv_cfg = ArxivSourceConfig(
+                enabled=arxiv_cfg.enabled,
+                categories=list(arxiv_cfg.categories),
+                max_results_per_category=per_day_max,
+                lookback_days=arxiv_cfg.lookback_days,
             )
+            pacing = float(config.resilience.arxiv_request_min_interval_seconds)
+            collected: list[ArxivItem] = []
+            seen_ids: set[str] = set()
+            current = backfill_range.date_from
+            while current < backfill_range.date_to:
+                day_range = BackfillRange(
+                    date_from=current,
+                    date_to=current + timedelta(days=1),
+                )
+                # Pace BEFORE each request so the very first fetch also
+                # respects the spacing budget on a fresh fire.
+                _sleep(pacing)
+                try:
+                    day_items = fetch_arxiv(
+                        arxiv_config=per_day_arxiv_cfg,
+                        resilience=config.resilience,
+                        backfill_range=day_range,
+                    )
+                except NetworkError:
+                    _log.warning(
+                        "arxiv fetch failed for day %s; continuing backfill",
+                        current.isoformat(),
+                        exc_info=True,
+                    )
+                    day_items = []
+                for it in day_items:
+                    if it.arxiv_id not in seen_ids:
+                        seen_ids.add(it.arxiv_id)
+                        collected.append(it)
+                current = current + timedelta(days=1)
+            return collected
 
         try:
             if cache is not None:

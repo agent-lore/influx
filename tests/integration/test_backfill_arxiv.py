@@ -615,7 +615,17 @@ class TestBackfillRangePropagation:
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
     ) -> None:
-        """``backfill --days 7`` must pass a concrete BackfillRange to fetch_arxiv."""
+        """``backfill --days 7`` splits into per-day fetches with pacing.
+
+        Review finding 2: a multi-day backfill must split into per-day
+        windows so the run actually realizes the
+        ``days × len(categories) × max_results_per_category`` contract
+        and applies pacing between requests.  The previous single-call
+        shape capped a 7-day run at ``max_results_per_category`` items
+        regardless of how many days were requested.
+        """
+        from datetime import timedelta
+
         from influx.sources.arxiv import BackfillRange
 
         config = _make_config(lithos_url=fake_lithos_url, arxiv_min_interval=3)
@@ -629,10 +639,10 @@ class TestBackfillRangePropagation:
         # Queue Lithos: feedback (no repair sweep for backfill)
         fake_lithos.list_responses.append(json.dumps({"items": []}))
 
-        captured_kwargs: dict[str, Any] = {}
+        all_calls: list[dict[str, Any]] = []
 
         def capturing_fetch(**kwargs: Any) -> list[ArxivItem]:
-            captured_kwargs.update(kwargs)
+            all_calls.append(dict(kwargs))
             return list(_FIXTURE_ARXIV_ITEMS)
 
         with (
@@ -651,24 +661,51 @@ class TestBackfillRangePropagation:
                 )
             )
 
-        # Backfill range must be propagated.
-        backfill_range = captured_kwargs.get("backfill_range")
-        assert backfill_range is not None
-        assert isinstance(backfill_range, BackfillRange)
-        assert backfill_range.days == 7
+        # One fetch per day in the backfill window (review finding 2).
+        assert len(all_calls) == 7
 
-        # Pacing sleep called with arxiv_request_min_interval_seconds.
-        assert mock_sleep.called
-        sleep_arg = mock_sleep.call_args[0][0]
-        assert sleep_arg == float(config.resilience.arxiv_request_min_interval_seconds)
+        # Each call MUST carry a 1-day BackfillRange.
+        per_day_ranges: list[BackfillRange] = []
+        for call_kwargs in all_calls:
+            r = call_kwargs.get("backfill_range")
+            assert isinstance(r, BackfillRange)
+            assert r.days == 1
+            per_day_ranges.append(r)
+
+        # The 7 ranges together cover the requested 7-day window with
+        # no gaps and no overlap.
+        per_day_ranges.sort(key=lambda r: r.date_from)
+        for i in range(1, len(per_day_ranges)):
+            assert per_day_ranges[i].date_from == (
+                per_day_ranges[i - 1].date_from + timedelta(days=1)
+            )
+        full_span = per_day_ranges[-1].date_to - per_day_ranges[0].date_from
+        assert full_span == timedelta(days=7)
+
+        # Each call also carries a widened ``max_results_per_category`` so
+        # the per-day OR-joined query can return up to the full estimator
+        # budget for that day (Q-3 / FR-BF-6).
+        n_categories = 1  # cs.AI only in the test config
+        for call_kwargs in all_calls:
+            arxiv_cfg = call_kwargs.get("arxiv_config")
+            assert arxiv_cfg is not None
+            assert arxiv_cfg.max_results_per_category == 10 * n_categories
+
+        # Pacing sleep called with arxiv_request_min_interval_seconds
+        # at least once per day-fetch (FR-BF-3).
+        assert mock_sleep.call_count >= 7
+        for sleep_call in mock_sleep.call_args_list:
+            assert sleep_call[0][0] == float(
+                config.resilience.arxiv_request_min_interval_seconds
+            )
 
     def test_backfill_from_to_threaded_into_fetch_arxiv(
         self,
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
     ) -> None:
-        """The ``--from``/``--to`` form propagates exact bounds to fetch_arxiv."""
-        from datetime import date
+        """The ``--from``/``--to`` form propagates per-day bounds to fetch_arxiv."""
+        from datetime import date, timedelta
 
         from influx.sources.arxiv import BackfillRange
 
@@ -682,10 +719,10 @@ class TestBackfillRangePropagation:
 
         fake_lithos.list_responses.append(json.dumps({"items": []}))
 
-        captured_kwargs: dict[str, Any] = {}
+        all_calls: list[dict[str, Any]] = []
 
         def capturing_fetch(**kwargs: Any) -> list[ArxivItem]:
-            captured_kwargs.update(kwargs)
+            all_calls.append(dict(kwargs))
             return list(_FIXTURE_ARXIV_ITEMS)
 
         with (
@@ -704,10 +741,19 @@ class TestBackfillRangePropagation:
                 )
             )
 
-        backfill_range = captured_kwargs.get("backfill_range")
-        assert isinstance(backfill_range, BackfillRange)
-        assert backfill_range.date_from == date(2026, 4, 20)
-        assert backfill_range.date_to == date(2026, 4, 27)
+        # 7 per-day calls covering [2026-04-20, 2026-04-27).
+        assert len(all_calls) == 7
+        starts = sorted(
+            call_kwargs["backfill_range"].date_from for call_kwargs in all_calls
+        )
+        assert starts[0] == date(2026, 4, 20)
+        assert starts[-1] == date(2026, 4, 26)
+        for i in range(1, len(starts)):
+            assert starts[i] == starts[i - 1] + timedelta(days=1)
+        for call_kwargs in all_calls:
+            r = call_kwargs["backfill_range"]
+            assert isinstance(r, BackfillRange)
+            assert r.days == 1
 
     def test_nonbackfill_does_not_pass_range_or_pace(
         self,
@@ -754,3 +800,214 @@ class TestBackfillRangePropagation:
         # Manual run: no backfill_range, no pacing sleep.
         assert captured_kwargs.get("backfill_range") is None
         mock_sleep.assert_not_called()
+
+
+# ── Finding 3: real /backfills endpoint integration ─────────────────
+
+
+def _wait_for_idle(
+    coordinator: Coordinator,
+    profile: str,
+    timeout: float = 10.0,
+) -> None:
+    """Poll until *profile* is no longer held by the coordinator."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not coordinator.is_busy(profile):
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"Profile {profile!r} still busy after {timeout}s")
+
+
+class TestBackfillEndpointEndToEnd:
+    """Review finding 3: drive ``POST /backfills`` through the real app.
+
+    The earlier tests in this module call ``run_backfill`` directly and
+    mock ``post_run_webhook_hook`` / ``repair_sweep``.  Those tests
+    cannot prove that ``kind="backfill"`` propagates from the HTTP layer
+    down to task tagging, that the webhook gate prevents a real outbound
+    HTTP call, or that the repair-sweep gate prevents a real
+    ``lithos_list(tags=["influx:repair-needed", ...])`` call.  This
+    class drives ``POST /backfills`` on the real
+    :func:`influx.service.create_app` factory with a fake arXiv fixture
+    and asserts the post-conditions on the *real* side effects (Lithos
+    calls + webhook sender).
+    """
+
+    def test_backfills_endpoint_drives_kind_backfill_end_to_end(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """``POST /backfills`` propagates kind=backfill through the full path.
+
+        Asserts the four end-to-end post-conditions for finding 3:
+
+        - AC-09-F: ``lithos_task_create`` carries ``influx:backfill`` tag.
+        - AC-09-G: no webhook HTTP call was emitted (the real
+          ``send_digest`` path is not reached).
+        - AC-09-H: no ``lithos_list(tags=["influx:repair-needed", ...])``
+          call was recorded against the real Lithos fake.
+        - AC-M3-7 sibling: the coordinator releases the profile lock
+          when the request completes.
+        """
+        from fastapi.testclient import TestClient
+
+        from influx.service import create_app
+
+        # Use a *real-looking* webhook URL so any leakage would actually
+        # try to POST and be observable through the patched sender.
+        config = _make_config(lithos_url=fake_lithos_url)
+        config.notifications.webhook_url = "https://example.invalid/hook"
+
+        # Pre-queue feedback list response.  No repair-sweep response is
+        # queued — if the gate fails and the sweep runs, the next
+        # ``lithos_list`` call would still receive the fake's default
+        # ``{"items": []}`` and we would see the call recorded with
+        # ``influx:repair-needed`` in the tags, which is what we assert
+        # against below.
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+
+        app = create_app(
+            config,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        with (
+            patch(
+                "influx.sources.arxiv.fetch_arxiv",
+                return_value=list(_FIXTURE_ARXIV_ITEMS),
+            ),
+            patch("influx.sources.arxiv._sleep"),
+            # ``send_digest`` lazily imports ``guarded_post_json`` from
+            # ``influx.http_client``, so the patch must target the
+            # source module rather than ``influx.notifications``.
+            patch(
+                "influx.http_client.guarded_post_json",
+                return_value=200,
+            ) as mock_webhook_post,
+            TestClient(app) as client,
+        ):
+            resp = client.post(
+                "/backfills",
+                json={"profile": PROFILE, "days": 1, "confirm": True},
+            )
+            assert resp.status_code == 202, resp.text
+            body = resp.json()
+            assert body["kind"] == "backfill"
+            assert body["scope"] == PROFILE
+
+            # Wait for the spawned background backfill to finish.
+            _wait_for_idle(app.state.coordinator, PROFILE, timeout=15.0)
+
+        # ── AC-09-F: task tagged ``influx:backfill`` ──────────────────
+        task_calls = [c for c in fake_lithos.calls if c[0] == "lithos_task_create"]
+        assert len(task_calls) == 1, fake_lithos.calls
+        task_tags = task_calls[0][1]["tags"]
+        assert "influx:backfill" in task_tags
+        assert "influx:run" not in task_tags
+
+        # ── AC-09-G: no webhook HTTP call ─────────────────────────────
+        # ``send_digest`` short-circuits for ``kind=BACKFILL`` so the
+        # real ``guarded_post_json`` sender must never be invoked.
+        mock_webhook_post.assert_not_called()
+
+        # ── AC-09-H: no repair-sweep ``lithos_list`` call ─────────────
+        repair_list_calls = [
+            c
+            for c in fake_lithos.calls
+            if c[0] == "lithos_list"
+            and "influx:repair-needed" in (c[1].get("tags") or [])
+        ]
+        assert repair_list_calls == [], (
+            "Repair sweep must not be invoked during backfill (FR-REP-2 / AC-09-H); "
+            f"recorded calls: {fake_lithos.calls}"
+        )
+
+    def test_backfills_endpoint_does_not_overlap_concurrent_run(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """AC-M3-7: a concurrently scheduled run blocks ``POST /backfills``.
+
+        The coordinator owns same-profile serialisation.  This test
+        holds the profile lock as if a scheduled run were in flight,
+        then exercises the real endpoint and verifies the production
+        path returns 409 with ``reason="profile_busy"`` rather than
+        racing into a second ingest cycle.
+        """
+        from fastapi.testclient import TestClient
+
+        from influx.service import create_app
+
+        config = _make_config(lithos_url=fake_lithos_url)
+        app = create_app(
+            config,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        # Hold the profile lock to simulate a concurrent scheduled run.
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                app.state.coordinator.try_acquire(PROFILE)
+            )
+            try:
+                with TestClient(app) as client:
+                    resp = client.post(
+                        "/backfills",
+                        json={"profile": PROFILE, "days": 1, "confirm": True},
+                    )
+                assert resp.status_code == 409
+                assert resp.json()["reason"] == "profile_busy"
+            finally:
+                app.state.coordinator.release(PROFILE)
+        finally:
+            loop.close()
+
+    def test_nonbackfill_endpoint_creates_influx_run_task(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """FR-BF-5 regression: ``POST /runs`` still creates ``influx:run`` tasks.
+
+        Drives the symmetric non-backfill path through the real
+        :func:`create_app` factory so the run-kind switch in
+        ``run_profile`` is verified end-to-end (i.e. backfill does NOT
+        leak the new ``influx:backfill`` tag onto scheduled / manual
+        runs).
+        """
+        from fastapi.testclient import TestClient
+
+        from influx.service import create_app
+
+        config = _make_config(lithos_url=fake_lithos_url)
+        # Repair-sweep + feedback list responses for the manual run.
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+
+        app = create_app(
+            config,
+            arxiv_scorer=_deterministic_scorer(5),
+        )
+
+        with (
+            patch(
+                "influx.sources.arxiv.fetch_arxiv",
+                return_value=list(_FIXTURE_ARXIV_ITEMS),
+            ),
+            TestClient(app) as client,
+        ):
+            resp = client.post("/runs", json={"profile": PROFILE})
+            assert resp.status_code == 202, resp.text
+            _wait_for_idle(app.state.coordinator, PROFILE, timeout=15.0)
+
+        task_calls = [c for c in fake_lithos.calls if c[0] == "lithos_task_create"]
+        assert len(task_calls) == 1
+        task_tags = task_calls[0][1]["tags"]
+        assert "influx:run" in task_tags
+        assert "influx:backfill" not in task_tags

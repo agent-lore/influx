@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from influx.config import RssSourceEntry
 from influx.sources.rss import RssFeedItem, parse_feed
@@ -159,3 +160,64 @@ class TestNoCrossBucketLeakage:
         tags = {it.source_tag for it in items}
         assert len(tags) == 1
         assert tags == {"blog"}
+
+
+# ── Published date UTC handling (review finding 1) ─────────────────
+
+
+class TestPublishedDateUtc:
+    """Review finding 1: feedparser tuples are UTC; convert without local-time shift.
+
+    A timestamp like ``2026-04-23 00:30 UTC`` must stay on April 23 in
+    UTC regardless of the host's local timezone.  Using
+    :func:`time.mktime` would silently apply ``TZ=local`` and shift the
+    entry into a different ``{YYYY-MM-DD}`` archive bucket on any host
+    not running in UTC.  Using :func:`calendar.timegm` keeps the
+    conversion UTC-safe.
+    """
+
+    def test_near_midnight_utc_preserves_day(self) -> None:
+        from time import struct_time
+
+        from influx.sources.rss import _parse_published
+
+        # 00:30 on 2026-04-23 (UTC) — within 1h of midnight on either
+        # side of UTC for any reasonable host TZ.
+        utc_tuple = struct_time((2026, 4, 23, 0, 30, 0, 0, 0, 0))
+
+        class _Entry:
+            def get(self, key: str) -> Any:
+                if key == "published_parsed":
+                    return utc_tuple
+                return None
+
+        published = _parse_published(_Entry())
+
+        assert published.tzinfo is UTC
+        assert published.year == 2026
+        assert published.month == 4
+        assert published.day == 23
+        assert published.hour == 0
+        assert published.minute == 30
+
+    def test_near_midnight_utc_does_not_shift_day(self) -> None:
+        """``2026-04-23 00:30 UTC`` must NOT roll back to April 22.
+
+        On hosts running in eastern timezones, ``mktime`` would convert
+        the tuple as local time and yield a UTC timestamp earlier than
+        the input — landing on April 22.
+        """
+        from time import struct_time
+
+        from influx.sources.rss import _parse_published
+
+        utc_tuple = struct_time((2026, 4, 23, 0, 30, 0, 0, 0, 0))
+
+        class _Entry:
+            def get(self, key: str) -> Any:
+                return utc_tuple if key == "published_parsed" else None
+
+        published = _parse_published(_Entry())
+
+        # Day MUST be 23, not 22 — regression guard for finding 1.
+        assert (published.year, published.month, published.day) == (2026, 4, 23)
