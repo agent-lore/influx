@@ -156,10 +156,29 @@ def _build_tracer() -> InfluxTracer:
     if not _otel_enabled() or not _otel_packages_available():
         return InfluxTracer(enabled=False)
 
+    from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 
-    provider = TracerProvider()
+    service_name = os.environ.get("OTEL_SERVICE_NAME", "influx")
+    provider = TracerProvider(
+        resource=Resource.create(
+            {
+                "service.name": service_name,
+            }
+        )
+    )
+
+    if _otlp_endpoint_configured():
+        try:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                OTLPSpanExporter,
+            )
+        except ImportError:
+            if not _console_fallback_enabled():
+                return InfluxTracer(enabled=True, tracer=provider.get_tracer("influx"))
+        else:
+            provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
 
     # Console fallback: emit spans to stdout when no collector is configured
     if _console_fallback_enabled() and not _otlp_endpoint_configured():

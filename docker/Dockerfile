@@ -13,16 +13,17 @@ RUN uv venv /app/.venv
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 ENV UV_LINK_MODE=copy
+ENV UV_PROJECT_ENVIRONMENT=/app/.venv
 
 # Cache dependency layer separately from source
 COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-install-project
+    uv sync --locked --no-dev --extra otel --no-install-project
 
 # Install the project separately so normal code changes reuse the cached dependency layer.
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install .
+    uv pip install ".[otel]"
 
 # Stage 2: Runtime image
 FROM python:3.12-slim AS runtime
