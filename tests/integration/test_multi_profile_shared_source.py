@@ -118,7 +118,7 @@ def _make_items_for_profile(profile: str) -> list[dict[str, Any]]:
         f"profile:{profile}",
         "source:arxiv",
         "ingested-by:influx",
-        "schema:v1",
+        "schema:1",
         "arxiv-id:2601.00001",
     ]
     score = 8 if profile == PROFILE_A else 7
@@ -361,13 +361,13 @@ class TestDisjointMatch:
             f"profile:{PROFILE_A}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         tags_b = [
             f"profile:{PROFILE_B}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         item_a = [
             {
@@ -445,7 +445,7 @@ class TestPreservationOnSingleProfileRun:
             f"profile:{PROFILE_B}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
             "arxiv-id:2601.00001",
         ]
         existing_content = _render_item_content(

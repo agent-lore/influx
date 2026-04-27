@@ -19,7 +19,9 @@ fails), the feed item's ``<summary>`` is used instead (FR-ENR-3, AC-09-J).
 from __future__ import annotations
 
 import calendar
+import json
 import logging
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,10 +31,14 @@ from typing import TYPE_CHECKING, Any
 import feedparser
 
 from influx.coordinator import RunKind
-from influx.errors import ExtractionError, NetworkError
+from influx.enrich import tier1_enrich, tier3_extract
+from influx.errors import ExtractionError, LCMAError, NetworkError
 from influx.extraction.article import extract_article
+from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch as _guarded_fetch
+from influx.http_client import guarded_post_json_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
+from influx.schemas import FilterResponse, Tier1Enrichment, Tier3Extraction
 from influx.slugs import slugify_feed_name
 from influx.storage import download_archive
 from influx.telemetry import current_run_id, get_tracer
@@ -146,6 +152,10 @@ def build_rss_note_item(
     item: RssFeedItem,
     profile_name: str,
     config: AppConfig,
+    score: int = 0,
+    confidence: float = 0.0,
+    reason: str = "",
+    filter_tags: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build a complete ``ProfileItem`` dict for an RSS feed item.
 
@@ -208,6 +218,7 @@ def build_rss_note_item(
     # Attempt web article extraction; fall back to the feed item's
     # <summary> when the extracted body is below min_web_chars or
     # extraction fails entirely (AC-09-J).
+    extracted_text: str | None = None
     summary = item.summary
     try:
         extraction = extract_article(
@@ -219,6 +230,7 @@ def build_rss_note_item(
             timeout_seconds=config.storage.download_timeout_seconds,
         )
         summary = extraction.text
+        extracted_text = extraction.text
     except (ExtractionError, NetworkError) as exc:
         _log.debug(
             "Article extraction failed for %s, using feed summary: %s",
@@ -231,7 +243,7 @@ def build_rss_note_item(
         f"source:{item.source_tag}",
         f"feed-slug:{feed_slug}",
         "ingested-by:influx",
-        "schema:v1",
+        f"schema:{config.influx.note_schema_version}",
     ]
 
     if not archive_result.ok:
@@ -243,11 +255,59 @@ def build_rss_note_item(
 
     source_url = normalise_url(item.url)
 
+    profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
+    thresholds = profile_cfg.thresholds if profile_cfg is not None else None
+    repair_needed = "influx:repair-needed" in tags
+
+    tier1_result: Tier1Enrichment | None = None
+    if thresholds is not None and score >= thresholds.relevance:
+        assert profile_cfg is not None
+        try:
+            tier1_result = tier1_enrich(
+                title=item.title,
+                abstract=item.summary,
+                profile_summary=profile_cfg.description,
+                config=config,
+            )
+        except LCMAError:
+            repair_needed = True
+
+    full_text_for_note: str | None = None
+    if (
+        thresholds is not None
+        and score >= thresholds.full_text
+        and extracted_text is not None
+    ):
+        full_text_for_note = extracted_text
+        tags.append("full-text")
+
+    tier3_result: Tier3Extraction | None = None
+    if (
+        thresholds is not None
+        and score >= thresholds.deep_extract
+        and full_text_for_note is not None
+    ):
+        try:
+            tier3_result = tier3_extract(
+                title=item.title,
+                full_text=full_text_for_note,
+                config=config,
+            )
+        except LCMAError:
+            repair_needed = True
+
+    if tier3_result is not None:
+        tags.append("influx:deep-extracted")
+    if repair_needed and "influx:repair-needed" not in tags:
+        tags.append("influx:repair-needed")
+
+    summary_for_note = "" if score and tier1_result is None else summary
+
     profile_entries = [
         ProfileRelevanceEntry(
             profile_name=profile_name,
-            score=0,
-            reason="",
+            score=score,
+            reason=reason,
         ),
     ]
 
@@ -255,11 +315,14 @@ def build_rss_note_item(
         title=item.title,
         source_url=source_url,
         tags=tags,
-        confidence=0.0,
+        confidence=confidence,
         archive_path=archive_path,
-        summary=summary,
+        summary=summary_for_note,
         keywords=[],
         profile_entries=profile_entries,
+        tier1_enrichment=tier1_result,
+        full_text=full_text_for_note,
+        tier3_extraction=tier3_result,
     )
 
     return {
@@ -268,12 +331,92 @@ def build_rss_note_item(
         "source_url": source_url,
         "content": content,
         "tags": tags,
-        "score": 0,
-        "confidence": 0.0,
-        "reason": "",
+        "filter_tags": list(filter_tags) if filter_tags is not None else [],
+        "score": score,
+        "confidence": confidence,
+        "reason": reason,
         "path": path,
         "abstract_or_summary": summary,
+        "contributions": tier1_result.contributions if tier1_result else None,
+        "builds_on": list(tier3_result.builds_on) if tier3_result else None,
     }
+
+
+async def _score_rss_items(
+    *,
+    items: list[RssFeedItem],
+    profile: str,
+    filter_prompt: str,
+    config: AppConfig,
+) -> dict[str, Any]:
+    """Score RSS items with the configured relevance filter."""
+    if not items:
+        return {}
+    slot = config.models.get("filter")
+    if slot is None:
+        raise FilterScorerError("models.filter is not configured")
+    provider = config.providers.get(slot.provider)
+    if provider is None:
+        raise FilterScorerError(f"filter provider {slot.provider!r} not configured")
+
+    candidates = [
+        {"id": _rss_filter_id(item), "title": item.title, "abstract": item.summary}
+        for item in items
+    ]
+    body: dict[str, Any] = {
+        "model": slot.model,
+        "temperature": slot.temperature,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    f"{filter_prompt}\n\n## CANDIDATES\n"
+                    f"{json.dumps(candidates, ensure_ascii=False)}"
+                ),
+            }
+        ],
+    }
+    if slot.max_tokens is not None:
+        body["max_tokens"] = slot.max_tokens
+    if slot.json_mode:
+        body["response_format"] = {"type": "json_object"}
+
+    headers: dict[str, str] = {**provider.extra_headers}
+    if provider.api_key_env:
+        api_key = os.environ.get(provider.api_key_env, "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+    url = f"{provider.base_url.rstrip('/')}/chat/completions"
+    attempts = slot.max_retries + 1
+    last_error: Exception | None = None
+    for _attempt in range(attempts):
+        try:
+            response = guarded_post_json_fetch(
+                url,
+                body,
+                headers=headers,
+                allow_private_ips=config.security.allow_private_ips,
+                max_response_bytes=config.storage.max_download_bytes,
+                timeout_seconds=slot.request_timeout,
+            )
+            if response.status_code >= 400:
+                last_error = FilterScorerError(f"HTTP {response.status_code}")
+                continue
+            envelope = json.loads(response.body.decode("utf-8"))
+            content = envelope["choices"][0]["message"]["content"]
+            parsed = FilterResponse.model_validate(json.loads(content))
+            return {result.id: result for result in parsed.results}
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise FilterScorerError(f"RSS filter failed after {attempts} attempts") from (
+        last_error
+    )
+
+
+def _rss_filter_id(item: RssFeedItem) -> str:
+    return url_hash(item.url)
 
 
 # ── Production-default RSS item provider ────────────────────────────
@@ -306,7 +449,7 @@ def make_rss_item_provider(
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
     ) -> Iterable[dict[str, Any]]:
-        del kind, run_range, filter_prompt
+        del kind, run_range
 
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
         if profile_cfg is None:
@@ -330,12 +473,35 @@ def make_rss_item_provider(
                     max_download_bytes=config.storage.max_download_bytes,
                     timeout_seconds=config.storage.download_timeout_seconds,
                 )
+                try:
+                    scores = await _score_rss_items(
+                        items=items,
+                        profile=profile,
+                        filter_prompt=filter_prompt,
+                        config=config,
+                    )
+                except FilterScorerError:
+                    _log.warning(
+                        "RSS filter failed for feed %r; skipping feed batch",
+                        feed_entry.name,
+                        exc_info=True,
+                    )
+                    continue
                 for item in items:
+                    scored = scores.get(_rss_filter_id(item))
+                    if scored is None:
+                        continue
+                    if scored.score < profile_cfg.thresholds.relevance:
+                        continue
                     results.append(
                         build_rss_note_item(
                             item=item,
                             profile_name=profile,
                             config=config,
+                            score=scored.score,
+                            confidence=1.0,
+                            reason=scored.reason,
+                            filter_tags=scored.tags,
                         )
                     )
             fetch_span.set_attribute("influx.item_count", len(results))

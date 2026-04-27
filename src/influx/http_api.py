@@ -190,7 +190,30 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
             status_code=202,
         )
 
-    # all_profiles path — accept but defer multi-profile execution to PRD 09.
+    acquired_profiles: list[str] = []
+    for profile_cfg in config.profiles:
+        acquired = await coordinator.try_acquire(profile_cfg.name)
+        if not acquired:
+            for acquired_profile in acquired_profiles:
+                coordinator.release(acquired_profile)
+            return JSONResponse(
+                {"reason": "profile_busy", "profile": profile_cfg.name},
+                status_code=409,
+            )
+        acquired_profiles.append(profile_cfg.name)
+
+    _spawn_tracked_task(
+        request.app,
+        _run_many_and_release(
+            coordinator,
+            acquired_profiles,
+            RunKind.MANUAL,
+            config=config,
+            item_provider=getattr(request.app.state, "item_provider", None),
+            probe_loop=getattr(request.app.state, "probe_loop", None),
+            fetch_cache=getattr(request.app.state, "fetch_cache", None),
+        ),
+    )
     return JSONResponse(
         {
             "status": "accepted",
@@ -285,6 +308,42 @@ async def _backfill_and_release(
             )
     finally:
         coordinator.release(profile)
+        if fetch_cache is not None:
+            fetch_cache.end_fire()
+
+
+async def _run_many_and_release(
+    coordinator: Coordinator,
+    profiles: list[str],
+    kind: RunKind,
+    run_range: dict[str, str | int] | None = None,
+    *,
+    config: Any = None,
+    item_provider: Any = None,
+    probe_loop: Any = None,
+    fetch_cache: Any = None,
+) -> None:
+    """Run several already-acquired profiles and release all locks."""
+    if fetch_cache is not None:
+        fetch_cache.begin_fire()
+    try:
+        await asyncio.gather(
+            *(
+                run_profile(
+                    profile,
+                    kind,
+                    run_range=run_range,
+                    config=config,
+                    item_provider=item_provider,
+                    probe_loop=probe_loop,
+                )
+                for profile in profiles
+            ),
+            return_exceptions=True,
+        )
+    finally:
+        for profile in profiles:
+            coordinator.release(profile)
         if fetch_cache is not None:
             fetch_cache.end_fire()
 
@@ -449,13 +508,25 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
     scope = body.profile if body.profile is not None else "all"
 
     # Naive estimator: days × categories × max_results (Q-3, FR-BF-6).
-    estimated = estimate_backfill_items(
-        scope,
-        config,
-        days=body.days,
-        date_from=body.date_from,
-        date_to=body.date_to,
-    )
+    if body.profile is None:
+        estimated = sum(
+            estimate_backfill_items(
+                profile_cfg.name,
+                config,
+                days=body.days,
+                date_from=body.date_from,
+                date_to=body.date_to,
+            )
+            for profile_cfg in config.profiles
+        )
+    else:
+        estimated = estimate_backfill_items(
+            scope,
+            config,
+            days=body.days,
+            date_from=body.date_from,
+            date_to=body.date_to,
+        )
     if estimated > 1000 and not body.confirm:
         return JSONResponse(
             {
@@ -509,7 +580,31 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
             status_code=202,
         )
 
-    # all_profiles path — accept but defer multi-profile execution to PRD 09.
+    acquired_profiles = []
+    for profile_cfg in config.profiles:
+        acquired = await coordinator.try_acquire(profile_cfg.name)
+        if not acquired:
+            for acquired_profile in acquired_profiles:
+                coordinator.release(acquired_profile)
+            return JSONResponse(
+                {"reason": "profile_busy", "profile": profile_cfg.name},
+                status_code=409,
+            )
+        acquired_profiles.append(profile_cfg.name)
+
+    _spawn_tracked_task(
+        request.app,
+        _run_many_and_release(
+            coordinator,
+            acquired_profiles,
+            RunKind.BACKFILL,
+            run_range=run_range,
+            config=config,
+            item_provider=getattr(request.app.state, "item_provider", None),
+            probe_loop=getattr(request.app.state, "probe_loop", None),
+            fetch_cache=getattr(request.app.state, "fetch_cache", None),
+        ),
+    )
     return JSONResponse(
         {
             "status": "accepted",

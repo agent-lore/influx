@@ -91,7 +91,7 @@ def _make_config(
                 name=PROFILE,
                 description="AI and robotics",
                 thresholds=ProfileThresholds(
-                    relevance=100,
+                    relevance=7,
                     full_text=100,
                     deep_extract=100,
                     notify_immediate=8,
@@ -182,7 +182,7 @@ class TestBackfillRunCompletes:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: feedback (no repair sweep for backfill)
@@ -224,7 +224,7 @@ class TestBackfillRunCompletes:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: feedback
@@ -264,7 +264,7 @@ class TestBackfillCacheLookupSkip:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: feedback
@@ -314,7 +314,7 @@ class TestBackfillCacheLookupSkip:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: feedback
@@ -385,7 +385,7 @@ class TestBackfillNoOverlap:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: feedback
@@ -424,7 +424,7 @@ class TestBackfillNoOverlap:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: feedback
@@ -473,7 +473,7 @@ class TestNonBackfillCacheHitStillWrites:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: repair sweep + feedback
@@ -523,7 +523,7 @@ class TestBackfillTaskTagging:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: feedback (no repair sweep for backfill)
@@ -570,7 +570,7 @@ class TestBackfillTaskTagging:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: repair sweep + feedback
@@ -633,7 +633,7 @@ class TestBackfillRangePropagation:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: feedback (no repair sweep for backfill)
@@ -714,7 +714,7 @@ class TestBackfillRangePropagation:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         fake_lithos.list_responses.append(json.dumps({"items": []}))
@@ -768,7 +768,7 @@ class TestBackfillRangePropagation:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos: repair sweep + feedback for the manual run.
@@ -872,7 +872,7 @@ class TestBackfillEndpointEndToEnd:
 
         app = create_app(
             config,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         with (
@@ -946,7 +946,7 @@ class TestBackfillEndpointEndToEnd:
         config = _make_config(lithos_url=fake_lithos_url)
         app = create_app(
             config,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Hold the profile lock to simulate a concurrent scheduled run.
@@ -990,7 +990,7 @@ class TestBackfillEndpointEndToEnd:
 
         app = create_app(
             config,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         with (

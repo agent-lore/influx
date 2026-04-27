@@ -294,7 +294,7 @@ class TestContentLevelProfileRelevanceMerge:
             f"profile:{PROFILE_A}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         existing_content = _make_note_content(
             tags=existing_tags,
@@ -311,7 +311,7 @@ class TestContentLevelProfileRelevanceMerge:
             f"profile:{PROFILE_B}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         new_content = _make_note_content(
             tags=new_tags,
@@ -329,7 +329,7 @@ class TestContentLevelProfileRelevanceMerge:
             f"profile:{PROFILE_B}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         merged_content = _merge_profile_relevance_in_content(
             existing_content, new_content, merged_tags
@@ -351,7 +351,7 @@ class TestContentLevelProfileRelevanceMerge:
             f"profile:{PROFILE_A}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         existing_content = _make_note_content(
             tags=tags,
@@ -368,7 +368,7 @@ class TestContentLevelProfileRelevanceMerge:
             f"profile:{PROFILE_B}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         new_content = _make_note_content(
             tags=new_tags,
@@ -393,7 +393,7 @@ class TestContentLevelProfileRelevanceMerge:
             f"profile:{PROFILE_A}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         new_content = _make_note_content(
             tags=new_tags,
@@ -429,7 +429,7 @@ class TestReplaceProfileRelevanceSection:
             f"profile:{PROFILE_A}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         original = _make_note_content(
             tags=tags,
@@ -484,7 +484,7 @@ class TestSingleProfileRunPreservesOthers:
             f"profile:{PROFILE_B}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         existing_content = _make_note_content(
             tags=existing_tags,
@@ -507,7 +507,7 @@ class TestSingleProfileRunPreservesOthers:
             f"profile:{PROFILE_B}",
             "source:arxiv",
             "ingested-by:influx",
-            "schema:v1",
+            "schema:1",
         ]
         new_content = _make_note_content(
             tags=new_tags,

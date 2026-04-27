@@ -118,7 +118,7 @@ def _make_items_for_profile(profile: str) -> list[dict[str, Any]]:
         f"profile:{profile}",
         "source:arxiv",
         "ingested-by:influx",
-        "schema:v1",
+        "schema:1",
         "arxiv-id:2601.00001",
     ]
     score = 8 if profile == PROFILE_A else 7
@@ -248,7 +248,7 @@ def _existing_rejected_note_tags() -> list[str]:
     return [
         "source:arxiv",
         "ingested-by:influx",
-        "schema:v1",
+        "schema:1",
         "arxiv-id:2601.00001",
         "influx:rejected:ai-robotics",
     ]

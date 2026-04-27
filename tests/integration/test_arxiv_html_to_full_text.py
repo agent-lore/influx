@@ -13,6 +13,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import patch
 
+import pytest
+
 from influx.config import (
     AppConfig,
     ExtractionConfig,
@@ -26,11 +28,26 @@ from influx.config import (
 )
 from influx.http_client import FetchResult
 from influx.sources.arxiv import ArxivItem, build_arxiv_note_item
+from influx.storage import ArchiveResult
 
 # ── Fixture data ──────────────────────────────────────────────────
 
 _ARXIV_ID = "2601.99001"
 _HTML_URL = f"https://arxiv.org/html/{_ARXIV_ID}"
+
+
+@pytest.fixture(autouse=True)
+def _archive_success() -> object:
+    with patch(
+        "influx.sources.arxiv.download_archive",
+        return_value=ArchiveResult(
+            ok=True,
+            rel_posix_path=f"arxiv/2026/04/{_ARXIV_ID}.pdf",
+            error="",
+        ),
+    ) as patched:
+        yield patched
+
 
 # Realistic HTML body that trafilatura can extract >= 1000 chars from.
 _HTML_BODY = """\

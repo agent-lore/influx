@@ -17,11 +17,11 @@ import logging
 import os
 from typing import Any
 
-import httpx
 from pydantic import ValidationError
 
 from influx.config import AppConfig
-from influx.errors import LCMAError
+from influx.errors import LCMAError, NetworkError
+from influx.http_client import guarded_post_json_fetch
 from influx.prompts import load_prompt
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 
@@ -96,60 +96,61 @@ def _call_json_model(
     if slot.json_mode:
         body["response_format"] = {"type": "json_object"}
 
-    try:
-        resp = httpx.post(
-            url,
-            json=body,
-            headers=headers,
-            timeout=float(slot.request_timeout),
-        )
-    except httpx.HTTPError as exc:
-        raise LCMAError(
-            f"HTTP error calling model slot {slot_name!r}: {exc}",
-            model=slot_name,
-            stage="http",
-            detail=str(exc),
-        ) from exc
+    attempts = slot.max_retries + 1
+    last_error: Exception | None = None
+    for _attempt in range(attempts):
+        try:
+            result = guarded_post_json_fetch(
+                url,
+                body,
+                headers=headers,
+                allow_private_ips=config.security.allow_private_ips,
+                max_response_bytes=config.storage.max_download_bytes,
+                timeout_seconds=slot.request_timeout,
+            )
+        except NetworkError as exc:
+            last_error = exc
+            continue
 
-    if resp.status_code >= 400:
-        raise LCMAError(
-            f"Model slot {slot_name!r} returned HTTP {resp.status_code}",
-            model=slot_name,
-            stage="http",
-            detail=resp.text[:500],
-        )
+        if result.status_code >= 400:
+            last_error = LCMAError(
+                f"Model slot {slot_name!r} returned HTTP {result.status_code}",
+                model=slot_name,
+                stage="http",
+                detail=result.body[:500].decode("utf-8", errors="replace"),
+            )
+            continue
 
-    try:
-        resp_json = resp.json()
-    except Exception as exc:
-        raise LCMAError(
-            f"Model slot {slot_name!r} returned non-JSON response",
-            model=slot_name,
-            stage="parse",
-            detail=str(exc),
-        ) from exc
+        try:
+            resp_json = json.loads(result.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            last_error = exc
+            continue
 
-    try:
-        content_str: str = resp_json["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
-        raise LCMAError(
-            f"Unexpected response structure from model slot {slot_name!r}",
-            model=slot_name,
-            stage="parse",
-            detail=str(resp_json)[:500],
-        ) from exc
+        try:
+            content_str: str = resp_json["choices"][0]["message"]["content"]
+        except (KeyError, IndexError) as exc:
+            raise LCMAError(
+                f"Unexpected response structure from model slot {slot_name!r}",
+                model=slot_name,
+                stage="parse",
+                detail=str(resp_json)[:500],
+            ) from exc
 
-    try:
-        parsed: dict[str, Any] = json.loads(content_str)
-    except json.JSONDecodeError as exc:
-        raise LCMAError(
-            f"Model slot {slot_name!r} returned invalid JSON in content",
-            model=slot_name,
-            stage="parse",
-            detail=str(exc),
-        ) from exc
+        try:
+            parsed: dict[str, Any] = json.loads(content_str)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
 
-    return parsed
+        return parsed
+
+    raise LCMAError(
+        f"Model slot {slot_name!r} failed after {attempts} attempts",
+        model=slot_name,
+        stage="http",
+        detail=str(last_error)[:500] if last_error is not None else "",
+    ) from last_error
 
 
 # ── Tier 1 enrichment caller ─────────────────────────────────────────

@@ -24,6 +24,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from influx.config import (
@@ -41,6 +42,7 @@ from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import Tier1Enrichment, Tier3Extraction
+from influx.storage import download_archive
 from influx.telemetry import current_run_id, get_tracer
 
 if TYPE_CHECKING:
@@ -580,14 +582,44 @@ def build_arxiv_note_item(
         f"arxiv-id:{item.arxiv_id}",
         "source:arxiv",
         "ingested-by:influx",
-        "schema:v1",
+        f"schema:{config.influx.note_schema_version}",
         *cat_tags,
     ]
+
+    repair_needed = False
+    archive_path: str | None = None
+    pdf_url = f"https://arxiv.org/pdf/{item.arxiv_id}.pdf"
+    tracer = get_tracer()
+    with tracer.span(
+        "influx.archive.download",
+        attributes={
+            "influx.profile": profile_name,
+            "influx.run_id": current_run_id.get() or "",
+            "influx.source": "arxiv",
+        },
+    ):
+        archive_result = download_archive(
+            url=pdf_url,
+            archive_root=Path(config.storage.archive_dir),
+            source="arxiv",
+            item_id=item.arxiv_id,
+            published_year=item.published.year,
+            published_month=item.published.month,
+            ext=".pdf",
+            allow_private_ips=config.security.allow_private_ips,
+            max_download_bytes=config.storage.max_download_bytes,
+            timeout_seconds=config.storage.download_timeout_seconds,
+            expected_content_type="pdf",
+        )
+    if archive_result.ok:
+        archive_path = archive_result.rel_posix_path
+    else:
+        tags.append("influx:archive-missing")
+        repair_needed = True
 
     # ── Extraction cascade ────────────────────────────────────────
     extracted_text: str | None = None
     text_tag = "text:abstract-only"
-    repair_needed = False
 
     if score >= thresholds.full_text:
         # ── Telemetry: influx.enrich.tier2 span (FR-OBS-4) ──
@@ -696,7 +728,7 @@ def build_arxiv_note_item(
         source_url=source_url,
         tags=tags,
         confidence=confidence,
-        archive_path=None,
+        archive_path=archive_path,
         summary=summary_text,
         keywords=[],
         profile_entries=profile_entries,
@@ -791,6 +823,7 @@ def make_arxiv_item_provider(
         # includes the bounded URL so that two profiles requesting the
         # same window dedup, but distinct windows do not collide.
         arxiv_cfg = profile_cfg.sources.arxiv
+        thresholds = profile_cfg.thresholds
         backfill_range = (
             resolve_backfill_range(run_range) if kind == RunKind.BACKFILL else None
         )
@@ -898,16 +931,9 @@ def make_arxiv_item_provider(
         # The per-item ``scorer`` seam stays available for tests that
         # want deterministic, synchronous scoring without an LLM.
         #
-        # Distinguish two filter-scorer outcomes:
-        #   - returned a (possibly empty) mapping → the filter ran and
-        #     intentionally omitted any items missing from the mapping
-        #     (typically because they fell below
-        #     ``filter.min_score_in_results``).  Drop those items.
-        #   - raised ``FilterScorerError`` → the filter could not produce
-        #     a scoring decision at all (provider misconfigured, HTTP
-        #     failure, parse failure).  Fall every item back to
-        #     abstract-only ingestion so the run still produces notes
-        #     (PRD 07 §5.6 graceful degradation).
+        # A failed filter batch is skipped per FR-FLT-6. Items returned
+        # by the filter but below the profile relevance threshold are
+        # also discarded per FR-FLT-7.
         batch_scores: dict[str, ArxivScoreResult] = {}
         filter_failed = False
         if scorer is None and filter_scorer is not None:
@@ -933,9 +959,7 @@ def make_arxiv_item_provider(
                         )
                     except FilterScorerError:
                         _log.warning(
-                            "filter_scorer failed for profile %r; "
-                            "falling back to abstract-only ingestion for "
-                            "entire batch",
+                            "filter_scorer failed for profile %r; skipping batch",
                             profile,
                             exc_info=True,
                         )
@@ -951,14 +975,7 @@ def make_arxiv_item_provider(
                     continue
             elif filter_scorer is not None:
                 if filter_failed:
-                    # The filter call hard-failed for the whole batch —
-                    # write each item abstract-only (score=0) instead of
-                    # dropping the run.
-                    score_result = ArxivScoreResult(
-                        score=0,
-                        confidence=0.0,
-                        reason="filter-scorer-failed",
-                    )
+                    continue
                 elif arxiv_item.arxiv_id not in batch_scores:
                     # Items absent from the LLM filter response are
                     # dropped entirely — the filter explicitly chose not
@@ -968,11 +985,10 @@ def make_arxiv_item_provider(
                 else:
                     score_result = batch_scores[arxiv_item.arxiv_id]
             else:
-                score_result = ArxivScoreResult(
-                    score=0,
-                    confidence=0.0,
-                    reason="no-scorer-configured",
-                )
+                continue
+
+            if score_result.score < thresholds.relevance:
+                continue
 
             results.append(
                 build_arxiv_note_item(

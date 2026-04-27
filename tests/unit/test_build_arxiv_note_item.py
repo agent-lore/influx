@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import patch
 
+import pytest
+
 from influx.config import (
     AppConfig,
     ExtractionConfig,
@@ -25,6 +27,21 @@ from influx.errors import ExtractionError, LCMAError
 from influx.extraction.pipeline import ArxivExtractionResult
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 from influx.sources.arxiv import ArxivItem, build_arxiv_note_item
+from influx.storage import ArchiveResult
+
+
+@pytest.fixture(autouse=True)
+def _archive_success() -> object:
+    """Keep unit tests focused on note-building unless they override archive IO."""
+    with patch(
+        "influx.sources.arxiv.download_archive",
+        return_value=ArchiveResult(
+            ok=True,
+            rel_posix_path="arxiv/2026/04/2601.12345.pdf",
+            error="",
+        ),
+    ) as patched:
+        yield patched
 
 
 def _make_config(
@@ -346,7 +363,7 @@ class TestItemShape:
         assert "arxiv-id:2601.12345" in result["tags"]
         assert "source:arxiv" in result["tags"]
         assert "ingested-by:influx" in result["tags"]
-        assert "schema:v1" in result["tags"]
+        assert "schema:1" in result["tags"]
 
     def test_tags_include_category_tags(self) -> None:
         config = _make_config()

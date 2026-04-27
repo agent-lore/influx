@@ -107,9 +107,11 @@ def _validate_json_mode_slots(config: AppConfig) -> None:
     The ``json_mode`` flag and slot configuration come from config
     (AC-X-1 — no hardcoded constants).  (FR-CLI-5, §16.4)
     """
+    import json
     import os
 
-    import httpx
+    from influx.errors import NetworkError
+    from influx.http_client import guarded_post_json_fetch
 
     for slot_name, slot in config.models.items():
         if not slot.json_mode:
@@ -142,13 +144,15 @@ def _validate_json_mode_slots(config: AppConfig) -> None:
         url = f"{provider.base_url.rstrip('/')}/chat/completions"
 
         try:
-            resp = httpx.post(
+            resp = guarded_post_json_fetch(
                 url,
-                json=body,
+                body,
                 headers=headers,
-                timeout=float(slot.request_timeout),
+                allow_private_ips=config.security.allow_private_ips,
+                max_response_bytes=config.storage.max_download_bytes,
+                timeout_seconds=slot.request_timeout,
             )
-        except Exception as exc:
+        except NetworkError as exc:
             print(
                 f"influx: model slot {slot_name!r}: JSON-mode "
                 f"dry-call to {url} failed: {exc}",
@@ -158,10 +162,12 @@ def _validate_json_mode_slots(config: AppConfig) -> None:
 
         if resp.status_code >= 400:
             try:
-                error_body = resp.json()
-                msg = error_body.get("error", {}).get("message", resp.text)
+                error_body = json.loads(resp.body.decode("utf-8"))
+                msg = error_body.get("error", {}).get(
+                    "message", resp.body.decode("utf-8", errors="replace")
+                )
             except Exception:
-                msg = resp.text
+                msg = resp.body.decode("utf-8", errors="replace")
             print(
                 f"influx: model slot {slot_name!r}: JSON-mode "
                 f"check failed ({resp.status_code}): {msg}",

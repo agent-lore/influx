@@ -510,7 +510,7 @@ class TestEndToEndFixtureFeed:
             assert "source:rss" in result["tags"]
             assert result["path"].startswith("articles/rss/2026/04")
             assert "ingested-by:influx" in result["tags"]
-            assert "schema:v1" in result["tags"]
+            assert "schema:1" in result["tags"]
             assert "influx:archive-missing" not in result["tags"]
 
     def test_rss2_feed_end_to_end(

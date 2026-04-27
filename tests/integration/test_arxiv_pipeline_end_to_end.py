@@ -43,6 +43,7 @@ from influx.http_client import FetchResult
 from influx.scheduler import run_profile
 from influx.service import create_app
 from influx.sources.arxiv import ArxivItem, ArxivScorer, ArxivScoreResult
+from influx.storage import ArchiveResult
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Fixture data ──────────────────────────────────────────────────
@@ -118,7 +119,7 @@ def _make_config(lithos_url: str) -> AppConfig:
                 name="ai-robotics",
                 description="Robotics papers",
                 thresholds=ProfileThresholds(
-                    relevance=100,
+                    relevance=7,
                     full_text=8,
                     deep_extract=100,
                     notify_immediate=8,
@@ -168,6 +169,19 @@ def clear_lithos(fake_lithos: FakeLithosServer) -> None:
     fake_lithos.read_responses.clear()
     fake_lithos.cache_lookup_responses.clear()
     fake_lithos.list_responses.clear()
+
+
+@pytest.fixture(autouse=True)
+def archive_success() -> Generator[None, None, None]:
+    with patch(
+        "influx.sources.arxiv.download_archive",
+        return_value=ArchiveResult(
+            ok=True,
+            rel_posix_path=f"arxiv/2026/04/{_ARXIV_ID}.pdf",
+            error="",
+        ),
+    ):
+        yield
 
 
 def _atom_fetch_result() -> FetchResult:
@@ -291,8 +305,8 @@ class TestRunProfileHonoursScoreGating:
     ) -> None:
         """Score below ``full_text`` → no extraction, no full-text tag."""
         config = _make_config(fake_lithos_url)
-        # Score 5 < relevance(100) < full_text(8) — no Tier 1, no extraction.
-        app = create_app(config, arxiv_scorer=_scorer_with_score(5))
+        # Score 7 passes relevance but is below full_text(8).
+        app = create_app(config, arxiv_scorer=_scorer_with_score(7))
 
         with (
             patch(
@@ -344,8 +358,7 @@ class TestRunProfileHonoursScoreGating:
                     name="ai-robotics",
                     description="Robotics papers",
                     thresholds=ProfileThresholds(
-                        relevance=100,  # disable Tier 1 so we don't need to
-                        # mock ``enrich.tier1_enrich``
+                        relevance=7,
                         full_text=8,
                         deep_extract=9,
                         notify_immediate=8,
@@ -482,7 +495,7 @@ def _make_config_with_filter(lithos_url: str) -> AppConfig:
                 name="ai-robotics",
                 description="Robotics papers",
                 thresholds=ProfileThresholds(
-                    relevance=100,  # disable Tier 1 (no enrich slot mocked)
+                    relevance=7,
                     full_text=8,
                     deep_extract=9,
                     notify_immediate=8,
@@ -539,16 +552,16 @@ def _filter_response(arxiv_id: str, score: int) -> dict[str, object]:
     }
 
 
-class _FakeFilterResponse:
-    """Minimal stand-in for ``httpx.Response`` returned by the filter call."""
+def _filter_fetch_result(body: dict[str, object]) -> FetchResult:
+    """Build a guarded POST result returned by the filter call."""
+    import json
 
-    def __init__(self, body: dict[str, object]) -> None:
-        self._body = body
-        self.status_code = 200
-        self.text = ""
-
-    def json(self) -> dict[str, object]:
-        return self._body
+    return FetchResult(
+        body=json.dumps(body).encode("utf-8"),
+        status_code=200,
+        content_type="application/json",
+        final_url="https://api.openai.invalid/v1/chat/completions",
+    )
 
 
 class TestDefaultFilterScorerEndToEnd:
@@ -557,7 +570,7 @@ class TestDefaultFilterScorerEndToEnd:
     These tests do NOT pass ``arxiv_scorer`` or ``arxiv_filter_scorer``
     to :func:`create_app` — they exercise the production-default scorer
     that ``create_app`` installs from ``[models.filter]``, mocking only
-    the underlying ``httpx.post`` so the filter LLM call is
+    the guarded model POST helper so the filter LLM call is
     deterministic.  This proves the finding's recommended fix: the
     shipped service / serve path now drives score-gated extraction +
     enrichment behaviour from US-014/US-015.
@@ -584,8 +597,8 @@ class TestDefaultFilterScorerEndToEnd:
                 "influx.extraction.html.guarded_fetch",
             ) as mock_html,
             patch(
-                "influx.filter.httpx.post",
-                return_value=_FakeFilterResponse(_filter_response(_ARXIV_ID, 5)),
+                "influx.filter.guarded_post_json_fetch",
+                return_value=_filter_fetch_result(_filter_response(_ARXIV_ID, 7)),
             ) as mock_filter_post,
         ):
             import asyncio
@@ -647,8 +660,8 @@ class TestDefaultFilterScorerEndToEnd:
                 return_value=_html_fetch_result(),
             ),
             patch(
-                "influx.filter.httpx.post",
-                return_value=_FakeFilterResponse(_filter_response(_ARXIV_ID, 9)),
+                "influx.filter.guarded_post_json_fetch",
+                return_value=_filter_fetch_result(_filter_response(_ARXIV_ID, 9)),
             ) as mock_filter_post,
             patch(
                 "influx.sources.arxiv.tier3_extract",
@@ -680,20 +693,13 @@ class TestDefaultFilterScorerEndToEnd:
         assert "influx:deep-extracted" in payload["tags"]
         assert "## Claims" in payload["content"]
 
-    def test_default_scorer_http_failure_yields_abstract_only(
+    def test_default_scorer_http_failure_skips_batch(
         self,
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
     ) -> None:
-        """Default LLM filter HTTP failure → note still written abstract-only.
-
-        Regression test for the finding: when the default batch scorer
-        hard-fails (HTTP error, parse error, missing provider) the
-        provider must fall every item back to abstract-only ingestion
-        rather than dropping the entire batch (PRD 07 §5.6 graceful
-        degradation).
-        """
-        import httpx
+        """Default LLM filter HTTP failure skips the batch per FR-FLT-6."""
+        from influx.errors import NetworkError
 
         config = _make_config_with_filter(fake_lithos_url)
 
@@ -709,8 +715,12 @@ class TestDefaultFilterScorerEndToEnd:
                 "influx.extraction.html.guarded_fetch",
             ) as mock_html,
             patch(
-                "influx.filter.httpx.post",
-                side_effect=httpx.ConnectError("simulated transport failure"),
+                "influx.filter.guarded_post_json_fetch",
+                side_effect=NetworkError(
+                    "simulated transport failure",
+                    url="https://api.openai.invalid/v1/chat/completions",
+                    kind="network",
+                ),
             ) as mock_filter_post,
         ):
             import asyncio
@@ -724,38 +734,18 @@ class TestDefaultFilterScorerEndToEnd:
                 )
             )
 
-            # Default scorer was attempted once and failed.
-            assert mock_filter_post.call_count == 1
-            # Abstract-only fallback must NOT trigger HTML extraction.
+            assert mock_filter_post.call_count == 3
             assert mock_html.call_count == 0
 
         write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-        # The note is still written even though the filter failed —
-        # that is the bug this regression test pins down.
-        assert len(write_calls) == 1, (
-            "filter scorer hard-failure must fall back to abstract-only "
-            "ingestion, not silently drop the batch"
-        )
-        payload = write_calls[0][1]
+        assert write_calls == []
 
-        assert "text:abstract-only" in payload["tags"]
-        assert "text:html" not in payload["tags"]
-        assert "full-text" not in payload["tags"]
-        assert "## Full Text" not in payload["content"]
-        assert "influx:deep-extracted" not in payload["tags"]
-
-    def test_default_scorer_missing_provider_yields_abstract_only(
+    def test_default_scorer_missing_provider_skips_batch(
         self,
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
     ) -> None:
-        """models.filter slot points at a missing provider → abstract-only note.
-
-        Misconfiguration where ``[models.filter]`` is configured but the
-        referenced provider is not declared in ``[providers]`` must not
-        silently drop the batch — every item should fall back to
-        abstract-only ingestion (PRD 07 §5.6).
-        """
+        """models.filter slot points at a missing provider → skipped batch."""
         config = _make_config_with_filter(fake_lithos_url)
         # Drop the provider that ``[models.filter]`` references so the
         # scorer's provider lookup fails at call time.
@@ -772,7 +762,7 @@ class TestDefaultFilterScorerEndToEnd:
             patch(
                 "influx.extraction.html.guarded_fetch",
             ) as mock_html,
-            patch("influx.filter.httpx.post") as mock_filter_post,
+            patch("influx.filter.guarded_post_json_fetch") as mock_filter_post,
         ):
             import asyncio
 
@@ -787,35 +777,17 @@ class TestDefaultFilterScorerEndToEnd:
 
             # Provider lookup fails before httpx is called.
             assert mock_filter_post.call_count == 0
-            # No HTML extraction either (score=0 fallback < full_text).
             assert mock_html.call_count == 0
 
         write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-        assert len(write_calls) == 1, (
-            "missing filter provider must fall back to abstract-only, "
-            "not silently drop the batch"
-        )
-        payload = write_calls[0][1]
+        assert write_calls == []
 
-        assert "text:abstract-only" in payload["tags"]
-        assert "text:html" not in payload["tags"]
-        assert "full-text" not in payload["tags"]
-
-    def test_default_scorer_malformed_response_yields_abstract_only(
+    def test_default_scorer_malformed_response_skips_batch(
         self,
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
     ) -> None:
-        """Structurally malformed filter response → abstract-only note.
-
-        Regression test for the finding: response shapes such as
-        ``{"choices": [{"message": {"content": None}}]}`` raise
-        ``TypeError`` (not ``JSONDecodeError`` / ``KeyError``) when the
-        scorer indexes the response.  The parse wrapper must normalise
-        these into ``FilterScorerError`` so the provider falls every
-        item back to abstract-only ingestion (PRD 07 §5.6 graceful
-        degradation) rather than letting the batch crash.
-        """
+        """Structurally malformed filter response is retried then skipped."""
         config = _make_config_with_filter(fake_lithos_url)
 
         app = create_app(config)
@@ -830,8 +802,8 @@ class TestDefaultFilterScorerEndToEnd:
                 "influx.extraction.html.guarded_fetch",
             ) as mock_html,
             patch(
-                "influx.filter.httpx.post",
-                return_value=_FakeFilterResponse(
+                "influx.filter.guarded_post_json_fetch",
+                return_value=_filter_fetch_result(
                     {"choices": [{"message": {"content": None}}]},
                 ),
             ) as mock_filter_post,
@@ -847,20 +819,8 @@ class TestDefaultFilterScorerEndToEnd:
                 )
             )
 
-            # Default scorer was attempted exactly once and parse-failed.
-            assert mock_filter_post.call_count == 1
-            # Abstract-only fallback must NOT trigger HTML extraction.
+            assert mock_filter_post.call_count == 3
             assert mock_html.call_count == 0
 
         write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-        assert len(write_calls) == 1, (
-            "structurally malformed filter response must fall back to "
-            "abstract-only, not silently drop the batch"
-        )
-        payload = write_calls[0][1]
-
-        assert "text:abstract-only" in payload["tags"]
-        assert "text:html" not in payload["tags"]
-        assert "full-text" not in payload["tags"]
-        assert "## Full Text" not in payload["content"]
-        assert "influx:deep-extracted" not in payload["tags"]
+        assert write_calls == []

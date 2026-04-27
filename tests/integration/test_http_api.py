@@ -412,7 +412,7 @@ class TestPostBackfills:
         """all_profiles=true returns 202 with scope='all'."""
         resp = client.post(
             "/backfills",
-            json={"all_profiles": True, "days": 7},
+            json={"all_profiles": True, "days": 7, "confirm": True},
         )
         assert resp.status_code == 202
         body = resp.json()

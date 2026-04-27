@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from influx.errors import ConfigError
+from influx.prompts import load_prompt, validate_prompt_variables
 from influx.slugs import slugify_feed_name
 
 __all__ = [
@@ -455,6 +456,34 @@ def _validate_provider_api_keys(cfg: AppConfig) -> None:
             )
 
 
+def _resolve_prompt_paths(raw: dict[str, Any], *, config_dir: Path) -> None:
+    """Resolve relative prompt paths against the config directory in-place."""
+    prompts = raw.get("prompts")
+    if not isinstance(prompts, dict):
+        return
+    for entry in prompts.values():
+        if not isinstance(entry, dict):
+            continue
+        prompt_path = entry.get("path")
+        if not isinstance(prompt_path, str):
+            continue
+        p = Path(prompt_path).expanduser()
+        if not p.is_absolute():
+            p = config_dir / p
+        entry["path"] = str(p)
+
+
+def _validate_prompts(cfg: AppConfig) -> None:
+    """Load every configured prompt and validate its template variables."""
+    for key, prompt in (
+        ("filter", cfg.prompts.filter),
+        ("tier1_enrich", cfg.prompts.tier1_enrich),
+        ("tier3_extract", cfg.prompts.tier3_extract),
+    ):
+        text = load_prompt(text=prompt.text, path=prompt.path)
+        validate_prompt_variables(key, text)
+
+
 def load_config(
     path: Path | None = None,
     *,
@@ -488,6 +517,7 @@ def load_config(
         raise ConfigError(f"{config_path}: invalid TOML: {exc}") from exc
 
     _apply_env_overrides(raw)
+    _resolve_prompt_paths(raw, config_dir=config_path.parent)
 
     try:
         cfg = AppConfig.model_validate(raw)
@@ -496,5 +526,6 @@ def load_config(
 
     if check_api_keys:
         _validate_provider_api_keys(cfg)
+    _validate_prompts(cfg)
 
     return cfg

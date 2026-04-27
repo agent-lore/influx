@@ -1,3 +1,8 @@
-"""Influx — project skeleton."""
+"""Influx package metadata."""
 
-__version__ = "0.7.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("influx")
+except PackageNotFoundError:  # pragma: no cover - source tree fallback
+    __version__ = "0.0.0"

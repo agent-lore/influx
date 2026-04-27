@@ -459,7 +459,7 @@ class TestInfluxFetchArxivSpan:
 
         # Deterministic scorer to avoid filter_scorer interactions
         def simple_scorer(item: Any, profile: str) -> ArxivScoreResult:
-            return ArxivScoreResult(score=5, confidence=0.8, reason="test")
+            return ArxivScoreResult(score=7, confidence=0.8, reason="test")
 
         token = current_run_id.set("test-run-fetch-arxiv")
         try:
@@ -528,7 +528,7 @@ class TestInfluxFetchArxivSpan:
         ]
 
         def simple_scorer(item: Any, profile: str) -> ArxivScoreResult:
-            return ArxivScoreResult(score=5, confidence=0.8, reason="test")
+            return ArxivScoreResult(score=7, confidence=0.8, reason="test")
 
         provider = make_arxiv_item_provider(config, scorer=simple_scorer)
 
@@ -542,7 +542,7 @@ class TestInfluxFetchArxivSpan:
                     "source_url": "u",
                     "content": "c",
                     "tags": [],
-                    "score": 5,
+                    "score": 7,
                     "confidence": 0.8,
                 },
             ),
@@ -623,6 +623,17 @@ class TestInfluxFetchRssSpan:
                     "influx.sources.rss._fetch_rss_feed",
                     new_callable=AsyncMock,
                     return_value=test_items,
+                ),
+                patch(
+                    "influx.sources.rss._score_rss_items",
+                    new_callable=AsyncMock,
+                    return_value={
+                        "781f5d2534": type(
+                            "Score",
+                            (),
+                            {"score": 7, "reason": "ok", "tags": []},
+                        )()
+                    },
                 ),
                 patch(
                     "influx.sources.rss.build_rss_note_item",
@@ -716,6 +727,17 @@ class TestInfluxFetchRssSpan:
                 "influx.sources.rss._fetch_rss_feed",
                 new_callable=AsyncMock,
                 return_value=test_items,
+            ),
+            patch(
+                "influx.sources.rss._score_rss_items",
+                new_callable=AsyncMock,
+                return_value={
+                    "781f5d2534": type(
+                        "Score",
+                        (),
+                        {"score": 7, "reason": "ok", "tags": []},
+                    )()
+                },
             ),
             patch(
                 "influx.sources.rss.build_rss_note_item",

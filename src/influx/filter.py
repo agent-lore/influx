@@ -38,10 +38,11 @@ import logging
 import os
 from typing import Any
 
-import httpx
 from pydantic import ValidationError
 
 from influx.config import AppConfig
+from influx.errors import NetworkError
+from influx.http_client import guarded_post_json_fetch
 from influx.schemas import FilterResponse
 
 __all__ = [
@@ -142,64 +143,75 @@ def make_default_arxiv_filter_scorer(
         if slot.json_mode:
             body["response_format"] = {"type": "json_object"}
 
-        try:
-            resp = httpx.post(
-                url,
-                json=body,
-                headers=headers,
-                timeout=float(slot.request_timeout),
-            )
-        except httpx.HTTPError as exc:
-            _log.warning(
-                "filter HTTP error for profile %r: %s; "
-                "falling back to abstract-only ingestion",
-                profile,
-                exc,
-            )
-            raise FilterScorerError(f"filter HTTP error: {exc}") from exc
+        attempts = slot.max_retries + 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                result = guarded_post_json_fetch(
+                    url,
+                    body,
+                    headers=headers,
+                    allow_private_ips=config.security.allow_private_ips,
+                    max_response_bytes=config.storage.max_download_bytes,
+                    timeout_seconds=slot.request_timeout,
+                )
+            except NetworkError as exc:
+                last_error = exc
+                _log.warning(
+                    "filter HTTP error for profile %r on attempt %d/%d: %s",
+                    profile,
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
+                continue
 
-        if resp.status_code >= 400:
-            _log.warning(
-                "filter slot HTTP %d for profile %r; "
-                "falling back to abstract-only ingestion",
-                resp.status_code,
-                profile,
-            )
-            raise FilterScorerError(
-                f"filter slot HTTP {resp.status_code}",
-            )
+            if result.status_code >= 400:
+                last_error = FilterScorerError(f"filter slot HTTP {result.status_code}")
+                _log.warning(
+                    "filter slot HTTP %d for profile %r on attempt %d/%d",
+                    result.status_code,
+                    profile,
+                    attempt + 1,
+                    attempts,
+                )
+                continue
 
-        try:
-            resp_json = resp.json()
-            content_str: str = resp_json["choices"][0]["message"]["content"]
-            parsed = json.loads(content_str)
-            response = FilterResponse.model_validate(parsed)
-        except (
-            json.JSONDecodeError,
-            KeyError,
-            IndexError,
-            TypeError,
-            ValidationError,
-            ValueError,
-        ) as exc:
-            _log.warning(
-                "filter response parse failure for profile %r: %s; "
-                "falling back to abstract-only ingestion",
-                profile,
-                exc,
-            )
-            raise FilterScorerError(
-                f"filter response parse failure: {exc}",
-            ) from exc
+            try:
+                resp_json = json.loads(result.body.decode("utf-8"))
+                content_str: str = resp_json["choices"][0]["message"]["content"]
+                parsed = json.loads(content_str)
+                response = FilterResponse.model_validate(parsed)
+                return {
+                    r.id: ArxivScoreResult(
+                        score=r.score,
+                        confidence=1.0,
+                        reason=r.reason,
+                        filter_tags=tuple(r.tags),
+                    )
+                    for r in response.results
+                }
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                KeyError,
+                IndexError,
+                TypeError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                last_error = exc
+                _log.warning(
+                    "filter response parse failure for profile %r on attempt %d/%d: %s",
+                    profile,
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
+                continue
 
-        return {
-            r.id: ArxivScoreResult(
-                score=r.score,
-                confidence=1.0,
-                reason=r.reason,
-                filter_tags=tuple(r.tags),
-            )
-            for r in response.results
-        }
+        raise FilterScorerError(f"filter failed after {attempts} attempts") from (
+            last_error
+        )
 
     return _scorer

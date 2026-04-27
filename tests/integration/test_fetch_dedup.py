@@ -79,7 +79,7 @@ def _make_config(lithos_url: str) -> AppConfig:
                 name=PROFILE_A,
                 description="AI and robotics",
                 thresholds=ProfileThresholds(
-                    relevance=100,
+                    relevance=7,
                     full_text=100,
                     deep_extract=100,
                     notify_immediate=8,
@@ -97,7 +97,7 @@ def _make_config(lithos_url: str) -> AppConfig:
                 name=PROFILE_B,
                 description="Web tech and standards",
                 thresholds=ProfileThresholds(
-                    relevance=100,
+                    relevance=7,
                     full_text=100,
                     deep_extract=100,
                     notify_immediate=8,
@@ -193,7 +193,7 @@ class TestArxivFetchDedup:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue Lithos responses for Profile A: repair sweep + feedback
@@ -328,7 +328,7 @@ class TestArxivFetchDedup:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Queue for both profiles: repair sweep + feedback
@@ -373,6 +373,8 @@ class TestRssFetchDedup:
     ) -> None:
         """Shared RSS feed URL fetched once, items fan-out to both profiles."""
         from influx.http_client import FetchResult
+        from influx.schemas import FilterResult
+        from influx.urls import url_hash
 
         rss_feed = RssSourceEntry(
             name="Shared Blog",
@@ -445,6 +447,16 @@ class TestRssFetchDedup:
                 final_url=url,
             )
 
+        async def score_rss_items(**kwargs: Any) -> dict[str, FilterResult]:
+            return {
+                url_hash("https://shared-blog.example/post-1"): FilterResult(
+                    id=url_hash("https://shared-blog.example/post-1"),
+                    score=7,
+                    tags=["shared"],
+                    reason="test-scorer",
+                )
+            }
+
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
@@ -473,6 +485,10 @@ class TestRssFetchDedup:
             patch(
                 "influx.extraction.article.guarded_fetch",
                 side_effect=counting_guarded_fetch,
+            ),
+            patch(
+                "influx.sources.rss._score_rss_items",
+                side_effect=score_rss_items,
             ),
         ):
             asyncio.run(
@@ -673,7 +689,7 @@ class TestFetchCacheConcurrencyAndScope:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         coordinator = Coordinator()
@@ -736,7 +752,7 @@ class TestFetchCacheConcurrencyAndScope:
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
-            arxiv_scorer=_deterministic_scorer(5),
+            arxiv_scorer=_deterministic_scorer(7),
         )
 
         # Repair sweep + feedback for each of two profiles.

@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from influx.config import load_config
+from influx.http_client import FetchResult
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "src" / "influx"
@@ -318,11 +319,11 @@ model = "test-model"
 json_mode = true
 
 [prompts.filter]
-text = "f {{profile_description}} {{negative_examples}} {{min_score_in_results}}"
+text = "f {profile_description} {negative_examples} {min_score_in_results}"
 [prompts.tier1_enrich]
-text = "e {{title}} {{abstract}} {{profile_summary}}"
+text = "e {title} {abstract} {profile_summary}"
 [prompts.tier3_extract]
-text = "x {{title}} {{full_text}}"
+text = "x {title} {full_text}"
 """
         cfg_path = tmp_path / "influx.toml"
 
@@ -737,9 +738,12 @@ class TestValidateConfig:
         # Stub the JSON-mode dry-call: any [models.*] slot with
         # ``json_mode=true`` will POST to /chat/completions during
         # validation. Return 200 OK so the CLI accepts the slot.
-        ok_response = MagicMock()
-        ok_response.status_code = 200
-        ok_response.json = MagicMock(return_value={"choices": []})
+        ok_response = FetchResult(
+            body=b'{"choices":[]}',
+            status_code=200,
+            content_type="application/json",
+            final_url="https://api.openai.com/v1/chat/completions",
+        )
 
         # Stub the LithosClient SSE dry-connect: ``_ensure_connected``
         # is what the CLI invokes; mocking it sidesteps a real MCP
@@ -749,7 +753,10 @@ class TestValidateConfig:
         fake_client.close = AsyncMock(return_value=None)
 
         with (
-            patch("httpx.post", return_value=ok_response),
+            patch(
+                "influx.http_client.guarded_post_json_fetch",
+                return_value=ok_response,
+            ),
             patch("influx.lithos_client.LithosClient", return_value=fake_client),
         ):
             # The CLI calls ``sys.exit`` only on failure paths; success

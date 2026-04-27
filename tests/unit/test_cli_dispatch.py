@@ -6,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+from influx.http_client import FetchResult
 from influx.main import EXIT_FAILURE, EXIT_PARTIAL, EXIT_SUCCESS, EXIT_USAGE, main
 
 # ── serve ─────────────────────────────────────────────────────────────
@@ -381,22 +382,12 @@ class TestValidateConfigUnchanged:
     def test_validate_config_still_works(
         self,
         influx_config_env: object,
+        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # Mock the provider endpoint for JSON-mode dry-call.
-        respx.post("https://api.test.example.com/v1/chat/completions").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "choices": [
-                        {
-                            "message": {"content": "{}"},
-                            "finish_reason": "stop",
-                            "index": 0,
-                        }
-                    ]
-                },
-            )
+        monkeypatch.setattr(
+            "influx.http_client.guarded_post_json_fetch",
+            lambda *args, **kwargs: _model_fetch_result(),
         )
         main(["validate-config"])
 
@@ -429,15 +420,32 @@ def _write_config_with_model_slot(
             json_mode = {jm}
 
             [prompts.filter]
-            text = "f"
+            text = '''
+            {{profile_description}}
+            {{negative_examples}}
+            {{min_score_in_results}}
+            '''
             [prompts.tier1_enrich]
-            text = "e"
+            text = "e {{title}} {{abstract}} {{profile_summary}}"
             [prompts.tier3_extract]
-            text = "x"
+            text = "x {{title}} {{full_text}}"
         """)
     )
     monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
     monkeypatch.setenv("FAKE_PROVIDER_KEY", "test-key")
+
+
+def _model_fetch_result(
+    *,
+    status_code: int = 200,
+    body: bytes = b'{"choices":[{"message":{"content":"{}"}}]}',
+) -> FetchResult:
+    return FetchResult(
+        body=body,
+        status_code=status_code,
+        content_type="application/json",
+        final_url="https://fake.api.example.com/v1/chat/completions",
+    )
 
 
 class TestValidateConfigJsonMode:
@@ -454,19 +462,9 @@ class TestValidateConfigJsonMode:
         _write_config_with_model_slot(
             tmp_path, monkeypatch, "https://fake.api.example.com/v1"
         )
-        respx.post("https://fake.api.example.com/v1/chat/completions").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "choices": [
-                        {
-                            "message": {"content": "{}"},
-                            "finish_reason": "stop",
-                            "index": 0,
-                        }
-                    ]
-                },
-            )
+        monkeypatch.setattr(
+            "influx.http_client.guarded_post_json_fetch",
+            lambda *args, **kwargs: _model_fetch_result(),
         )
 
         # Should NOT raise SystemExit — exit 0.
@@ -486,18 +484,15 @@ class TestValidateConfigJsonMode:
         _write_config_with_model_slot(
             tmp_path, monkeypatch, "https://fake.api.example.com/v1"
         )
-        respx.post("https://fake.api.example.com/v1/chat/completions").mock(
-            return_value=httpx.Response(
-                400,
-                json={
-                    "error": {
-                        "message": (
-                            "response_format json_object is not "
-                            "supported for this model"
-                        )
-                    }
-                },
-            )
+        monkeypatch.setattr(
+            "influx.http_client.guarded_post_json_fetch",
+            lambda *args, **kwargs: _model_fetch_result(
+                status_code=400,
+                body=(
+                    b'{"error":{"message":"response_format json_object is not '
+                    b'supported for this model"}}'
+                ),
+            ),
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -558,41 +553,36 @@ class TestValidateConfigJsonMode:
                 json_mode = false
 
                 [prompts.filter]
-                text = "f"
+                text = '''
+                {profile_description}
+                {negative_examples}
+                {min_score_in_results}
+                '''
                 [prompts.tier1_enrich]
-                text = "e"
+                text = "e {title} {abstract} {profile_summary}"
                 [prompts.tier3_extract]
-                text = "x"
+                text = "x {title} {full_text}"
             """)
         )
         monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
         monkeypatch.setenv("FAKE_PROVIDER_KEY", "test-key")
 
-        route = respx.post("https://fake.api.example.com/v1/chat/completions")
-        route.mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "choices": [
-                        {
-                            "message": {"content": "{}"},
-                            "finish_reason": "stop",
-                            "index": 0,
-                        }
-                    ]
-                },
-            )
-        )
+        calls: list[dict[str, object]] = []
+
+        def fake_fetch(
+            url: str, body: dict[str, object], **kwargs: object
+        ) -> FetchResult:
+            calls.append(body)
+            return _model_fetch_result()
+
+        monkeypatch.setattr("influx.http_client.guarded_post_json_fetch", fake_fetch)
 
         main(["validate-config"])
 
         # Only the json_mode=true slot (filter) should trigger a dry-call;
         # enrich (json_mode=false) should NOT.
-        assert route.call_count == 1
-        import json as json_mod
-
-        sent_body = json_mod.loads(route.calls[0].request.content)
-        assert sent_body["model"] == "fake-model-a"
+        assert len(calls) == 1
+        assert calls[0]["model"] == "fake-model-a"
 
 
 def _write_config_with_lithos(
@@ -610,11 +600,15 @@ def _write_config_with_lithos(
             transport = "sse"
 
             [prompts.filter]
-            text = "f"
+            text = '''
+            {{profile_description}}
+            {{negative_examples}}
+            {{min_score_in_results}}
+            '''
             [prompts.tier1_enrich]
-            text = "e"
+            text = "e {{title}} {{abstract}} {{profile_summary}}"
             [prompts.tier3_extract]
-            text = "x"
+            text = "x {{title}} {{full_text}}"
         """)
     )
     monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
@@ -758,11 +752,11 @@ class TestMigrateNotes:
             note_schema_version = 42
 
             [prompts.filter]
-            text = "f"
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
             [prompts.tier1_enrich]
-            text = "e"
+            text = "e {title} {abstract} {profile_summary}"
             [prompts.tier3_extract]
-            text = "x"
+            text = "x {title} {full_text}"
         """)
         )
         monkeypatch.setenv("INFLUX_CONFIG", str(config_path))

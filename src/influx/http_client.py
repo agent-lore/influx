@@ -21,7 +21,13 @@ import httpx
 from influx.config import NotificationsConfig, StorageConfig
 from influx.errors import NetworkError
 
-__all__ = ["ContentTypeFamily", "FetchResult", "guarded_fetch", "guarded_post_json"]
+__all__ = [
+    "ContentTypeFamily",
+    "FetchResult",
+    "guarded_fetch",
+    "guarded_post_json",
+    "guarded_post_json_fetch",
+]
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
@@ -299,6 +305,87 @@ def guarded_post_json(
         with httpx.Client(timeout=timeout) as client:
             response = client.post(url, json=payload)
             return response.status_code
+    except httpx.TimeoutException as exc:
+        raise NetworkError(
+            f"Request timed out: {exc}",
+            url=url,
+            kind="timeout",
+            reason=str(exc),
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise NetworkError(
+            f"HTTP error: {exc}",
+            url=url,
+            kind="network",
+            reason=str(exc),
+        ) from exc
+
+
+def guarded_post_json_fetch(
+    url: str,
+    payload: dict[str, object],
+    *,
+    headers: dict[str, str] | None = None,
+    allow_private_ips: bool = False,
+    max_response_bytes: int | None = None,
+    timeout_seconds: int | None = None,
+) -> FetchResult:
+    """POST JSON and return the response body under the outbound HTTP guard.
+
+    This is the POST analogue of :func:`guarded_fetch`: it enforces the
+    scheme allow-list, SSRF checks, streaming response-size cap, and timeout.
+    It intentionally does not enforce a content-type family because model
+    provider error responses vary; callers parse or validate the body.
+    """
+    _validate_scheme(url)
+    _ssrf_check(url, allow_private_ips=allow_private_ips)
+
+    if max_response_bytes is None or timeout_seconds is None:
+        _storage_defaults = StorageConfig()
+        if max_response_bytes is None:
+            max_response_bytes = _storage_defaults.max_download_bytes
+        if timeout_seconds is None:
+            timeout_seconds = _storage_defaults.download_timeout_seconds
+
+    timeout = httpx.Timeout(
+        connect=timeout_seconds,
+        read=timeout_seconds,
+        write=timeout_seconds,
+        pool=timeout_seconds,
+    )
+
+    try:
+        with (
+            httpx.Client(timeout=timeout, follow_redirects=False) as client,
+            client.stream(
+                "POST",
+                url,
+                json=payload,
+                headers=headers,
+            ) as response,
+        ):
+            chunks: list[bytes] = []
+            received = 0
+            for chunk in response.iter_bytes():
+                received += len(chunk)
+                if received > max_response_bytes:
+                    raise NetworkError(
+                        f"Response body exceeds {max_response_bytes} bytes",
+                        url=url,
+                        kind="oversize",
+                        reason=(
+                            f"Received {received} bytes, limit is {max_response_bytes}"
+                        ),
+                    )
+                chunks.append(chunk)
+            return FetchResult(
+                body=b"".join(chunks),
+                status_code=response.status_code,
+                content_type=response.headers.get("content-type", ""),
+                final_url=str(response.url),
+            )
+    except NetworkError:
+        raise
     except httpx.TimeoutException as exc:
         raise NetworkError(
             f"Request timed out: {exc}",

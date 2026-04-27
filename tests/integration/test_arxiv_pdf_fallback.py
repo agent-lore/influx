@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from influx.config import (
     AppConfig,
     ExtractionConfig,
@@ -28,12 +30,27 @@ from influx.config import (
 )
 from influx.http_client import FetchResult
 from influx.sources.arxiv import ArxivItem, build_arxiv_note_item
+from influx.storage import ArchiveResult
 
 # ── Fixture data ──────────────────────────────────────────────────
 
 _ARXIV_ID = "2601.88001"
 _HTML_URL = f"https://arxiv.org/html/{_ARXIV_ID}"
 _PDF_URL = f"https://arxiv.org/pdf/{_ARXIV_ID}.pdf"
+
+
+@pytest.fixture(autouse=True)
+def _archive_success() -> object:
+    with patch(
+        "influx.sources.arxiv.download_archive",
+        return_value=ArchiveResult(
+            ok=True,
+            rel_posix_path=f"arxiv/2026/04/{_ARXIV_ID}.pdf",
+            error="",
+        ),
+    ) as patched:
+        yield patched
+
 
 _FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "extraction"
 

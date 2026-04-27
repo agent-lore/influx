@@ -5,38 +5,31 @@ from __future__ import annotations
 from pathlib import Path
 from textwrap import dedent
 
-import httpx
 import pytest
-import respx
 
+from influx.http_client import FetchResult
 from influx.main import main
 
 
 class TestValidateConfigSuccess:
     """AC-M1-1: ``validate-config`` on a valid config exits 0 and prints."""
 
-    @respx.mock
     def test_valid_config_exits_zero_and_prints_json(
         self,
         influx_config_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         assert influx_config_env.exists()
 
-        # Mock the provider endpoint for JSON-mode dry-call.
-        respx.post("https://api.test.example.com/v1/chat/completions").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "choices": [
-                        {
-                            "message": {"content": "{}"},
-                            "finish_reason": "stop",
-                            "index": 0,
-                        }
-                    ]
-                },
-            )
+        monkeypatch.setattr(
+            "influx.http_client.guarded_post_json_fetch",
+            lambda *args, **kwargs: FetchResult(
+                body=b'{"choices":[{"message":{"content":"{}"}}]}',
+                status_code=200,
+                content_type="application/json",
+                final_url="https://api.test.example.com/v1/chat/completions",
+            ),
         )
 
         main(["validate-config"])

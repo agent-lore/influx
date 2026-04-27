@@ -188,11 +188,11 @@ _GRACE_ZERO_TOML = dedent("""\
     name = "ai-robotics"
 
     [prompts.filter]
-    text = "test"
+    text = "Filter {profile_description} {negative_examples} {min_score_in_results}"
     [prompts.tier1_enrich]
-    text = "test"
+    text = "Enrich {title} {abstract} {profile_summary}"
     [prompts.tier3_extract]
-    text = "test"
+    text = "Extract {title} {full_text}"
 """)
 
 
@@ -352,11 +352,11 @@ _MINIMAL_TOML = dedent("""\
     name = "ai-robotics"
 
     [prompts.filter]
-    text = "test"
+    text = "Filter {profile_description} {negative_examples} {min_score_in_results}"
     [prompts.tier1_enrich]
-    text = "test"
+    text = "Enrich {title} {abstract} {profile_summary}"
     [prompts.tier3_extract]
-    text = "test"
+    text = "Extract {title} {full_text}"
 """)
 
 
