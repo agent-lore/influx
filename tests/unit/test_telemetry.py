@@ -125,6 +125,38 @@ class TestOtelEnabled:
         tracer = get_tracer(force_rebuild=True)
         assert tracer.enabled
 
+    def test_influx_environment_sets_deployment_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """INFLUX_ENVIRONMENT becomes OTEL deployment.environment."""
+        _rebuild_tracer(monkeypatch, "true")
+        monkeypatch.setenv("INFLUX_ENVIRONMENT", "staging")
+        monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES", raising=False)
+
+        tracer = get_tracer(force_rebuild=True)
+
+        resource = tracer._tracer.resource  # type: ignore[attr-defined]  # noqa: SLF001
+        assert resource.attributes["deployment.environment"] == "staging"
+        assert resource.attributes["service.name"] == "influx"
+
+    def test_resource_attributes_environment_takes_precedence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit OTEL_RESOURCE_ATTRIBUTES can override environment metadata."""
+        _rebuild_tracer(monkeypatch, "true")
+        monkeypatch.setenv("INFLUX_ENVIRONMENT", "staging")
+        monkeypatch.setenv(
+            "OTEL_RESOURCE_ATTRIBUTES",
+            "deployment.environment=production,service.namespace=lab",
+        )
+
+        tracer = get_tracer(force_rebuild=True)
+
+        resource = tracer._tracer.resource  # type: ignore[attr-defined]  # noqa: SLF001
+        attrs = resource.attributes
+        assert attrs["deployment.environment"] == "production"
+        assert attrs["service.namespace"] == "lab"
+
     def test_enabled_span_creates_real_span(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

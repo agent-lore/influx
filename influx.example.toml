@@ -239,4 +239,5 @@ max_items_per_run = 100
 enabled = false
 console_fallback = false
 service_name = "influx"
+# environment = "staging"        # usually supplied by env INFLUX_ENVIRONMENT
 export_interval_ms = 30000

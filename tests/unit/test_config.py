@@ -303,6 +303,28 @@ class TestEnvVarOverrides:
 
         assert cfg.telemetry.console_fallback is True
 
+    def test_influx_environment_maps_to_telemetry_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """INFLUX_ENVIRONMENT maps to telemetry.environment."""
+        toml = dedent("""\
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+        monkeypatch.setenv("INFLUX_ENVIRONMENT", "staging")
+
+        cfg = load_config()
+
+        assert cfg.telemetry.environment == "staging"
+
     def test_unset_env_var_leaves_toml_untouched(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

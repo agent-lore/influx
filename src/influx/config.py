@@ -340,6 +340,7 @@ class TelemetryConfig(BaseModel):
     enabled: bool = False
     console_fallback: bool = False
     service_name: str = "influx"
+    environment: str | None = None
     export_interval_ms: int = 30000
 
 
@@ -424,6 +425,7 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
         ("INFLUX_ARCHIVE_DIR", "storage", "archive_dir", str),
         ("INFLUX_OTEL_ENABLED", "telemetry", "enabled", bool),
         ("INFLUX_OTEL_CONSOLE_FALLBACK", "telemetry", "console_fallback", bool),
+        ("INFLUX_ENVIRONMENT", "telemetry", "environment", str),
         ("AGENT_ZERO_WEBHOOK_URL", "notifications", "webhook_url", str),
     ]
 

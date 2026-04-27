@@ -151,6 +151,19 @@ def _otlp_endpoint_configured() -> bool:
     return bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""))
 
 
+def _parse_resource_attributes(value: str) -> dict[str, str]:
+    """Parse OTEL_RESOURCE_ATTRIBUTES-style ``key=value`` pairs."""
+    attrs: dict[str, str] = {}
+    for pair in value.split(","):
+        if not pair.strip() or "=" not in pair:
+            continue
+        key, raw = pair.split("=", 1)
+        key = key.strip()
+        if key:
+            attrs[key] = raw.strip()
+    return attrs
+
+
 def _build_tracer() -> InfluxTracer:
     """Construct an ``InfluxTracer`` based on current env + package state."""
     if not _otel_enabled() or not _otel_packages_available():
@@ -161,13 +174,14 @@ def _build_tracer() -> InfluxTracer:
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 
     service_name = os.environ.get("OTEL_SERVICE_NAME", "influx")
-    provider = TracerProvider(
-        resource=Resource.create(
-            {
-                "service.name": service_name,
-            }
-        )
+    resource_attrs = _parse_resource_attributes(
+        os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
     )
+    resource_attrs["service.name"] = service_name
+    environment = os.environ.get("INFLUX_ENVIRONMENT", "")
+    if environment and "deployment.environment" not in resource_attrs:
+        resource_attrs["deployment.environment"] = environment
+    provider = TracerProvider(resource=Resource.create(resource_attrs))
 
     if _otlp_endpoint_configured():
         try:
