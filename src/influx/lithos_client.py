@@ -697,26 +697,25 @@ class LithosClient:
         """List notes by tag filter (FR-MCP-5, FR-REP-1).
 
         Invokes the underlying MCP ``lithos_list`` tool with the provided
-        *tags* and optional *limit*, *order_by*, and *order*.  The server
-        response is returned unchanged so callers can inspect titles/IDs
-        directly.
+        *tags* and optional *limit*.  ``order_by`` and ``order`` are accepted
+        for compatibility with callers, but current Lithos does not expose
+        server-side ordering on ``lithos_list``; callers that need ordering
+        should sort the returned items locally.  The server response is
+        returned unchanged so callers can inspect titles/IDs directly.
 
         Parameters
         ----------
         order_by:
-            Field to sort by (e.g. ``"updated_at"``).  Forwarded to the
-            MCP call when non-None.
+            Field to sort by (e.g. ``"updated_at"``).  Accepted for API
+            compatibility but not forwarded to Lithos.
         order:
-            Sort direction (``"asc"`` or ``"desc"``).  Forwarded to the
-            MCP call when non-None.
+            Sort direction (``"asc"`` or ``"desc"``).  Accepted for API
+            compatibility but not forwarded to Lithos.
         """
+        del order_by, order
         args: dict[str, Any] = {"tags": tags}
         if limit is not None:
             args["limit"] = limit
-        if order_by is not None:
-            args["order_by"] = order_by
-        if order is not None:
-            args["order"] = order
         return await self.call_tool("lithos_list", args)
 
     # ── LCMA wrappers (PRD 08) ──────────────────────────────────────

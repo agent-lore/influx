@@ -1004,8 +1004,17 @@ async def sweep(
     )
 
     text = list_result.content[0].text  # type: ignore[union-attr]
+    if getattr(list_result, "isError", False):
+        raise LithosError(
+            "lithos_list failed during repair sweep",
+            operation="repair_sweep",
+            detail=text,
+        )
     body = json.loads(text)
     items: list[dict[str, Any]] = body.get("items", [])
+    items.sort(
+        key=lambda item: str(item.get("updated_at") or item.get("updated") or "")
+    )
 
     if not items:
         logger.debug("repair sweep for %r: no candidates found", profile)

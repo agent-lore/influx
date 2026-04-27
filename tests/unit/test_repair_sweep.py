@@ -29,6 +29,7 @@ def _make_list_result(items: list[dict[str, Any]]) -> MagicMock:
     text_content.text = json.dumps({"items": items})
     result = MagicMock()
     result.content = [text_content]
+    result.isError = False
     return result
 
 
@@ -162,6 +163,29 @@ class TestSweepIteration:
         assert calls[0].kwargs["note_id"] == "note-001"
         assert calls[1].kwargs["note_id"] == "note-002"
         assert calls[2].kwargs["note_id"] == "note-003"
+
+    async def test_candidates_sorted_by_updated_at(self) -> None:
+        items = [
+            {"id": "note-new", "title": "New", "updated_at": "2026-01-03T00:00:00Z"},
+            {"id": "note-old", "title": "Old", "updated_at": "2026-01-01T00:00:00Z"},
+            {"id": "note-mid", "title": "Mid", "updated_at": "2026-01-02T00:00:00Z"},
+        ]
+        read_notes = [
+            {"id": "note-old", "content": "Old", "tags": []},
+            {"id": "note-mid", "content": "Mid", "tags": []},
+            {"id": "note-new", "content": "New", "tags": []},
+        ]
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=read_notes)
+
+        await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
+
+        calls = client.read_note.call_args_list
+        assert [call.kwargs["note_id"] for call in calls] == [
+            "note-old",
+            "note-mid",
+            "note-new",
+        ]
 
     async def test_returns_reread_notes_in_order(self) -> None:
         items = [

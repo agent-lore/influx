@@ -8,6 +8,8 @@ live in ``tests/contract/test_lcma_calls.py`` (PRD 08).
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from influx.errors import ConfigError
@@ -54,3 +56,23 @@ class TestLCMAStubsRemoved:
             assert hasattr(client, method_name), (
                 f"LithosClient.{method_name} should exist"
             )
+
+
+class TestListNotes:
+    """LithosClient.list_notes adapts Influx call shape to current Lithos."""
+
+    async def test_does_not_forward_unsupported_ordering_args(self) -> None:
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(return_value=object())  # type: ignore[method-assign]
+
+        await client.list_notes(
+            tags=["influx:repair-needed", "profile:staging-ai"],
+            limit=25,
+            order_by="updated_at",
+            order="asc",
+        )
+
+        client.call_tool.assert_awaited_once_with(
+            "lithos_list",
+            {"tags": ["influx:repair-needed", "profile:staging-ai"], "limit": 25},
+        )
