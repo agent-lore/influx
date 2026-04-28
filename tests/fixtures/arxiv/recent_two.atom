@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <link href="http://arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.RO&amp;sortBy=submittedDate&amp;sortOrder=descending&amp;max_results=200" rel="self" type="application/atom+xml"/>
+  <title type="html">ArXiv Query: cat:cs.AI OR cat:cs.RO</title>
+  <id>http://arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.RO</id>
+  <updated>2026-04-23T00:00:00-04:00</updated>
+  <opensearch:totalResults xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">2</opensearch:totalResults>
+  <opensearch:startIndex xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">0</opensearch:startIndex>
+  <opensearch:itemsPerPage xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">200</opensearch:itemsPerPage>
+  <entry>
+    <id>http://arxiv.org/abs/2604.11111v1</id>
+    <updated>2026-04-23T18:00:00Z</updated>
+    <published>2026-04-23T18:00:00Z</published>
+    <title>Emergent Planning in Multi-Agent Reinforcement Learning</title>
+    <summary>  We present a novel approach to emergent planning in multi-agent
+reinforcement learning systems. Our method combines hierarchical
+task decomposition with learned communication protocols to enable
+coordinated behaviour in complex environments.
+</summary>
+    <author><name>Alice Zhang</name></author>
+    <author><name>Bob Chen</name></author>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.MA" scheme="http://arxiv.org/schemas/atom"/>
+    <link href="http://arxiv.org/abs/2604.11111v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2604.11111v1" rel="related" type="application/pdf"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2604.22222v1</id>
+    <updated>2026-04-23T17:30:00Z</updated>
+    <published>2026-04-23T17:30:00Z</published>
+    <title>Self-Supervised Learning for Robotic Manipulation with
+  Sparse Rewards</title>
+    <summary>  This paper introduces a self-supervised learning framework for
+robotic manipulation tasks operating under sparse reward signals.
+We demonstrate improved sample efficiency through a combination
+of contrastive learning and hindsight experience replay.
+</summary>
+    <author><name>Carol Park</name></author>
+    <category term="cs.RO" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+    <link href="http://arxiv.org/abs/2604.22222v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2604.22222v1" rel="related" type="application/pdf"/>
+  </entry>
+</feed>

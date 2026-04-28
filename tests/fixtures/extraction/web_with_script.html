@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head><title>Article With Dangerous Tags</title></head>
+<body>
+<article>
+<h1>Article With Dangerous Tags</h1>
+<p>This article contains dangerous embedded tags that must be stripped before
+extraction to prevent security issues in the output.</p>
+<script>alert('malicious_web_script'); document.cookie;</script>
+<iframe src="https://evil-tracker.example.com/spy">iframe tracking content</iframe>
+<object data="malware-payload.swf" type="application/x-shockwave-flash">object embedded content</object>
+<embed src="dangerous-plugin.swf" type="application/x-shockwave-flash">
+<p>The actual article content continues here with substantial text about the
+topic at hand. Distributed systems require careful attention to failure modes
+and recovery strategies that ensure data consistency across replicas.</p>
+<p>Additional content to ensure the extraction meets minimum length requirements
+after the dangerous tags have been removed from the document body. This paragraph
+adds more legitimate article text to exceed the threshold for web extraction.</p>
+</article>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Web Engineering Weekly</title>
+    <link>https://webeng.example/</link>
+    <description>Weekly digest of web engineering best practices</description>
+    <lastBuildDate>Sun, 19 Apr 2026 14:00:00 +0000</lastBuildDate>
+
+    <item>
+      <title>Building Resilient Microservices</title>
+      <link>https://webeng.example/posts/resilient-microservices</link>
+      <guid>https://webeng.example/posts/resilient-microservices</guid>
+      <pubDate>Sun, 19 Apr 2026 14:00:00 +0000</pubDate>
+      <description>Patterns and practices for building microservices that gracefully handle failure, including circuit breakers, bulkheads, and retry strategies.</description>
+    </item>
+
+    <item>
+      <title>Edge Computing with WebAssembly</title>
+      <link>https://webeng.example/posts/edge-wasm</link>
+      <guid>https://webeng.example/posts/edge-wasm</guid>
+      <pubDate>Sat, 18 Apr 2026 09:15:00 +0000</pubDate>
+      <description>How WebAssembly is enabling new edge computing paradigms with near-native performance and universal portability.</description>
+    </item>
+  </channel>
+</rss>

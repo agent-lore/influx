@@ -4,7 +4,7 @@
 # Usage:
 #   ./run.sh <env> [action]
 #
-#   env     One of: dev, prod (matches docker/.env.<env>)
+#   env     Environment name matching docker/.env.<env>
 #   action  up      Build and start the stack in detached mode (default)
 #           down    Stop and remove the stack
 #           logs    Tail container logs (Ctrl-C to detach)
@@ -13,6 +13,7 @@
 #
 # Examples:
 #   ./run.sh dev             # build & start dev
+#   ./run.sh staging up      # build & start staging
 #   ./run.sh prod up         # same, explicit
 #   ./run.sh dev down        # stop the dev stack
 #   ./run.sh prod logs       # follow prod logs
@@ -26,7 +27,7 @@ action="${2:-up}"
 
 if [[ -z "${env_name}" ]]; then
     echo "Error: environment name is required" >&2
-    echo "Usage: $0 <dev|prod> [up|down|logs|status|restart]" >&2
+    echo "Usage: $0 <env> [up|down|logs|status|restart]" >&2
     exit 1
 fi
 
