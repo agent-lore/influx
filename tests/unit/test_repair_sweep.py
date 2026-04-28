@@ -354,7 +354,8 @@ class TestSweepRewriteInvariant:
             "confidence": 0.9,
         }
 
-        def failing_tier3(_note: dict[str, object]) -> None:
+        def failing_tier3(note: dict[str, object]) -> None:
+            del note
             raise LCMAError("validation failed", stage="validate")
 
         config = _make_config()

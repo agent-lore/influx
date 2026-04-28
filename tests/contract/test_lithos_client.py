@@ -672,13 +672,13 @@ class TestListNotes:
         finally:
             await client.close()
 
-    async def test_order_by_and_order_forwarded(
+    async def test_order_by_and_order_not_forwarded_to_current_lithos(
         self,
         fake_lithos_url: str,
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
     ) -> None:
-        """order_by and order parameters are forwarded to the MCP call (FR-REP-1)."""
+        """Ordering args are accepted but not sent to current Lithos."""
         client = LithosClient(url=fake_lithos_url)
         try:
             await client.list_notes(
@@ -694,8 +694,8 @@ class TestListNotes:
                 "profile:ai-robotics",
             ]
             assert list_calls[0][1]["limit"] == 100
-            assert list_calls[0][1]["order_by"] == "updated_at"
-            assert list_calls[0][1]["order"] == "asc"
+            assert list_calls[0][1]["order_by"] is None
+            assert list_calls[0][1]["order"] is None
         finally:
             await client.close()
 

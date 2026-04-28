@@ -179,13 +179,13 @@ class TestTier3Extraction:
             Tier3Extraction(claims=["   "])
 
     def test_too_many_claims(self) -> None:
-        t = Tier3Extraction(claims=[f"c{i}" for i in range(11)])
-        assert t.claims == [f"c{i}" for i in range(10)]
+        with pytest.raises(ValidationError):
+            Tier3Extraction(claims=[f"c{i}" for i in range(11)])
 
     def test_no_claims_rejected(self) -> None:
         with pytest.raises(ValidationError):
             Tier3Extraction(claims=[])
 
     def test_too_many_datasets(self) -> None:
-        t = Tier3Extraction(claims=["c"], datasets=[f"d{i}" for i in range(11)])
-        assert t.datasets == [f"d{i}" for i in range(10)]
+        with pytest.raises(ValidationError):
+            Tier3Extraction(claims=["c"], datasets=[f"d{i}" for i in range(11)])

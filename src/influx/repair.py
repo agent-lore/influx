@@ -1004,7 +1004,7 @@ async def sweep(
     )
 
     text = list_result.content[0].text  # type: ignore[union-attr]
-    if getattr(list_result, "isError", False):
+    if getattr(list_result, "isError", False) is True:
         raise LithosError(
             "lithos_list failed during repair sweep",
             operation="repair_sweep",
