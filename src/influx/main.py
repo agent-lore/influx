@@ -10,6 +10,8 @@ with a non-zero status.
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import sys
 
 from influx.config import AppConfig, load_config
@@ -20,6 +22,19 @@ EXIT_SUCCESS = 0
 EXIT_PARTIAL = 1
 EXIT_FAILURE = 2
 EXIT_USAGE = 64
+
+
+def _configure_logging() -> None:
+    """Configure process-wide logging for the long-running service."""
+    level_name = os.environ.get("INFLUX_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        force=True,
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -263,6 +278,8 @@ def _cmd_serve() -> None:
         validate_bind_host,
     )
 
+    _configure_logging()
+
     app_config = load_config(check_api_keys=False)
     host, port = resolve_bind_address()
     validate_bind_host(host, allow_remote_admin=app_config.security.allow_remote_admin)
@@ -275,6 +292,7 @@ def _cmd_serve() -> None:
         port=port,
         timeout_graceful_shutdown=app_config.schedule.shutdown_grace_seconds,
         log_level="info",
+        log_config=None,
     )
     server = uvicorn.Server(uv_config)
     # Disable uvicorn's built-in ``signal.signal`` handlers so that

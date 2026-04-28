@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from influx.config import AppConfig, RepairConfig
-from influx.errors import LithosError
+from influx.errors import LCMAError, LithosError
 from influx.repair import ContentTooLargeSkipped, SweepHooks, SweepWriteError, sweep
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -323,6 +323,58 @@ class TestSweepRewriteInvariant:
         assert args["source_url"] == "https://example.com"
         assert args["confidence"] == 0.7
         assert args["expected_version"] == 5
+
+    async def test_tier3_lcma_error_is_per_note_failure_not_abort(self) -> None:
+        """Tier-3 model validation errors should not abort the whole sweep."""
+        items = [{"id": "n1", "title": "Paper"}]
+        note = {
+            "id": "n1",
+            "title": "Paper",
+            "content": (
+                "---\n"
+                "source_url: https://example.com/paper\n"
+                "tags: []\n"
+                "confidence: 0.9\n"
+                "---\n"
+                "# Paper\n\n"
+                "## Archive\n"
+                "path: arxiv/2026/04/paper.pdf\n\n"
+                "## Summary\n"
+                "Summary\n\n"
+                "## Full Text\n"
+                "Full text\n\n"
+                "## Profile Relevance\n"
+                "### ai-robotics\n"
+                "Score: 9/10\n"
+                "Relevant\n\n"
+                "## User Notes\n"
+            ),
+            "tags": ["influx:repair-needed", "text:html", "full-text"],
+            "source_url": "https://example.com/paper",
+            "confidence": 0.9,
+        }
+
+        def failing_tier3(_note: dict[str, object]) -> None:
+            raise LCMAError("validation failed", stage="validate")
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        result = await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(tier3_extract=failing_tier3),
+        )
+
+        assert len(result) == 1
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert len(write_calls) == 1
+        write_args = write_calls[0].args[1]
+        assert "influx:repair-needed" in write_args["tags"]
+        assert "influx:deep-extracted" not in write_args["tags"]
 
 
 # ── Version conflict handling (AC-06-F) ──────────────────────────────

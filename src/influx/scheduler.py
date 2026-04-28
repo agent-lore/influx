@@ -147,6 +147,14 @@ async def run_profile(
     run_id = str(uuid.uuid4())
     run_id_token = current_run_id.set(run_id)
     tracer = get_tracer()
+    started_at = datetime.now(UTC)
+    logger.info(
+        "run started profile=%s kind=%s run_id=%s range=%s",
+        profile,
+        kind.value,
+        run_id,
+        run_range or {},
+    )
 
     try:
         with tracer.span(
@@ -157,7 +165,7 @@ async def run_profile(
                 "influx.run_type": kind.value,
             },
         ):
-            return await _run_profile_body(
+            result = await _run_profile_body(
                 profile,
                 kind,
                 run_range,
@@ -165,6 +173,38 @@ async def run_profile(
                 item_provider=provider,
                 probe_loop=probe_loop,
             )
+            elapsed = (datetime.now(UTC) - started_at).total_seconds()
+            if result is None:
+                logger.info(
+                    "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
+                    "result=none",
+                    profile,
+                    kind.value,
+                    run_id,
+                    elapsed,
+                )
+            else:
+                logger.info(
+                    "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
+                    "sources_checked=%d ingested=%d",
+                    profile,
+                    kind.value,
+                    run_id,
+                    elapsed,
+                    result.stats.sources_checked,
+                    result.stats.ingested,
+                )
+            return result
+    except Exception:
+        elapsed = (datetime.now(UTC) - started_at).total_seconds()
+        logger.exception(
+            "run failed profile=%s kind=%s run_id=%s duration=%.1fs",
+            profile,
+            kind.value,
+            run_id,
+            elapsed,
+        )
+        raise
     finally:
         current_run_id.reset(run_id_token)
 
@@ -233,7 +273,7 @@ async def _run_profile_body(
             #    Runs for scheduled and manual runs only; backfills skip (FR-REP-2).
             if kind != RunKind.BACKFILL:
                 try:
-                    await repair_sweep(profile, client=client, config=config)
+                    repaired = await repair_sweep(profile, client=client, config=config)
                 except SweepWriteError:
                     # §5.4 failure mode 1: terminal write failure aborts the
                     # run AND degrades readiness (US-011).
@@ -248,6 +288,11 @@ async def _run_profile_body(
                         probe_loop, "clear_repair_write_failure"
                     ):
                         probe_loop.clear_repair_write_failure()
+                    logger.info(
+                        "repair sweep completed profile=%s candidates_visited=%d",
+                        profile,
+                        len(repaired),
+                    )
 
             # 1. Feedback ingestion → negative examples block (FR-FB-1..3, AC-05-H).
             neg_block = await build_negative_examples_block(
@@ -271,7 +316,13 @@ async def _run_profile_body(
                 filter_prompt = prompt_text
 
             # 3. Source acquisition (PRD 04 plugs in arXiv + RSS).
-            items = await provider(profile, kind, run_range, filter_prompt)
+            items = list(await provider(profile, kind, run_range, filter_prompt))
+            logger.info(
+                "source acquisition completed profile=%s kind=%s candidates=%d",
+                profile,
+                kind.value,
+                len(items),
+            )
 
             # 4. Per-item: cache_lookup → write_note.
             ingested: list[HighlightItem] = []
@@ -287,6 +338,16 @@ async def _run_profile_body(
                 # filter-tag entries to the rejection-rate map.
                 record_filter_result(profile, title, item.get("filter_tags", []))
                 source_url = item["source_url"]
+                logger.info(
+                    "article inspected profile=%s source_url=%s title=%r "
+                    "score=%s path=%s tags=%s",
+                    profile,
+                    source_url,
+                    title,
+                    item.get("score", ""),
+                    item.get("path", ""),
+                    item.get("tags", []),
+                )
                 cache_result = await client.cache_lookup_for_item(
                     title=title,
                     source_url=source_url,
@@ -296,6 +357,15 @@ async def _run_profile_body(
                     cache_result.content[0].text  # type: ignore[union-attr]
                 )
                 if cache_body.get("hit"):
+                    logger.info(
+                        "article cache hit profile=%s source_url=%s title=%r "
+                        "kind=%s action=%s",
+                        profile,
+                        source_url,
+                        title,
+                        kind.value,
+                        "skip" if kind == RunKind.BACKFILL else "merge-profile",
+                    )
                     # FR-BF-2: backfills skip already-ingested items
                     # entirely — no write attempt, no network traffic.
                     if kind == RunKind.BACKFILL:
@@ -321,6 +391,15 @@ async def _run_profile_body(
                             confidence=float(item.get("confidence", 0.0)),
                         )
                     if write_result.status in ("created", "updated"):
+                        logger.info(
+                            "article write completed profile=%s source_url=%s "
+                            "title=%r status=%s note_id=%s cache_hit=true",
+                            profile,
+                            source_url,
+                            title,
+                            write_result.status,
+                            write_result.note_id,
+                        )
                         related_in_lithos: list[dict[str, Any]] = []
                         if run_task_id is not None:
                             source_note_id = write_result.note_id
@@ -370,6 +449,15 @@ async def _run_profile_body(
                         confidence=float(item.get("confidence", 0.0)),
                     )
                 if write_result.status in ("created", "updated"):
+                    logger.info(
+                        "article write completed profile=%s source_url=%s title=%r "
+                        "status=%s note_id=%s cache_hit=false",
+                        profile,
+                        source_url,
+                        title,
+                        write_result.status,
+                        write_result.note_id,
+                    )
                     # ── LCMA post-write hook (FR-LCMA-2/3, AC-M2-5/6) ──
                     related_in_lithos: list[dict[str, Any]] = []
                     if run_task_id is not None:
@@ -406,6 +494,15 @@ async def _run_profile_body(
                             url=source_url,
                             related_in_lithos=related_in_lithos,
                         )
+                    )
+                else:
+                    logger.info(
+                        "article write skipped profile=%s source_url=%s title=%r "
+                        "status=%s cache_hit=false",
+                        profile,
+                        source_url,
+                        title,
+                        write_result.status,
                     )
 
             # 5. Build result + fire post-run webhook hook (FR-NOT-1..6, AC-05-I).

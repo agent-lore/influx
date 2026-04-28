@@ -14,6 +14,7 @@ and confirm-required flow (FR-HTTP-5, FR-BF-6).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from collections.abc import Coroutine
@@ -30,6 +31,7 @@ from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.scheduler import run_profile
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/live")
@@ -178,6 +180,12 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
                 fetch_cache=getattr(request.app.state, "fetch_cache", None),
             ),
         )
+        logger.info(
+            "manual run accepted request_id=%s profile=%s submitted_at=%s",
+            request_id,
+            body.profile,
+            submitted_at,
+        )
 
         return JSONResponse(
             {
@@ -213,6 +221,12 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
             probe_loop=getattr(request.app.state, "probe_loop", None),
             fetch_cache=getattr(request.app.state, "fetch_cache", None),
         ),
+    )
+    logger.info(
+        "manual run accepted request_id=%s scope=all profiles=%s submitted_at=%s",
+        request_id,
+        acquired_profiles,
+        submitted_at,
     )
     return JSONResponse(
         {

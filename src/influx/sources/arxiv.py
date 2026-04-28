@@ -813,8 +813,10 @@ def make_arxiv_item_provider(
     ) -> Iterable[dict[str, Any]]:
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
         if profile_cfg is None:
+            _log.info("arxiv source skipped profile=%s reason=unknown_profile", profile)
             return ()
         if not profile_cfg.sources.arxiv.enabled:
+            _log.info("arxiv source skipped profile=%s reason=disabled", profile)
             return ()
 
         # ── Cached fetch (R-8 dedup) ─────────────────────────────
@@ -849,6 +851,15 @@ def make_arxiv_item_provider(
             # Scheduled / manual runs make a single fetch per category
             # set, so pacing is irrelevant there.
             if kind != RunKind.BACKFILL or backfill_range is None:
+                _log.info(
+                    "arxiv fetch started profile=%s kind=%s categories=%s "
+                    "max_results=%d lookback_days=%d",
+                    profile,
+                    kind.value,
+                    arxiv_cfg.categories,
+                    arxiv_cfg.max_results_per_category,
+                    arxiv_cfg.lookback_days,
+                )
                 return fetch_arxiv(
                     arxiv_config=profile_cfg.sources.arxiv,
                     resilience=config.resilience,
@@ -878,6 +889,14 @@ def make_arxiv_item_provider(
                     date_from=current,
                     date_to=current + timedelta(days=1),
                 )
+                _log.info(
+                    "arxiv backfill day fetch started profile=%s day=%s "
+                    "categories=%s max_results=%d",
+                    profile,
+                    current.isoformat(),
+                    arxiv_cfg.categories,
+                    per_day_max,
+                )
                 # Pace BEFORE each request so the very first fetch also
                 # respects the spacing budget on a fresh fire.
                 _sleep(pacing)
@@ -900,6 +919,14 @@ def make_arxiv_item_provider(
                     if it.arxiv_id not in seen_ids:
                         seen_ids.add(it.arxiv_id)
                         collected.append(it)
+                _log.info(
+                    "arxiv backfill day fetch completed profile=%s day=%s items=%d "
+                    "collected=%d",
+                    profile,
+                    current.isoformat(),
+                    len(day_items),
+                    len(collected),
+                )
                 current = current + timedelta(days=1)
             return collected
 
@@ -926,6 +953,12 @@ def make_arxiv_item_provider(
                 )
                 return ()
             fetch_span.set_attribute("influx.item_count", len(items))
+            _log.info(
+                "arxiv fetch completed profile=%s kind=%s items=%d",
+                profile,
+                kind.value,
+                len(items),
+            )
 
         # Batched LLM filter takes precedence as the production default.
         # The per-item ``scorer`` seam stays available for tests that
@@ -953,6 +986,13 @@ def make_arxiv_item_provider(
                 batch_size = max(int(config.filter.batch_size), 1)
                 for chunk_start in range(0, len(items), batch_size):
                     chunk = items[chunk_start : chunk_start + batch_size]
+                    _log.info(
+                        "arxiv filter batch started profile=%s batch_start=%d "
+                        "batch_size=%d",
+                        profile,
+                        chunk_start,
+                        len(chunk),
+                    )
                     try:
                         chunk_scores = await filter_scorer(
                             chunk, profile, filter_prompt
@@ -966,30 +1006,95 @@ def make_arxiv_item_provider(
                         filter_failed = True
                         break
                     batch_scores.update(chunk_scores)
+                    _log.info(
+                        "arxiv filter batch completed profile=%s batch_start=%d "
+                        "batch_size=%d scores_returned=%d",
+                        profile,
+                        chunk_start,
+                        len(chunk),
+                        len(chunk_scores),
+                    )
 
         results: list[dict[str, Any]] = []
         for arxiv_item in items:
             if scorer is not None:
                 score_result: ArxivScoreResult | None = scorer(arxiv_item, profile)
                 if score_result is None:
+                    _log.info(
+                        "article inspected source=arxiv profile=%s arxiv_id=%s "
+                        "published=%s score=none decision=drop reason=scorer_none "
+                        "title=%r",
+                        profile,
+                        arxiv_item.arxiv_id,
+                        arxiv_item.published.isoformat(),
+                        arxiv_item.title,
+                    )
                     continue
             elif filter_scorer is not None:
                 if filter_failed:
+                    _log.info(
+                        "article inspected source=arxiv profile=%s arxiv_id=%s "
+                        "published=%s score=none decision=drop reason=filter_failed "
+                        "title=%r",
+                        profile,
+                        arxiv_item.arxiv_id,
+                        arxiv_item.published.isoformat(),
+                        arxiv_item.title,
+                    )
                     continue
                 elif arxiv_item.arxiv_id not in batch_scores:
                     # Items absent from the LLM filter response are
                     # dropped entirely — the filter explicitly chose not
                     # to score them (typically because they fell below
                     # ``filter.min_score_in_results``).
+                    _log.info(
+                        "article inspected source=arxiv profile=%s arxiv_id=%s "
+                        "published=%s score=none decision=drop "
+                        "reason=not_returned_by_filter title=%r",
+                        profile,
+                        arxiv_item.arxiv_id,
+                        arxiv_item.published.isoformat(),
+                        arxiv_item.title,
+                    )
                     continue
                 else:
                     score_result = batch_scores[arxiv_item.arxiv_id]
             else:
+                _log.info(
+                    "article inspected source=arxiv profile=%s arxiv_id=%s "
+                    "published=%s score=none decision=drop reason=no_scorer "
+                    "title=%r",
+                    profile,
+                    arxiv_item.arxiv_id,
+                    arxiv_item.published.isoformat(),
+                    arxiv_item.title,
+                )
                 continue
 
             if score_result.score < thresholds.relevance:
+                _log.info(
+                    "article inspected source=arxiv profile=%s arxiv_id=%s "
+                    "published=%s score=%d threshold=%d decision=drop "
+                    "reason=below_relevance title=%r",
+                    profile,
+                    arxiv_item.arxiv_id,
+                    arxiv_item.published.isoformat(),
+                    score_result.score,
+                    thresholds.relevance,
+                    arxiv_item.title,
+                )
                 continue
 
+            _log.info(
+                "article inspected source=arxiv profile=%s arxiv_id=%s "
+                "published=%s score=%d threshold=%d decision=accept title=%r",
+                profile,
+                arxiv_item.arxiv_id,
+                arxiv_item.published.isoformat(),
+                score_result.score,
+                thresholds.relevance,
+                arxiv_item.title,
+            )
             results.append(
                 build_arxiv_note_item(
                     item=arxiv_item,
@@ -1002,6 +1107,12 @@ def make_arxiv_item_provider(
                 )
             )
 
+        _log.info(
+            "arxiv source completed profile=%s fetched=%d accepted=%d",
+            profile,
+            len(items),
+            len(results),
+        )
         return results
 
     return provider

@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from influx.errors import ExtractionError, LithosError
+from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.notes import merge_tags
 
 if TYPE_CHECKING:
@@ -902,7 +902,7 @@ async def _process_sweep_note(
             # Sync any tag/content mutations the hook applied to the
             # note dict back into the local working set.
             current_tags = list(note.get("tags", current_tags))
-        except (ExtractionError, LithosError):
+        except (ExtractionError, LCMAError, LithosError):
             # Per-stage failure: roll back any partial in-place
             # mutations from the failing hook (finding #1).  Do NOT
             # sync hook mutations into ``current_tags``.
@@ -916,7 +916,7 @@ async def _process_sweep_note(
         try:
             hooks.tier3_extract(note)
             current_tags = list(note.get("tags", current_tags))
-        except (ExtractionError, LithosError):
+        except (ExtractionError, LCMAError, LithosError):
             _restore_note(note, snapshot)
             logger.info("sweep: tier3 extraction failed for %s", note.get("id"))
 

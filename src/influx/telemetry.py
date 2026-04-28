@@ -15,6 +15,7 @@ no attribute-setting calls (AC-10-A).
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -35,6 +36,7 @@ __all__ = [
 # that downstream call sites (e.g. filter scorer, source fetchers) can
 # attach ``influx.run_id`` to their spans without interface changes.
 current_run_id: ContextVar[str | None] = ContextVar("current_run_id", default=None)
+logger = logging.getLogger(__name__)
 
 
 def _otel_enabled() -> bool:
@@ -166,7 +168,11 @@ def _parse_resource_attributes(value: str) -> dict[str, str]:
 
 def _build_tracer() -> InfluxTracer:
     """Construct an ``InfluxTracer`` based on current env + package state."""
-    if not _otel_enabled() or not _otel_packages_available():
+    if not _otel_enabled():
+        logger.info("OTEL disabled: INFLUX_OTEL_ENABLED is not true")
+        return InfluxTracer(enabled=False)
+    if not _otel_packages_available():
+        logger.warning("OTEL disabled: opentelemetry packages are not installed")
         return InfluxTracer(enabled=False)
 
     from opentelemetry.sdk.resources import Resource
@@ -190,15 +196,27 @@ def _build_tracer() -> InfluxTracer:
             )
         except ImportError:
             if not _console_fallback_enabled():
+                logger.warning(
+                    "OTEL enabled but OTLP HTTP exporter is not installed; "
+                    "spans will not be exported"
+                )
                 return InfluxTracer(enabled=True, tracer=provider.get_tracer("influx"))
         else:
             provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+            logger.info(
+                "OTEL OTLP trace exporter configured endpoint=%s traces_endpoint=%s",
+                os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+                os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", ""),
+            )
 
     # Console fallback: emit spans to stdout when no collector is configured
     if _console_fallback_enabled() and not _otlp_endpoint_configured():
         from opentelemetry.sdk.trace.export import ConsoleSpanExporter
 
         provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+        logger.info("OTEL console span exporter configured")
+    elif not _otlp_endpoint_configured():
+        logger.warning("OTEL enabled but no exporter endpoint is configured")
 
     tracer = provider.get_tracer("influx")
     return InfluxTracer(enabled=True, tracer=tracer)

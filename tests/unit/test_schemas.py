@@ -28,6 +28,16 @@ class TestFilterResultPositive:
         r = FilterResult(id="x", score=10, tags=tags, reason="r")
         assert len(r.tags) == 5
 
+    def test_extra_tags_are_trimmed_to_contract_limit(self) -> None:
+        r = FilterResult(
+            id="x",
+            score=5,
+            tags=["a", "b", "c", "d", "e", "f"],
+            reason="r",
+        )
+
+        assert r.tags == ["a", "b", "c", "d", "e"]
+
     def test_score_boundary_low(self) -> None:
         r = FilterResult(id="x", score=1, tags=[], reason="r")
         assert r.score == 1
@@ -51,15 +61,6 @@ class TestFilterResultNegative:
     def test_score_above_maximum(self) -> None:
         with pytest.raises(ValidationError):
             FilterResult(id="x", score=11, tags=[], reason="r")
-
-    def test_tags_exceeds_max_length(self) -> None:
-        with pytest.raises(ValidationError):
-            FilterResult(
-                id="x",
-                score=5,
-                tags=["a", "b", "c", "d", "e", "f"],
-                reason="r",
-            )
 
     def test_missing_id(self) -> None:
         with pytest.raises(ValidationError):
@@ -178,13 +179,13 @@ class TestTier3Extraction:
             Tier3Extraction(claims=["   "])
 
     def test_too_many_claims(self) -> None:
-        with pytest.raises(ValidationError):
-            Tier3Extraction(claims=[f"c{i}" for i in range(11)])
+        t = Tier3Extraction(claims=[f"c{i}" for i in range(11)])
+        assert t.claims == [f"c{i}" for i in range(10)]
 
     def test_no_claims_rejected(self) -> None:
         with pytest.raises(ValidationError):
             Tier3Extraction(claims=[])
 
     def test_too_many_datasets(self) -> None:
-        with pytest.raises(ValidationError):
-            Tier3Extraction(claims=["c"], datasets=[f"d{i}" for i in range(11)])
+        t = Tier3Extraction(claims=["c"], datasets=[f"d{i}" for i in range(11)])
+        assert t.datasets == [f"d{i}" for i in range(10)]

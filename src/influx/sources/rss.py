@@ -453,6 +453,7 @@ def make_rss_item_provider(
 
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
         if profile_cfg is None:
+            _log.info("rss source skipped profile=%s reason=unknown_profile", profile)
             return ()
 
         # ── Telemetry: influx.fetch.rss span (FR-OBS-4) ──
@@ -467,11 +468,24 @@ def make_rss_item_provider(
         ) as fetch_span:
             results: list[dict[str, Any]] = []
             for feed_entry in profile_cfg.sources.rss:
+                _log.info(
+                    "rss feed fetch started profile=%s feed=%r url=%s source_tag=%s",
+                    profile,
+                    feed_entry.name,
+                    feed_entry.url,
+                    feed_entry.source_tag,
+                )
                 items = await _fetch_rss_feed(
                     feed_entry,
                     cache,
                     max_download_bytes=config.storage.max_download_bytes,
                     timeout_seconds=config.storage.download_timeout_seconds,
+                )
+                _log.info(
+                    "rss feed fetch completed profile=%s feed=%r items=%d",
+                    profile,
+                    feed_entry.name,
+                    len(items),
                 )
                 try:
                     scores = await _score_rss_items(
@@ -487,12 +501,54 @@ def make_rss_item_provider(
                         exc_info=True,
                     )
                     continue
+                _log.info(
+                    "rss filter completed profile=%s feed=%r items=%d "
+                    "scores_returned=%d",
+                    profile,
+                    feed_entry.name,
+                    len(items),
+                    len(scores),
+                )
                 for item in items:
                     scored = scores.get(_rss_filter_id(item))
                     if scored is None:
+                        _log.info(
+                            "article inspected source=rss profile=%s feed=%r "
+                            "published=%s score=none decision=drop "
+                            "reason=not_returned_by_filter title=%r url=%s",
+                            profile,
+                            feed_entry.name,
+                            item.published.isoformat(),
+                            item.title,
+                            item.url,
+                        )
                         continue
                     if scored.score < profile_cfg.thresholds.relevance:
+                        _log.info(
+                            "article inspected source=rss profile=%s feed=%r "
+                            "published=%s score=%d threshold=%d decision=drop "
+                            "reason=below_relevance title=%r url=%s",
+                            profile,
+                            feed_entry.name,
+                            item.published.isoformat(),
+                            scored.score,
+                            profile_cfg.thresholds.relevance,
+                            item.title,
+                            item.url,
+                        )
                         continue
+                    _log.info(
+                        "article inspected source=rss profile=%s feed=%r "
+                        "published=%s score=%d threshold=%d decision=accept "
+                        "title=%r url=%s",
+                        profile,
+                        feed_entry.name,
+                        item.published.isoformat(),
+                        scored.score,
+                        profile_cfg.thresholds.relevance,
+                        item.title,
+                        item.url,
+                    )
                     results.append(
                         build_rss_note_item(
                             item=item,
@@ -504,7 +560,19 @@ def make_rss_item_provider(
                             filter_tags=scored.tags,
                         )
                     )
+                _log.info(
+                    "rss feed completed profile=%s feed=%r accepted_so_far=%d",
+                    profile,
+                    feed_entry.name,
+                    len(results),
+                )
             fetch_span.set_attribute("influx.item_count", len(results))
+            _log.info(
+                "rss source completed profile=%s feeds=%d accepted=%d",
+                profile,
+                len(profile_cfg.sources.rss),
+                len(results),
+            )
 
         return results
 

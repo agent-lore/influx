@@ -9,11 +9,13 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, field_validator
 
 _TIER3_MAX_CHARS = 500
+_TIER3_MAX_ITEMS = 10
+_FILTER_MAX_TAGS = 5
 
 
-def _trim_and_truncate(values: list[str]) -> list[str]:
-    """Trim whitespace and truncate each element to 500 chars (FR-ENR-5)."""
-    return [v.strip()[:_TIER3_MAX_CHARS] for v in values]
+def _trim_truncate_and_cap(values: list[str]) -> list[str]:
+    """Keep Tier-3 LLM list output within the documented contract."""
+    return [v.strip()[:_TIER3_MAX_CHARS] for v in values[:_TIER3_MAX_ITEMS]]
 
 
 def _check_non_empty(values: list[str]) -> list[str]:
@@ -52,8 +54,8 @@ class Tier3Extraction(BaseModel):
     )
     @classmethod
     def trim_and_truncate(cls, v: list[str]) -> list[str]:
-        """Trim whitespace and truncate to 500 chars per element."""
-        return _trim_and_truncate(v)
+        """Trim strings and cap list length before field validation."""
+        return _trim_truncate_and_cap(v)
 
     @field_validator(
         "claims",
@@ -92,8 +94,16 @@ class FilterResult(BaseModel):
 
     id: str
     score: int = Field(ge=1, le=10)
-    tags: list[str] = Field(default_factory=list, max_length=5)
+    tags: list[str] = Field(default_factory=list, max_length=_FILTER_MAX_TAGS)
     reason: str
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def cap_tags(cls, v: object) -> object:
+        """Keep LLM tag output within the documented filter contract."""
+        if isinstance(v, list):
+            return v[:_FILTER_MAX_TAGS]
+        return v
 
 
 class FilterResponse(BaseModel):

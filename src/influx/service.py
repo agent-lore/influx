@@ -35,6 +35,7 @@ from influx.sources.arxiv import (
     ArxivFilterScorer,
     ArxivScorer,
 )
+from influx.telemetry import get_tracer
 
 __all__ = [
     "InfluxService",
@@ -238,7 +239,14 @@ class InfluxService:
         """
         if self._started:
             return
-        logger.info("Starting Influx service")
+        logger.info(
+            "Starting Influx service profiles=%s schedule=%r timezone=%s",
+            [profile.name for profile in self._config.profiles],
+            self._config.schedule.cron,
+            self._config.schedule.timezone,
+        )
+        tracer = get_tracer(force_rebuild=True)
+        logger.info("OTEL telemetry %s", "enabled" if tracer.enabled else "disabled")
         await self.probe_loop.start()
         self.scheduler.start()
         self._started = True
