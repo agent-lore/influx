@@ -41,6 +41,7 @@ JSON-mode model dry-calls for configured slots, and dry-connects to Lithos.
 Influx reads `influx.toml` from `INFLUX_CONFIG`, the current directory,
 `~/.influx/influx.toml`, or `/etc/influx/influx.toml`, in that order. See
 [influx.example.toml](influx.example.toml) for a complete annotated template.
+For the current system behavior and contracts, use [docs/SPECIFICATION.md](docs/SPECIFICATION.md).
 
 Important sections:
 

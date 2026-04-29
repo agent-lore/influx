@@ -185,8 +185,8 @@ async def ready(request: Request) -> JSONResponse:
 async def status(request: Request) -> JSONResponse:
     """Detailed operator-facing status — always ``200 OK`` (FR-HTTP-3).
 
-    Returns a JSON body satisfying the §14.4 status contract of
-    ``docs/REQUIREMENTS.md``.
+    Returns the operator-facing status shape documented in
+    ``docs/SPECIFICATION.md``.
     """
     from influx.probes import ProbeLoop
     from influx.scheduler import InfluxScheduler

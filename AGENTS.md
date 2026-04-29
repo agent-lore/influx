@@ -12,4 +12,4 @@ Use the default Matt Pocock skills triage label vocabulary. See `docs/agents/tri
 
 ### Domain docs
 
-This is a single-context repo. Read root `CONTEXT.md` and `docs/adr/` if present, plus the existing requirements/specification docs. See `docs/agents/domain.md`.
+This is a single-context repo. Read root `CONTEXT.md` and `docs/adr/` if present, plus `docs/SPECIFICATION.md` as the current source of truth. See `docs/agents/domain.md`.

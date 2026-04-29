@@ -8,7 +8,7 @@ from textwrap import dedent
 import pytest
 
 # Realistic multi-section v0.7 TOML fixture usable by later PRDs.
-# Covers every schema section defined in PRD 01 §5 and docs/REQUIREMENTS.md §4.2.
+# Covers every schema section reflected in the current specification.
 # Provider api_key_env values use test-only env vars set by the fixture.
 _REALISTIC_V07_TOML = dedent("""\
     [influx]
