@@ -28,6 +28,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -45,6 +46,7 @@ from influx.rejection_rate import on_run_complete as rejection_rate_on_run_compl
 from influx.rejection_rate import record_filter_result
 from influx.repair import SweepWriteError
 from influx.repair import sweep as repair_sweep
+from influx.run_ledger import RunLedger
 from influx.telemetry import current_run_id, get_tracer
 
 __all__ = [
@@ -105,6 +107,8 @@ async def run_profile(
     config: AppConfig | None = None,
     item_provider: ItemProvider | None = None,
     probe_loop: Any | None = None,
+    run_id: str | None = None,
+    run_ledger: RunLedger | None = None,
 ) -> ProfileRunResult | None:
     """Execute a single ingestion cycle for the given profile.
 
@@ -144,7 +148,14 @@ async def run_profile(
 
     # ── Telemetry: influx.run span (FR-OBS-4) ──
     provider = item_provider if item_provider is not None else default_item_provider
-    run_id = str(uuid.uuid4())
+    run_id = run_id or str(uuid.uuid4())
+    ledger = run_ledger or RunLedger(Path(config.storage.state_dir))
+    ledger.start(
+        run_id=run_id,
+        profile=profile,
+        kind=kind.value,
+        run_range=run_range,
+    )
     run_id_token = current_run_id.set(run_id)
     tracer = get_tracer()
     started_at = datetime.now(UTC)
@@ -183,6 +194,11 @@ async def run_profile(
                     run_id,
                     elapsed,
                 )
+                ledger.complete(
+                    run_id=run_id,
+                    sources_checked=None,
+                    ingested=None,
+                )
             else:
                 logger.info(
                     "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
@@ -194,8 +210,13 @@ async def run_profile(
                     result.stats.sources_checked,
                     result.stats.ingested,
                 )
+                ledger.complete(
+                    run_id=run_id,
+                    sources_checked=result.stats.sources_checked,
+                    ingested=result.stats.ingested,
+                )
             return result
-    except Exception:
+    except Exception as exc:
         elapsed = (datetime.now(UTC) - started_at).total_seconds()
         logger.exception(
             "run failed profile=%s kind=%s run_id=%s duration=%.1fs",
@@ -204,6 +225,7 @@ async def run_profile(
             run_id,
             elapsed,
         )
+        ledger.fail(run_id=run_id, error=f"{type(exc).__name__}: {exc}")
         raise
     finally:
         current_run_id.reset(run_id_token)

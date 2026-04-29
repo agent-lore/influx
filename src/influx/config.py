@@ -76,6 +76,7 @@ class StorageConfig(BaseModel):
     """``[storage]`` archive storage settings."""
 
     archive_dir: str = "/archive"
+    state_dir: str = "/state"
     retain_days: int = 3650
     max_download_bytes: int = 52_428_800
     download_timeout_seconds: int = 30

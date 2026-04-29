@@ -48,9 +48,13 @@ Important sections:
 - `[[profiles]]`: interest profiles, thresholds, arXiv categories, and RSS feeds.
 - `[providers]` and `[models]`: model provider URLs, API-key env vars, and model slots for filtering, enrichment, and extraction.
 - `[prompts]`: inline prompt text or prompt file paths. Required variables are validated at startup.
-- `[storage]`: archive location, download limits, and timeout policy.
+- `[storage]`: archive location, local state directory, download limits, and timeout policy.
 - `[security]`: outbound network guardrails, including private-IP policy.
 - `[resilience]`, `[feedback]`, `[repair]`, `[telemetry]`: retry, negative-example, repair, and observability settings.
+
+`storage.state_dir` defaults to `/state`. It stores the local run ledger used by
+`/runs/recent` and the reporting script. This is operational state for the
+running deployment, not Lithos knowledge content.
 
 ## Development
 
@@ -85,3 +89,33 @@ cp docker/.env.example docker/.env.dev
 ```
 
 The Docker stack is configured through per-environment `.env.<env>` files.
+Each environment can set:
+
+- `INFLUX_DATA_PATH`: host directory mounted at `/data`; contains `influx.toml`.
+- `INFLUX_ARCHIVE_PATH`: host directory mounted at `/archive`; stores fetched source material.
+- `INFLUX_STATE_PATH`: host directory mounted at `/state`; stores the local run ledger.
+- `INFLUX_ADMIN_HOST_PORT`: host port used to reach the admin API.
+
+## Operator Report
+
+Use the report script to summarize a running Influx environment:
+
+```bash
+scripts/influx-report.py staging --limit 10
+```
+
+The positional environment name maps to `docker/.env.<env>`. The script reads
+that file to find the admin URL, archive path, and state path, then calls
+`/status` and `/runs/recent`.
+
+Useful options:
+
+```bash
+scripts/influx-report.py dev
+scripts/influx-report.py staging --limit 50
+scripts/influx-report.py staging --base-url http://127.0.0.1:18080
+```
+
+The report includes service readiness, package version, per-profile scheduler
+state, active and recent runs from the run ledger, archive file counts, inferred
+Lithos article-note counts, and the path to `runs.jsonl`.

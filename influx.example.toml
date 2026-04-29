@@ -16,6 +16,7 @@ misfire_grace_seconds = 3600    # tolerate missed fires within an hour
 
 [storage]
 archive_dir = "/archive"
+state_dir = "/state"
 retain_days = 3650              # ~10 years
 max_download_bytes = 52_428_800 # 50 MB per file
 download_timeout_seconds = 30

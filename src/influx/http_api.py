@@ -19,6 +19,7 @@ import os
 import uuid
 from collections.abc import Coroutine
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request
@@ -28,10 +29,21 @@ from pydantic import BaseModel, Field, model_validator
 import influx
 from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
+from influx.run_ledger import RunLedger
 from influx.scheduler import run_profile
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _get_run_ledger(request: Request) -> RunLedger:
+    ledger = getattr(request.app.state, "run_ledger", None)
+    if isinstance(ledger, RunLedger):
+        return ledger
+    config: AppConfig = request.app.state.config
+    ledger = RunLedger(Path(config.storage.state_dir))
+    request.app.state.run_ledger = ledger
+    return ledger
 
 
 @router.get("/live")
@@ -71,6 +83,8 @@ async def status(request: Request) -> JSONResponse:
     scheduler: InfluxScheduler = request.app.state.scheduler
     coordinator: Coordinator = request.app.state.coordinator
     config: AppConfig = request.app.state.config
+    run_ledger = _get_run_ledger(request)
+    last_by_profile = run_ledger.last_by_profile()
 
     probe_state = probe_loop.state
 
@@ -84,12 +98,13 @@ async def status(request: Request) -> JSONResponse:
     if tick_job is not None and tick_job.next_run_time is not None:
         next_run = tick_job.next_run_time.astimezone(UTC).isoformat()
     for profile in config.profiles:
+        last_run = last_by_profile.get(profile.name, {})
         profiles[profile.name] = {
             "scheduled": tick_job is not None,
             "currently_running": coordinator.is_busy(profile.name),
             "next_run_at": next_run,
-            "last_run_at": None,
-            "last_run_status": None,
+            "last_run_at": last_run.get("completed_at"),
+            "last_run_status": last_run.get("status"),
         }
 
     body: dict[str, Any] = {
@@ -107,6 +122,23 @@ async def status(request: Request) -> JSONResponse:
         "profiles": profiles,
     }
     return JSONResponse(body, status_code=200)
+
+
+@router.get("/runs/recent")
+async def recent_runs(
+    request: Request,
+    limit: int = 20,
+    profile: str | None = None,
+) -> JSONResponse:
+    """Return recent local run ledger entries for operator reporting."""
+    ledger = _get_run_ledger(request)
+    return JSONResponse(
+        {
+            "active": ledger.active_runs(),
+            "runs": ledger.recent(limit=limit, profile=profile),
+        },
+        status_code=200,
+    )
 
 
 # ── POST /runs ──────────────────────────────────────────────────────
@@ -144,6 +176,7 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
     """
     coordinator: Coordinator = request.app.state.coordinator
     config: AppConfig = request.app.state.config
+    run_ledger = _get_run_ledger(request)
 
     request_id = str(uuid.uuid4())
     submitted_at = datetime.now(UTC).isoformat()
@@ -178,6 +211,8 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
                 item_provider=getattr(request.app.state, "item_provider", None),
                 probe_loop=getattr(request.app.state, "probe_loop", None),
                 fetch_cache=getattr(request.app.state, "fetch_cache", None),
+                run_id=request_id,
+                run_ledger=run_ledger,
             ),
         )
         logger.info(
@@ -220,6 +255,8 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
             item_provider=getattr(request.app.state, "item_provider", None),
             probe_loop=getattr(request.app.state, "probe_loop", None),
             fetch_cache=getattr(request.app.state, "fetch_cache", None),
+            request_id=request_id,
+            run_ledger=run_ledger,
         ),
     )
     logger.info(
@@ -250,6 +287,8 @@ async def _run_and_release(
     item_provider: Any = None,
     probe_loop: Any = None,
     fetch_cache: Any = None,
+    run_id: str | None = None,
+    run_ledger: RunLedger | None = None,
 ) -> None:
     """Run ``run_profile`` and release the coordinator lock afterward.
 
@@ -268,6 +307,8 @@ async def _run_and_release(
                 config=config,
                 item_provider=item_provider,
                 probe_loop=probe_loop,
+                run_id=run_id,
+                run_ledger=run_ledger,
             )
         except Exception:
             import logging
@@ -292,6 +333,8 @@ async def _backfill_and_release(
     item_provider: Any = None,
     probe_loop: Any = None,
     fetch_cache: Any = None,
+    run_id: str | None = None,
+    run_ledger: RunLedger | None = None,
 ) -> None:
     """Run ``backfill.run_backfill`` and release the coordinator lock afterward.
 
@@ -311,6 +354,8 @@ async def _backfill_and_release(
                 config=config,
                 item_provider=item_provider,
                 probe_loop=probe_loop,
+                run_id=run_id,
+                run_ledger=run_ledger,
             )
         except Exception:
             import logging
@@ -336,6 +381,8 @@ async def _run_many_and_release(
     item_provider: Any = None,
     probe_loop: Any = None,
     fetch_cache: Any = None,
+    request_id: str | None = None,
+    run_ledger: RunLedger | None = None,
 ) -> None:
     """Run several already-acquired profiles and release all locks."""
     if fetch_cache is not None:
@@ -350,6 +397,8 @@ async def _run_many_and_release(
                     config=config,
                     item_provider=item_provider,
                     probe_loop=probe_loop,
+                    run_id=f"{request_id}:{profile}" if request_id else None,
+                    run_ledger=run_ledger,
                 )
                 for profile in profiles
             ),
@@ -505,6 +554,7 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
     """
     coordinator: Coordinator = request.app.state.coordinator
     config: AppConfig = request.app.state.config
+    run_ledger = _get_run_ledger(request)
 
     request_id = str(uuid.uuid4())
     submitted_at = datetime.now(UTC).isoformat()
@@ -580,6 +630,8 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
                 item_provider=getattr(request.app.state, "item_provider", None),
                 probe_loop=getattr(request.app.state, "probe_loop", None),
                 fetch_cache=getattr(request.app.state, "fetch_cache", None),
+                run_id=request_id,
+                run_ledger=run_ledger,
             ),
         )
 
@@ -617,6 +669,8 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
             item_provider=getattr(request.app.state, "item_provider", None),
             probe_loop=getattr(request.app.state, "probe_loop", None),
             fetch_cache=getattr(request.app.state, "fetch_cache", None),
+            request_id=request_id,
+            run_ledger=run_ledger,
         ),
     )
     return JSONResponse(
