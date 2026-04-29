@@ -1,12 +1,4 @@
-"""Tests for webhook sender + service.py post-run hook (US-016).
-
-Covers:
-- AC-05-I: digest POST reaches receiver with FR-NOT-2 body keys,
-  highlights selected by score >= threshold from config
-- AC-05-J: empty AGENT_ZERO_WEBHOOK_URL → silently skipped
-- FR-NOT-4: kind == "backfill" → no-op (zero requests)
-- Timeout/no-retry: hanging receiver → one attempt, timeout logged
-"""
+"""Tests for typed notification webhook dispatch."""
 
 from __future__ import annotations
 
@@ -23,6 +15,7 @@ import pytest
 from influx.config import (
     AppConfig,
     NotificationsConfig,
+    NotificationWebhookConfig,
     ProfileConfig,
     ProfileThresholds,
     PromptEntryConfig,
@@ -35,17 +28,17 @@ from influx.notifications import (
     ProfileRunResult,
     RunStats,
     build_digest,
+    dispatch_notifications,
     send_digest,
 )
 from influx.service import post_run_webhook_hook
 
-# ── Fake webhook receiver ────────────────────────────────────────────
-
 
 class _RecordingHandler(BaseHTTPRequestHandler):
-    """HTTP handler that records POST bodies."""
+    """HTTP handler that records POST bodies and headers."""
 
     received: list[dict[str, Any]]
+    headers_seen: list[dict[str, str]]
     request_count: int
 
     def do_POST(self) -> None:  # noqa: N802
@@ -53,11 +46,14 @@ class _RecordingHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         self.__class__.request_count += 1
         self.__class__.received.append(json.loads(body))
+        self.__class__.headers_seen.append(
+            {key.lower(): value for key, value in self.headers.items()}
+        )
         self.send_response(200)
         self.end_headers()
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        pass  # silence request logging
+        pass
 
 
 class _HangingHandler(BaseHTTPRequestHandler):
@@ -67,7 +63,6 @@ class _HangingHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         self.__class__.request_count += 1
-        # Sleep longer than any configured timeout
         time.sleep(30)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -76,8 +71,8 @@ class _HangingHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture()
 def fake_webhook_url() -> Generator[str]:
-    """Start a local HTTP server that records POST requests."""
     _RecordingHandler.received = []
+    _RecordingHandler.headers_seen = []
     _RecordingHandler.request_count = 0
 
     srv = HTTPServer(("127.0.0.1", 0), _RecordingHandler)
@@ -90,7 +85,6 @@ def fake_webhook_url() -> Generator[str]:
 
 @pytest.fixture()
 def hanging_webhook_url() -> Generator[str]:
-    """Start a local HTTP server that hangs on POST."""
     _HangingHandler.request_count = 0
 
     srv = HTTPServer(("127.0.0.1", 0), _HangingHandler)
@@ -99,9 +93,6 @@ def hanging_webhook_url() -> Generator[str]:
     thread.start()
     yield f"http://127.0.0.1:{port}/webhook"
     srv.shutdown()
-
-
-# ── Helpers ──────────────────────────────────────────────────────────
 
 
 def _make_item(
@@ -136,23 +127,23 @@ def _make_result(
 
 def _make_config(
     *,
-    webhook_url: str = "",
     timeout_seconds: int = 5,
     notify_immediate: int = 8,
     allow_private_ips: bool = True,
+    webhook_url: str = "",
+    webhooks: list[NotificationWebhookConfig] | None = None,
 ) -> AppConfig:
     return AppConfig(
         notifications=NotificationsConfig(
             webhook_url=webhook_url,
             timeout_seconds=timeout_seconds,
+            webhooks=webhooks or [],
         ),
         security=SecurityConfig(allow_private_ips=allow_private_ips),
         profiles=[
             ProfileConfig(
                 name="ai-robotics",
-                thresholds=ProfileThresholds(
-                    notify_immediate=notify_immediate,
-                ),
+                thresholds=ProfileThresholds(notify_immediate=notify_immediate),
             ),
         ],
         prompts=PromptsConfig(
@@ -163,14 +154,10 @@ def _make_config(
     )
 
 
-# ── AC-05-I: digest POST reaches receiver ───────────────────────────
-
-
-class TestWebhookSendDigest:
-    """AC-05-I: webhook sender POSTs digest to receiver."""
-
-    def test_digest_post_reaches_receiver(self, fake_webhook_url: str) -> None:
-        """Digest POST reaches the fake receiver with FR-NOT-2 body keys."""
+class TestGenericDigestNotifications:
+    def test_legacy_send_digest_posts_expected_body(
+        self, fake_webhook_url: str
+    ) -> None:
         result = _make_result(
             items=[
                 _make_item(score=10),
@@ -187,169 +174,203 @@ class TestWebhookSendDigest:
 
         assert _RecordingHandler.request_count == 1
         body = _RecordingHandler.received[0]
-
-        # FR-NOT-2 body keys
         assert body["type"] == "influx_digest"
-        assert body["run_date"] == "2026-04-25"
         assert body["profile"] == "ai-robotics"
-        assert "stats" in body
-        assert "highlights" in body
-        assert "all_ingested" in body
+        assert body["stats"]["high_relevance"] == 1
 
-    def test_highlights_selected_by_threshold_from_config(
+    def test_dispatch_uses_legacy_generic_webhook_url(
         self, fake_webhook_url: str
     ) -> None:
-        """AC-05-I: highlights use score >= notify_immediate from config."""
-        items = [
-            _make_item(id="a", score=9, url="https://a"),
-            _make_item(id="b", score=7, url="https://b"),
-            _make_item(id="c", score=10, url="https://c"),
-        ]
-        result = _make_result(ingested=3, items=items)
-        digest = build_digest(result, notify_immediate_threshold=9)
-        send_digest(
-            digest,
-            webhook_url=fake_webhook_url,
-            timeout_seconds=5,
-            allow_private_ips=True,
+        config = _make_config(webhook_url=fake_webhook_url)
+        dispatch_notifications(
+            _make_result(),
+            config,
+            kind=RunKind.MANUAL,
+            run_id="run-1",
         )
 
+        assert _RecordingHandler.request_count == 1
+        assert _RecordingHandler.received[0]["type"] == "influx_digest"
+
+    def test_generic_digest_webhook_supports_min_score_gate(
+        self, fake_webhook_url: str
+    ) -> None:
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="generic",
+                    type="generic_digest",
+                    url=fake_webhook_url,
+                    min_score=9,
+                )
+            ]
+        )
+        result = _make_result(items=[_make_item(score=8)])
+        dispatch_notifications(result, config, kind=RunKind.MANUAL, run_id="run-2")
+
+        assert _RecordingHandler.request_count == 0
+
+
+class TestAgentZeroNotifications:
+    def test_agent_zero_message_async_article_payload(
+        self, fake_webhook_url: str
+    ) -> None:
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="agent-zero-inbox",
+                    type="agent_zero_message_async",
+                    url=fake_webhook_url,
+                    event_mode="article",
+                    context="ctx-123",
+                    min_score=8,
+                )
+            ]
+        )
+        result = _make_result(
+            items=[_make_item(score=9), _make_item(id="low", score=6, url="https://l")]
+        )
+
+        dispatch_notifications(result, config, kind=RunKind.MANUAL, run_id="run-3")
+
+        assert _RecordingHandler.request_count == 1
         body = _RecordingHandler.received[0]
-        highlight_ids = {h["id"] for h in body["highlights"]}
-        assert highlight_ids == {"a", "c"}
-        assert body["stats"]["high_relevance"] == 2
+        assert body["context"] == "ctx-123"
+        assert "Influx ingested a document." in body["text"]
+        assert "Score: 9/10" in body["text"]
 
-
-# ── AC-05-J: empty webhook URL → silent skip ────────────────────────
-
-
-class TestWebhookEmptyUrl:
-    """AC-05-J: empty URL → silently skipped."""
-
-    def test_empty_url_skips(self, fake_webhook_url: str) -> None:
-        """With empty webhook_url, no request is sent."""
-        digest = build_digest(_make_result(), notify_immediate_threshold=8)
-        send_digest(
-            digest,
-            webhook_url="",
-            timeout_seconds=5,
-            allow_private_ips=True,
+    def test_agent_zero_toast_article_payload(self, fake_webhook_url: str) -> None:
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="agent-zero-toast",
+                    type="agent_zero_notification_create",
+                    url=fake_webhook_url,
+                    event_mode="article",
+                    min_score=8,
+                )
+            ]
         )
+
+        dispatch_notifications(_make_result(), config, kind=RunKind.MANUAL, run_id="4")
+
+        assert _RecordingHandler.request_count == 1
+        body = _RecordingHandler.received[0]
+        assert body["title"] == "Influx: Score 10/10"
+        assert body["message"] == "RoboStream: Real-Time Robot Memory"
+        assert body["priority"] == "high"
+
+
+class TestOpenClawNotifications:
+    def test_openclaw_agent_digest_payload_and_bearer_auth(
+        self,
+        fake_webhook_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("INFLUX_OPENCLAW_TOKEN", "secret-token")
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="openclaw-whatsapp",
+                    type="openclaw_agent",
+                    url=fake_webhook_url,
+                    event_mode="digest",
+                    auth_token_env="INFLUX_OPENCLAW_TOKEN",
+                    deliver=True,
+                    channel="whatsapp",
+                    sender_name="Influx",
+                )
+            ]
+        )
+
+        dispatch_notifications(
+            _make_result(), config, kind=RunKind.SCHEDULED, run_id="5"
+        )
+
+        assert _RecordingHandler.request_count == 1
+        body = _RecordingHandler.received[0]
+        headers = _RecordingHandler.headers_seen[0]
+        assert body["name"] == "Influx"
+        assert body["deliver"] is True
+        assert body["channel"] == "whatsapp"
+        assert "Influx run completed." in body["message"]
+        assert headers["authorization"] == "Bearer secret-token"
+
+    def test_missing_auth_token_skips_delivery(
+        self,
+        fake_webhook_url: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="openclaw",
+                    type="openclaw_agent",
+                    url=fake_webhook_url,
+                    event_mode="digest",
+                    auth_token_env="MISSING_OPENCLAW_TOKEN",
+                )
+            ]
+        )
+
+        with caplog.at_level(logging.WARNING, logger="influx.notifications"):
+            dispatch_notifications(
+                _make_result(),
+                config,
+                kind=RunKind.MANUAL,
+                run_id="6",
+            )
+
         assert _RecordingHandler.request_count == 0
-
-    def test_send_digest_returns_without_raising(self) -> None:
-        """Empty URL returns cleanly — no exception."""
-        digest = build_digest(_make_result(), notify_immediate_threshold=8)
-        # Should not raise
-        send_digest(digest, webhook_url="", timeout_seconds=5)
+        assert any("missing auth token" in record.message for record in caplog.records)
 
 
-# ── FR-NOT-4: backfill → no-op ──────────────────────────────────────
-
-
-class TestWebhookBackfillNoop:
-    """FR-NOT-4: post_run_webhook_hook is no-op for backfills."""
-
+class TestNotificationDeliveryBehavior:
     def test_backfill_sends_no_request(self, fake_webhook_url: str) -> None:
-        """kind == backfill → zero requests recorded."""
         config = _make_config(
-            webhook_url=fake_webhook_url,
-            allow_private_ips=True,
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="generic",
+                    type="generic_digest",
+                    url=fake_webhook_url,
+                )
+            ]
         )
-        result = _make_result()
-        post_run_webhook_hook(result, config, kind=RunKind.BACKFILL)
+        post_run_webhook_hook(_make_result(), config, kind=RunKind.BACKFILL)
         assert _RecordingHandler.request_count == 0
-
-    def test_manual_run_sends_request(self, fake_webhook_url: str) -> None:
-        """kind == manual → request sent (positive control)."""
-        config = _make_config(
-            webhook_url=fake_webhook_url,
-            allow_private_ips=True,
-        )
-        result = _make_result()
-        post_run_webhook_hook(result, config, kind=RunKind.MANUAL)
-        assert _RecordingHandler.request_count == 1
-
-    def test_scheduled_run_sends_request(self, fake_webhook_url: str) -> None:
-        """kind == scheduled → request sent (positive control)."""
-        config = _make_config(
-            webhook_url=fake_webhook_url,
-            allow_private_ips=True,
-        )
-        result = _make_result()
-        post_run_webhook_hook(result, config, kind=RunKind.SCHEDULED)
-        assert _RecordingHandler.request_count == 1
-
-
-# ── Timeout / no-retry ──────────────────────────────────────────────
-
-
-class TestWebhookTimeout:
-    """Timeout/no-retry: hanging receiver → one attempt, logged."""
 
     def test_timeout_logs_and_returns(
         self,
         hanging_webhook_url: str,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Hanging receiver → timeout, log, return (no retry)."""
-        digest = build_digest(_make_result(), notify_immediate_threshold=8)
-        with caplog.at_level(logging.WARNING, logger="influx.notifications"):
-            send_digest(
-                digest,
-                webhook_url=hanging_webhook_url,
-                timeout_seconds=1,
-                allow_private_ips=True,
-            )
-
-        # Exactly ONE request attempt (no retry)
-        assert _HangingHandler.request_count == 1
-        # Warning was logged
-        assert any("failed" in r.message.lower() for r in caplog.records)
-
-    def test_timeout_does_not_raise(self, hanging_webhook_url: str) -> None:
-        """Sender catches timeout — does not propagate."""
-        digest = build_digest(_make_result(), notify_immediate_threshold=8)
-        # Should not raise
-        send_digest(
-            digest,
-            webhook_url=hanging_webhook_url,
-            timeout_seconds=1,
-            allow_private_ips=True,
-        )
-
-
-# ── Post-run hook via service.py ─────────────────────────────────────
-
-
-class TestPostRunWebhookHook:
-    """post_run_webhook_hook invoked directly — sender integration."""
-
-    def test_hook_posts_digest_with_threshold_from_config(
-        self, fake_webhook_url: str
-    ) -> None:
-        """AC-05-I via hook: digest has highlights per config threshold."""
         config = _make_config(
-            webhook_url=fake_webhook_url,
-            notify_immediate=9,
-            allow_private_ips=True,
+            timeout_seconds=1,
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="generic",
+                    type="generic_digest",
+                    url=hanging_webhook_url,
+                )
+            ],
         )
-        items = [
-            _make_item(id="high", score=10, url="https://h"),
-            _make_item(id="at", score=9, url="https://a"),
-            _make_item(id="low", score=7, url="https://l"),
-        ]
-        result = _make_result(ingested=3, items=items)
-        post_run_webhook_hook(result, config, kind=RunKind.MANUAL)
 
-        assert _RecordingHandler.request_count == 1
-        body = _RecordingHandler.received[0]
-        highlight_ids = {h["id"] for h in body["highlights"]}
-        assert highlight_ids == {"high", "at"}
+        with caplog.at_level(logging.WARNING, logger="influx.notifications"):
+            post_run_webhook_hook(_make_result(), config, kind=RunKind.MANUAL)
 
-    def test_hook_empty_url_skips(self) -> None:
-        """AC-05-J via hook: empty URL → no request."""
-        config = _make_config(webhook_url="")
-        result = _make_result()
-        # Should return without raising
-        post_run_webhook_hook(result, config, kind=RunKind.MANUAL)
+        assert _HangingHandler.request_count == 1
+        assert any("delivery failed" in record.message for record in caplog.records)
+
+    def test_webhook_failures_do_not_raise(self, hanging_webhook_url: str) -> None:
+        config = _make_config(
+            timeout_seconds=1,
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="generic",
+                    type="generic_digest",
+                    url=hanging_webhook_url,
+                )
+            ],
+        )
+
+        post_run_webhook_hook(_make_result(), config, kind=RunKind.MANUAL)

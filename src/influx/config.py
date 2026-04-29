@@ -33,6 +33,10 @@ __all__ = [
     "LithosConfig",
     "ModelSlotConfig",
     "NotificationsConfig",
+    "NotificationEventMode",
+    "NotificationRunKind",
+    "NotificationWebhookConfig",
+    "NotificationWebhookType",
     "ProfileConfig",
     "ProfileSources",
     "ProfileThresholds",
@@ -87,6 +91,18 @@ class NotificationsConfig(BaseModel):
 
     webhook_url: str = ""
     timeout_seconds: int = 5
+    webhooks: list[NotificationWebhookConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_unique_webhook_names(self) -> NotificationsConfig:
+        names = [webhook.name for webhook in self.webhooks]
+        duplicates = {name for name in names if names.count(name) > 1}
+        if duplicates:
+            raise ConfigError(
+                "Duplicate notification webhook name(s): "
+                f"{', '.join(sorted(duplicates))}"
+            )
+        return self
 
 
 class LithosConfig(BaseModel):
@@ -101,6 +117,94 @@ class SecurityConfig(BaseModel):
 
     allow_private_ips: bool = False
     allow_remote_admin: bool = False
+
+
+NotificationWebhookType = Literal[
+    "generic_digest",
+    "agent_zero_message_async",
+    "agent_zero_notification_create",
+    "openclaw_agent",
+]
+NotificationEventMode = Literal["digest", "article"]
+NotificationRunKind = Literal["scheduled", "manual", "backfill"]
+
+
+_WEBHOOK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+class NotificationWebhookConfig(BaseModel):
+    """One configured outbound notification sink."""
+
+    name: str
+    type: NotificationWebhookType
+    url: str
+    enabled: bool = True
+    notify_on: list[NotificationRunKind] = Field(
+        default_factory=lambda: ["manual", "scheduled"]
+    )
+    event_mode: NotificationEventMode = "digest"
+    min_score: int | None = None
+    auth_token_env: str = ""
+    context: str = ""
+    deliver: bool = False
+    channel: str = ""
+    sender_name: str = "Influx"
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        if not _WEBHOOK_NAME_RE.match(v):
+            raise ConfigError(
+                f"Notification webhook name {v!r} is invalid; "
+                r"must match ^[a-z0-9][a-z0-9-]{0,63}$"
+            )
+        return v
+
+    @field_validator("url")
+    @classmethod
+    def _url_must_be_http(cls, v: str) -> str:
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https"):
+            raise ConfigError(
+                "Notification webhook URL must use http or https scheme, "
+                f"got {parsed.scheme!r}"
+            )
+        return v
+
+    @field_validator("notify_on")
+    @classmethod
+    def _notify_on_must_not_be_empty(
+        cls, v: list[NotificationRunKind]
+    ) -> list[NotificationRunKind]:
+        if not v:
+            raise ConfigError("Notification webhook notify_on must not be empty")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_type_specific_fields(self) -> NotificationWebhookConfig:
+        if self.type == "generic_digest" and self.event_mode != "digest":
+            raise ConfigError(
+                f"Notification webhook {self.name!r}: generic_digest only supports "
+                "event_mode='digest'"
+            )
+        if (
+            self.type == "agent_zero_notification_create"
+            and self.event_mode != "article"
+        ):
+            raise ConfigError(
+                f"Notification webhook {self.name!r}: "
+                "agent_zero_notification_create only supports event_mode='article'"
+            )
+        if self.type == "agent_zero_message_async" and self.context == "":
+            raise ConfigError(
+                f"Notification webhook {self.name!r}: context is required for "
+                "agent_zero_message_async"
+            )
+        if self.type == "openclaw_agent" and not self.sender_name:
+            raise ConfigError(
+                f"Notification webhook {self.name!r}: sender_name must not be empty"
+            )
+        return self
 
 
 # ── Profiles ─────────────────────────────────────────────────────────
@@ -415,11 +519,7 @@ def _parse_bool_env(value: str) -> bool:
 
 
 def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
-    """Apply environment variable overrides per REQUIREMENTS §19.
-
-    Env vars listed with an 'Overrides config key' entry in §19
-    take precedence over values set in the TOML file (FR-CFG-3).
-    """
+    """Apply supported environment variable overrides to the parsed TOML."""
     overrides: list[tuple[str, str, str, type]] = [
         ("LITHOS_URL", "lithos", "url", str),
         ("LITHOS_MCP_TRANSPORT", "lithos", "transport", str),
@@ -427,7 +527,6 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
         ("INFLUX_OTEL_ENABLED", "telemetry", "enabled", bool),
         ("INFLUX_OTEL_CONSOLE_FALLBACK", "telemetry", "console_fallback", bool),
         ("INFLUX_ENVIRONMENT", "telemetry", "environment", str),
-        ("AGENT_ZERO_WEBHOOK_URL", "notifications", "webhook_url", str),
     ]
 
     for env_var, section, key, value_type in overrides:

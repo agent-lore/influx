@@ -50,6 +50,7 @@ Important sections:
 - `[providers]` and `[models]`: model provider URLs, API-key env vars, and model slots for filtering, enrichment, and extraction.
 - `[prompts]`: inline prompt text or prompt file paths. Required variables are validated at startup.
 - `[storage]`: archive location, local state directory, download limits, and timeout policy.
+- `[notifications]`: outbound webhook timeout plus typed `[[notifications.webhooks]]` sinks for generic digests, Agent Zero, and OpenClaw.
 - `[security]`: outbound network guardrails, including private-IP policy.
 - `[resilience]`, `[feedback]`, `[repair]`, `[telemetry]`: retry, negative-example, repair, and observability settings.
 
@@ -60,6 +61,23 @@ running deployment, not Lithos knowledge content.
 Logs are structured JSON by default using Lithos-compatible core fields:
 `timestamp`, `level`, `logger`, and `message`. Set `INFLUX_LOG_FORMAT=text` for
 plain local logs, and `INFLUX_LOG_LEVEL` to control verbosity.
+
+Notification targets are configured in TOML. Secrets stay in the environment.
+Each `[[notifications.webhooks]]` entry defines a typed sink with:
+
+- `name`, `type`, `url`
+- `enabled`, `notify_on`, `event_mode`, `min_score`
+- `auth_token_env` for bearer-token auth
+- target-specific fields such as `context` for `agent_zero_message_async` and `deliver` / `channel` / `sender_name` for `openclaw_agent`
+
+Supported webhook types:
+
+- `generic_digest`
+- `agent_zero_message_async`
+- `agent_zero_notification_create`
+- `openclaw_agent`
+
+`event_mode = "digest"` sends one run summary per matching run. `event_mode = "article"` sends one notification per ingested article that meets `min_score`. Webhook failures are logged and do not fail the run.
 
 ## Development
 
