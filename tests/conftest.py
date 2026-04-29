@@ -21,6 +21,7 @@ _REALISTIC_V07_TOML = dedent("""\
 
     [storage]
     archive_dir = "/archive"
+    state_dir = "/state"
     retain_days = 3650
     max_download_bytes = 52_428_800
     download_timeout_seconds = 30

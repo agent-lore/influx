@@ -9,6 +9,7 @@ scheduler, and probe loop instances.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,6 +27,7 @@ from influx.config import (
 from influx.coordinator import Coordinator
 from influx.http_api import router
 from influx.probes import ProbeLoop
+from influx.run_ledger import RunLedger
 from influx.scheduler import InfluxScheduler
 
 
@@ -51,12 +53,13 @@ def _make_config(
 
 
 @pytest.fixture
-def app_with_state(fake_lithos_sse_url: str) -> FastAPI:
+def app_with_state(fake_lithos_sse_url: str, tmp_path: Path) -> FastAPI:
     """Create a FastAPI app with router, coordinator, scheduler, and probe loop."""
     config = _make_config(
         profiles=["ai-robotics", "web-tech"],
         lithos_url=fake_lithos_sse_url,
     )
+    config.storage.state_dir = str(tmp_path / "state")
     app = FastAPI()
     app.include_router(router)
 
@@ -71,6 +74,7 @@ def app_with_state(fake_lithos_sse_url: str) -> FastAPI:
     app.state.coordinator = coordinator
     app.state.scheduler = scheduler
     app.state.probe_loop = probe_loop
+    app.state.run_ledger = RunLedger(Path(config.storage.state_dir))
 
     return app
 
@@ -203,6 +207,25 @@ class TestStatus:
                 f"Profile {name!r} should have null next_run_at when scheduler stopped"
             )
 
+    def test_status_profiles_include_last_run_from_ledger(
+        self, client: TestClient, app_with_state: FastAPI
+    ) -> None:
+        """last_run_* fields come from the local run ledger."""
+        ledger: RunLedger = app_with_state.state.run_ledger
+        ledger.start(
+            run_id="run-1",
+            profile="ai-robotics",
+            kind="manual",
+            run_range=None,
+        )
+        ledger.complete(run_id="run-1", sources_checked=12, ingested=4)
+
+        body = client.get("/status").json()
+
+        profile = body["profiles"]["ai-robotics"]
+        assert profile["last_run_status"] == "completed"
+        assert profile["last_run_at"] is not None
+
     async def test_status_currently_running_reflects_coordinator(
         self, app_with_state: FastAPI
     ) -> None:
@@ -334,6 +357,63 @@ class TestPostRuns:
         assert r1.status_code == 202
         assert r2.status_code == 202
         assert r1.json()["request_id"] != r2.json()["request_id"]
+
+
+class TestRecentRuns:
+    """``GET /runs/recent`` returns local run ledger state."""
+
+    def test_recent_runs_empty_shape(self, client: TestClient) -> None:
+        resp = client.get("/runs/recent")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {"active": [], "runs": []}
+
+    def test_recent_runs_returns_active_and_recent(
+        self, client: TestClient, app_with_state: FastAPI
+    ) -> None:
+        ledger: RunLedger = app_with_state.state.run_ledger
+        ledger.start(
+            run_id="active-1",
+            profile="web-tech",
+            kind="manual",
+            run_range=None,
+        )
+        ledger.start(
+            run_id="done-1",
+            profile="ai-robotics",
+            kind="scheduled",
+            run_range=None,
+        )
+        ledger.complete(run_id="done-1", sources_checked=3, ingested=2)
+
+        body = client.get("/runs/recent").json()
+
+        assert body["active"][0]["run_id"] == "active-1"
+        assert body["runs"][0]["run_id"] == "done-1"
+        assert body["runs"][0]["status"] == "completed"
+
+    def test_recent_runs_filters_by_profile(
+        self, client: TestClient, app_with_state: FastAPI
+    ) -> None:
+        ledger: RunLedger = app_with_state.state.run_ledger
+        ledger.start(
+            run_id="run-ai",
+            profile="ai-robotics",
+            kind="manual",
+            run_range=None,
+        )
+        ledger.complete(run_id="run-ai", sources_checked=1, ingested=1)
+        ledger.start(
+            run_id="run-web",
+            profile="web-tech",
+            kind="manual",
+            run_range=None,
+        )
+        ledger.complete(run_id="run-web", sources_checked=1, ingested=0)
+
+        body = client.get("/runs/recent?profile=web-tech").json()
+
+        assert [run["run_id"] for run in body["runs"]] == ["run-web"]
 
 
 class TestPostRunsSchedulerOverlap:

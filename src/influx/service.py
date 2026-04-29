@@ -18,6 +18,7 @@ import os
 import socket
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
@@ -29,6 +30,7 @@ from influx.filter import make_default_arxiv_filter_scorer
 from influx.http_api import router
 from influx.notifications import ProfileRunResult, build_digest, send_digest
 from influx.probes import ProbeLoop
+from influx.run_ledger import RunLedger
 from influx.scheduler import InfluxScheduler
 from influx.sources import FetchCache, make_item_provider
 from influx.sources.arxiv import (
@@ -184,6 +186,9 @@ def create_app(
         item_provider_factory=_scheduled_tick_provider_factory,
     )
 
+    run_ledger = RunLedger(Path(config.storage.state_dir))
+    run_ledger.abandon_active(reason="Influx process restarted")
+
     app.state.config = config
     app.state.coordinator = coordinator
     app.state.scheduler = scheduler
@@ -191,6 +196,7 @@ def create_app(
     app.state.active_tasks = active_tasks
     app.state.item_provider = item_provider
     app.state.fetch_cache = fetch_cache
+    app.state.run_ledger = run_ledger
 
     return app
 

@@ -1,7 +1,7 @@
 # Influx - Specification
 
 Version: 0.1.0
-Date: 2026-04-27
+Date: 2026-04-29
 Status: Aligned with Implementation
 
 ---
@@ -16,7 +16,7 @@ Status: Aligned with Implementation
 4. **Tiered enrichment**: Add structured summary, full text, and deep extraction sections according to per-profile score thresholds.
 5. **Local archive**: Store source PDFs or HTML under a configured archive directory and link archived paths from notes.
 6. **Lithos integration**: Write canonical Markdown notes to Lithos over MCP/SSE, deduplicate by cache lookup, and wire LCMA relationships after writes.
-7. **Operator control**: Provide a local admin HTTP API plus CLI commands for validation, serving, manual runs, and backfills.
+7. **Operator control**: Provide a local admin HTTP API plus CLI commands for validation, serving, manual runs, backfills, and recent run reporting.
 8. **Operational safety**: Apply outbound HTTP guardrails, local-admin bind protection, per-profile run locks, and bounded shutdown.
 
 ### 1.2 Non-Goals
@@ -50,7 +50,7 @@ Status: Aligned with Implementation
 |                         |                                       |
 |                         v                                       |
 |  FastAPI Admin API + InfluxService                              |
-|  /live /ready /status /runs /backfills                           |
+|  /live /ready /status /runs /runs/recent /backfills              |
 |                         |                                       |
 |        +----------------+----------------+                      |
 |        v                                 v                      |
@@ -77,7 +77,8 @@ Status: Aligned with Implementation
 2. The scheduler registers one `influx-tick` cron dispatcher job. Each tick creates a fresh source provider/cache pair and starts profile runs as background tasks.
 3. Manual `POST /runs` and `POST /backfills` requests acquire per-profile locks and spawn background run tasks.
 4. `run_profile` creates a Lithos task, runs the repair sweep for non-backfill runs, loads negative feedback examples, composes the filter prompt, calls the source provider, checks Lithos cache, writes notes, runs LCMA post-write hooks, and sends a webhook digest for non-backfill runs.
-5. Backfills use the same write path but skip repair sweep and skip already-ingested cache hits.
+5. `run_profile` records start, completion, failure, and basic run counts in the local run ledger.
+6. Backfills use the same write path but skip repair sweep and skip already-ingested cache hits.
 
 ### 2.3 In-Process State
 
@@ -85,6 +86,13 @@ Status: Aligned with Implementation
 - `ProbeLoop`: caches Lithos reachability and provider credential status for `/ready` and `/status`.
 - `FetchCache`: deduplicates shared source fetches within a scheduled fire or HTTP-triggered run scope.
 - `active_tasks`: tracks scheduler and HTTP background tasks for graceful shutdown.
+
+### 2.4 Local Persistent State
+
+- `RunLedger`: stores local operational run history under `storage.state_dir`.
+- The ledger uses `active-runs.json` for in-flight runs and `runs.jsonl` for terminal run history.
+- On service startup, any leftover active runs from a previous process are marked `abandoned`.
+- The ledger is intentionally not stored in Lithos. It is service operational state rather than knowledge content.
 
 ---
 
@@ -106,7 +114,7 @@ Environment overrides are applied for selected runtime values. The complete anno
 - `[influx]`: `note_schema_version`, stamped as `schema:<version>` on Influx-authored notes.
 - `[lithos]`: Lithos MCP endpoint and transport. Only `transport = "sse"` is supported.
 - `[schedule]`: cron expression, timezone, misfire grace, and shutdown grace.
-- `[storage]`: archive directory, retention setting, max download size, and download timeout.
+- `[storage]`: archive directory, local state directory, retention setting, max download size, and download timeout.
 - `[notifications]`: webhook URL and timeout.
 - `[security]`: outbound/private-IP and remote-admin bind policy.
 - `[[profiles]]`: profile name, description, thresholds, and source configuration.
@@ -178,7 +186,8 @@ The admin API is intended to bind to loopback by default. Non-loopback bind host
 
 - `GET /live`: always returns `200 {"live": true}` while the process is alive.
 - `GET /ready`: returns `200` when cached probes are ready, otherwise `503`.
-- `GET /status`: returns process status, readiness, version, dependency probe states, and per-profile scheduler/busy state.
+- `GET /status`: returns process status, readiness, version, dependency probe states, and per-profile scheduler, busy, and last-run state.
+- `GET /runs/recent`: returns active runs and recent terminal run ledger entries. Query parameters are `limit` and `profile`.
 - `POST /runs`: accepts `{"profile": "<name>"}` or `{"all_profiles": true}`.
 - `POST /backfills`: accepts `{"profile": "<name>", "days": n}` or `{"profile": "<name>", "from": "...", "to": "..."}`; `all_profiles` is also supported.
 
@@ -311,6 +320,47 @@ Archive paths are relative POSIX paths rendered in the note's `## Archive` secti
 - Item IDs are rejected if they contain path traversal or absolute-path components.
 - Resolved paths must remain under `archive_dir`.
 - Downloads use the guarded HTTP client with scheme checks, DNS/private-IP checks, timeouts, content-type checks, and max response size enforcement.
+
+---
+
+## 8A. Local Run Ledger
+
+### 8A.1 Layout
+
+The run ledger is written under `storage.state_dir`, which defaults to `/state`.
+
+```text
+<state_dir>/
++-- active-runs.json
++-- runs.jsonl
+```
+
+`active-runs.json` is a JSON object keyed by `run_id`. `runs.jsonl` is append-only JSON Lines history for terminal runs.
+
+### 8A.2 Entry Fields
+
+Ledger entries include:
+
+- `run_id`
+- `profile`
+- `kind`: `scheduled`, `manual`, or `backfill`
+- `status`: `running`, `completed`, `failed`, or `abandoned`
+- `run_range`
+- `started_at`
+- `completed_at`
+- `duration_seconds`
+- `sources_checked`
+- `ingested`
+- `error`
+
+### 8A.3 Semantics
+
+- Manual single-profile runs use the HTTP `request_id` as the ledger `run_id`.
+- Multi-profile manual and backfill requests derive per-profile ledger IDs from the parent request ID.
+- Scheduled runs generate a UUID.
+- Completed runs record `sources_checked` and `ingested` when available.
+- Failed runs record the exception type and message.
+- Active runs left behind by a previous process are marked `abandoned` on startup.
 
 ---
 
@@ -556,7 +606,7 @@ Current implementation verification at the time of this specification:
 - Ruff lint: passing
 - Ruff format check: passing
 - Pyright: passing
-- Pytest: `1354 passed`
+- Pytest: `1368 passed`
 
 Known warnings in the suite:
 

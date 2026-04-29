@@ -30,6 +30,7 @@ from influx.config import AppConfig
 from influx.coordinator import RunKind
 from influx.http_api import estimate_backfill_items
 from influx.notifications import ProfileRunResult
+from influx.run_ledger import RunLedger
 from influx.scheduler import ItemProvider, run_profile
 
 __all__ = [
@@ -97,6 +98,8 @@ async def run_backfill(
     config: AppConfig,
     item_provider: ItemProvider | None = None,
     probe_loop: Any | None = None,
+    run_id: str | None = None,
+    run_ledger: RunLedger | None = None,
 ) -> ProfileRunResult | None:
     """Execute a backfill run for a single profile.
 
@@ -134,4 +137,6 @@ async def run_backfill(
         config=config,
         item_provider=item_provider,
         probe_loop=probe_loop,
+        run_id=run_id,
+        run_ledger=run_ledger,
     )
