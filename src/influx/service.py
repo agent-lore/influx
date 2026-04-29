@@ -27,7 +27,7 @@ from influx.config import AppConfig, ProfileThresholds
 from influx.coordinator import Coordinator, RunKind
 from influx.errors import ConfigError
 from influx.filter import make_default_arxiv_filter_scorer
-from influx.http_api import router
+from influx.http_api import install_exception_handlers, router
 from influx.notifications import ProfileRunResult, build_digest, send_digest
 from influx.probes import ProbeLoop
 from influx.run_ledger import RunLedger
@@ -133,6 +133,7 @@ def create_app(
     """
     app = FastAPI(title="Influx Admin API", lifespan=lifespan)
     app.include_router(router)
+    install_exception_handlers(app)
 
     coordinator = Coordinator()
     # Tracks in-flight run/backfill tasks — both HTTP-triggered and

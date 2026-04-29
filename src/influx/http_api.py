@@ -20,9 +20,11 @@ import uuid
 from collections.abc import Coroutine
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
@@ -34,6 +36,116 @@ from influx.scheduler import run_profile
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _error_body(
+    *,
+    status: str,
+    error: str,
+    message: str,
+    **fields: Any,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "status": status,
+        "error": error,
+        "message": message,
+    }
+    body.update(fields)
+    return body
+
+
+def _active_run_for_profile(
+    ledger: RunLedger,
+    profile: str,
+) -> dict[str, Any] | None:
+    for run in ledger.active_runs():
+        if run.get("profile") == profile:
+            return {
+                "kind": run.get("kind"),
+                "profile": run.get("profile"),
+                "run_id": run.get("run_id"),
+                "started_at": run.get("started_at"),
+            }
+    return None
+
+
+def _profile_busy_response(
+    *,
+    profile: str,
+    request_id: str,
+    ledger: RunLedger,
+) -> JSONResponse:
+    return JSONResponse(
+        _error_body(
+            status="conflict",
+            error="profile_busy",
+            message=f"Profile {profile!r} is already running.",
+            reason="profile_busy",
+            request_id=request_id,
+            profile=profile,
+            active_run=_active_run_for_profile(ledger, profile),
+        ),
+        status_code=409,
+    )
+
+
+def _invalid_request_response(
+    *,
+    error: str,
+    message: str,
+    status_code: int = 422,
+    **fields: Any,
+) -> JSONResponse:
+    return JSONResponse(
+        _error_body(
+            status="invalid_request",
+            error=error,
+            message=message,
+            reason=error,
+            **fields,
+        ),
+        status_code=status_code,
+    )
+
+
+def install_exception_handlers(app: FastAPI) -> None:
+    """Install structured JSON error handlers for the admin API."""
+
+    async def _validation_exception_handler(
+        _request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            _error_body(
+                status="invalid_request",
+                error="invalid_request",
+                message="Request validation failed.",
+                detail=jsonable_encoder(exc.errors()),
+            ),
+            status_code=422,
+        )
+
+    async def _http_exception_handler(
+        _request: Request,
+        exc: HTTPException,
+    ) -> JSONResponse:
+        detail = exc.detail if isinstance(exc.detail, str) else "HTTP error."
+        return JSONResponse(
+            _error_body(
+                status="error",
+                error=f"http_{exc.status_code}",
+                message=detail,
+                detail=jsonable_encoder(exc.detail),
+            ),
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+
+    app.add_exception_handler(
+        RequestValidationError,
+        cast(Any, _validation_exception_handler),
+    )
+    app.add_exception_handler(HTTPException, cast(Any, _http_exception_handler))
 
 
 def _get_run_ledger(request: Request) -> RunLedger:
@@ -185,9 +297,10 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
         # Validate the profile name exists in config.
         known = {p.name for p in config.profiles}
         if body.profile not in known:
-            return JSONResponse(
-                {"detail": f"Unknown profile: {body.profile!r}"},
-                status_code=422,
+            return _invalid_request_response(
+                error="unknown_profile",
+                message=f"Unknown profile: {body.profile!r}",
+                profile=body.profile,
             )
 
         try:
@@ -195,9 +308,10 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
             if not acquired:
                 raise ProfileBusyError(body.profile)
         except ProfileBusyError:
-            return JSONResponse(
-                {"reason": "profile_busy", "profile": body.profile},
-                status_code=409,
+            return _profile_busy_response(
+                profile=body.profile,
+                request_id=request_id,
+                ledger=run_ledger,
             )
 
         # Launch the run in the background so the response returns immediately.
@@ -239,9 +353,10 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
         if not acquired:
             for acquired_profile in acquired_profiles:
                 coordinator.release(acquired_profile)
-            return JSONResponse(
-                {"reason": "profile_busy", "profile": profile_cfg.name},
-                status_code=409,
+            return _profile_busy_response(
+                profile=profile_cfg.name,
+                request_id=request_id,
+                ledger=run_ledger,
             )
         acquired_profiles.append(profile_cfg.name)
 
@@ -592,21 +707,21 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
             date_to=body.date_to,
         )
     if estimated > 1000 and not body.confirm:
-        return JSONResponse(
-            {
-                "reason": "confirm_required",
-                "estimated_items": estimated,
-            },
+        return _invalid_request_response(
+            error="confirm_required",
+            message="Backfill exceeds confirmation threshold.",
             status_code=400,
+            estimated_items=estimated,
         )
 
     if body.profile is not None:
         # Validate the profile name exists in config.
         known = {p.name for p in config.profiles}
         if body.profile not in known:
-            return JSONResponse(
-                {"detail": f"Unknown profile: {body.profile!r}"},
-                status_code=422,
+            return _invalid_request_response(
+                error="unknown_profile",
+                message=f"Unknown profile: {body.profile!r}",
+                profile=body.profile,
             )
 
         try:
@@ -614,9 +729,10 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
             if not acquired:
                 raise ProfileBusyError(body.profile)
         except ProfileBusyError:
-            return JSONResponse(
-                {"reason": "profile_busy", "profile": body.profile},
-                status_code=409,
+            return _profile_busy_response(
+                profile=body.profile,
+                request_id=request_id,
+                ledger=run_ledger,
             )
 
         # Launch the backfill in the background via backfill.run_backfill.
@@ -652,9 +768,10 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
         if not acquired:
             for acquired_profile in acquired_profiles:
                 coordinator.release(acquired_profile)
-            return JSONResponse(
-                {"reason": "profile_busy", "profile": profile_cfg.name},
-                status_code=409,
+            return _profile_busy_response(
+                profile=profile_cfg.name,
+                request_id=request_id,
+                ledger=run_ledger,
             )
         acquired_profiles.append(profile_cfg.name)
 

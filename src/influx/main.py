@@ -26,13 +26,11 @@ EXIT_USAGE = 64
 
 def _configure_logging() -> None:
     """Configure process-wide logging for the long-running service."""
+    from influx.logging_config import setup_logging
+
     level_name = os.environ.get("INFLUX_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        force=True,
-    )
+    setup_logging(level=level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 

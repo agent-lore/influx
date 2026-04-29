@@ -56,6 +56,10 @@ Important sections:
 `/runs/recent` and the reporting script. This is operational state for the
 running deployment, not Lithos knowledge content.
 
+Logs are structured JSON by default using Lithos-compatible core fields:
+`timestamp`, `level`, `logger`, and `message`. Set `INFLUX_LOG_FORMAT=text` for
+plain local logs, and `INFLUX_LOG_LEVEL` to control verbosity.
+
 ## Development
 
 Format, lint, type-check, and test:
@@ -95,6 +99,8 @@ Each environment can set:
 - `INFLUX_ARCHIVE_PATH`: host directory mounted at `/archive`; stores fetched source material.
 - `INFLUX_STATE_PATH`: host directory mounted at `/state`; stores the local run ledger.
 - `INFLUX_ADMIN_HOST_PORT`: host port used to reach the admin API.
+- `INFLUX_LOG_FORMAT`: `json` by default; set `text` for local plain-text logs.
+- `INFLUX_LOG_LEVEL`: Python logging level, default `INFO`.
 
 ## Operator Report
 

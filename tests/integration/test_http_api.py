@@ -25,7 +25,7 @@ from influx.config import (
     ScheduleConfig,
 )
 from influx.coordinator import Coordinator
-from influx.http_api import router
+from influx.http_api import install_exception_handlers, router
 from influx.probes import ProbeLoop
 from influx.run_ledger import RunLedger
 from influx.scheduler import InfluxScheduler
@@ -62,6 +62,7 @@ def app_with_state(fake_lithos_sse_url: str, tmp_path: Path) -> FastAPI:
     config.storage.state_dir = str(tmp_path / "state")
     app = FastAPI()
     app.include_router(router)
+    install_exception_handlers(app)
 
     coordinator = Coordinator()
     scheduler = InfluxScheduler(config, coordinator)
@@ -263,6 +264,7 @@ class TestDegradedStateLithosUnreachable:
         )
         app = FastAPI()
         app.include_router(router)
+        install_exception_handlers(app)
         coordinator = Coordinator()
         scheduler = InfluxScheduler(config, coordinator)
         probe_loop = ProbeLoop(config, interval=30.0)
@@ -315,7 +317,10 @@ class TestPostRuns:
             with TestClient(app_with_state) as tc:
                 resp = tc.post("/runs", json={"profile": "ai-robotics"})
             assert resp.status_code == 409
-            assert resp.json()["reason"] == "profile_busy"
+            body = resp.json()
+            assert body["status"] == "conflict"
+            assert body["error"] == "profile_busy"
+            assert body["reason"] == "profile_busy"
         finally:
             coordinator.release("ai-robotics")
             loop.close()
@@ -332,11 +337,17 @@ class TestPostRuns:
         """Body with neither profile nor all_profiles → 422."""
         resp = client.post("/runs", json={})
         assert resp.status_code == 422
+        body = resp.json()
+        assert body["status"] == "invalid_request"
+        assert body["error"] == "invalid_request"
 
     def test_runs_unknown_profile_returns_422(self, client: TestClient) -> None:
         """Unknown profile name → 422."""
         resp = client.post("/runs", json={"profile": "does-not-exist"})
         assert resp.status_code == 422
+        body = resp.json()
+        assert body["status"] == "invalid_request"
+        assert body["error"] == "unknown_profile"
 
     def test_runs_all_profiles_returns_202(self, client: TestClient) -> None:
         """all_profiles=true returns 202 with scope='all'."""
@@ -550,6 +561,9 @@ class TestPostBackfills:
             json={"profile": "does-not-exist", "days": 7},
         )
         assert resp.status_code == 422
+        body = resp.json()
+        assert body["status"] == "invalid_request"
+        assert body["error"] == "unknown_profile"
 
     def test_backfills_conflict_409(self, app_with_state: FastAPI) -> None:
         """Duplicate backfill while run in flight → 409 + profile_busy."""
@@ -564,7 +578,10 @@ class TestPostBackfills:
                     json={"profile": "ai-robotics", "days": 7, "confirm": True},
                 )
             assert resp.status_code == 409
-            assert resp.json()["reason"] == "profile_busy"
+            body = resp.json()
+            assert body["status"] == "conflict"
+            assert body["error"] == "profile_busy"
+            assert body["reason"] == "profile_busy"
         finally:
             coordinator.release("ai-robotics")
             loop.close()
@@ -586,6 +603,8 @@ class TestBackfillConfirmRequired:
         )
         assert resp.status_code == 400
         body = resp.json()
+        assert body["status"] == "invalid_request"
+        assert body["error"] == "confirm_required"
         assert body["reason"] == "confirm_required"
         assert body["estimated_items"] == 5000
 
@@ -641,7 +660,10 @@ class TestBackfillSchedulerOverlap:
                     json={"profile": "ai-robotics", "days": 7, "confirm": True},
                 )
             assert resp.status_code == 409
-            assert resp.json()["reason"] == "profile_busy"
+            body = resp.json()
+            assert body["status"] == "conflict"
+            assert body["error"] == "profile_busy"
+            assert body["reason"] == "profile_busy"
         finally:
             coordinator.release("ai-robotics")
 

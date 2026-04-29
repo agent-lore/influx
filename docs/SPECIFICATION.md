@@ -194,10 +194,25 @@ The admin API is intended to bind to loopback by default. Non-loopback bind host
 ### 5.3 Run and Backfill Semantics
 
 - Unknown profiles return `422`.
-- Busy profiles return `409 {"reason": "profile_busy", "profile": "<name>"}`.
+- Busy profiles return `409` with `status="conflict"`, `error="profile_busy"`, the profile name, request ID, and any known active-run summary.
 - Accepted jobs return `202` with `request_id`, `kind`, `scope`, and `submitted_at`.
 - `all_profiles` acquires all profile locks before starting work. If any profile is busy, already-acquired locks are released and the request returns `409`.
 - Backfill estimates are calculated as `days * categories * max_results_per_category`; estimates above 1000 require `confirm`.
+
+### 5.4 Error Responses
+
+Admin API errors use compact structured JSON, aligned with Lithos' `error`/`message` convention where it maps cleanly:
+
+```json
+{
+  "status": "invalid_request",
+  "error": "unknown_profile",
+  "message": "Unknown profile: 'example'",
+  "reason": "unknown_profile"
+}
+```
+
+Validation errors include `detail`; conflict responses include `active_run` when the local run ledger can identify the conflicting run. Existing CLI compatibility aliases such as `reason` are retained.
 
 ---
 
@@ -560,7 +575,18 @@ Readiness is degraded when:
 
 When telemetry is enabled, spans are emitted for run, source fetch, archive download, enrichment, Lithos write, and Lithos retrieve operations. The service name and export interval are configured under `[telemetry]`.
 
-### 13.3 Rejection Rate Logging
+### 13.3 Logging
+
+Influx logs to stdout/stderr through Python logging. By default logs are single-line JSON objects using the same core field names as Lithos:
+
+- `timestamp`
+- `level`
+- `logger`
+- `message`
+
+Caller-provided `extra` fields are preserved, including OTEL trace-correlation fields when present. Set `INFLUX_LOG_FORMAT=text` for local plain-text logs. `INFLUX_LOG_LEVEL` controls verbosity.
+
+### 13.4 Rejection Rate Logging
 
 Filter result tags are recorded per profile. At run completion Influx records rejection-rate data through the configured Lithos client path.
 
@@ -606,7 +632,7 @@ Current implementation verification at the time of this specification:
 - Ruff lint: passing
 - Ruff format check: passing
 - Pyright: passing
-- Pytest: `1368 passed`
+- Pytest: `1373 passed`
 
 Known warnings in the suite:
 
