@@ -9,6 +9,7 @@ per-article events.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import os
 from dataclasses import dataclass, field
@@ -479,4 +480,4 @@ def _build_auth_headers(
 
 
 def _hash_agent_zero_rfc_input(data: str, password: str) -> str:
-    return hashlib.sha256(f"{data}{password}".encode()).hexdigest()
+    return hmac.new(password.encode(), data.encode(), hashlib.sha256).hexdigest()

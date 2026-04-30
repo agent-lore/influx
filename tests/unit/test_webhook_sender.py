@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import threading
@@ -302,7 +304,12 @@ class TestAgentZeroNotifications:
         assert rfc_input["function_name"] == "enqueue_message"
         assert rfc_input["kwargs"]["context"] == "InfluxIn"
         assert "Influx ingested a document." in rfc_input["kwargs"]["text"]
-        assert len(body["hash"]) == 64
+        expected_hash = hmac.new(
+            b"rfc-secret",
+            body["rfc_input"].encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        assert body["hash"] == expected_hash
 
     def test_missing_rfc_password_skips_delivery(
         self,
