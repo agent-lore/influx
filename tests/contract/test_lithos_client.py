@@ -1067,7 +1067,9 @@ class TestWriteEnvelopeUnknownStatus:
                 if r.levelname == "WARNING"
                 and "lithos_write returned non-success" in r.getMessage()
             ]
-            assert matching, f"expected warning, got {[r.getMessage() for r in caplog.records]}"
+            assert matching, (
+                f"expected warning, got {[r.getMessage() for r in caplog.records]}"
+            )
             r = matching[0]
             assert getattr(r, "lithos_status", None) == "error"
             assert getattr(r, "source_url", None) == "https://arxiv.org/abs/2601.99998"

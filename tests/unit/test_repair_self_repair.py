@@ -14,8 +14,6 @@ tag) is exercised in ``test_repair_sweep.py``.
 
 from __future__ import annotations
 
-import pytest
-
 from influx.errors import ExtractionError, InfluxError, LCMAError, LithosError
 from influx.repair import (
     RepairCounters,
@@ -25,7 +23,6 @@ from influx.repair import (
     upsert_repair_section,
 )
 
-
 # ── Classifier ───────────────────────────────────────────────────────
 
 
@@ -33,12 +30,10 @@ class TestClassifyFailure:
     """Counted = persistent (advances cap). Transient = retry forever."""
 
     def test_lithos_error_is_transient(self) -> None:
-        assert (
-            classify_failure(
-                LithosError("connection refused", operation="write", detail="econnrefused")
-            )
-            == "transient"
+        exc = LithosError(
+            "connection refused", operation="write", detail="econnrefused"
         )
+        assert classify_failure(exc) == "transient"
 
     def test_lcma_http_stage_is_transient(self) -> None:
         assert (
@@ -171,9 +166,7 @@ class TestRenderRepairSection:
         )
         # Multi-line errors must collapse to a single line so the markdown
         # bullet list parses round-trippably.
-        repair_lines = [
-            ln for ln in rendered.splitlines() if "tier3_last_error" in ln
-        ]
+        repair_lines = [ln for ln in rendered.splitlines() if "tier3_last_error" in ln]
         assert len(repair_lines) == 1
         assert "\n" not in repair_lines[0]
 

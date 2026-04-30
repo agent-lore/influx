@@ -952,7 +952,7 @@ class TestSweepCapCounterAndTerminalFlip:
         content = rewritten["content"]
         assert "## Repair" in content
         assert "tier3_attempts: 1" in content
-        assert "tier3_last_stage: \"validate\"" in content
+        assert 'tier3_last_stage: "validate"' in content
         # Terminal not yet flipped.
         assert "influx:tier3-terminal" not in rewritten["tags"]
 
