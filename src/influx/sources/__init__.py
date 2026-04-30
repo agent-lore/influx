@@ -109,6 +109,11 @@ class FetchCache:
             # than receiving the same cached failure forever.
             self._store.pop(key, None)
             future.set_exception(exc)
+            # The owner path may be the only consumer of this future.
+            # Mark the exception as retrieved so asyncio does not emit
+            # "Future exception was never retrieved" when the future is
+            # dropped after we re-raise to the caller.
+            future.exception()
             raise
         future.set_result(result)
         # Collapse the resolved future to a literal so subsequent

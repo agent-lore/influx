@@ -547,7 +547,12 @@ async def _run_profile_body(
             # Lazy import to avoid the service ↔ scheduler import cycle.
             from influx.service import post_run_webhook_hook
 
-            post_run_webhook_hook(result, config, kind=kind)
+            post_run_webhook_hook(
+                result,
+                config,
+                kind=kind,
+                run_id=current_run_id.get() or None,
+            )
             return result
         except LCMAError as exc:
             outcome = "error"

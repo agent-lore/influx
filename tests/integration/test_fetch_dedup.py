@@ -16,6 +16,7 @@ These tests exercise the ``FetchCache`` wiring in
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from collections.abc import Generator
 from datetime import UTC, datetime
@@ -657,6 +658,41 @@ class TestFetchCacheConcurrencyAndScope:
         # Last fire ends; cache is cleared.
         cache.end_fire()
         assert not cache.has("arxiv:cs.AI")
+
+    def test_single_caller_failure_does_not_leave_orphan_future(self) -> None:
+        """A failed owner fetch should not trip asyncio's
+        ``Future exception was never retrieved`` noise when there are no
+        concurrent waiters.
+        """
+        cache = FetchCache()
+        loop_errors: list[dict[str, Any]] = []
+
+        async def failing_factory() -> str:
+            raise RuntimeError("boom")
+
+        async def runner() -> None:
+            loop = asyncio.get_running_loop()
+            previous = loop.get_exception_handler()
+
+            def handler(
+                _loop: asyncio.AbstractEventLoop,
+                context: dict[str, Any],
+            ) -> None:
+                loop_errors.append(context)
+
+            loop.set_exception_handler(handler)
+            try:
+                with pytest.raises(RuntimeError, match="boom"):
+                    await cache.get_or_fetch("k", failing_factory)
+                await asyncio.sleep(0)
+                gc.collect()
+                await asyncio.sleep(0)
+            finally:
+                loop.set_exception_handler(previous)
+
+        asyncio.run(runner())
+
+        assert loop_errors == []
 
     def test_sequential_same_tick_profiles_share_one_fetch(
         self,

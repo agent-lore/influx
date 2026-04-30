@@ -273,6 +273,7 @@ def guarded_post_json(
     url: str,
     payload: dict[str, object],
     *,
+    headers: dict[str, str] | None = None,
     allow_private_ips: bool = False,
     timeout_seconds: int | None = None,
 ) -> int:
@@ -303,7 +304,7 @@ def guarded_post_json(
 
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, json=payload)
+            response = client.post(url, json=payload, headers=headers)
             return response.status_code
     except httpx.TimeoutException as exc:
         raise NetworkError(

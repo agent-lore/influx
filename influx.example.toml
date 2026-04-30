@@ -22,8 +22,63 @@ max_download_bytes = 52_428_800 # 50 MB per file
 download_timeout_seconds = 30
 
 [notifications]
-webhook_url = ""                # override via env AGENT_ZERO_WEBHOOK_URL
 timeout_seconds = 5
+
+# Legacy fallback: when set, Influx emits a single generic run digest.
+# Prefer [[notifications.webhooks]] for new deployments.
+webhook_url = ""
+
+# Example typed sinks:
+#
+# [[notifications.webhooks]]
+# name = "generic-digest"
+# type = "generic_digest"
+# url = "http://webhook-receiver.local/influx"
+# enabled = true
+# notify_on = ["manual", "scheduled"]
+# event_mode = "digest"
+#
+# [[notifications.webhooks]]
+# name = "agent-zero-inbox-rfc"
+# type = "agent_zero_rfc_message"
+# url = "http://agent-zero:50001/api/rfc"
+# enabled = true
+# notify_on = ["manual", "scheduled"]
+# event_mode = "article"
+# min_score = 8
+# context = "InfluxIn"
+# rfc_module = "usr.influx_rfc"
+# rfc_function = "enqueue_message"
+# rfc_password_env = "AGENT_ZERO_RFC_PASSWORD"
+#
+# [[notifications.webhooks]]
+# name = "agent-zero-toast"
+# type = "agent_zero_notification_create"
+# url = "http://agent-zero:50001/api/notification_create"
+# enabled = true
+# notify_on = ["manual", "scheduled"]
+# event_mode = "article"
+# min_score = 8
+# auth_token_env = "INFLUX_AGENT_ZERO_TOKEN"
+#
+# The direct Agent Zero HTTP endpoints above sit behind session auth when Agent
+# Zero login is enabled. Prefer the RFC sink for service-to-service delivery.
+# The toast adapter is mainly useful in deployments without Agent Zero UI auth,
+# or after adding a separate RFC helper for notifications.
+#
+# [[notifications.webhooks]]
+# name = "openclaw-whatsapp"
+# type = "openclaw_agent"
+# url = "http://127.0.0.1:18789/hooks/agent"
+# enabled = true
+# notify_on = ["manual", "scheduled"]
+# event_mode = "digest"
+# min_score = 8
+# deliver = true
+# wake_mode = "now"
+# channel = "whatsapp"
+# sender_name = "Influx"
+# auth_token_env = "INFLUX_OPENCLAW_TOKEN"
 
 [security]
 allow_private_ips = false

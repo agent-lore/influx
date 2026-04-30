@@ -76,7 +76,7 @@ Status: Aligned with Implementation
 1. `serve` loads config, validates the local admin bind address, creates the FastAPI app, starts the probe loop, and starts the scheduler.
 2. The scheduler registers one `influx-tick` cron dispatcher job. Each tick creates a fresh source provider/cache pair and starts profile runs as background tasks.
 3. Manual `POST /runs` and `POST /backfills` requests acquire per-profile locks and spawn background run tasks.
-4. `run_profile` creates a Lithos task, runs the repair sweep for non-backfill runs, loads negative feedback examples, composes the filter prompt, calls the source provider, checks Lithos cache, writes notes, runs LCMA post-write hooks, and sends a webhook digest for non-backfill runs.
+4. `run_profile` creates a Lithos task, runs the repair sweep for non-backfill runs, loads negative feedback examples, composes the filter prompt, calls the source provider, checks Lithos cache, writes notes, runs LCMA post-write hooks, and dispatches configured notifications for non-backfill runs.
 5. `run_profile` records start, completion, failure, and basic run counts in the local run ledger.
 6. Backfills use the same write path but skip repair sweep and skip already-ingested cache hits.
 
@@ -115,7 +115,7 @@ Environment overrides are applied for selected runtime values. The complete anno
 - `[lithos]`: Lithos MCP endpoint and transport. Only `transport = "sse"` is supported.
 - `[schedule]`: cron expression, timezone, misfire grace, and shutdown grace.
 - `[storage]`: archive directory, local state directory, retention setting, max download size, and download timeout.
-- `[notifications]`: webhook URL and timeout.
+- `[notifications]`: outbound timeout plus typed `[[notifications.webhooks]]` sinks. `notifications.webhook_url` remains as a legacy single-sink generic-digest fallback.
 - `[security]`: outbound/private-IP and remote-admin bind policy.
 - `[[profiles]]`: profile name, description, thresholds, and source configuration.
 - `[providers.*]`: OpenAI-compatible provider base URLs, API-key environment variables, and extra headers.
@@ -131,6 +131,11 @@ Environment overrides are applied for selected runtime values. The complete anno
 ### 3.3 Validation Rules
 
 - Profile names must match `^[a-z][a-z0-9-]{0,31}$`.
+- Notification webhook names must match `^[a-z0-9][a-z0-9-]{0,63}$` and be unique within `notifications.webhooks`.
+- Notification webhook URLs must use `http` or `https`.
+- `generic_digest` only supports `event_mode = "digest"`.
+- `agent_zero_notification_create` only supports `event_mode = "article"`.
+- `agent_zero_message_async` requires a non-empty `context`.
 - RSS URLs must use `http` or `https`; RSS `source_tag` is `rss` or `blog`.
 - Prompt entries must specify exactly one of `text` or `path`.
 - Relative prompt paths are resolved relative to the config file.
@@ -541,14 +546,53 @@ Failure behavior:
 
 ## 12. Notifications
 
-Influx can POST an Agent Zero-style webhook digest after scheduled/manual runs. Backfills do not send webhooks.
+Influx can fan out notifications after scheduled and manual runs. Backfills do not emit notifications.
 
-Digest shapes:
+Notification configuration:
+
+- `timeout_seconds` applies to every outbound notification call.
+- `[[notifications.webhooks]]` defines typed sinks with:
+  - `name`
+  - `type`
+  - `url`
+  - `enabled`
+  - `notify_on`
+  - `event_mode`
+  - optional `min_score`
+  - optional `auth_token_env`
+  - target-specific fields such as `context`, `deliver`, `wake_mode`, `channel`, and `sender_name`
+- `notifications.webhook_url` remains as a legacy compatibility path. When set and `notifications.webhooks` is empty, Influx sends one `generic_digest` notification to that URL.
+
+Supported types:
+
+- `generic_digest`
+- `agent_zero_message_async`
+- `agent_zero_notification_create`
+- `agent_zero_rfc_message`
+- `openclaw_agent`
+
+Supported event modes:
+
+- `digest`: one notification per run
+- `article`: one notification per ingested article that meets `min_score`
+
+`generic_digest` payloads:
 
 - Zero-ingest run: quiet digest with message and stats.
 - Non-zero run: includes `highlights`, `all_ingested`, and `stats.high_relevance`.
 
-Highlights are items with `score >= thresholds.notify_immediate`. Webhook delivery uses the guarded POST client. Empty webhook URLs are a no-op. Delivery failures are logged and do not fail the run.
+Highlights are items with `score >= thresholds.notify_immediate`.
+
+Typed target behavior:
+
+- `agent_zero_message_async` sends `{"text", "context"}`.
+- `agent_zero_notification_create` sends one toast-style payload per matching article.
+- `agent_zero_rfc_message` sends `{"rfc_input", "hash"}` to Agent Zero's `/api/rfc` endpoint. The RFC input names a helper module and function plus keyword arguments `text` and `context`. The shared secret is loaded from `rfc_password_env`.
+- `openclaw_agent` sends `{"message", "name", "deliver"}` and includes `wakeMode` and `channel` when configured.
+
+Bearer-token auth is supported via `auth_token_env`; missing tokens cause the sink to be skipped with a warning. `agent_zero_rfc_message` uses `rfc_password_env` instead of bearer auth. Agent Zero's direct HTTP endpoints remain session-authenticated when Agent Zero login is enabled, so `agent_zero_rfc_message` is the preferred service-to-service integration path for that deployment shape.
+
+Delivery uses the guarded POST client. Only HTTP `2xx` responses count as successful delivery; redirects such as `302 /login` are logged as failures. Empty legacy webhook URLs are a no-op. Delivery failures are logged and do not fail the run.
 
 ---
 

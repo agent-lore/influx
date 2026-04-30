@@ -251,33 +251,6 @@ class TestEnvVarOverrides:
 
         assert cfg.telemetry.enabled is True
 
-    def test_agent_zero_webhook_url_overrides_toml(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """AGENT_ZERO_WEBHOOK_URL overrides notifications.webhook_url (str)."""
-        toml = dedent("""\
-            [notifications]
-            webhook_url = "https://original.example.com/hook"
-
-            [prompts.filter]
-            text = "f {profile_description} {negative_examples} {min_score_in_results}"
-
-            [prompts.tier1_enrich]
-            text = "e {title} {abstract} {profile_summary}"
-
-            [prompts.tier3_extract]
-            text = "x {title} {full_text}"
-        """)
-        config_path = _write_config(tmp_path, toml)
-        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
-        monkeypatch.setenv(
-            "AGENT_ZERO_WEBHOOK_URL", "https://override.example.com/hook"
-        )
-
-        cfg = load_config()
-
-        assert cfg.notifications.webhook_url == "https://override.example.com/hook"
-
     def test_otel_console_fallback_overrides_toml(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -416,6 +389,240 @@ class TestProfileNameValidation:
 
         with pytest.raises(ConfigError, match="MyProfile"):
             load_config()
+
+
+class TestNotificationWebhookConfig:
+    """Typed notification webhook config validation."""
+
+    def test_notification_webhooks_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+            timeout_seconds = 7
+
+            [[notifications.webhooks]]
+            name = "agent-zero-inbox"
+            type = "agent_zero_message_async"
+            url = "http://agent-zero:50001/api/message_async"
+            event_mode = "article"
+            context = "influx-inbox"
+            auth_token_env = "INFLUX_AGENT_ZERO_TOKEN"
+            min_score = 8
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        assert cfg.notifications.timeout_seconds == 7
+        assert len(cfg.notifications.webhooks) == 1
+        webhook = cfg.notifications.webhooks[0]
+        assert webhook.name == "agent-zero-inbox"
+        assert webhook.type == "agent_zero_message_async"
+        assert webhook.event_mode == "article"
+        assert webhook.context == "influx-inbox"
+        assert webhook.auth_token_env == "INFLUX_AGENT_ZERO_TOKEN"
+
+    def test_agent_zero_rfc_webhook_parses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+
+            [[notifications.webhooks]]
+            name = "agent-zero-rfc"
+            type = "agent_zero_rfc_message"
+            url = "http://agent-zero:50001/api/rfc"
+            event_mode = "article"
+            context = "InfluxIn"
+            rfc_module = "usr.influx_rfc"
+            rfc_function = "enqueue_message"
+            rfc_password_env = "AGENT_ZERO_RFC_PASSWORD"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        webhook = cfg.notifications.webhooks[0]
+        assert webhook.type == "agent_zero_rfc_message"
+        assert webhook.context == "InfluxIn"
+        assert webhook.rfc_module == "usr.influx_rfc"
+        assert webhook.rfc_function == "enqueue_message"
+        assert webhook.rfc_password_env == "AGENT_ZERO_RFC_PASSWORD"
+
+    def test_openclaw_webhook_parses_wake_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+
+            [[notifications.webhooks]]
+            name = "openclaw-agent"
+            type = "openclaw_agent"
+            url = "http://192.168.0.160:18789/hooks/agent"
+            event_mode = "digest"
+            deliver = true
+            wake_mode = "now"
+            sender_name = "Influx"
+            auth_token_env = "OPENCLAW_TOKEN"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        webhook = cfg.notifications.webhooks[0]
+        assert webhook.type == "openclaw_agent"
+        assert webhook.deliver is True
+        assert webhook.wake_mode == "now"
+
+    def test_duplicate_notification_webhook_name_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+
+            [[notifications.webhooks]]
+            name = "duplicate"
+            type = "generic_digest"
+            url = "https://example.com/one"
+
+            [[notifications.webhooks]]
+            name = "duplicate"
+            type = "generic_digest"
+            url = "https://example.com/two"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        with pytest.raises(ConfigError, match="Duplicate notification webhook"):
+            load_config()
+
+    def test_agent_zero_message_async_requires_context(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+
+            [[notifications.webhooks]]
+            name = "agent-zero-inbox"
+            type = "agent_zero_message_async"
+            url = "http://agent-zero:50001/api/message_async"
+            event_mode = "article"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        with pytest.raises(ConfigError, match="context is required"):
+            load_config()
+
+    def test_generic_digest_rejects_article_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+
+            [[notifications.webhooks]]
+            name = "generic"
+            type = "generic_digest"
+            url = "https://example.com/hook"
+            event_mode = "article"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        with pytest.raises(ConfigError, match="generic_digest only supports"):
+            load_config()
+
+    def test_agent_zero_rfc_requires_password_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+
+            [[notifications.webhooks]]
+            name = "agent-zero-rfc"
+            type = "agent_zero_rfc_message"
+            url = "http://agent-zero:50001/api/rfc"
+            event_mode = "article"
+            context = "InfluxIn"
+            rfc_module = "usr.influx_rfc"
+            rfc_function = "enqueue_message"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        with pytest.raises(ConfigError, match="rfc_password_env is required"):
+            load_config()
+
+
+class TestProfileNameValidationMore:
+    """Additional profile-name validation coverage."""
 
     def test_invalid_profile_name_starts_with_digit_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

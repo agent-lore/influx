@@ -23,12 +23,12 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from influx.config import AppConfig, ProfileThresholds
+from influx.config import AppConfig
 from influx.coordinator import Coordinator, RunKind
 from influx.errors import ConfigError
 from influx.filter import make_default_arxiv_filter_scorer
 from influx.http_api import install_exception_handlers, router
-from influx.notifications import ProfileRunResult, build_digest, send_digest
+from influx.notifications import ProfileRunResult, dispatch_notifications
 from influx.probes import ProbeLoop
 from influx.run_ledger import RunLedger
 from influx.scheduler import InfluxScheduler
@@ -325,35 +325,16 @@ def post_run_webhook_hook(
     config: AppConfig,
     *,
     kind: RunKind,
+    run_id: str | None = None,
 ) -> None:
-    """Post-run webhook hook — POSTs digest for non-backfill runs.
+    """Post-run notification hook for non-backfill runs.
 
     No-op when ``kind`` is ``RunKind.BACKFILL`` (FR-NOT-4).
-    Failures inside the sender are logged but do NOT propagate.
+    Failures inside outbound delivery are logged but do NOT propagate.
     The end-to-end assertion that this hook fires automatically after
     each completed run is covered by US-019.
     """
     if kind == RunKind.BACKFILL:
         return
 
-    profile_cfg = next(
-        (p for p in config.profiles if p.name == result.profile),
-        None,
-    )
-    # Fall back to the pydantic ``ProfileThresholds`` field default so the
-    # only place this tunable's default lives is config-parsing code
-    # (AC-X-1).  In practice ``profile_cfg`` is always present because the
-    # caller posts run results for known profiles.
-    threshold = (
-        profile_cfg.thresholds.notify_immediate
-        if profile_cfg
-        else ProfileThresholds().notify_immediate
-    )
-
-    digest = build_digest(result, notify_immediate_threshold=threshold)
-    send_digest(
-        digest,
-        webhook_url=config.notifications.webhook_url,
-        timeout_seconds=config.notifications.timeout_seconds,
-        allow_private_ips=config.security.allow_private_ips,
-    )
+    dispatch_notifications(result, config, kind=kind, run_id=run_id)
