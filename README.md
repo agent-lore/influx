@@ -68,16 +68,21 @@ Each `[[notifications.webhooks]]` entry defines a typed sink with:
 - `name`, `type`, `url`
 - `enabled`, `notify_on`, `event_mode`, `min_score`
 - `auth_token_env` for bearer-token auth
-- target-specific fields such as `context` for `agent_zero_message_async` and `deliver` / `channel` / `sender_name` for `openclaw_agent`
+- target-specific fields such as `context` for `agent_zero_message_async`, `rfc_module` / `rfc_function` / `rfc_password_env` for `agent_zero_rfc_message`, and `deliver` / `channel` / `sender_name` for `openclaw_agent`
 
 Supported webhook types:
 
 - `generic_digest`
 - `agent_zero_message_async`
 - `agent_zero_notification_create`
+- `agent_zero_rfc_message`
 - `openclaw_agent`
 
-`event_mode = "digest"` sends one run summary per matching run. `event_mode = "article"` sends one notification per ingested article that meets `min_score`. Webhook failures are logged and do not fail the run.
+`event_mode = "digest"` sends one run summary per matching run. `event_mode = "article"` sends one notification per ingested article that meets `min_score`.
+
+Agent Zero's normal HTTP API endpoints remain session-authenticated when login is enabled. For machine-to-machine delivery, prefer `agent_zero_rfc_message`; see [docs/AGENT_ZERO_RFC.md](docs/AGENT_ZERO_RFC.md). Direct `agent_zero_message_async` and `agent_zero_notification_create` sinks are still available for deployments that intentionally use session auth or no auth.
+
+Webhook delivery is considered successful only on HTTP `2xx`. Redirects such as `302 /login` are logged as failures. Webhook failures never fail the Influx run itself.
 
 ## Development
 

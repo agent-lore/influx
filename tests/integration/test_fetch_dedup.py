@@ -674,7 +674,10 @@ class TestFetchCacheConcurrencyAndScope:
             loop = asyncio.get_running_loop()
             previous = loop.get_exception_handler()
 
-            def handler(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+            def handler(
+                _loop: asyncio.AbstractEventLoop,
+                context: dict[str, Any],
+            ) -> None:
                 loop_errors.append(context)
 
             loop.set_exception_handler(handler)

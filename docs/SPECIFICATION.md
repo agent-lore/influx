@@ -568,6 +568,7 @@ Supported types:
 - `generic_digest`
 - `agent_zero_message_async`
 - `agent_zero_notification_create`
+- `agent_zero_rfc_message`
 - `openclaw_agent`
 
 Supported event modes:
@@ -586,9 +587,12 @@ Typed target behavior:
 
 - `agent_zero_message_async` sends `{"text", "context"}`.
 - `agent_zero_notification_create` sends one toast-style payload per matching article.
+- `agent_zero_rfc_message` sends `{"rfc_input", "hash"}` to Agent Zero's `/api/rfc` endpoint. The RFC input names a helper module and function plus keyword arguments `text` and `context`. The shared secret is loaded from `rfc_password_env`.
 - `openclaw_agent` sends `{"message", "name", "deliver"}` and includes `channel` when configured.
 
-Bearer-token auth is supported via `auth_token_env`; missing tokens cause the sink to be skipped with a warning. Delivery uses the guarded POST client. Empty legacy webhook URLs are a no-op. Delivery failures are logged and do not fail the run.
+Bearer-token auth is supported via `auth_token_env`; missing tokens cause the sink to be skipped with a warning. `agent_zero_rfc_message` uses `rfc_password_env` instead of bearer auth. Agent Zero's direct HTTP endpoints remain session-authenticated when Agent Zero login is enabled, so `agent_zero_rfc_message` is the preferred service-to-service integration path for that deployment shape.
+
+Delivery uses the guarded POST client. Only HTTP `2xx` responses count as successful delivery; redirects such as `302 /login` are logged as failures. Empty legacy webhook URLs are a no-op. Delivery failures are logged and do not fail the run.
 
 ---
 

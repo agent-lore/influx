@@ -123,6 +123,7 @@ NotificationWebhookType = Literal[
     "generic_digest",
     "agent_zero_message_async",
     "agent_zero_notification_create",
+    "agent_zero_rfc_message",
     "openclaw_agent",
 ]
 NotificationEventMode = Literal["digest", "article"]
@@ -146,6 +147,9 @@ class NotificationWebhookConfig(BaseModel):
     min_score: int | None = None
     auth_token_env: str = ""
     context: str = ""
+    rfc_module: str = ""
+    rfc_function: str = ""
+    rfc_password_env: str = ""
     deliver: bool = False
     channel: str = ""
     sender_name: str = "Influx"
@@ -200,6 +204,27 @@ class NotificationWebhookConfig(BaseModel):
                 f"Notification webhook {self.name!r}: context is required for "
                 "agent_zero_message_async"
             )
+        if self.type == "agent_zero_rfc_message":
+            if self.context == "":
+                raise ConfigError(
+                    f"Notification webhook {self.name!r}: context is required for "
+                    "agent_zero_rfc_message"
+                )
+            if not self.rfc_module:
+                raise ConfigError(
+                    f"Notification webhook {self.name!r}: rfc_module is required for "
+                    "agent_zero_rfc_message"
+                )
+            if not self.rfc_function:
+                raise ConfigError(
+                    f"Notification webhook {self.name!r}: rfc_function is required for "
+                    "agent_zero_rfc_message"
+                )
+            if not self.rfc_password_env:
+                raise ConfigError(
+                    f"Notification webhook {self.name!r}: rfc_password_env is "
+                    "required for agent_zero_rfc_message"
+                )
         if self.type == "openclaw_agent" and not self.sender_name:
             raise ConfigError(
                 f"Notification webhook {self.name!r}: sender_name must not be empty"

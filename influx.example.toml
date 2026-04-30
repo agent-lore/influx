@@ -39,15 +39,17 @@ webhook_url = ""
 # event_mode = "digest"
 #
 # [[notifications.webhooks]]
-# name = "agent-zero-inbox"
-# type = "agent_zero_message_async"
-# url = "http://agent-zero:50001/api/message_async"
+# name = "agent-zero-inbox-rfc"
+# type = "agent_zero_rfc_message"
+# url = "http://agent-zero:50001/api/rfc"
 # enabled = true
 # notify_on = ["manual", "scheduled"]
 # event_mode = "article"
 # min_score = 8
-# context = "influx-inbox"
-# auth_token_env = "INFLUX_AGENT_ZERO_TOKEN"
+# context = "InfluxIn"
+# rfc_module = "usr.influx_rfc"
+# rfc_function = "enqueue_message"
+# rfc_password_env = "AGENT_ZERO_RFC_PASSWORD"
 #
 # [[notifications.webhooks]]
 # name = "agent-zero-toast"
@@ -58,6 +60,11 @@ webhook_url = ""
 # event_mode = "article"
 # min_score = 8
 # auth_token_env = "INFLUX_AGENT_ZERO_TOKEN"
+#
+# The direct Agent Zero HTTP endpoints above sit behind session auth when Agent
+# Zero login is enabled. Prefer the RFC sink for service-to-service delivery.
+# The toast adapter is mainly useful in deployments without Agent Zero UI auth,
+# or after adding a separate RFC helper for notifications.
 #
 # [[notifications.webhooks]]
 # name = "openclaw-whatsapp"

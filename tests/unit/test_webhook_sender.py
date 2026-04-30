@@ -69,6 +69,21 @@ class _HangingHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _RedirectHandler(BaseHTTPRequestHandler):
+    """HTTP handler that returns a redirect response."""
+
+    request_count: int
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.__class__.request_count += 1
+        self.send_response(302)
+        self.send_header("Location", "/login")
+        self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        pass
+
+
 @pytest.fixture()
 def fake_webhook_url() -> Generator[str]:
     _RecordingHandler.received = []
@@ -88,6 +103,18 @@ def hanging_webhook_url() -> Generator[str]:
     _HangingHandler.request_count = 0
 
     srv = HTTPServer(("127.0.0.1", 0), _HangingHandler)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}/webhook"
+    srv.shutdown()
+
+
+@pytest.fixture()
+def redirect_webhook_url() -> Generator[str]:
+    _RedirectHandler.request_count = 0
+
+    srv = HTTPServer(("127.0.0.1", 0), _RedirectHandler)
     port = srv.server_address[1]
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
@@ -239,6 +266,76 @@ class TestAgentZeroNotifications:
         assert "Influx ingested a document." in body["text"]
         assert "Score: 9/10" in body["text"]
 
+    def test_agent_zero_rfc_article_payload(
+        self,
+        fake_webhook_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("AGENT_ZERO_RFC_PASSWORD", "rfc-secret")
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="agent-zero-rfc",
+                    type="agent_zero_rfc_message",
+                    url=fake_webhook_url,
+                    event_mode="article",
+                    context="InfluxIn",
+                    rfc_module="usr.influx_rfc",
+                    rfc_function="enqueue_message",
+                    rfc_password_env="AGENT_ZERO_RFC_PASSWORD",
+                    min_score=8,
+                )
+            ]
+        )
+
+        dispatch_notifications(
+            _make_result(),
+            config,
+            kind=RunKind.MANUAL,
+            run_id="rfc-1",
+        )
+
+        assert _RecordingHandler.request_count == 1
+        body = _RecordingHandler.received[0]
+        rfc_input = json.loads(body["rfc_input"])
+        assert rfc_input["module"] == "usr.influx_rfc"
+        assert rfc_input["function_name"] == "enqueue_message"
+        assert rfc_input["kwargs"]["context"] == "InfluxIn"
+        assert "Influx ingested a document." in rfc_input["kwargs"]["text"]
+        assert len(body["hash"]) == 64
+
+    def test_missing_rfc_password_skips_delivery(
+        self,
+        fake_webhook_url: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="agent-zero-rfc",
+                    type="agent_zero_rfc_message",
+                    url=fake_webhook_url,
+                    event_mode="article",
+                    context="InfluxIn",
+                    rfc_module="usr.influx_rfc",
+                    rfc_function="enqueue_message",
+                    rfc_password_env="MISSING_AGENT_ZERO_RFC_PASSWORD",
+                    min_score=8,
+                )
+            ]
+        )
+
+        with caplog.at_level(logging.WARNING, logger="influx.notifications"):
+            dispatch_notifications(
+                _make_result(),
+                config,
+                kind=RunKind.MANUAL,
+                run_id="rfc-2",
+            )
+
+        assert _RecordingHandler.request_count == 0
+        assert any("missing auth token" in record.message for record in caplog.records)
+
     def test_agent_zero_toast_article_payload(self, fake_webhook_url: str) -> None:
         config = _make_config(
             webhooks=[
@@ -374,3 +471,33 @@ class TestNotificationDeliveryBehavior:
         )
 
         post_run_webhook_hook(_make_result(), config, kind=RunKind.MANUAL)
+
+    def test_redirect_status_is_logged_as_failure(
+        self,
+        redirect_webhook_url: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="agent-zero-toast",
+                    type="agent_zero_notification_create",
+                    url=redirect_webhook_url,
+                    event_mode="article",
+                    min_score=8,
+                )
+            ]
+        )
+
+        with caplog.at_level(logging.WARNING, logger="influx.notifications"):
+            dispatch_notifications(
+                _make_result(),
+                config,
+                kind=RunKind.MANUAL,
+                run_id="redirect-1",
+            )
+
+        assert _RedirectHandler.request_count == 1
+        assert any(
+            "unexpected HTTP status" in record.message for record in caplog.records
+        )

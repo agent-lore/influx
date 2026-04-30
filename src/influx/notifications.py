@@ -8,9 +8,11 @@ per-article events.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
+from json import dumps as json_dumps
 from typing import Any
 
 from influx.config import (
@@ -278,6 +280,8 @@ def _build_payload(
             "text": _build_message_text(result, item=item),
             "context": webhook.context,
         }
+    if webhook.type == "agent_zero_rfc_message":
+        return _build_agent_zero_rfc_payload(webhook, result, item=item)
     if webhook.type == "agent_zero_notification_create":
         assert item is not None
         return {
@@ -344,6 +348,30 @@ def _build_message_text(
         if related_titles:
             lines.append(f"Related in Lithos: {', '.join(related_titles)}")
     return "\n".join(lines)
+
+
+def _build_agent_zero_rfc_payload(
+    webhook: NotificationWebhookConfig,
+    result: ProfileRunResult,
+    *,
+    item: HighlightItem | None,
+) -> dict[str, Any]:
+    password = os.environ.get(webhook.rfc_password_env, "")
+
+    rfc_input = {
+        "module": webhook.rfc_module,
+        "function_name": webhook.rfc_function,
+        "args": [],
+        "kwargs": {
+            "text": _build_message_text(result, item=item),
+            "context": webhook.context,
+        },
+    }
+    rfc_input_json = json_dumps(rfc_input)
+    return {
+        "rfc_input": rfc_input_json,
+        "hash": _hash_agent_zero_rfc_input(rfc_input_json, password),
+    }
 
 
 def _digest_is_below_threshold(
@@ -416,9 +444,9 @@ def _deliver_json_payload(
             allow_private_ips=allow_private_ips,
             timeout_seconds=timeout_seconds,
         )
-        if status >= 400:
+        if status < 200 or status >= 300:
             logger.warning(
-                "notification webhook returned HTTP error",
+                "notification webhook returned unexpected HTTP status",
                 extra={**extra, "status_code": status},
             )
         else:
@@ -437,9 +465,18 @@ def _deliver_json_payload(
 def _build_auth_headers(
     webhook: NotificationWebhookConfig,
 ) -> dict[str, str] | None:
+    if webhook.type == "agent_zero_rfc_message":
+        password = os.environ.get(webhook.rfc_password_env, "")
+        if not password:
+            return None
+        return {}
     if not webhook.auth_token_env:
         return {}
     token = os.environ.get(webhook.auth_token_env, "")
     if not token:
         return None
     return {"Authorization": f"Bearer {token}"}
+
+
+def _hash_agent_zero_rfc_input(data: str, password: str) -> str:
+    return hashlib.sha256(f"{data}{password}".encode()).hexdigest()

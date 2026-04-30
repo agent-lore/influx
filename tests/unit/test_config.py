@@ -433,6 +433,43 @@ class TestNotificationWebhookConfig:
         assert webhook.context == "influx-inbox"
         assert webhook.auth_token_env == "INFLUX_AGENT_ZERO_TOKEN"
 
+    def test_agent_zero_rfc_webhook_parses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+
+            [[notifications.webhooks]]
+            name = "agent-zero-rfc"
+            type = "agent_zero_rfc_message"
+            url = "http://agent-zero:50001/api/rfc"
+            event_mode = "article"
+            context = "InfluxIn"
+            rfc_module = "usr.influx_rfc"
+            rfc_function = "enqueue_message"
+            rfc_password_env = "AGENT_ZERO_RFC_PASSWORD"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        webhook = cfg.notifications.webhooks[0]
+        assert webhook.type == "agent_zero_rfc_message"
+        assert webhook.context == "InfluxIn"
+        assert webhook.rfc_module == "usr.influx_rfc"
+        assert webhook.rfc_function == "enqueue_message"
+        assert webhook.rfc_password_env == "AGENT_ZERO_RFC_PASSWORD"
+
     def test_duplicate_notification_webhook_name_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -516,6 +553,36 @@ class TestNotificationWebhookConfig:
         monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
 
         with pytest.raises(ConfigError, match="generic_digest only supports"):
+            load_config()
+
+    def test_agent_zero_rfc_requires_password_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+
+            [[notifications.webhooks]]
+            name = "agent-zero-rfc"
+            type = "agent_zero_rfc_message"
+            url = "http://agent-zero:50001/api/rfc"
+            event_mode = "article"
+            context = "InfluxIn"
+            rfc_module = "usr.influx_rfc"
+            rfc_function = "enqueue_message"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        with pytest.raises(ConfigError, match="rfc_password_env is required"):
             load_config()
 
 
