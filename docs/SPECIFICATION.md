@@ -464,6 +464,8 @@ Common tags include:
 - `influx:archive-missing`
 - `influx:repair-needed`
 - `influx:text-terminal`
+- `influx:tier2-terminal`
+- `influx:tier3-terminal`
 
 ---
 
@@ -516,6 +518,7 @@ Backfills skip cache hits entirely. Scheduled/manual runs still attempt a write 
 - `slug_collision`: retried once with a disambiguating title suffix.
 - `version_conflict`: re-read existing note, merge tags, preserve `## User Notes`, merge Profile Relevance, then retry once.
 - `content_too_large`: drop `## Full Text` and retry. On a second failure, create-path writes are skipped; repair-path writes retry with Tier 1 only and `influx:repair-needed`.
+- Any other status (e.g. an undocumented `error` envelope): the response body's `reason` / `detail` / `error` / `message` field is captured into `WriteResult.detail` and a `WARNING`-level log is emitted with `lithos_status`, `source_url`, and `detail` so the failure is diagnosable from logs.
 
 ### 10.5 LCMA Hooks
 
@@ -541,6 +544,24 @@ Failure behavior:
 - Terminal Lithos write failure aborts the run and latches degraded readiness.
 - Chronic `content_too_large` on repair leaves the existing note untouched and continues to the next candidate.
 - Successful sweep clears the repair-write readiness latch.
+
+### 11.1 Per-stage cap and self-repair
+
+Tier 2 and Tier 3 hook failures are partitioned into transient (HTTP, transport, resolve, archive_read, etc.) and counted (model output `parse` / `validate` failures). Counted failures advance a per-stage attempt counter persisted in a `## Repair` section in the note body:
+
+```
+## Repair
+- tier2_attempts: 0
+- tier2_last_stage: ""
+- tier2_last_error: ""
+- tier3_attempts: 2
+- tier3_last_stage: "validate"
+- tier3_last_error: "schema mismatch"
+```
+
+When `tier{N}_attempts` reaches the cap (currently 3), `influx:tier{N}-terminal` is added to the note's tags and that stage is skipped on subsequent sweeps. Transient failures never advance the counter, so flaky network conditions do not burn the cap.
+
+To re-enable a stage on a single note, an operator removes the `influx:tier{N}-terminal` tag (and optionally clears the `## Repair` section) — the next sweep retries from a clean slate. This mirrors the existing `influx:text-terminal` escape hatch.
 
 ---
 

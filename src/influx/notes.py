@@ -274,6 +274,11 @@ _INFLUX_OWNED_EXACT: frozenset[str] = frozenset(
         "influx:archive-missing",
         "influx:deep-extracted",
         "influx:text-terminal",
+        # Per-stage terminal markers — set after the cap of counted-
+        # toward-cap failures is reached so the sweep stops re-running
+        # the same broken extraction (mirrors influx:text-terminal).
+        "influx:tier2-terminal",
+        "influx:tier3-terminal",
     }
 )
 

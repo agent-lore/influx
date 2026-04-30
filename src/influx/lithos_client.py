@@ -64,6 +64,15 @@ def _is_unknown_tool_message(message: str | None) -> bool:
     return any(marker in lowered for marker in _UNKNOWN_TOOL_MARKERS)
 
 
+def _first_non_empty_str(body: dict[str, Any], keys: tuple[str, ...]) -> str:
+    """Return the first non-empty string value among *keys* in *body*."""
+    for key in keys:
+        value = body.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 @dataclasses.dataclass(frozen=True)
 class WriteResult:
     """Result of a ``write_note`` call after envelope handling (FR-MCP-7).
@@ -677,12 +686,37 @@ class LithosClient:
                 source_url=source_url,
             )
 
-        # ``created`` / ``updated`` (and any other success-shaped
-        # envelope) carry a ``note_id`` that LCMA needs as the
-        # ``source_note_id`` on subsequent ``edge_upsert`` calls.
+        if status in ("created", "updated"):
+            # Success — ``note_id`` is plumbed through so LCMA can use it
+            # as the ``source_note_id`` on subsequent ``edge_upsert`` calls.
+            return WriteResult(
+                status=status,
+                source_url=source_url,
+                note_id=body.get("note_id", ""),
+            )
+
+        # Undocumented / unexpected envelope (e.g. ``status="error"``).
+        # Surface whatever diagnostic the server returned so the failure
+        # is root-causable from logs alone — see staging incident
+        # 2026-04-30 where a bare ``status=error`` left no breadcrumb.
+        detail = _first_non_empty_str(body, ("reason", "detail", "error", "message"))
+        body_excerpt = "" if detail else json.dumps(body, default=str)[:500]
+        logger.warning(
+            "lithos_write returned non-success status=%s for %s: %s",
+            status or "<empty>",
+            source_url,
+            detail or body_excerpt,
+            extra={
+                "lithos_status": status,
+                "source_url": source_url,
+                "detail": detail,
+                "body_excerpt": body_excerpt,
+            },
+        )
         return WriteResult(
             status=status,
             source_url=source_url,
+            detail=detail,
             note_id=body.get("note_id", ""),
         )
 

@@ -518,13 +518,28 @@ async def _run_profile_body(
                         )
                     )
                 else:
-                    logger.info(
+                    # Promoted INFO→WARNING with structured `extra` so the
+                    # underlying Lithos failure is diagnosable from logs.
+                    # See lithos_client._parse_write_response for `detail`
+                    # population on the undocumented "error" envelope.
+                    logger.warning(
                         "article write skipped profile=%s source_url=%s title=%r "
-                        "status=%s cache_hit=false",
+                        "status=%s detail=%r cache_hit=false",
                         profile,
                         source_url,
                         title,
                         write_result.status,
+                        write_result.detail,
+                        extra={
+                            "profile": profile,
+                            "source_url": source_url,
+                            "title": title,
+                            "status": write_result.status,
+                            "detail": write_result.detail,
+                            "run_id": current_run_id.get() or "",
+                            "tags": list(item.get("tags", [])),
+                            "cache_hit": False,
+                        },
                     )
 
             # 5. Build result + fire post-run webhook hook (FR-NOT-1..6, AC-05-I).
