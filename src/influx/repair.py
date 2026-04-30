@@ -17,11 +17,13 @@ import copy
 import enum
 import json
 import logging
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+import re
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.notes import merge_tags
+from influx.telemetry import current_run_id, get_tracer
 
 if TYPE_CHECKING:
     from influx.config import AppConfig
@@ -34,16 +36,26 @@ __all__ = [
     "ExtractionOutcome",
     "ReExtractionResult",
     "ReExtractArchiveHook",
+    "RepairCounters",
     "StageSelection",
     "SweepHooks",
     "SweepWriteError",
     "Tier2EnrichHook",
     "Tier3ExtractHook",
     "apply_abstract_only_reextraction",
+    "classify_failure",
     "compute_clearing",
+    "parse_repair_section",
+    "render_repair_section",
     "select_stages",
     "sweep",
+    "upsert_repair_section",
 ]
+
+# Per-stage cap on counted failures before flipping influx:tier{2,3}-terminal.
+# Tunable via influx.toml in a follow-up; hardcoded for the initial roll-out
+# (plan: 3 mirrors the abstract-only re-extraction TERMINAL outcome cadence).
+REPAIR_COUNTED_CAP = 3
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +339,8 @@ def select_stages(
     """
     tag_set = set(tags)
     is_text_terminal = "influx:text-terminal" in tag_set
+    is_tier2_terminal = "influx:tier2-terminal" in tag_set
+    is_tier3_terminal = "influx:tier3-terminal" in tag_set
 
     # 1. Archive retry: influx:archive-missing present (AC-06-A).
     archive_retry = "influx:archive-missing" in tag_set
@@ -345,19 +359,23 @@ def select_stages(
     )
 
     # 4. Tier 2 retry: full-text missing AND score >= threshold AND
-    #    NOT terminal.
+    #    neither the global text-terminal nor the per-stage tier2-terminal
+    #    marker is set (the latter caps repeated parse/validate failures).
     tier2_retry = (
         "full-text" not in tag_set
         and max_profile_score >= full_text_threshold
         and not is_text_terminal
+        and not is_tier2_terminal
     )
 
     # 5. Tier 3 retry: influx:deep-extracted missing AND score >=
-    #    threshold AND NOT terminal.
+    #    threshold AND neither text-terminal nor the per-stage
+    #    tier3-terminal marker is set.
     tier3_retry = (
         "influx:deep-extracted" not in tag_set
         and max_profile_score >= deep_extract_threshold
         and not is_text_terminal
+        and not is_tier3_terminal
     )
 
     return StageSelection(
@@ -390,6 +408,225 @@ def _restore_note(note: dict[str, Any], snapshot: dict[str, Any]) -> None:
     """Restore *note* to *snapshot* state in place."""
     note.clear()
     note.update(snapshot)
+
+
+# ── ## Repair section: per-stage attempt counters (Layer 2) ─────────
+
+
+@dataclass(frozen=True, slots=True)
+class RepairCounters:
+    """Per-stage attempt counters tracked in the note's ``## Repair`` section.
+
+    ``tier{2,3}_attempts`` count *counted-toward-cap* failures only —
+    transient HTTP / network failures are not bumped (see
+    :func:`classify_failure`).  When ``tier{N}_attempts`` reaches the
+    configured cap, the sweep adds the ``influx:tier{N}-terminal`` tag
+    and stops re-running that stage on subsequent passes.
+    """
+
+    tier2_attempts: int = 0
+    tier2_last_stage: str = ""
+    tier2_last_error: str = ""
+    tier3_attempts: int = 0
+    tier3_last_stage: str = ""
+    tier3_last_error: str = ""
+
+    def bump_tier2(self, *, stage: str, error: str) -> RepairCounters:
+        """Return a new counters value with Tier 2 attempts incremented."""
+        return replace(
+            self,
+            tier2_attempts=self.tier2_attempts + 1,
+            tier2_last_stage=stage,
+            tier2_last_error=_collapse_to_single_line(error),
+        )
+
+    def bump_tier3(self, *, stage: str, error: str) -> RepairCounters:
+        """Return a new counters value with Tier 3 attempts incremented."""
+        return replace(
+            self,
+            tier3_attempts=self.tier3_attempts + 1,
+            tier3_last_stage=stage,
+            tier3_last_error=_collapse_to_single_line(error),
+        )
+
+
+_REPAIR_HEADING_RE = re.compile(r"^## Repair[ \t]*\n", re.MULTILINE)
+_REPAIR_BULLET_RE = re.compile(r"^[ \t]*-\s*(\w+)\s*:\s*(.*)$")
+_QUOTED_RE = re.compile(r'^"(.*)"$')
+_NEXT_HEADING_RE = re.compile(r"^## ", re.MULTILINE)
+_REPAIR_PROFILE_RELEVANCE_RE = re.compile(r"^## Profile Relevance\b", re.MULTILINE)
+_REPAIR_USER_NOTES_RE = re.compile(r"^## User Notes\b", re.MULTILINE)
+
+
+def _collapse_to_single_line(value: str) -> str:
+    """Flatten *value* to a single line (caps at 300 chars).
+
+    The ``## Repair`` section uses one bullet per key, so multi-line
+    values would corrupt round-tripping.  Truncating long error strings
+    also keeps notes from ballooning when the same provider message
+    repeats every sweep.
+    """
+    return " ".join(value.replace("\r", " ").split())[:300]
+
+
+def _find_repair_section_span(content: str) -> tuple[int, int] | None:
+    """Return (start, end) of the existing ``## Repair`` section, or None."""
+    m = _REPAIR_HEADING_RE.search(content)
+    if not m:
+        return None
+    body_start = m.end()
+    next_h = _NEXT_HEADING_RE.search(content, body_start)
+    end = next_h.start() if next_h else len(content)
+    return m.start(), end
+
+
+def parse_repair_section(content: str) -> RepairCounters:
+    """Parse the ``## Repair`` section of *content* into :class:`RepairCounters`.
+
+    Returns zero-defaults when the section is absent.  Unknown bullets
+    are ignored; malformed integer counts default to zero so a hand-edit
+    cannot break the sweep.
+    """
+    span = _find_repair_section_span(content)
+    if span is None:
+        return RepairCounters()
+    start, end = span
+    # Skip past the heading line we already matched.
+    body_start = content.find("\n", start)
+    if body_start < 0 or body_start >= end:
+        return RepairCounters()
+    body = content[body_start + 1 : end]
+
+    fields: dict[str, Any] = {}
+    int_keys = {"tier2_attempts", "tier3_attempts"}
+    str_keys = {
+        "tier2_last_stage",
+        "tier2_last_error",
+        "tier3_last_stage",
+        "tier3_last_error",
+    }
+    for line in body.splitlines():
+        bm = _REPAIR_BULLET_RE.match(line)
+        if not bm:
+            continue
+        key = bm.group(1)
+        raw = bm.group(2).strip()
+        qm = _QUOTED_RE.match(raw)
+        value: Any = qm.group(1) if qm else raw
+        if key in int_keys:
+            try:
+                fields[key] = int(value)
+            except (TypeError, ValueError):
+                fields[key] = 0
+        elif key in str_keys:
+            fields[key] = value
+    return RepairCounters(**fields)
+
+
+def render_repair_section(counters: RepairCounters) -> str:
+    """Serialise *counters* as a ``## Repair`` section (trailing newline)."""
+    lines = [
+        "## Repair",
+        f"- tier2_attempts: {counters.tier2_attempts}",
+        f'- tier2_last_stage: "{counters.tier2_last_stage}"',
+        f'- tier2_last_error: "{_collapse_to_single_line(counters.tier2_last_error)}"',
+        f"- tier3_attempts: {counters.tier3_attempts}",
+        f'- tier3_last_stage: "{counters.tier3_last_stage}"',
+        f'- tier3_last_error: "{_collapse_to_single_line(counters.tier3_last_error)}"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def upsert_repair_section(content: str, counters: RepairCounters) -> str:
+    """Return *content* with the ``## Repair`` section set to *counters*.
+
+    Replaces an existing section in place; otherwise inserts the new
+    section before ``## Profile Relevance`` (canonical placement,
+    matching ``repair_hooks._find_insertion_point``), or before
+    ``## User Notes``, or at end of content when neither is present.
+    """
+    rendered = render_repair_section(counters)
+    span = _find_repair_section_span(content)
+    if span is not None:
+        start, end = span
+        # Trim leading whitespace from the post-section so we don't
+        # accumulate blank lines on every re-render.
+        tail = content[end:].lstrip("\n")
+        if tail:
+            tail = "\n" + tail
+        head = content[:start].rstrip("\n")
+        separator = "\n\n" if head.strip() else ""
+        return head + separator + rendered + tail
+
+    pr = _REPAIR_PROFILE_RELEVANCE_RE.search(content)
+    if pr:
+        ins = pr.start()
+        return content[:ins] + rendered + "\n" + content[ins:]
+    un = _REPAIR_USER_NOTES_RE.search(content)
+    if un:
+        ins = un.start()
+        return content[:ins] + rendered + "\n" + content[ins:]
+    if content and not content.endswith("\n"):
+        content += "\n"
+    return content + ("\n" if content else "") + rendered
+
+
+# ── Failure classification (Layer 2) ────────────────────────────────
+
+
+def classify_failure(exc: BaseException) -> Literal["transient", "counted"]:
+    """Partition a sweep stage failure into transient vs counted.
+
+    *Counted* failures advance the per-stage attempt counter and
+    eventually flip the stage to terminal — these are exceptions whose
+    ``stage`` indicates the model output itself was malformed (``parse``,
+    ``validate``).  Re-running the same prompt on the same input will
+    almost certainly keep failing.
+
+    *Transient* failures (HTTP, transport, resolve, archive_read, or
+    anything we don't specifically recognise) leave the counter alone.
+    The next sweep retries them indefinitely.
+    """
+    if isinstance(exc, (LCMAError, ExtractionError)):
+        stage = getattr(exc, "stage", "") or ""
+        if stage in ("parse", "validate"):
+            return "counted"
+    return "transient"
+
+
+def _log_stage_failure(
+    stage: str,
+    *,
+    note: dict[str, Any],
+    profile: str,
+    exc: BaseException,
+) -> None:
+    """Emit a structured WARNING for a sweep-stage hook failure.
+
+    The pre-existing logging at these call sites used ``logger.info`` and
+    discarded the exception object entirely, leaving operators with a
+    bare "stage failed for <id>" line and no way to root-cause the
+    incident from logs (staging incident 2026-04-30).  We now lift the
+    structured ``model``/``stage``/``detail`` fields off ``LCMAError``
+    and ``ExtractionError`` into the JSON record alongside ``exc_info``.
+    """
+    logger.warning(
+        "sweep: %s failed for %s",
+        stage,
+        note.get("id", "?"),
+        extra={
+            "sweep_stage": stage,
+            "note_id": note.get("id"),
+            "profile": profile,
+            "run_id": current_run_id.get() or "",
+            "exc_type": type(exc).__name__,
+            "model": getattr(exc, "model", None),
+            "stage": getattr(exc, "stage", None),
+            "detail": getattr(exc, "detail", None),
+            "url": getattr(exc, "url", None),
+        },
+        exc_info=exc,
+    )
 
 
 # ── Abstract-only re-extraction stage (§5.2) ──────────────────────
@@ -808,10 +1045,18 @@ async def _process_sweep_note(
         entries = parse_profile_relevance(parsed)
         if entries:
             max_profile_score = max(e.score for e in entries)
-    except Exception:
+    except Exception as exc:
         logger.warning(
             "sweep: could not parse note %s; will still rewrite",
             note.get("id", "?"),
+            extra={
+                "sweep_stage": "parse_note",
+                "note_id": note.get("id"),
+                "profile": profile,
+                "run_id": current_run_id.get() or "",
+                "exc_type": type(exc).__name__,
+            },
+            exc_info=exc,
         )
 
     ft_thresh, de_thresh = _get_profile_thresholds(config, profile)
@@ -834,8 +1079,17 @@ async def _process_sweep_note(
         # Snapshot before the hook so a raise rolls back any partial
         # in-place note mutations the hook applied (finding #1).
         snapshot = _snapshot_note(note)
+        tracer = get_tracer()
         try:
-            downloaded_path = hooks.archive_download(note)
+            with tracer.span(
+                "influx.repair.archive",
+                attributes={
+                    "influx.note_id": note.get("id", ""),
+                    "influx.profile": profile,
+                    "influx.run_id": current_run_id.get() or "",
+                },
+            ):
+                downloaded_path = hooks.archive_download(note)
             archive_path = downloaded_path
             archive_succeeded = True
             # Update ## Archive in note content with the new path.
@@ -851,14 +1105,16 @@ async def _process_sweep_note(
                         + f"path: {downloaded_path}\n"
                         + content[insert_pos:]
                     )
-        except (ExtractionError, LithosError):
+        except (ExtractionError, LithosError) as exc:
             # Hook raises are per-stage failures, not fatal aborts.
             # Restore the note dict so partial in-place mutations from
             # the failing hook are NOT persisted (finding #1).
             _restore_note(note, snapshot)
-            logger.info(
-                "sweep: archive download failed for %s",
-                note.get("id"),
+            _log_stage_failure(
+                "archive_download",
+                note=note,
+                profile=profile,
+                exc=exc,
             )
 
     # Text extraction retry (PRD 07 hook — not yet wired).
@@ -897,28 +1153,116 @@ async def _process_sweep_note(
         # the expected pre-hook state — including the latest current_tags
         # rather than whatever was on the note before this stage ran.
         snapshot = _snapshot_note(note)
+        tracer = get_tracer()
         try:
-            hooks.tier2_enrich(note)
+            with tracer.span(
+                "influx.repair.tier2",
+                attributes={
+                    "influx.note_id": note.get("id", ""),
+                    "influx.profile": profile,
+                    "influx.run_id": current_run_id.get() or "",
+                },
+            ):
+                hooks.tier2_enrich(note)
             # Sync any tag/content mutations the hook applied to the
             # note dict back into the local working set.
             current_tags = list(note.get("tags", current_tags))
-        except (ExtractionError, LCMAError, LithosError):
+        except (ExtractionError, LCMAError, LithosError) as exc:
             # Per-stage failure: roll back any partial in-place
             # mutations from the failing hook (finding #1).  Do NOT
             # sync hook mutations into ``current_tags``.
             _restore_note(note, snapshot)
-            logger.info("sweep: tier2 enrichment failed for %s", note.get("id"))
+            if classify_failure(exc) == "counted":
+                counters = parse_repair_section(str(note.get("content", "")))
+                counters = counters.bump_tier2(
+                    stage=getattr(exc, "stage", "") or "",
+                    error=str(exc),
+                )
+                note["content"] = upsert_repair_section(
+                    str(note.get("content", "")), counters
+                )
+                if (
+                    counters.tier2_attempts >= REPAIR_COUNTED_CAP
+                    and "influx:tier2-terminal" not in current_tags
+                ):
+                    current_tags.append("influx:tier2-terminal")
+                    note["tags"] = list(current_tags)
+                    logger.warning(
+                        "sweep: tier2 marked terminal after %d counted failures for %s",
+                        counters.tier2_attempts,
+                        note.get("id", "?"),
+                        extra={
+                            "sweep_stage": "tier2_terminal_flip",
+                            "note_id": note.get("id"),
+                            "profile": profile,
+                            "run_id": current_run_id.get() or "",
+                            "tier2_attempts": counters.tier2_attempts,
+                            "exc_type": type(exc).__name__,
+                            "stage": getattr(exc, "stage", None),
+                            "detail": getattr(exc, "detail", None),
+                        },
+                    )
+            _log_stage_failure(
+                "tier2_enrichment",
+                note=note,
+                profile=profile,
+                exc=exc,
+            )
 
     # Tier 3 retry.
     if stages.tier3_retry and hooks.tier3_extract:
         note["tags"] = list(current_tags)
         snapshot = _snapshot_note(note)
+        tracer = get_tracer()
         try:
-            hooks.tier3_extract(note)
+            with tracer.span(
+                "influx.repair.tier3",
+                attributes={
+                    "influx.note_id": note.get("id", ""),
+                    "influx.profile": profile,
+                    "influx.run_id": current_run_id.get() or "",
+                },
+            ):
+                hooks.tier3_extract(note)
             current_tags = list(note.get("tags", current_tags))
-        except (ExtractionError, LCMAError, LithosError):
+        except (ExtractionError, LCMAError, LithosError) as exc:
             _restore_note(note, snapshot)
-            logger.info("sweep: tier3 extraction failed for %s", note.get("id"))
+            if classify_failure(exc) == "counted":
+                counters = parse_repair_section(str(note.get("content", "")))
+                counters = counters.bump_tier3(
+                    stage=getattr(exc, "stage", "") or "",
+                    error=str(exc),
+                )
+                note["content"] = upsert_repair_section(
+                    str(note.get("content", "")), counters
+                )
+                if (
+                    counters.tier3_attempts >= REPAIR_COUNTED_CAP
+                    and "influx:tier3-terminal" not in current_tags
+                ):
+                    current_tags.append("influx:tier3-terminal")
+                    note["tags"] = list(current_tags)
+                    logger.warning(
+                        "sweep: tier3 marked terminal after %d counted failures for %s",
+                        counters.tier3_attempts,
+                        note.get("id", "?"),
+                        extra={
+                            "sweep_stage": "tier3_terminal_flip",
+                            "note_id": note.get("id"),
+                            "profile": profile,
+                            "run_id": current_run_id.get() or "",
+                            "tier3_attempts": counters.tier3_attempts,
+                            "exc_type": type(exc).__name__,
+                            "stage": getattr(exc, "stage", None),
+                            "detail": getattr(exc, "detail", None),
+                        },
+                    )
+            _log_stage_failure(
+                "tier3_extraction",
+                note=note,
+                profile=profile,
+                exc=exc,
+            )
 
     # ── Compute and apply clearing ──────────────────────────────
     post_archive_path = archive_path

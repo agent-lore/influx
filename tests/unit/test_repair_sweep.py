@@ -749,3 +749,313 @@ class TestContentTooLargeSkippedException:
         exc = ContentTooLargeSkipped("n1")
         assert not isinstance(exc, SweepWriteError)
         assert not isinstance(exc, LithosError)
+
+
+# ── Structured logging on stage failures (staging incident 2026-04-30) ──
+
+
+class TestStageFailureLogging:
+    """Per-stage hook failures must surface ``exc_info`` and structured
+    ``extra`` fields so root cause is recoverable from logs alone.
+    Pre-incident behaviour was a bare ``logger.info('… failed for <id>')``
+    that dropped the exception type, message, model, and stage.
+    """
+
+    @staticmethod
+    def _note(note_id: str, *, with_full_text: bool = True) -> dict[str, Any]:
+        body = (
+            "---\n"
+            f"source_url: https://example.com/{note_id}\n"
+            "tags: []\n"
+            "confidence: 0.9\n"
+            "---\n"
+            "# Paper\n\n"
+            "## Archive\n"
+            "path: arxiv/2026/04/paper.pdf\n\n"
+            "## Summary\n"
+            "Summary\n\n"
+        )
+        if with_full_text:
+            body += "## Full Text\nFull text\n\n"
+        body += (
+            "## Profile Relevance\n"
+            "### ai-robotics\n"
+            "Score: 9/10\n"
+            "Relevant\n\n"
+            "## User Notes\n"
+        )
+        return {
+            "id": note_id,
+            "title": "Paper",
+            "content": body,
+            "tags": ["influx:repair-needed", "text:html", "full-text"],
+            "source_url": f"https://example.com/{note_id}",
+            "confidence": 0.9,
+        }
+
+    async def test_tier3_failure_logs_warning_with_extra_and_exc_info(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note("n1")
+
+        def failing(note: dict[str, object]) -> None:
+            del note
+            raise LCMAError(
+                "Tier 3 extraction response failed validation",
+                model="extract",
+                stage="validate",
+                detail="missing 'contributions' field",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        with caplog.at_level(logging.WARNING, logger="influx.repair"):
+            await sweep(
+                "ai-robotics",
+                client=client,
+                config=config,
+                hooks=SweepHooks(tier3_extract=failing),
+            )
+
+        matching = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING"
+            and getattr(r, "sweep_stage", None) == "tier3_extraction"
+        ]
+        assert matching, [
+            (r.levelname, r.getMessage(), getattr(r, "sweep_stage", None))
+            for r in caplog.records
+        ]
+        rec = matching[0]
+        assert getattr(rec, "note_id", None) == "n1"
+        assert getattr(rec, "profile", None) == "ai-robotics"
+        assert getattr(rec, "exc_type", None) == "LCMAError"
+        assert getattr(rec, "model", None) == "extract"
+        assert getattr(rec, "stage", None) == "validate"
+        assert getattr(rec, "detail", None) == "missing 'contributions' field"
+        # ``exc_info`` must be populated so the JSON formatter renders the traceback.
+        assert rec.exc_info is not None
+
+    async def test_tier2_failure_logs_warning_with_extra(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        items = [{"id": "n2", "title": "Paper"}]
+        note = self._note("n2", with_full_text=False)
+        # Strip ``full-text`` so tier2_retry is selected.
+        note["tags"] = ["influx:repair-needed", "text:html"]
+
+        def failing(note: dict[str, object]) -> None:
+            del note
+            raise LCMAError(
+                "Tier 2 enrichment HTTP failure",
+                model="enrich",
+                stage="http",
+                detail="connect timeout",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        with caplog.at_level(logging.WARNING, logger="influx.repair"):
+            await sweep(
+                "ai-robotics",
+                client=client,
+                config=config,
+                hooks=SweepHooks(tier2_enrich=failing),
+            )
+
+        matching = [
+            r
+            for r in caplog.records
+            if getattr(r, "sweep_stage", None) == "tier2_enrichment"
+        ]
+        assert matching
+        rec = matching[0]
+        assert getattr(rec, "exc_type", None) == "LCMAError"
+        assert getattr(rec, "stage", None) == "http"
+        assert rec.exc_info is not None
+
+
+# ── Layer 2 self-repair: counter + terminal flip ─────────────────────
+
+
+class TestSweepCapCounterAndTerminalFlip:
+    """Repeat-fail sweeps cap counted failures at REPAIR_COUNTED_CAP and add
+    ``influx:tier{N}-terminal`` so future sweeps skip the broken stage.
+    """
+
+    @staticmethod
+    def _note_for_tier3(note_id: str) -> dict[str, Any]:
+        # Has full-text + text:html so tier2 is NOT selected; tier3 IS.
+        body = (
+            "---\n"
+            f"source_url: https://example.com/{note_id}\n"
+            "tags: []\n"
+            "confidence: 0.9\n"
+            "---\n"
+            "# Paper\n\n"
+            "## Archive\n"
+            "path: arxiv/2026/04/paper.pdf\n\n"
+            "## Summary\nSummary\n\n"
+            "## Full Text\nFull text\n\n"
+            "## Profile Relevance\n"
+            "### ai-robotics\nScore: 9/10\nRelevant\n\n"
+            "## User Notes\n"
+        )
+        return {
+            "id": note_id,
+            "title": "Paper",
+            "content": body,
+            "tags": ["influx:repair-needed", "text:html", "full-text"],
+            "source_url": f"https://example.com/{note_id}",
+            "confidence": 0.9,
+        }
+
+    @staticmethod
+    def _last_write_args(client: AsyncMock) -> dict[str, Any]:
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        args = write_calls[-1].args[1]
+        return dict(args)
+
+    async def test_validate_failure_bumps_counter_in_repair_section(self) -> None:
+        """A single counted failure increments tier3_attempts in ## Repair."""
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_tier3("n1")
+
+        def failing(note: dict[str, object]) -> None:
+            del note
+            raise LCMAError("validation failed", model="extract", stage="validate")
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(tier3_extract=failing),
+        )
+
+        rewritten = self._last_write_args(client)
+        content = rewritten["content"]
+        assert "## Repair" in content
+        assert "tier3_attempts: 1" in content
+        assert 'tier3_last_stage: "validate"' in content
+        # Terminal not yet flipped.
+        assert "influx:tier3-terminal" not in rewritten["tags"]
+
+    async def test_http_failure_does_not_bump_counter(self) -> None:
+        """Transient (HTTP) failures must NOT advance the cap counter."""
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_tier3("n1")
+
+        def failing(note: dict[str, object]) -> None:
+            del note
+            raise LCMAError("connect timeout", model="extract", stage="http")
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(tier3_extract=failing),
+        )
+
+        rewritten = self._last_write_args(client)
+        content = rewritten["content"]
+        # Either no Repair section, or counter is 0.
+        if "## Repair" in content:
+            assert "tier3_attempts: 0" in content
+        assert "influx:tier3-terminal" not in rewritten["tags"]
+
+    async def test_third_counted_failure_flips_tier3_terminal(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """At cap=3, ``influx:tier3-terminal`` is added and a WARNING is logged."""
+        import logging
+
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_tier3("n1")
+        # Pre-existing ## Repair section showing 2 prior counted failures.
+        note["content"] = note["content"].replace(
+            "## User Notes\n",
+            (
+                "## Repair\n"
+                "- tier2_attempts: 0\n"
+                '- tier2_last_stage: ""\n'
+                '- tier2_last_error: ""\n'
+                "- tier3_attempts: 2\n"
+                '- tier3_last_stage: "validate"\n'
+                '- tier3_last_error: "earlier failure"\n\n'
+                "## User Notes\n"
+            ),
+        )
+
+        def failing(note: dict[str, object]) -> None:
+            del note
+            raise LCMAError("schema mismatch", model="extract", stage="validate")
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        with caplog.at_level(logging.WARNING, logger="influx.repair"):
+            await sweep(
+                "ai-robotics",
+                client=client,
+                config=config,
+                hooks=SweepHooks(tier3_extract=failing),
+            )
+
+        rewritten = self._last_write_args(client)
+        assert "influx:tier3-terminal" in rewritten["tags"]
+        assert "tier3_attempts: 3" in rewritten["content"]
+
+        flip_logs = [
+            r
+            for r in caplog.records
+            if getattr(r, "sweep_stage", None) == "tier3_terminal_flip"
+        ]
+        assert flip_logs, "expected tier3_terminal_flip log"
+        rec = flip_logs[0]
+        assert getattr(rec, "tier3_attempts", None) == 3
+        assert getattr(rec, "stage", None) == "validate"
+
+    async def test_tier3_terminal_present_skips_tier3(self) -> None:
+        """Once ``influx:tier3-terminal`` is set, the hook is not called."""
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_tier3("n1")
+        note["tags"] = list(note["tags"]) + ["influx:tier3-terminal"]
+
+        call_count = 0
+
+        def spy(note: dict[str, object]) -> None:
+            nonlocal call_count
+            del note
+            call_count += 1
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(tier3_extract=spy),
+        )
+
+        assert call_count == 0

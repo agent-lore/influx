@@ -1006,6 +1006,78 @@ class TestWriteEnvelopeInvalidInput:
             await client.close()
 
 
+class TestWriteEnvelopeUnknownStatus:
+    """Undocumented statuses (e.g. ``status='error'``) must surface a diagnosable
+    detail and a WARNING log so operators can root-cause from logs alone.
+    """
+
+    async def test_error_status_captures_detail(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """status='error' surfaces the response ``reason`` as WriteResult.detail."""
+        fake_lithos_server.write_responses.append(
+            '{"status": "error", "reason": "lithos says no"}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Broken item",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.99999",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+            assert result.status == "error"
+            assert result.detail == "lithos says no"
+            assert result.source_url == "https://arxiv.org/abs/2601.99999"
+        finally:
+            await client.close()
+
+    async def test_unknown_status_logs_warning_with_structured_extra(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Undocumented status emits a WARNING carrying status, source_url, detail."""
+        import logging
+
+        fake_lithos_server.write_responses.append(
+            '{"status": "error", "detail": "constraint failure"}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with caplog.at_level(logging.WARNING, logger="influx.lithos_client"):
+                await client.write_note(
+                    title="Broken item 2",
+                    content="# Summary\nContent.",
+                    path="papers/arxiv/2026/03",
+                    source_url="https://arxiv.org/abs/2601.99998",
+                    tags=["profile:ml-research"],
+                    confidence=0.8,
+                )
+            matching = [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING"
+                and "lithos_write returned non-success" in r.getMessage()
+            ]
+            assert matching, (
+                f"expected warning, got {[r.getMessage() for r in caplog.records]}"
+            )
+            r = matching[0]
+            assert getattr(r, "lithos_status", None) == "error"
+            assert getattr(r, "source_url", None) == "https://arxiv.org/abs/2601.99998"
+            assert getattr(r, "detail", None) == "constraint failure"
+        finally:
+            await client.close()
+
+
 # ── Write envelopes — slug_collision (FR-MCP-7, AC-05-D) ──────────
 
 

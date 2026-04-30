@@ -339,6 +339,45 @@ class TestTextTerminalPresent:
         assert s.tier3_retry is False
 
 
+# ── Per-stage tier{2,3}-terminal suppression ─────────────────────────
+
+
+class TestTier2TerminalPresent:
+    """``influx:tier2-terminal`` suppresses Tier 2 only — Tier 3 still runs."""
+
+    def test_tier2_not_selected_with_tier2_terminal(self) -> None:
+        s = _select(
+            ["influx:repair-needed", "text:html", "influx:tier2-terminal"],
+            max_profile_score=HIGH_SCORE,
+        )
+        assert s.tier2_retry is False
+
+    def test_tier3_still_selected_with_only_tier2_terminal(self) -> None:
+        s = _select(
+            ["influx:repair-needed", "text:html", "influx:tier2-terminal"],
+            max_profile_score=HIGH_SCORE,
+        )
+        assert s.tier3_retry is True
+
+
+class TestTier3TerminalPresent:
+    """``influx:tier3-terminal`` suppresses Tier 3 only — Tier 2 still runs."""
+
+    def test_tier3_not_selected_with_tier3_terminal(self) -> None:
+        s = _select(
+            ["influx:repair-needed", "text:html", "influx:tier3-terminal"],
+            max_profile_score=HIGH_SCORE,
+        )
+        assert s.tier3_retry is False
+
+    def test_tier2_still_selected_with_only_tier3_terminal(self) -> None:
+        s = _select(
+            ["influx:repair-needed", "text:html", "influx:tier3-terminal"],
+            max_profile_score=HIGH_SCORE,
+        )
+        assert s.tier2_retry is True
+
+
 # ── Abstract-only re-extraction with stored archive path ─────────────
 
 
