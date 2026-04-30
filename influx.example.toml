@@ -75,6 +75,7 @@ webhook_url = ""
 # event_mode = "digest"
 # min_score = 8
 # deliver = true
+# wake_mode = "now"
 # channel = "whatsapp"
 # sender_name = "Influx"
 # auth_token_env = "INFLUX_OPENCLAW_TOKEN"

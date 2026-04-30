@@ -470,6 +470,41 @@ class TestNotificationWebhookConfig:
         assert webhook.rfc_function == "enqueue_message"
         assert webhook.rfc_password_env == "AGENT_ZERO_RFC_PASSWORD"
 
+    def test_openclaw_webhook_parses_wake_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        toml = dedent("""\
+            [notifications]
+
+            [[notifications.webhooks]]
+            name = "openclaw-agent"
+            type = "openclaw_agent"
+            url = "http://192.168.0.160:18789/hooks/agent"
+            event_mode = "digest"
+            deliver = true
+            wake_mode = "now"
+            sender_name = "Influx"
+            auth_token_env = "OPENCLAW_TOKEN"
+
+            [prompts.filter]
+            text = "f {profile_description} {negative_examples} {min_score_in_results}"
+
+            [prompts.tier1_enrich]
+            text = "e {title} {abstract} {profile_summary}"
+
+            [prompts.tier3_extract]
+            text = "x {title} {full_text}"
+        """)
+        config_path = _write_config(tmp_path, toml)
+        monkeypatch.setenv("INFLUX_CONFIG", str(config_path))
+
+        cfg = load_config()
+
+        webhook = cfg.notifications.webhooks[0]
+        assert webhook.type == "openclaw_agent"
+        assert webhook.deliver is True
+        assert webhook.wake_mode == "now"
+
     def test_duplicate_notification_webhook_name_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

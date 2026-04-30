@@ -68,7 +68,7 @@ Each `[[notifications.webhooks]]` entry defines a typed sink with:
 - `name`, `type`, `url`
 - `enabled`, `notify_on`, `event_mode`, `min_score`
 - `auth_token_env` for bearer-token auth
-- target-specific fields such as `context` for `agent_zero_message_async`, `rfc_module` / `rfc_function` / `rfc_password_env` for `agent_zero_rfc_message`, and `deliver` / `channel` / `sender_name` for `openclaw_agent`
+- target-specific fields such as `context` for `agent_zero_message_async`, `rfc_module` / `rfc_function` / `rfc_password_env` for `agent_zero_rfc_message`, and `deliver` / `wake_mode` / `channel` / `sender_name` for `openclaw_agent`
 
 Supported webhook types:
 

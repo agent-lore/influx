@@ -299,6 +299,8 @@ def _build_payload(
             "name": webhook.sender_name,
             "deliver": webhook.deliver,
         }
+        if webhook.wake_mode:
+            payload["wakeMode"] = webhook.wake_mode
         if webhook.channel:
             payload["channel"] = webhook.channel
         return payload

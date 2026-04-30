@@ -560,7 +560,7 @@ Notification configuration:
   - `event_mode`
   - optional `min_score`
   - optional `auth_token_env`
-  - target-specific fields such as `context`, `deliver`, `channel`, and `sender_name`
+  - target-specific fields such as `context`, `deliver`, `wake_mode`, `channel`, and `sender_name`
 - `notifications.webhook_url` remains as a legacy compatibility path. When set and `notifications.webhooks` is empty, Influx sends one `generic_digest` notification to that URL.
 
 Supported types:
@@ -588,7 +588,7 @@ Typed target behavior:
 - `agent_zero_message_async` sends `{"text", "context"}`.
 - `agent_zero_notification_create` sends one toast-style payload per matching article.
 - `agent_zero_rfc_message` sends `{"rfc_input", "hash"}` to Agent Zero's `/api/rfc` endpoint. The RFC input names a helper module and function plus keyword arguments `text` and `context`. The shared secret is loaded from `rfc_password_env`.
-- `openclaw_agent` sends `{"message", "name", "deliver"}` and includes `channel` when configured.
+- `openclaw_agent` sends `{"message", "name", "deliver"}` and includes `wakeMode` and `channel` when configured.
 
 Bearer-token auth is supported via `auth_token_env`; missing tokens cause the sink to be skipped with a warning. `agent_zero_rfc_message` uses `rfc_password_env` instead of bearer auth. Agent Zero's direct HTTP endpoints remain session-authenticated when Agent Zero login is enabled, so `agent_zero_rfc_message` is the preferred service-to-service integration path for that deployment shape.
 

@@ -400,6 +400,36 @@ class TestOpenClawNotifications:
         assert "Influx run completed." in body["message"]
         assert headers["authorization"] == "Bearer secret-token"
 
+    def test_openclaw_agent_includes_wake_mode(
+        self,
+        fake_webhook_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("INFLUX_OPENCLAW_TOKEN", "secret-token")
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="openclaw-whatsapp",
+                    type="openclaw_agent",
+                    url=fake_webhook_url,
+                    event_mode="digest",
+                    auth_token_env="INFLUX_OPENCLAW_TOKEN",
+                    deliver=True,
+                    wake_mode="now",
+                    sender_name="Influx",
+                )
+            ]
+        )
+
+        dispatch_notifications(
+            _make_result(), config, kind=RunKind.SCHEDULED, run_id="5b"
+        )
+
+        assert _RecordingHandler.request_count == 1
+        body = _RecordingHandler.received[0]
+        assert body["deliver"] is True
+        assert body["wakeMode"] == "now"
+
     def test_missing_auth_token_skips_delivery(
         self,
         fake_webhook_url: str,

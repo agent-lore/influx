@@ -151,6 +151,7 @@ class NotificationWebhookConfig(BaseModel):
     rfc_function: str = ""
     rfc_password_env: str = ""
     deliver: bool = False
+    wake_mode: str = ""
     channel: str = ""
     sender_name: str = "Influx"
 
