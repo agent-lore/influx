@@ -45,6 +45,10 @@ def _make_config(
     config = MagicMock(spec=AppConfig)
     config.storage = MagicMock(spec=StorageConfig)
     config.storage.archive_dir = str(tmp_path / "archive")
+    config.storage.max_download_bytes = 10_000_000
+    config.storage.download_timeout_seconds = 30
+    config.security = MagicMock()
+    config.security.allow_private_ips = False
     config.extraction = MagicMock(spec=ExtractionConfig)
     config.extraction.min_html_chars = min_html_chars
     config.extraction.min_web_chars = min_web_chars
@@ -132,14 +136,15 @@ class TestMakeDefaultSweepHooks:
         config = _make_config(tmp_path)
         sweep_hooks = make_default_sweep_hooks(config).to_sweep_hooks()
         assert isinstance(sweep_hooks, SweepHooks)
+        assert sweep_hooks.archive_download is not None
         assert sweep_hooks.re_extract_archive is not None
         assert sweep_hooks.tier2_enrich is not None
         assert sweep_hooks.tier3_extract is not None
 
-    def test_archive_download_left_none(self, tmp_path: Path) -> None:
+    def test_archive_download_wired(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
-        assert hooks.archive_download is None
+        assert callable(hooks.archive_download)
 
 
 # ── re_extract_archive hook ──────────────────────────────────────────
@@ -539,3 +544,174 @@ class TestSweepHooksInjectionSeam:
         assert hooks.tier2_enrich is None
         assert hooks.tier3_extract is None
         assert hooks.archive_download is None
+
+
+# ── archive_download hook (issue #23, FR-REP-1 stage 1) ───────────────
+
+
+def _make_archive_missing_note(
+    *,
+    arxiv_id: str = "2604.26946",
+    note_path: str = "papers/arxiv/2026/04",
+    extra_tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a note dict in the ``influx:archive-missing`` state."""
+    tags = [
+        "profile:ai-robotics",
+        "ingested-by:influx",
+        "source:arxiv",
+        f"arxiv-id:{arxiv_id}",
+        "text:abstract-only",
+        "influx:repair-needed",
+        "influx:archive-missing",
+    ]
+    if extra_tags:
+        tags.extend(extra_tags)
+    return {
+        "id": f"arxiv-{arxiv_id}",
+        "title": "Test Paper",
+        "source_url": f"https://arxiv.org/abs/{arxiv_id}",
+        "path": note_path,
+        "content": _sample_note_content(),
+        "tags": tags,
+        "version": 1,
+    }
+
+
+class TestArchiveDownloadHookSuccess:
+    def test_returns_relative_path_on_success(self, tmp_path: Path) -> None:
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=True,
+                rel_posix_path="arxiv/2026/04/2604.26946.pdf",
+                error="",
+            )
+            assert hooks.archive_download is not None
+            result = hooks.archive_download(note)
+
+        assert result == "arxiv/2026/04/2604.26946.pdf"
+        # Verify the download was invoked with the recovered metadata.
+        kwargs = mock_dl.call_args.kwargs
+        assert kwargs["url"] == "https://arxiv.org/pdf/2604.26946.pdf"
+        assert kwargs["source"] == "arxiv"
+        assert kwargs["item_id"] == "2604.26946"
+        assert kwargs["published_year"] == 2026
+        assert kwargs["published_month"] == 4
+        assert kwargs["ext"] == ".pdf"
+        assert kwargs["expected_content_type"] == "pdf"
+
+
+class TestArchiveDownloadHookFailures:
+    def test_oversize_raises_extraction_error_with_oversize_stage(
+        self, tmp_path: Path
+    ) -> None:
+        """Oversize is a counted failure — the stage must round-trip."""
+        from influx.repair import classify_failure
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error="oversize: response body 12000000 bytes exceeds limit",
+            )
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.archive_download(note)
+
+        assert exc_info.value.stage == "oversize"
+        assert classify_failure(exc_info.value) == "counted"
+
+    def test_http_error_raises_transient(self, tmp_path: Path) -> None:
+        """HTTP 4xx/5xx is currently transient — the note retries next sweep."""
+        from influx.repair import classify_failure
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error="HTTP 503 for https://arxiv.org/pdf/2604.26946.pdf",
+            )
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.archive_download(note)
+
+        assert exc_info.value.stage == "http"
+        assert classify_failure(exc_info.value) == "transient"
+
+    def test_timeout_is_transient(self, tmp_path: Path) -> None:
+        from influx.repair import classify_failure
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error="timeout: read timed out after 30s",
+            )
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.archive_download(note)
+
+        assert exc_info.value.stage == "timeout"
+        assert classify_failure(exc_info.value) == "transient"
+
+
+class TestArchiveDownloadHookMetadataRecovery:
+    def test_missing_arxiv_id_tag_raises_resolve(self, tmp_path: Path) -> None:
+        from influx.repair import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+        note["tags"] = [t for t in note["tags"] if not t.startswith("arxiv-id:")]
+
+        assert hooks.archive_download is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.archive_download(note)
+        assert exc_info.value.stage == "resolve"
+        assert classify_failure(exc_info.value) == "transient"
+
+    def test_missing_year_month_in_path_raises_resolve(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note(note_path="papers/arxiv/")
+
+        assert hooks.archive_download is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.archive_download(note)
+        assert exc_info.value.stage == "resolve"
+
+    def test_unsupported_source_raises_unsupported_source(self, tmp_path: Path) -> None:
+        from influx.repair import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+        note["tags"] = [t.replace("source:arxiv", "source:rss") for t in note["tags"]]
+
+        assert hooks.archive_download is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.archive_download(note)
+        assert exc_info.value.stage == "unsupported_source"
+        # Still transient — RSS support can land later without a forced cap.
+        assert classify_failure(exc_info.value) == "transient"

@@ -35,6 +35,7 @@ from influx.repair import (
     Tier3ExtractHook,
 )
 from influx.schemas import Tier3Extraction
+from influx.storage import download_archive
 
 __all__ = ["DefaultSweepHooks", "make_default_sweep_hooks"]
 
@@ -186,7 +187,146 @@ def _extract_from_archive(
     return extracted, "text:html"
 
 
+# ── Archive download metadata recovery ──────────────────────────────
+
+_ARXIV_ID_TAG_PREFIX = "arxiv-id:"
+_SOURCE_TAG_PREFIX = "source:"
+_NOTE_PATH_RE = re.compile(r"papers/(?P<source>[^/]+)/(?P<year>\d{4})/(?P<month>\d{2})")
+
+
+def _find_tag(tags: list[str], prefix: str) -> str | None:
+    """Return the suffix of the first tag starting with *prefix*, or None."""
+    for tag in tags:
+        if tag.startswith(prefix):
+            return tag[len(prefix) :]
+    return None
+
+
+def _parse_year_month_from_note_path(note_path: str) -> tuple[int, int] | None:
+    """Pull ``(year, month)`` from a Lithos note path like ``papers/arxiv/2026/04``."""
+    m = _NOTE_PATH_RE.search(note_path)
+    if not m:
+        return None
+    try:
+        return int(m.group("year")), int(m.group("month"))
+    except ValueError:
+        return None
+
+
+def _classify_download_kind(error: str) -> str:
+    """Return the ``kind`` discriminator from an ``ArchiveResult.error`` string.
+
+    ``download_archive`` packs ``"<kind>: <message>"`` for ``NetworkError``
+    cases and ``"HTTP <code> for ..."`` / ``"write: ..."`` for the other
+    failure paths.  We surface a stable ``stage`` value to the sweep so
+    :func:`influx.repair.classify_failure` can decide counted vs transient.
+    """
+    if error.startswith("HTTP "):
+        return "http"
+    head, _, _rest = error.partition(":")
+    head = head.strip()
+    return head or "archive_failed"
+
+
+def _resolve_arxiv_download_args(
+    note: dict[str, object],
+    config: AppConfig,
+) -> dict[str, object]:
+    """Build kwargs for :func:`download_archive` from an arxiv note's state.
+
+    Raises :class:`ExtractionError` (stage ``"resolve"``) when the note is
+    missing fields needed to retry — the sweep treats this as transient
+    so an operator hand-fix lands the next pass.
+    """
+    raw_tags = note.get("tags", [])
+    tags: list[str] = list(raw_tags) if isinstance(raw_tags, list) else []
+    arxiv_id = _find_tag(tags, _ARXIV_ID_TAG_PREFIX)
+    if not arxiv_id:
+        raise ExtractionError(
+            "Cannot retry archive download: no arxiv-id tag on note",
+            stage="resolve",
+            detail=f"note id={note.get('id', '?')}",
+        )
+    note_path = str(note.get("path", ""))
+    ym = _parse_year_month_from_note_path(note_path)
+    if ym is None:
+        raise ExtractionError(
+            "Cannot retry archive download: note path missing year/month",
+            stage="resolve",
+            detail=f"path={note_path!r}",
+        )
+    year, month = ym
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    return {
+        "url": pdf_url,
+        "archive_root": Path(config.storage.archive_dir),
+        "source": "arxiv",
+        "item_id": arxiv_id,
+        "published_year": year,
+        "published_month": month,
+        "ext": ".pdf",
+        "allow_private_ips": config.security.allow_private_ips,
+        "max_download_bytes": config.storage.max_download_bytes,
+        "timeout_seconds": config.storage.download_timeout_seconds,
+        "expected_content_type": "pdf",
+    }
+
+
 # ── Hook factories ──────────────────────────────────────────────────
+
+
+def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
+    """Create the production ``archive_download`` hook (FR-REP-1).
+
+    The hook re-runs :func:`influx.storage.download_archive` for a note
+    tagged ``influx:archive-missing`` and returns the relative POSIX
+    path on success.  On failure it raises :class:`ExtractionError` so
+    the sweep's existing ``(ExtractionError, LithosError)`` branch
+    bumps the per-note ``archive_attempts`` counter (only for
+    counted-class kinds — currently ``"oversize"``) and flips
+    ``influx:archive-terminal`` once the cap is reached.
+
+    Currently scoped to ``source:arxiv`` notes.  Other sources raise an
+    ``ExtractionError(stage="unsupported_source")`` which classifies as
+    transient — the note re-enters the sweep next pass and is fixed
+    automatically once a per-source resolver is added.
+    """
+
+    def hook(note: dict[str, object]) -> str:
+        raw_tags = note.get("tags", [])
+        tags: list[str] = list(raw_tags) if isinstance(raw_tags, list) else []
+        source = _find_tag(tags, _SOURCE_TAG_PREFIX) or ""
+        if source != "arxiv":
+            raise ExtractionError(
+                f"archive_download retry: source {source!r} not supported",
+                stage="unsupported_source",
+                detail=f"note id={note.get('id', '?')}",
+            )
+
+        kwargs = _resolve_arxiv_download_args(note, config)
+        result = download_archive(**kwargs)  # type: ignore[arg-type]
+        if result.ok and result.rel_posix_path:
+            _log.info(
+                "archive_download retry succeeded for %s path=%s",
+                note.get("id", "?"),
+                result.rel_posix_path,
+            )
+            return result.rel_posix_path
+
+        # The sweep classifies counted vs transient via
+        # ``influx.repair.classify_failure`` based on the ``stage``
+        # attribute below; surface the discriminator from
+        # ``ArchiveResult.error`` verbatim so e.g. ``"oversize"`` lines
+        # up with ``influx.repair._COUNTED_STAGES`` and bumps the cap.
+        stage = _classify_download_kind(result.error) or "archive_failed"
+        raise ExtractionError(
+            f"archive_download retry failed: {result.error}",
+            url=str(kwargs.get("url", "")),
+            stage=stage,
+            detail=result.error,
+        )
+
+    return hook
 
 
 def _make_re_extract_archive_hook(
@@ -323,20 +463,19 @@ def _make_tier3_extract_hook(config: AppConfig) -> Tier3ExtractHook:
 class DefaultSweepHooks:
     """Production-default sweep hook wiring with non-optional callables.
 
-    Holds the three production hooks with non-``Optional`` types so
+    Holds the four production hooks with non-``Optional`` types so
     pyright can statically know they are wired, while the parent
     :class:`~influx.repair.SweepHooks` keeps them ``| None`` to preserve
-    the test-injection seam.  ``archive_download`` remains optional —
-    it is owned by PRD 04 and not wired here.
+    the test-injection seam.
 
     Use :meth:`to_sweep_hooks` to obtain a ``SweepHooks`` instance for
     passing into :func:`influx.repair.sweep`.
     """
 
+    archive_download: ArchiveDownloadHook
     re_extract_archive: ReExtractArchiveHook
     tier2_enrich: Tier2EnrichHook
     tier3_extract: Tier3ExtractHook
-    archive_download: ArchiveDownloadHook | None = None
 
     def to_sweep_hooks(self) -> SweepHooks:
         """Return a :class:`SweepHooks` carrying these production hooks."""
@@ -352,8 +491,7 @@ def make_default_sweep_hooks(config: AppConfig) -> DefaultSweepHooks:
     """Create production-default sweep hooks for the repair sweep.
 
     Each hook bridges the PRD 06 hook signature to the lower-level
-    extraction and enrichment helpers from PRD 07.  The
-    ``archive_download`` hook is left ``None`` (PRD 04 responsibility).
+    fetch / extraction / enrichment helpers (FR-REP-1).
 
     Returns :class:`DefaultSweepHooks` (typed with non-optional
     callables) so callers and tests do not need to narrow ``Optional``
@@ -361,6 +499,7 @@ def make_default_sweep_hooks(config: AppConfig) -> DefaultSweepHooks:
     the sweep entrypoint via :meth:`DefaultSweepHooks.to_sweep_hooks`.
     """
     return DefaultSweepHooks(
+        archive_download=_make_archive_download_hook(config),
         re_extract_archive=_make_re_extract_archive_hook(config),
         tier2_enrich=_make_tier2_enrich_hook(config),
         tier3_extract=_make_tier3_extract_hook(config),
