@@ -81,3 +81,79 @@ def test_run_ledger_abandons_stale_active_runs(tmp_path: Path) -> None:
     assert recent[0]["run_id"] == "run-1"
     assert recent[0]["status"] == "abandoned"
     assert recent[0]["error"] == "process restarted"
+
+
+# ── Issue #20: surface swallowed source-acquisition failures ────────
+
+
+def test_complete_without_source_errors_marks_run_not_degraded(
+    tmp_path: Path,
+) -> None:
+    """A clean run carries ``degraded=false`` and an empty error list so
+    dashboards can grep on the field reliably (issue #20)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="ai-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.complete(run_id="run-1", sources_checked=10, ingested=4)
+
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is False
+    assert entry["source_acquisition_errors"] == []
+
+
+def test_complete_with_source_errors_marks_run_degraded(tmp_path: Path) -> None:
+    """A run that swallowed a fetch failure surfaces as ``degraded=true``
+    with the structured error list preserved verbatim (issue #20).
+
+    Distinguishes a partial-failure run from a quiet window in which the
+    source legitimately had no items — both used to land as
+    ``sources_checked=0, error=null``.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="ai-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    errors = [
+        {
+            "source": "arxiv",
+            "kind": "http",
+            "detail": "HTTP 500 from arXiv API",
+        }
+    ]
+    ledger.complete(
+        run_id="run-1",
+        sources_checked=0,
+        ingested=0,
+        source_acquisition_errors=errors,
+    )
+
+    entry = ledger.recent()[0]
+    assert entry["status"] == "completed"
+    assert entry["degraded"] is True
+    assert entry["source_acquisition_errors"] == errors
+
+
+def test_failed_run_has_degraded_false(tmp_path: Path) -> None:
+    """``fail`` always lands ``degraded=false`` so the field's semantics
+    stay narrow: it means *partial source-fetch failure on an otherwise
+    completed run*, not "anything went wrong".
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="ai-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.fail(run_id="run-1", error="RuntimeError: boom")
+
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is False
+    assert entry["source_acquisition_errors"] == []

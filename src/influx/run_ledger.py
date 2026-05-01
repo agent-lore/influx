@@ -57,6 +57,8 @@ class RunLedger:
             "sources_checked": None,
             "ingested": None,
             "error": None,
+            "degraded": False,
+            "source_acquisition_errors": [],
         }
         try:
             active = self._read_active()
@@ -71,14 +73,25 @@ class RunLedger:
         run_id: str,
         sources_checked: int | None,
         ingested: int | None,
+        source_acquisition_errors: list[dict[str, str]] | None = None,
     ) -> None:
-        """Mark an active run as completed and append it to history."""
+        """Mark an active run as completed and append it to history.
+
+        *source_acquisition_errors* records source-fetch failures that
+        were swallowed during the run (e.g. arxiv HTTP 5xx, RSS
+        timeout).  When non-empty the run is flagged ``degraded=True``
+        in the ledger so dashboards can distinguish a partial-failure
+        run from a genuinely quiet window (issue #20).
+        """
+        errors = list(source_acquisition_errors or [])
         self._finish(
             run_id=run_id,
             status="completed",
             sources_checked=sources_checked,
             ingested=ingested,
             error=None,
+            degraded=bool(errors),
+            source_acquisition_errors=errors,
         )
 
     def fail(self, *, run_id: str, error: str) -> None:
@@ -89,6 +102,8 @@ class RunLedger:
             sources_checked=None,
             ingested=None,
             error=error,
+            degraded=False,
+            source_acquisition_errors=[],
         )
 
     def active_runs(self) -> list[RunEntry]:
@@ -117,6 +132,10 @@ class RunLedger:
                             completed_at,
                         ),
                         "error": reason,
+                        "degraded": entry.get("degraded", False),
+                        "source_acquisition_errors": list(
+                            entry.get("source_acquisition_errors") or []
+                        ),
                     }
                 )
                 self._append(entry)
@@ -171,6 +190,8 @@ class RunLedger:
         sources_checked: int | None,
         ingested: int | None,
         error: str | None,
+        degraded: bool = False,
+        source_acquisition_errors: list[dict[str, str]] | None = None,
     ) -> None:
         try:
             active = self._read_active()
@@ -198,6 +219,8 @@ class RunLedger:
                     "sources_checked": sources_checked,
                     "ingested": ingested,
                     "error": error,
+                    "degraded": degraded,
+                    "source_acquisition_errors": list(source_acquisition_errors or []),
                 }
             )
             self._append(entry)

@@ -109,14 +109,24 @@ def _print_runs(runs_payload: dict[str, object]) -> None:
     for raw in runs:
         if not isinstance(raw, dict):
             continue
+        status = raw.get("status")
+        if raw.get("degraded"):
+            status = f"{status} (degraded)"
         print(
             "  "
             f"{raw.get('completed_at')} {raw.get('profile')} {raw.get('kind')} "
-            f"{raw.get('status')} checked={raw.get('sources_checked')} "
+            f"{status} checked={raw.get('sources_checked')} "
             f"ingested={raw.get('ingested')} duration={raw.get('duration_seconds')}"
         )
         if raw.get("error"):
             print(f"    error={raw.get('error')}")
+        for src_err in raw.get("source_acquisition_errors") or []:
+            if isinstance(src_err, dict):
+                print(
+                    f"    source_error: source={src_err.get('source')} "
+                    f"kind={src_err.get('kind')} "
+                    f"detail={src_err.get('detail')}"
+                )
 
 
 def main() -> int:

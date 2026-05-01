@@ -43,7 +43,11 @@ from influx.http_client import guarded_fetch
 from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 from influx.storage import download_archive
-from influx.telemetry import current_run_id, get_tracer
+from influx.telemetry import (
+    current_run_id,
+    get_tracer,
+    record_source_acquisition_error,
+)
 
 if TYPE_CHECKING:
     from influx.sources import FetchCache
@@ -968,11 +972,18 @@ def make_arxiv_item_provider(
                     items = await cache.get_or_fetch(cache_key, _do_fetch)
                 else:
                     items = await _do_fetch()
-            except NetworkError:
+            except NetworkError as exc:
                 _log.warning(
                     "arxiv fetch failed for profile %r; yielding zero items",
                     profile,
                     exc_info=True,
+                )
+                # Surface to the run ledger so a degraded run is no longer
+                # indistinguishable from a quiet window (issue #20).
+                record_source_acquisition_error(
+                    source="arxiv",
+                    kind=exc.kind or "unknown",
+                    detail=str(exc),
                 )
                 return ()
             fetch_span.set_attribute("influx.item_count", len(items))
