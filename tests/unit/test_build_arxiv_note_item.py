@@ -1181,3 +1181,100 @@ class TestFilterTagsPropagation:
             config=config,
         )
         assert result["filter_tags"] == []
+
+
+# ── Inspector pre-check for influx:archive-terminal (issue #14) ─────
+
+
+from influx.telemetry import current_archive_terminal_arxiv_ids  # noqa: E402
+
+
+class TestInspectorArchiveTerminalSkip:
+    """When the current run's contextvar contains the paper's arxiv-id,
+    ``build_arxiv_note_item`` skips ``download_archive`` and tags the
+    item with ``influx:archive-terminal`` directly so subsequent runs
+    don't re-attempt a permanently-unfetchable PDF (issue #14).
+    """
+
+    @patch("influx.sources.arxiv.download_archive")
+    def test_terminal_arxiv_id_skips_download(self, mock_download: object) -> None:
+        config = _make_config()
+        token = current_archive_terminal_arxiv_ids.set(frozenset({"2601.12345"}))
+        try:
+            result = build_arxiv_note_item(
+                item=_make_item(),  # arxiv_id = "2601.12345"
+                score=7,
+                confidence=0.7,
+                reason="R",
+                profile_name="ai-robotics",
+                config=config,
+            )
+        finally:
+            current_archive_terminal_arxiv_ids.reset(token)
+
+        # download_archive must NOT have been called.
+        mock_download.assert_not_called()  # type: ignore[attr-defined]
+        # And the canonical tag set carries archive-missing + archive-terminal
+        # + repair-needed so the existing repair semantics still apply on
+        # rewrite — the operator sees the note's terminal state without
+        # needing to read the ## Repair body.
+        assert "influx:archive-missing" in result["tags"]
+        assert "influx:archive-terminal" in result["tags"]
+        assert "influx:repair-needed" in result["tags"]
+
+    @patch("influx.sources.arxiv.download_archive")
+    def test_non_terminal_arxiv_id_still_downloads(self, mock_download: object) -> None:
+        """Sanity: an arxiv-id NOT in the terminal set follows the normal
+        download path."""
+        from influx.storage import ArchiveResult
+
+        mock_download.return_value = ArchiveResult(  # type: ignore[union-attr]
+            ok=True,
+            rel_posix_path="arxiv/2026/04/2601.12345.pdf",
+            error="",
+        )
+        config = _make_config()
+        token = current_archive_terminal_arxiv_ids.set(
+            frozenset({"9999.99999"})  # different id
+        )
+        try:
+            build_arxiv_note_item(
+                item=_make_item(),
+                score=7,
+                confidence=0.7,
+                reason="R",
+                profile_name="ai-robotics",
+                config=config,
+            )
+        finally:
+            current_archive_terminal_arxiv_ids.reset(token)
+
+        mock_download.assert_called_once()  # type: ignore[attr-defined]
+
+    @patch("influx.sources.arxiv.download_archive")
+    def test_empty_terminal_set_default_behaviour_unchanged(
+        self, mock_download: object
+    ) -> None:
+        """No contextvar set (default frozenset()) → downloads happen as
+        today.  Guards against a regression where an empty set is
+        treated as 'everything is terminal'.
+        """
+        from influx.storage import ArchiveResult
+
+        mock_download.return_value = ArchiveResult(  # type: ignore[union-attr]
+            ok=True,
+            rel_posix_path="arxiv/2026/04/p.pdf",
+            error="",
+        )
+        config = _make_config()
+
+        build_arxiv_note_item(
+            item=_make_item(),
+            score=7,
+            confidence=0.7,
+            reason="R",
+            profile_name="ai-robotics",
+            config=config,
+        )
+
+        mock_download.assert_called_once()  # type: ignore[attr-defined]

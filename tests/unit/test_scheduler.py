@@ -455,6 +455,11 @@ class TestSweepWriteErrorMarksReadinessDegraded:
         class _NoopClient:
             async def close(self) -> None: ...
 
+            async def list_archive_terminal_arxiv_ids(
+                self, *, profile: str
+            ) -> frozenset[str]:
+                return frozenset()
+
             async def task_create(self, **kwargs: Any) -> Any:
                 import json as _json
 
@@ -518,6 +523,11 @@ class TestSweepWriteErrorMarksReadinessDegraded:
 
         class _NoopClient:
             async def close(self) -> None: ...
+
+            async def list_archive_terminal_arxiv_ids(
+                self, *, profile: str
+            ) -> frozenset[str]:
+                return frozenset()
 
             async def cache_lookup_for_item(self, **kwargs: Any) -> Any:
                 # Should not be called — empty provider.
@@ -591,6 +601,11 @@ class TestSweepWriteErrorMarksReadinessDegraded:
         probe_loop = _FakeProbeLoop()
 
         class _NoopClient:
+            async def list_archive_terminal_arxiv_ids(
+                self, *, profile: str
+            ) -> frozenset[str]:
+                return frozenset()
+
             async def task_create(self, **kwargs: Any) -> Any:
                 import json as _json
 
@@ -663,6 +678,11 @@ class TestScheduledFireInvokesRepairSweep:
 
         class _NoopClient:
             async def close(self) -> None: ...
+
+            async def list_archive_terminal_arxiv_ids(
+                self, *, profile: str
+            ) -> frozenset[str]:
+                return frozenset()
 
             async def task_create(self, **kwargs: Any) -> Any:
                 import json as _json
@@ -753,6 +773,11 @@ class TestNegativeExampleMaxTitleCharsWired:
 
         class _NoopClient:
             async def close(self) -> None: ...
+
+            async def list_archive_terminal_arxiv_ids(
+                self, *, profile: str
+            ) -> frozenset[str]:
+                return frozenset()
 
             async def task_create(self, **kwargs: Any) -> Any:
                 import json as _json
