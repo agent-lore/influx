@@ -40,6 +40,7 @@ __all__ = [
     "StageSelection",
     "SweepHooks",
     "SweepWriteError",
+    "TextExtractionHook",
     "Tier2EnrichHook",
     "Tier3ExtractHook",
     "apply_abstract_only_reextraction",
@@ -271,6 +272,43 @@ class ArchiveDownloadHook(Protocol):
     def __call__(self, note: dict[str, object]) -> str: ...
 
 
+class TextExtractionHook(Protocol):
+    """Callable protocol for text-extraction retry (FR-REP-1 stage 2).
+
+    Called by the sweep when a note carries no ``text:*`` tag at all
+    — typically a legacy note from before ``text:*`` was always set,
+    or one whose tag was hand-stripped.  Distinct from
+    ``re_extract_archive``, which upgrades ``text:abstract-only``
+    against an existing archive.
+
+    Implementations run the source-specific extraction cascade and
+    return the new ``text:*`` tag (e.g. ``"text:html"``,
+    ``"text:pdf"``, or ``"text:abstract-only"`` when the cascade
+    falls all the way through).
+
+    Parameters
+    ----------
+    note:
+        The current note state (as returned by ``lithos_read``).
+
+    Returns
+    -------
+    str
+        The replacement ``text:*`` tag to add to the note.
+
+    Raises
+    ------
+    ExtractionError
+        On extraction failure — the sweep treats this as "stage
+        failed this pass" and keeps ``influx:repair-needed``.
+    LithosError
+        On Lithos API failure — propagated to the sweep's error
+        handling.
+    """
+
+    def __call__(self, note: dict[str, object]) -> str: ...
+
+
 @dataclass(frozen=True, slots=True)
 class SweepHooks:
     """Optional hook callables for stage execution within the sweep.
@@ -284,6 +322,7 @@ class SweepHooks:
     re_extract_archive: ReExtractArchiveHook | None = None
     tier2_enrich: Tier2EnrichHook | None = None
     tier3_extract: Tier3ExtractHook | None = None
+    text_extraction: TextExtractionHook | None = None
 
 
 # ── Per-note stage selection (§5.2) ────────────────────────────────
@@ -1186,9 +1225,37 @@ async def _process_sweep_note(
                 exc=exc,
             )
 
-    # Text extraction retry hook intentionally not wired yet (issue #24,
-    # FR-REP-1 stage 2).  Until that lands, notes lacking any ``text:*``
-    # tag fall through to abstract-only re-extraction below.
+    # Text extraction retry (FR-REP-1 stage 2).  Runs when the note
+    # carries no ``text:*`` tag at all — distinct from the abstract-
+    # only re-extraction stage below, which upgrades ``text:abstract-
+    # only`` against an existing archive.  No new terminal tag is
+    # introduced here (out of scope for #24); failures roll back the
+    # in-place note mutations and re-enter the sweep next pass.
+    if stages.text_extraction_retry and hooks.text_extraction:
+        note["tags"] = list(current_tags)
+        snapshot = _snapshot_note(note)
+        tracer = get_tracer()
+        try:
+            with tracer.span(
+                "influx.repair.text_extraction",
+                attributes={
+                    "influx.note_id": note.get("id", ""),
+                    "influx.profile": profile,
+                    "influx.run_id": current_run_id.get() or "",
+                },
+            ):
+                new_text_tag = hooks.text_extraction(note)
+            if new_text_tag and not any(t.startswith("text:") for t in current_tags):
+                current_tags.append(new_text_tag)
+                note["tags"] = list(current_tags)
+        except (ExtractionError, LCMAError, LithosError) as exc:
+            _restore_note(note, snapshot)
+            _log_stage_failure(
+                "text_extraction",
+                note=note,
+                profile=profile,
+                exc=exc,
+            )
 
     # Abstract-only re-extraction.
     # Re-evaluate eligibility if archive just succeeded this pass

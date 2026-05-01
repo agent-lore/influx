@@ -1235,3 +1235,117 @@ class TestSweepArchiveTerminalCap:
         )
 
         assert call_count == 0
+
+
+class TestSweepTextExtractionRetry:
+    """text_extraction stage executes when the note has no ``text:*`` tag.
+
+    Verifies issue #24 wiring: select_stages selects the stage, the
+    executor calls the hook, and a successful return appends the new
+    ``text:*`` tag to the rewritten note.
+    """
+
+    @staticmethod
+    def _note_textless(note_id: str) -> dict[str, Any]:
+        body = (
+            "---\n"
+            f"source_url: https://arxiv.org/abs/{note_id}\n"
+            "tags: []\n"
+            "confidence: 0.9\n"
+            "---\n"
+            "# Paper\n\n"
+            "## Archive\n"
+            "path: arxiv/2026/04/x.pdf\n\n"
+            "## Summary\nSummary\n\n"
+            "## Profile Relevance\n"
+            "### ai-robotics\nScore: 5/10\nRelevant\n\n"
+            "## User Notes\n"
+        )
+        return {
+            "id": note_id,
+            "title": "Paper",
+            "content": body,
+            "tags": ["influx:repair-needed"],
+            "source_url": f"https://arxiv.org/abs/{note_id}",
+            "confidence": 0.9,
+        }
+
+    @staticmethod
+    def _last_write_args(client: AsyncMock) -> dict[str, Any]:
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        return dict(write_calls[-1].args[1])
+
+    async def test_success_appends_text_tag(self) -> None:
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_textless("n1")
+
+        def hook(note: dict[str, object]) -> str:
+            del note
+            return "text:html"
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(text_extraction=hook),
+        )
+
+        rewritten = self._last_write_args(client)
+        assert "text:html" in rewritten["tags"]
+
+    async def test_skipped_when_text_tag_already_present(self) -> None:
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_textless("n1")
+        note["tags"] = list(note["tags"]) + ["text:abstract-only"]
+
+        call_count = 0
+
+        def hook(note: dict[str, object]) -> str:
+            nonlocal call_count
+            del note
+            call_count += 1
+            return "text:html"
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(text_extraction=hook),
+        )
+
+        assert call_count == 0
+
+    async def test_failure_keeps_note_textless_and_repair_needed(self) -> None:
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_textless("n1")
+
+        def hook(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                "cascade fell through",
+                stage="cascade",
+                detail="all paths failed",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(text_extraction=hook),
+        )
+
+        rewritten = self._last_write_args(client)
+        assert not any(t.startswith("text:") for t in rewritten["tags"])
+        assert "influx:repair-needed" in rewritten["tags"]

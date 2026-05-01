@@ -21,9 +21,10 @@ import trafilatura
 
 from influx.config import AppConfig
 from influx.enrich import tier3_extract as _tier3_extract
-from influx.errors import ExtractionError, LCMAError
+from influx.errors import ExtractionError, LCMAError, NetworkError
 from influx.extraction.html import _clean_html_fragments, _strip_tags
 from influx.extraction.pdf import extract_pdf
+from influx.extraction.pipeline import extract_arxiv_text
 from influx.notes import parse_archive_path, parse_note
 from influx.repair import (
     ArchiveDownloadHook,
@@ -31,6 +32,7 @@ from influx.repair import (
     ReExtractArchiveHook,
     ReExtractionResult,
     SweepHooks,
+    TextExtractionHook,
     Tier2EnrichHook,
     Tier3ExtractHook,
 )
@@ -329,6 +331,61 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
     return hook
 
 
+def _make_text_extraction_hook(config: AppConfig) -> TextExtractionHook:
+    """Create the production ``text_extraction`` hook (FR-REP-1 stage 2).
+
+    The hook re-runs the source-specific extraction cascade for a note
+    that carries no ``text:*`` tag and returns the resulting tag.  On
+    cascade fall-through (both HTML and PDF failed) the underlying
+    helper raises :class:`ExtractionError`; we surface it to the sweep
+    so the per-stage failure logging path fires.
+
+    Currently scoped to ``source:arxiv`` — RSS support follows when
+    the multi-source resolver lands (out of scope for issue #24).
+    """
+
+    def hook(note: dict[str, object]) -> str:
+        raw_tags = note.get("tags", [])
+        tags: list[str] = list(raw_tags) if isinstance(raw_tags, list) else []
+        source = _find_tag(tags, _SOURCE_TAG_PREFIX) or ""
+        if source != "arxiv":
+            raise ExtractionError(
+                f"text_extraction retry: source {source!r} not supported",
+                stage="unsupported_source",
+                detail=f"note id={note.get('id', '?')}",
+            )
+
+        arxiv_id = _find_tag(tags, _ARXIV_ID_TAG_PREFIX)
+        if not arxiv_id:
+            raise ExtractionError(
+                "Cannot retry text extraction: no arxiv-id tag on note",
+                stage="resolve",
+                detail=f"note id={note.get('id', '?')}",
+            )
+
+        try:
+            result = extract_arxiv_text(arxiv_id, config)
+        except NetworkError as exc:
+            # extract_arxiv_text raises ExtractionError on full cascade
+            # fall-through, but a NetworkError can leak from helpers it
+            # calls (e.g. SSRF guards on the PDF fetch).  Re-wrap so the
+            # sweep's ``(ExtractionError, ...)`` branch handles it.
+            raise ExtractionError(
+                f"text_extraction retry network failure: {exc.kind}",
+                url=getattr(exc, "url", "") or "",
+                stage=exc.kind or "network",
+                detail=str(exc),
+            ) from exc
+        _log.info(
+            "text_extraction retry succeeded for %s tag=%s",
+            note.get("id", "?"),
+            result.source_tag,
+        )
+        return result.source_tag
+
+    return hook
+
+
 def _make_re_extract_archive_hook(
     config: AppConfig,
 ) -> ReExtractArchiveHook:
@@ -463,7 +520,7 @@ def _make_tier3_extract_hook(config: AppConfig) -> Tier3ExtractHook:
 class DefaultSweepHooks:
     """Production-default sweep hook wiring with non-optional callables.
 
-    Holds the four production hooks with non-``Optional`` types so
+    Holds the five production hooks with non-``Optional`` types so
     pyright can statically know they are wired, while the parent
     :class:`~influx.repair.SweepHooks` keeps them ``| None`` to preserve
     the test-injection seam.
@@ -476,6 +533,7 @@ class DefaultSweepHooks:
     re_extract_archive: ReExtractArchiveHook
     tier2_enrich: Tier2EnrichHook
     tier3_extract: Tier3ExtractHook
+    text_extraction: TextExtractionHook
 
     def to_sweep_hooks(self) -> SweepHooks:
         """Return a :class:`SweepHooks` carrying these production hooks."""
@@ -484,6 +542,7 @@ class DefaultSweepHooks:
             re_extract_archive=self.re_extract_archive,
             tier2_enrich=self.tier2_enrich,
             tier3_extract=self.tier3_extract,
+            text_extraction=self.text_extraction,
         )
 
 
@@ -503,4 +562,5 @@ def make_default_sweep_hooks(config: AppConfig) -> DefaultSweepHooks:
         re_extract_archive=_make_re_extract_archive_hook(config),
         tier2_enrich=_make_tier2_enrich_hook(config),
         tier3_extract=_make_tier3_extract_hook(config),
+        text_extraction=_make_text_extraction_hook(config),
     )
