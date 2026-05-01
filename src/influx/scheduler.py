@@ -47,7 +47,11 @@ from influx.rejection_rate import record_filter_result
 from influx.repair import SweepWriteError
 from influx.repair import sweep as repair_sweep
 from influx.run_ledger import RunLedger
-from influx.telemetry import current_run_id, get_tracer
+from influx.telemetry import (
+    current_run_id,
+    current_source_acquisition_errors,
+    get_tracer,
+)
 
 __all__ = [
     "InfluxScheduler",
@@ -157,6 +161,11 @@ async def run_profile(
         run_range=run_range,
     )
     run_id_token = current_run_id.set(run_id)
+    # Initialise the per-run record of swallowed source-fetch failures.
+    # Source providers (arxiv/rss) append on ``NetworkError`` paths via
+    # ``record_source_acquisition_error``; we drain the list before the
+    # ledger entry is finalised below.  See issue #20.
+    source_errors_token = current_source_acquisition_errors.set([])
     tracer = get_tracer()
     started_at = datetime.now(UTC)
     logger.info(
@@ -198,22 +207,27 @@ async def run_profile(
                     run_id=run_id,
                     sources_checked=None,
                     ingested=None,
+                    source_acquisition_errors=current_source_acquisition_errors.get()
+                    or [],
                 )
             else:
+                source_errors = current_source_acquisition_errors.get() or []
                 logger.info(
                     "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
-                    "sources_checked=%d ingested=%d",
+                    "sources_checked=%d ingested=%d degraded=%s",
                     profile,
                     kind.value,
                     run_id,
                     elapsed,
                     result.stats.sources_checked,
                     result.stats.ingested,
+                    bool(source_errors),
                 )
                 ledger.complete(
                     run_id=run_id,
                     sources_checked=result.stats.sources_checked,
                     ingested=result.stats.ingested,
+                    source_acquisition_errors=source_errors,
                 )
             return result
     except Exception as exc:
@@ -229,6 +243,7 @@ async def run_profile(
         raise
     finally:
         current_run_id.reset(run_id_token)
+        current_source_acquisition_errors.reset(source_errors_token)
 
 
 async def _run_profile_body(

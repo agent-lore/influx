@@ -41,7 +41,11 @@ from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import FilterResponse, Tier1Enrichment, Tier3Extraction
 from influx.slugs import slugify_feed_name
 from influx.storage import download_archive
-from influx.telemetry import current_run_id, get_tracer
+from influx.telemetry import (
+    current_run_id,
+    get_tracer,
+    record_source_acquisition_error,
+)
 from influx.urls import normalise_url, url_hash
 
 if TYPE_CHECKING:
@@ -607,11 +611,18 @@ async def _fetch_rss_feed(
                 max_download_bytes=max_download_bytes,
                 timeout_seconds=timeout_seconds,
             )
-        except NetworkError:
+        except NetworkError as exc:
             _log.warning(
                 "RSS feed fetch failed for %r; yielding zero items",
                 feed_entry.name,
                 exc_info=True,
+            )
+            # Issue #20: surface to the run ledger so the degraded
+            # outcome is distinguishable from a quiet feed.
+            record_source_acquisition_error(
+                source="rss",
+                kind=exc.kind or "unknown",
+                detail=f"{feed_entry.name}: {exc}",
             )
             return None
         return result.body

@@ -27,15 +27,66 @@ if TYPE_CHECKING:
 
 __all__ = [
     "InfluxTracer",
+    "SourceAcquisitionError",
     "SpanWrapper",
     "current_run_id",
+    "current_source_acquisition_errors",
     "get_tracer",
+    "record_source_acquisition_error",
 ]
 
 # Context variable for the current run ID — set by ``run_profile()`` so
 # that downstream call sites (e.g. filter scorer, source fetchers) can
 # attach ``influx.run_id`` to their spans without interface changes.
 current_run_id: ContextVar[str | None] = ContextVar("current_run_id", default=None)
+
+
+# Concrete shape of a source-acquisition error record:
+#   {"source": "arxiv" | "rss" | ..., "kind": "oversize" | "timeout" |
+#    "ssrf" | ..., "detail": "<short diagnostic>"}
+# Plain dicts so they round-trip through ``json.dumps`` in the run
+# ledger without a custom encoder.
+SourceAcquisitionError = dict[str, str]
+
+
+# Context variable carrying any source-acquisition failures the current
+# run has swallowed without aborting.  ``run_profile()`` sets it to an
+# empty list at run start; providers append on ``NetworkError`` paths
+# that today return zero items silently (issue #20).  The scheduler
+# reads it before writing the ledger entry so a degraded run is no
+# longer indistinguishable from a quiet window.
+current_source_acquisition_errors: ContextVar[list[SourceAcquisitionError] | None] = (
+    ContextVar("current_source_acquisition_errors", default=None)
+)
+
+
+def record_source_acquisition_error(
+    *,
+    source: str,
+    kind: str,
+    detail: str,
+) -> None:
+    """Append a swallowed source-fetch failure to the current run's record.
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_source_acquisition_errors` is unset.  Callers
+    should still emit their existing structured WARNING log; this
+    helper only adds the run-ledger linkage.
+    """
+    errors = current_source_acquisition_errors.get()
+    if errors is None:
+        return
+    errors.append(
+        SourceAcquisitionError(
+            {
+                "source": source,
+                "kind": kind,
+                "detail": detail[:300],
+            }
+        )
+    )
+
+
 logger = logging.getLogger(__name__)
 
 

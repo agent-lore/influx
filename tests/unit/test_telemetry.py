@@ -557,3 +557,63 @@ class TestAC10ARegressionGuard:
             s.set_attribute("influx.profile", "test")
             # The span wrapper wraps the no-op — no OTEL calls made
             assert isinstance(s, SpanWrapper)
+
+
+# ── Issue #20: source-acquisition error context ────────────────────
+
+
+from influx.telemetry import (  # noqa: E402
+    current_source_acquisition_errors,
+    record_source_acquisition_error,
+)
+
+
+class TestRecordSourceAcquisitionError:
+    """``record_source_acquisition_error`` is the linkage between
+    swallowed-NetworkError paths in source providers and the run
+    ledger's ``source_acquisition_errors`` field (issue #20).
+    """
+
+    def test_no_op_outside_run_context(self) -> None:
+        """Outside a run context the contextvar is unset; calling the
+        helper must NOT raise so legitimate uses (e.g. CLI smoke
+        commands that share the provider code path) keep working.
+        """
+        # No token set → contextvar is None.  Should silently do nothing.
+        record_source_acquisition_error(
+            source="arxiv", kind="http", detail="500 from arxiv"
+        )
+
+    def test_appends_inside_run_context(self) -> None:
+        token = current_source_acquisition_errors.set([])
+        try:
+            record_source_acquisition_error(
+                source="arxiv", kind="http", detail="500 from arxiv"
+            )
+            record_source_acquisition_error(
+                source="rss", kind="timeout", detail="connect timeout"
+            )
+            errors = current_source_acquisition_errors.get()
+        finally:
+            current_source_acquisition_errors.reset(token)
+
+        assert errors == [
+            {"source": "arxiv", "kind": "http", "detail": "500 from arxiv"},
+            {"source": "rss", "kind": "timeout", "detail": "connect timeout"},
+        ]
+
+    def test_detail_is_truncated(self) -> None:
+        """Long error bodies are capped so the run ledger doesn't grow
+        unbounded if a provider returns a stack trace as the message.
+        """
+        token = current_source_acquisition_errors.set([])
+        try:
+            record_source_acquisition_error(
+                source="arxiv", kind="http", detail="x" * 1000
+            )
+            errors = current_source_acquisition_errors.get()
+        finally:
+            current_source_acquisition_errors.reset(token)
+
+        assert errors is not None
+        assert len(errors[0]["detail"]) == 300
