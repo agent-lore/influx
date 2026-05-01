@@ -140,11 +140,17 @@ class TestMakeDefaultSweepHooks:
         assert sweep_hooks.re_extract_archive is not None
         assert sweep_hooks.tier2_enrich is not None
         assert sweep_hooks.tier3_extract is not None
+        assert sweep_hooks.text_extraction is not None
 
     def test_archive_download_wired(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
         assert callable(hooks.archive_download)
+
+    def test_text_extraction_wired(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        assert callable(hooks.text_extraction)
 
 
 # ── re_extract_archive hook ──────────────────────────────────────────
@@ -544,6 +550,7 @@ class TestSweepHooksInjectionSeam:
         assert hooks.tier2_enrich is None
         assert hooks.tier3_extract is None
         assert hooks.archive_download is None
+        assert hooks.text_extraction is None
 
 
 # ── archive_download hook (issue #23, FR-REP-1 stage 1) ───────────────
@@ -714,4 +721,141 @@ class TestArchiveDownloadHookMetadataRecovery:
             hooks.archive_download(note)
         assert exc_info.value.stage == "unsupported_source"
         # Still transient — RSS support can land later without a forced cap.
+        assert classify_failure(exc_info.value) == "transient"
+
+
+# ── text_extraction hook (issue #24, FR-REP-1 stage 2) ───────────────
+
+
+def _make_textless_note(
+    *,
+    arxiv_id: str = "2604.26946",
+    archive_path: str | None = None,
+) -> dict[str, Any]:
+    """Build a note dict with no ``text:*`` tag at all."""
+    tags = [
+        "profile:ai-robotics",
+        "ingested-by:influx",
+        "source:arxiv",
+        f"arxiv-id:{arxiv_id}",
+        "influx:repair-needed",
+    ]
+    return {
+        "id": f"arxiv-{arxiv_id}",
+        "title": "Test Paper",
+        "source_url": f"https://arxiv.org/abs/{arxiv_id}",
+        "path": "papers/arxiv/2026/04",
+        "content": _sample_note_content(archive_path=archive_path),
+        "tags": tags,
+        "version": 1,
+    }
+
+
+class TestTextExtractionHookSuccess:
+    def test_returns_html_tag_on_html_cascade_hit(self, tmp_path: Path) -> None:
+        from influx.extraction.pipeline import ArxivExtractionResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_textless_note()
+
+        with patch("influx.repair_hooks.extract_arxiv_text") as mock_x:
+            mock_x.return_value = ArxivExtractionResult(
+                text="full body",
+                source_tag="text:html",
+            )
+            assert hooks.text_extraction is not None
+            tag = hooks.text_extraction(note)
+
+        assert tag == "text:html"
+        assert mock_x.call_args.args[0] == "2604.26946"
+
+    def test_returns_pdf_tag_when_html_falls_through(self, tmp_path: Path) -> None:
+        from influx.extraction.pipeline import ArxivExtractionResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_textless_note()
+
+        with patch("influx.repair_hooks.extract_arxiv_text") as mock_x:
+            mock_x.return_value = ArxivExtractionResult(
+                text="pdf body",
+                source_tag="text:pdf",
+            )
+            assert hooks.text_extraction is not None
+            tag = hooks.text_extraction(note)
+
+        assert tag == "text:pdf"
+
+
+class TestTextExtractionHookFailures:
+    def test_cascade_failure_propagates_extraction_error(self, tmp_path: Path) -> None:
+        from influx.repair import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_textless_note()
+
+        with patch("influx.repair_hooks.extract_arxiv_text") as mock_x:
+            mock_x.side_effect = ExtractionError(
+                "cascade fell through",
+                stage="cascade",
+                detail="both html and pdf failed",
+            )
+            assert hooks.text_extraction is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.text_extraction(note)
+
+        assert exc_info.value.stage == "cascade"
+        # ``cascade`` is not in _COUNTED_STAGES, so it stays transient —
+        # the note re-enters the sweep next pass.
+        assert classify_failure(exc_info.value) == "transient"
+
+    def test_network_error_rewrapped_as_extraction_error(self, tmp_path: Path) -> None:
+        from influx.errors import NetworkError
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_textless_note()
+
+        with patch("influx.repair_hooks.extract_arxiv_text") as mock_x:
+            mock_x.side_effect = NetworkError(
+                "ssrf guard tripped",
+                url="https://arxiv.org/pdf/2604.26946.pdf",
+                kind="ssrf",
+            )
+            assert hooks.text_extraction is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.text_extraction(note)
+
+        assert exc_info.value.stage == "ssrf"
+
+
+class TestTextExtractionHookMetadataRecovery:
+    def test_missing_arxiv_id_raises_resolve(self, tmp_path: Path) -> None:
+        from influx.repair import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_textless_note()
+        note["tags"] = [t for t in note["tags"] if not t.startswith("arxiv-id:")]
+
+        assert hooks.text_extraction is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.text_extraction(note)
+        assert exc_info.value.stage == "resolve"
+        assert classify_failure(exc_info.value) == "transient"
+
+    def test_unsupported_source_raises_unsupported_source(self, tmp_path: Path) -> None:
+        from influx.repair import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_textless_note()
+        note["tags"] = [t.replace("source:arxiv", "source:rss") for t in note["tags"]]
+
+        assert hooks.text_extraction is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.text_extraction(note)
+        assert exc_info.value.stage == "unsupported_source"
         assert classify_failure(exc_info.value) == "transient"
