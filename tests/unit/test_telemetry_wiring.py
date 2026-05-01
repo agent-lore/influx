@@ -303,8 +303,14 @@ class TestInfluxFilterSpan:
                     return_value=test_items,
                 ),
                 patch(
+                    # ``build_arxiv_note_item`` is synchronous — see
+                    # src/influx/sources/arxiv.py:531.  Using ``AsyncMock``
+                    # here returned an unawaited coroutine to the provider
+                    # (which calls the helper synchronously), producing
+                    # ``RuntimeWarning: coroutine '...' was never awaited``
+                    # on every test run (issue #3).
                     "influx.sources.arxiv.build_arxiv_note_item",
-                    new_callable=AsyncMock,
+                    new_callable=MagicMock,
                     return_value={
                         "title": "Test Paper",
                         "source_url": "http://example.com",

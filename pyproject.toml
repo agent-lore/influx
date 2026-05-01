@@ -69,3 +69,26 @@ typeCheckingMode = "standard"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Make Influx-owned warnings fail CI.  The unawaited-coroutine pattern
+# from issue #3 is emitted from a destructor and pytest wraps it as a
+# ``PytestUnraisableExceptionWarning``, so we error on both that and
+# plain ``RuntimeWarning``.  Known third-party teardown noise from
+# anyio MCP-client streams, file descriptors, and sockets is ignored
+# narrowly so the gate doesn't drown in upstream resource leaks.
+#
+# ``DeprecationWarning`` is dominated by upstream packages
+# (``websockets`` via MCP/uvicorn) and left at default verbosity.
+#
+# Re-tighten as upstream packages are updated.
+filterwarnings = [
+    # Anyio MCP-client teardown leaks (third-party, not actionable here).
+    # pytest filter strings use ``:`` as a separator, so we match against
+    # the substrings that follow the ``Exception ignored in:`` prefix.
+    "ignore:.*MemoryObjectReceiveStream",
+    "ignore:.*<_io\\.FileIO",
+    "ignore:.*<_io\\.BufferedReader",
+    "ignore:.*<socket\\.socket",
+    # Influx-owned regressions.
+    "error::RuntimeWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
