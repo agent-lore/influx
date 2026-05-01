@@ -1186,8 +1186,9 @@ async def _process_sweep_note(
                 exc=exc,
             )
 
-    # Text extraction retry (PRD 07 hook — not yet wired).
-    # Placeholder: text extraction hook would go here.
+    # Text extraction retry hook intentionally not wired yet (issue #24,
+    # FR-REP-1 stage 2).  Until that lands, notes lacking any ``text:*``
+    # tag fall through to abstract-only re-extraction below.
 
     # Abstract-only re-extraction.
     # Re-evaluate eligibility if archive just succeeded this pass
