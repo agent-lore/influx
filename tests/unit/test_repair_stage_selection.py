@@ -378,6 +378,38 @@ class TestTier3TerminalPresent:
         assert s.tier2_retry is True
 
 
+class TestArchiveTerminalPresent:
+    """``influx:archive-terminal`` caps the archive_retry stage so a
+    permanently-oversize PDF stops being retried every sweep.
+    """
+
+    def test_archive_retry_not_selected_with_archive_terminal(self) -> None:
+        s = _select(
+            [
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "influx:archive-terminal",
+                "text:abstract-only",
+            ],
+        )
+        assert s.archive_retry is False
+
+    def test_other_stages_still_eligible_with_only_archive_terminal(self) -> None:
+        """Tier 2 / Tier 3 are independent of archive-terminal."""
+        s = _select(
+            [
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "influx:archive-terminal",
+                "text:html",
+            ],
+            max_profile_score=HIGH_SCORE,
+        )
+        assert s.archive_retry is False
+        assert s.tier2_retry is True
+        assert s.tier3_retry is True
+
+
 # ── Abstract-only re-extraction with stored archive path ─────────────
 
 

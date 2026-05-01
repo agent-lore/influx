@@ -279,6 +279,10 @@ _INFLUX_OWNED_EXACT: frozenset[str] = frozenset(
         # the same broken extraction (mirrors influx:text-terminal).
         "influx:tier2-terminal",
         "influx:tier3-terminal",
+        # Set after repeated oversize (or other counted-class) archive
+        # download failures — caps the archive_retry stage in select_stages
+        # the same way tier{2,3}-terminal cap their respective stages.
+        "influx:archive-terminal",
     }
 )
 

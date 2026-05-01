@@ -341,9 +341,11 @@ def select_stages(
     is_text_terminal = "influx:text-terminal" in tag_set
     is_tier2_terminal = "influx:tier2-terminal" in tag_set
     is_tier3_terminal = "influx:tier3-terminal" in tag_set
+    is_archive_terminal = "influx:archive-terminal" in tag_set
 
-    # 1. Archive retry: influx:archive-missing present (AC-06-A).
-    archive_retry = "influx:archive-missing" in tag_set
+    # 1. Archive retry: influx:archive-missing present (AC-06-A) AND
+    #    the per-stage archive-terminal cap has not been reached.
+    archive_retry = "influx:archive-missing" in tag_set and not is_archive_terminal
 
     # 2. Text-extraction retry: no text:* tag present.
     has_text_tag = any(t.startswith("text:") for t in tag_set)
@@ -417,11 +419,11 @@ def _restore_note(note: dict[str, Any], snapshot: dict[str, Any]) -> None:
 class RepairCounters:
     """Per-stage attempt counters tracked in the note's ``## Repair`` section.
 
-    ``tier{2,3}_attempts`` count *counted-toward-cap* failures only —
-    transient HTTP / network failures are not bumped (see
-    :func:`classify_failure`).  When ``tier{N}_attempts`` reaches the
-    configured cap, the sweep adds the ``influx:tier{N}-terminal`` tag
-    and stops re-running that stage on subsequent passes.
+    ``{archive,tier2,tier3}_attempts`` count *counted-toward-cap*
+    failures only — transient HTTP / network failures are not bumped
+    (see :func:`classify_failure`).  When ``<stage>_attempts`` reaches
+    the configured cap, the sweep adds the ``influx:<stage>-terminal``
+    tag and stops re-running that stage on subsequent passes.
     """
 
     tier2_attempts: int = 0
@@ -430,6 +432,9 @@ class RepairCounters:
     tier3_attempts: int = 0
     tier3_last_stage: str = ""
     tier3_last_error: str = ""
+    archive_attempts: int = 0
+    archive_last_kind: str = ""
+    archive_last_error: str = ""
 
     def bump_tier2(self, *, stage: str, error: str) -> RepairCounters:
         """Return a new counters value with Tier 2 attempts incremented."""
@@ -447,6 +452,23 @@ class RepairCounters:
             tier3_attempts=self.tier3_attempts + 1,
             tier3_last_stage=stage,
             tier3_last_error=_collapse_to_single_line(error),
+        )
+
+    def bump_archive(self, *, kind: str, error: str) -> RepairCounters:
+        """Return a new counters value with archive attempts incremented.
+
+        *kind* is the underlying failure classifier — typically the
+        ``stage`` from ``ExtractionError`` or the ``kind`` from
+        ``NetworkError`` (e.g. ``"oversize"``).  Stored verbatim so an
+        operator inspecting the note can tell at a glance whether the
+        archive is being terminated for size, content-type mismatch,
+        or some other persistent reason.
+        """
+        return replace(
+            self,
+            archive_attempts=self.archive_attempts + 1,
+            archive_last_kind=kind,
+            archive_last_error=_collapse_to_single_line(error),
         )
 
 
@@ -498,12 +520,14 @@ def parse_repair_section(content: str) -> RepairCounters:
     body = content[body_start + 1 : end]
 
     fields: dict[str, Any] = {}
-    int_keys = {"tier2_attempts", "tier3_attempts"}
+    int_keys = {"tier2_attempts", "tier3_attempts", "archive_attempts"}
     str_keys = {
         "tier2_last_stage",
         "tier2_last_error",
         "tier3_last_stage",
         "tier3_last_error",
+        "archive_last_kind",
+        "archive_last_error",
     }
     for line in body.splitlines():
         bm = _REPAIR_BULLET_RE.match(line)
@@ -533,6 +557,12 @@ def render_repair_section(counters: RepairCounters) -> str:
         f"- tier3_attempts: {counters.tier3_attempts}",
         f'- tier3_last_stage: "{counters.tier3_last_stage}"',
         f'- tier3_last_error: "{_collapse_to_single_line(counters.tier3_last_error)}"',
+        f"- archive_attempts: {counters.archive_attempts}",
+        f'- archive_last_kind: "{counters.archive_last_kind}"',
+        (
+            "- archive_last_error: "
+            f'"{_collapse_to_single_line(counters.archive_last_error)}"'
+        ),
     ]
     return "\n".join(lines) + "\n"
 
@@ -589,9 +619,16 @@ def classify_failure(exc: BaseException) -> Literal["transient", "counted"]:
     """
     if isinstance(exc, (LCMAError, ExtractionError)):
         stage = getattr(exc, "stage", "") or ""
-        if stage in ("parse", "validate"):
+        if stage in _COUNTED_STAGES:
             return "counted"
     return "transient"
+
+
+# Stage / kind discriminators that mean "rerunning will almost certainly
+# fail the same way" — bump the attempt counter toward the cap.  Includes
+# both LCMA-side schema failures (parse, validate) and archive-side
+# size violations (oversize) which won't shrink on retry.
+_COUNTED_STAGES: frozenset[str] = frozenset({"parse", "validate", "oversize"})
 
 
 def _log_stage_failure(
@@ -1110,6 +1147,38 @@ async def _process_sweep_note(
             # Restore the note dict so partial in-place mutations from
             # the failing hook are NOT persisted (finding #1).
             _restore_note(note, snapshot)
+            if classify_failure(exc) == "counted":
+                counters = parse_repair_section(str(note.get("content", "")))
+                kind = (
+                    getattr(exc, "stage", "")
+                    or getattr(exc, "kind", "")
+                    or "archive_failed"
+                )
+                counters = counters.bump_archive(kind=kind, error=str(exc))
+                note["content"] = upsert_repair_section(
+                    str(note.get("content", "")), counters
+                )
+                if (
+                    counters.archive_attempts >= REPAIR_COUNTED_CAP
+                    and "influx:archive-terminal" not in current_tags
+                ):
+                    current_tags.append("influx:archive-terminal")
+                    note["tags"] = list(current_tags)
+                    logger.warning(
+                        "sweep: archive marked terminal after %d failures for %s",
+                        counters.archive_attempts,
+                        note.get("id", "?"),
+                        extra={
+                            "sweep_stage": "archive_terminal_flip",
+                            "note_id": note.get("id"),
+                            "profile": profile,
+                            "run_id": current_run_id.get() or "",
+                            "archive_attempts": counters.archive_attempts,
+                            "exc_type": type(exc).__name__,
+                            "kind": kind,
+                            "detail": getattr(exc, "detail", None),
+                        },
+                    )
             _log_stage_failure(
                 "archive_download",
                 note=note,
