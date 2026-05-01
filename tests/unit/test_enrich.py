@@ -466,6 +466,29 @@ class TestTier3ExtractValidationFailure:
         assert exc_info.value.stage == "validate"
         assert exc_info.value.model == "extract"
 
+    def test_dict_elements_raise_lcma_validate_error(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Some extract models occasionally emit ``[{"claim": "...", ...}]``
+        instead of plain strings.  The schema-level validator must surface
+        this as ``LCMAError(stage="validate")`` so the per-paper failure
+        path runs (``influx:repair-needed``) rather than aborting the
+        whole scheduler run with a bare ``AttributeError`` (staging
+        incident 2026-05-01).
+        """
+        config = load_config()
+        payload = _valid_tier3_response(
+            claims=[{"claim": "x", "score": 0.8}],  # type: ignore[list-item]
+        )
+
+        with (
+            patch("influx.enrich._call_json_model", return_value=payload),
+            pytest.raises(LCMAError) as exc_info,
+        ):
+            tier3_extract(title="T", full_text="F", config=config)
+        assert exc_info.value.stage == "validate"
+        assert exc_info.value.model == "extract"
+
 
 class TestTier3ExtractPromptRendering:
     """Prompt is rendered with both required variables."""
