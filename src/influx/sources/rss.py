@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import feedparser
 
+from influx import metrics
 from influx.coordinator import RunKind
 from influx.enrich import tier1_enrich, tier3_extract
 from influx.errors import ExtractionError, LCMAError, NetworkError
@@ -332,6 +333,7 @@ def build_rss_note_item(
     return {
         "id": f"rss-{feed_slug}-{hash_val}",
         "title": item.title,
+        "source": "rss",
         "source_url": source_url,
         "content": content,
         "tags": tags,
@@ -484,6 +486,10 @@ def make_rss_item_provider(
                     cache,
                     max_download_bytes=config.storage.max_download_bytes,
                     timeout_seconds=config.storage.download_timeout_seconds,
+                    profile=profile,
+                )
+                metrics.candidates_fetched().add(
+                    len(items), {"profile": profile, "source": "rss"}
                 )
                 _log.info(
                     "rss feed fetch completed profile=%s feed=%r items=%d",
@@ -513,9 +519,12 @@ def make_rss_item_provider(
                     len(items),
                     len(scores),
                 )
+                drop_attrs = {"profile": profile, "decision": "drop"}
+                pass_attrs = {"profile": profile, "decision": "pass"}
                 for item in items:
                     scored = scores.get(_rss_filter_id(item))
                     if scored is None:
+                        metrics.articles_filtered().add(1, drop_attrs)
                         _log.info(
                             "article inspected source=rss profile=%s feed=%r "
                             "published=%s score=none decision=drop "
@@ -528,6 +537,7 @@ def make_rss_item_provider(
                         )
                         continue
                     if scored.score < profile_cfg.thresholds.relevance:
+                        metrics.articles_filtered().add(1, drop_attrs)
                         _log.info(
                             "article inspected source=rss profile=%s feed=%r "
                             "published=%s score=%d threshold=%d decision=drop "
@@ -541,6 +551,7 @@ def make_rss_item_provider(
                             item.url,
                         )
                         continue
+                    metrics.articles_filtered().add(1, pass_attrs)
                     _log.info(
                         "article inspected source=rss profile=%s feed=%r "
                         "published=%s score=%d threshold=%d decision=accept "
@@ -589,6 +600,7 @@ async def _fetch_rss_feed(
     *,
     max_download_bytes: int | None = None,
     timeout_seconds: int | None = None,
+    profile: str = "",
 ) -> list[RssFeedItem]:
     """Fetch raw feed bytes, then parse-and-stamp per *feed_entry*.
 
@@ -623,6 +635,14 @@ async def _fetch_rss_feed(
                 source="rss",
                 kind=exc.kind or "unknown",
                 detail=f"{feed_entry.name}: {exc}",
+            )
+            metrics.source_acquisition_errors().add(
+                1,
+                {
+                    "profile": profile,
+                    "source": "rss",
+                    "kind": exc.kind or "unknown",
+                },
             )
             return None
         return result.body

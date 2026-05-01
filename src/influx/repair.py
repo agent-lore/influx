@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from influx import metrics
 from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.notes import merge_tags
 from influx.telemetry import current_run_id, get_tracer
@@ -1155,6 +1156,9 @@ async def _process_sweep_note(
         # Snapshot before the hook so a raise rolls back any partial
         # in-place note mutations the hook applied (finding #1).
         snapshot = _snapshot_note(note)
+        metrics.repair_candidates().add(
+            1, {"profile": profile, "kind": "archive"}
+        )
         tracer = get_tracer()
         try:
             with tracer.span(
@@ -1234,6 +1238,9 @@ async def _process_sweep_note(
     if stages.text_extraction_retry and hooks.text_extraction:
         note["tags"] = list(current_tags)
         snapshot = _snapshot_note(note)
+        metrics.repair_candidates().add(
+            1, {"profile": profile, "kind": "text_extraction"}
+        )
         tracer = get_tracer()
         try:
             with tracer.span(
@@ -1290,6 +1297,9 @@ async def _process_sweep_note(
         # the expected pre-hook state — including the latest current_tags
         # rather than whatever was on the note before this stage ran.
         snapshot = _snapshot_note(note)
+        metrics.repair_candidates().add(
+            1, {"profile": profile, "kind": "tier2"}
+        )
         tracer = get_tracer()
         try:
             with tracer.span(
@@ -1350,6 +1360,9 @@ async def _process_sweep_note(
     if stages.tier3_retry and hooks.tier3_extract:
         note["tags"] = list(current_tags)
         snapshot = _snapshot_note(note)
+        metrics.repair_candidates().add(
+            1, {"profile": profile, "kind": "tier3"}
+        )
         tracer = get_tracer()
         try:
             with tracer.span(

@@ -27,6 +27,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from influx import metrics
 from influx.config import (
     AppConfig,
     ArxivSourceConfig,
@@ -606,6 +607,9 @@ def build_arxiv_note_item(
         tags.append("influx:archive-missing")
         tags.append("influx:archive-terminal")
         repair_needed = True
+        metrics.archive_missing().add(
+            1, {"profile": profile_name, "source": "arxiv"}
+        )
         _log.info(
             "archive download skipped (terminal) profile=%s arxiv_id=%s",
             profile_name,
@@ -638,6 +642,9 @@ def build_arxiv_note_item(
         else:
             tags.append("influx:archive-missing")
             repair_needed = True
+            metrics.archive_missing().add(
+                1, {"profile": profile_name, "source": "arxiv"}
+            )
 
     # ── Extraction cascade ────────────────────────────────────────
     extracted_text: str | None = None
@@ -698,6 +705,9 @@ def build_arxiv_note_item(
             except LCMAError:
                 _log.warning("Tier 1 enrichment failed for %s", item.arxiv_id)
                 repair_needed = True
+                metrics.llm_validation_failures().add(
+                    1, {"profile": profile_name, "tier": "1"}
+                )
             except Exception:
                 # Defensive: any unexpected failure during Tier 1
                 # (e.g. an LLM response shape that bypasses the schema's
@@ -710,6 +720,9 @@ def build_arxiv_note_item(
                     exc_info=True,
                 )
                 repair_needed = True
+                metrics.llm_validation_failures().add(
+                    1, {"profile": profile_name, "tier": "1"}
+                )
 
     # ── Tier 3 deep extraction (FR-ENR-5) ─────────────────────────
     tier3_result: Tier3Extraction | None = None
@@ -733,6 +746,9 @@ def build_arxiv_note_item(
             except LCMAError:
                 _log.warning("Tier 3 extraction failed for %s", item.arxiv_id)
                 repair_needed = True
+                metrics.llm_validation_failures().add(
+                    1, {"profile": profile_name, "tier": "3"}
+                )
             except Exception:
                 # Defensive: same rationale as the Tier 1 catch — a
                 # validator bug or unforeseen response shape must not
@@ -744,6 +760,9 @@ def build_arxiv_note_item(
                     exc_info=True,
                 )
                 repair_needed = True
+                metrics.llm_validation_failures().add(
+                    1, {"profile": profile_name, "tier": "3"}
+                )
 
     # influx:deep-extracted iff all four Tier 3 sections exist.
     if tier3_result is not None:
@@ -788,6 +807,7 @@ def build_arxiv_note_item(
     return {
         "id": f"arxiv-{item.arxiv_id}",
         "title": item.title,
+        "source": "arxiv",
         "source_url": source_url,
         "content": content,
         "tags": tags,
@@ -1003,8 +1023,19 @@ def make_arxiv_item_provider(
                     kind=exc.kind or "unknown",
                     detail=str(exc),
                 )
+                metrics.source_acquisition_errors().add(
+                    1,
+                    {
+                        "profile": profile,
+                        "source": "arxiv",
+                        "kind": exc.kind or "unknown",
+                    },
+                )
                 return ()
             fetch_span.set_attribute("influx.item_count", len(items))
+            metrics.candidates_fetched().add(
+                len(items), {"profile": profile, "source": "arxiv"}
+            )
             _log.info(
                 "arxiv fetch completed profile=%s kind=%s items=%d",
                 profile,
@@ -1068,10 +1099,13 @@ def make_arxiv_item_provider(
                     )
 
         results: list[dict[str, Any]] = []
+        drop_attrs = {"profile": profile, "decision": "drop"}
+        pass_attrs = {"profile": profile, "decision": "pass"}
         for arxiv_item in items:
             if scorer is not None:
                 score_result: ArxivScoreResult | None = scorer(arxiv_item, profile)
                 if score_result is None:
+                    metrics.articles_filtered().add(1, drop_attrs)
                     _log.info(
                         "article inspected source=arxiv profile=%s arxiv_id=%s "
                         "published=%s score=none decision=drop reason=scorer_none "
@@ -1084,6 +1118,7 @@ def make_arxiv_item_provider(
                     continue
             elif filter_scorer is not None:
                 if filter_failed:
+                    metrics.articles_filtered().add(1, drop_attrs)
                     _log.info(
                         "article inspected source=arxiv profile=%s arxiv_id=%s "
                         "published=%s score=none decision=drop reason=filter_failed "
@@ -1099,6 +1134,7 @@ def make_arxiv_item_provider(
                     # dropped entirely — the filter explicitly chose not
                     # to score them (typically because they fell below
                     # ``filter.min_score_in_results``).
+                    metrics.articles_filtered().add(1, drop_attrs)
                     _log.info(
                         "article inspected source=arxiv profile=%s arxiv_id=%s "
                         "published=%s score=none decision=drop "
@@ -1112,6 +1148,7 @@ def make_arxiv_item_provider(
                 else:
                     score_result = batch_scores[arxiv_item.arxiv_id]
             else:
+                metrics.articles_filtered().add(1, drop_attrs)
                 _log.info(
                     "article inspected source=arxiv profile=%s arxiv_id=%s "
                     "published=%s score=none decision=drop reason=no_scorer "
@@ -1124,6 +1161,7 @@ def make_arxiv_item_provider(
                 continue
 
             if score_result.score < thresholds.relevance:
+                metrics.articles_filtered().add(1, drop_attrs)
                 _log.info(
                     "article inspected source=arxiv profile=%s arxiv_id=%s "
                     "published=%s score=%d threshold=%d decision=drop "
@@ -1137,6 +1175,7 @@ def make_arxiv_item_provider(
                 )
                 continue
 
+            metrics.articles_filtered().add(1, pass_attrs)
             _log.info(
                 "article inspected source=arxiv profile=%s arxiv_id=%s "
                 "published=%s score=%d threshold=%d decision=accept title=%r",

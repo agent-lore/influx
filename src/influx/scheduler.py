@@ -34,6 +34,7 @@ from typing import Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from influx import metrics
 from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.errors import LCMAError
@@ -86,6 +87,25 @@ ItemProviderFactory = Callable[[], tuple[ItemProvider, Any]]
 # APScheduler's ``max_instances`` is never the gate on a slow tick.
 # Same-profile non-overlap is enforced by the coordinator alone.
 _TICK_MAX_INSTANCES = 1
+
+
+def _item_source(item: ProfileItem) -> str:
+    """Derive the source family (``"arxiv"`` | ``"rss"`` | ``"unknown"``).
+
+    Used as a bounded metric label.  Builders may stamp the ``source``
+    key directly; this helper falls back to scanning ``tags`` for the
+    canonical ``source:*`` provenance entry so RSS feeds with custom
+    ``source_tag`` values (e.g. ``"blog"``) still roll up to ``"rss"``
+    at the metric layer rather than fan out into per-feed cardinality.
+    """
+    direct = item.get("source")
+    if isinstance(direct, str) and direct:
+        return direct
+    for tag in item.get("tags", []) or []:
+        if isinstance(tag, str) and tag.startswith("source:"):
+            value = tag.split(":", 1)[1]
+            return "rss" if value not in ("arxiv",) else "arxiv"
+    return "unknown"
 
 
 async def default_item_provider(
@@ -169,6 +189,12 @@ async def run_profile(
     source_errors_token = current_source_acquisition_errors.set([])
     tracer = get_tracer()
     started_at = datetime.now(UTC)
+    # Run-lifecycle metrics (issue #6): start counter + active-runs gauge
+    # bracket the run end-to-end so dashboards can answer "is anything
+    # actually running?" without relying on docker logs.
+    run_metric_attrs = {"profile": profile, "run_type": kind.value}
+    metrics.run_starts().add(1, run_metric_attrs)
+    metrics.active_runs().add(1, {"profile": profile})
     logger.info(
         "run started profile=%s kind=%s run_id=%s range=%s",
         profile,
@@ -195,6 +221,8 @@ async def run_profile(
                 probe_loop=probe_loop,
             )
             elapsed = (datetime.now(UTC) - started_at).total_seconds()
+            source_errors = current_source_acquisition_errors.get() or []
+            outcome = "degraded" if source_errors else "success"
             if result is None:
                 logger.info(
                     "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
@@ -208,11 +236,9 @@ async def run_profile(
                     run_id=run_id,
                     sources_checked=None,
                     ingested=None,
-                    source_acquisition_errors=current_source_acquisition_errors.get()
-                    or [],
+                    source_acquisition_errors=source_errors,
                 )
             else:
-                source_errors = current_source_acquisition_errors.get() or []
                 logger.info(
                     "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
                     "sources_checked=%d ingested=%d degraded=%s",
@@ -230,6 +256,8 @@ async def run_profile(
                     ingested=result.stats.ingested,
                     source_acquisition_errors=source_errors,
                 )
+            metrics.run_duration().record(elapsed, run_metric_attrs)
+            metrics.run_completions().add(1, {**run_metric_attrs, "outcome": outcome})
             return result
     except Exception as exc:
         elapsed = (datetime.now(UTC) - started_at).total_seconds()
@@ -241,8 +269,11 @@ async def run_profile(
             elapsed,
         )
         ledger.fail(run_id=run_id, error=f"{type(exc).__name__}: {exc}")
+        metrics.run_duration().record(elapsed, run_metric_attrs)
+        metrics.run_completions().add(1, {**run_metric_attrs, "outcome": "failure"})
         raise
     finally:
+        metrics.active_runs().add(-1, {"profile": profile})
         current_run_id.reset(run_id_token)
         current_source_acquisition_errors.reset(source_errors_token)
 
@@ -389,6 +420,13 @@ async def _run_profile_body(
                 # filter-tag entries to the rejection-rate map.
                 record_filter_result(profile, title, item.get("filter_tags", []))
                 source_url = item["source_url"]
+                # Source family for metric labels — derived from the
+                # ``source:*`` provenance tag when build_*_note_item did
+                # not stamp the dedicated key directly.
+                item_source = item.get("source") or _item_source(item)
+                metrics.articles_inspected().add(
+                    1, {"profile": profile, "source": item_source}
+                )
                 logger.info(
                     "article inspected profile=%s source_url=%s title=%r "
                     "score=%s path=%s tags=%s",
@@ -408,6 +446,9 @@ async def _run_profile_body(
                     cache_result.content[0].text  # type: ignore[union-attr]
                 )
                 if cache_body.get("hit"):
+                    metrics.cache_hits().add(
+                        1, {"profile": profile, "source": item_source}
+                    )
                     logger.info(
                         "article cache hit profile=%s source_url=%s title=%r "
                         "kind=%s action=%s",
@@ -441,6 +482,14 @@ async def _run_profile_body(
                             tags=list(item.get("tags", [])),
                             confidence=float(item.get("confidence", 0.0)),
                         )
+                    metrics.lithos_writes().add(
+                        1,
+                        {
+                            "profile": profile,
+                            "source": item_source,
+                            "status": write_result.status,
+                        },
+                    )
                     if write_result.status in ("created", "updated"):
                         logger.info(
                             "article write completed profile=%s source_url=%s "
@@ -499,6 +548,14 @@ async def _run_profile_body(
                         tags=list(item.get("tags", [])),
                         confidence=float(item.get("confidence", 0.0)),
                     )
+                metrics.lithos_writes().add(
+                    1,
+                    {
+                        "profile": profile,
+                        "source": item_source,
+                        "status": write_result.status,
+                    },
+                )
                 if write_result.status in ("created", "updated"):
                     logger.info(
                         "article write completed profile=%s source_url=%s title=%r "
