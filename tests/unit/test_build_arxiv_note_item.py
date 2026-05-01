@@ -854,6 +854,66 @@ class TestTier3ExtractionFailure:
 
         assert "influx:repair-needed" in result["tags"]
 
+    @patch("influx.sources.arxiv.tier3_extract")
+    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.sources.arxiv.extract_arxiv_text")
+    def test_unexpected_tier3_exception_degrades_to_repair(
+        self, mock_ext: object, mock_t1: object, mock_t3: object
+    ) -> None:
+        """A non-LCMAError raised by tier3_extract (e.g. an AttributeError
+        from a validator that bypassed Pydantic's ValidationError wrapper)
+        must degrade to ``influx:repair-needed`` for this paper, not abort
+        the run with an uncaught exception (staging incident 2026-05-01).
+        """
+        mock_ext.return_value = ArxivExtractionResult(  # type: ignore[union-attr]
+            text="text", source_tag="text:html"
+        )
+        mock_t1.return_value = _make_tier1()  # type: ignore[union-attr]
+        mock_t3.side_effect = AttributeError(  # type: ignore[union-attr]
+            "'dict' object has no attribute 'strip'"
+        )
+        config = _make_config(relevance=7, full_text=8, deep_extract=9)
+
+        # Must not raise.
+        result = build_arxiv_note_item(
+            item=_make_item(),
+            score=9,
+            confidence=0.9,
+            reason="R",
+            profile_name="ai-robotics",
+            config=config,
+        )
+
+        assert "influx:repair-needed" in result["tags"]
+        assert "influx:deep-extracted" not in result["tags"]
+        assert "## Claims" not in result["content"]
+
+    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.sources.arxiv.extract_arxiv_text")
+    def test_unexpected_tier1_exception_degrades_to_repair(
+        self, mock_ext: object, mock_t1: object
+    ) -> None:
+        """Same defence-in-depth for Tier 1 — an unexpected exception must
+        not abort the run.
+        """
+        mock_ext.return_value = ArxivExtractionResult(  # type: ignore[union-attr]
+            text="text", source_tag="text:html"
+        )
+        mock_t1.side_effect = TypeError("bad shape")  # type: ignore[union-attr]
+        config = _make_config(relevance=7, deep_extract=100)
+
+        result = build_arxiv_note_item(
+            item=_make_item(),
+            score=7,
+            confidence=0.7,
+            reason="R",
+            profile_name="ai-robotics",
+            config=config,
+        )
+
+        assert "influx:repair-needed" in result["tags"]
+        assert "## Summary" not in result["content"]
+
 
 # ── Per-tier failure independence (AC-07-D) ──────────────────────
 

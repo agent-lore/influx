@@ -676,6 +676,18 @@ def build_arxiv_note_item(
             except LCMAError:
                 _log.warning("Tier 1 enrichment failed for %s", item.arxiv_id)
                 repair_needed = True
+            except Exception:
+                # Defensive: any unexpected failure during Tier 1
+                # (e.g. an LLM response shape that bypasses the schema's
+                # validators with an AttributeError, per staging incident
+                # 2026-05-01) must degrade to a per-paper repair, not
+                # take the whole scheduler run down.
+                _log.warning(
+                    "Tier 1 enrichment crashed unexpectedly for %s",
+                    item.arxiv_id,
+                    exc_info=True,
+                )
+                repair_needed = True
 
     # ── Tier 3 deep extraction (FR-ENR-5) ─────────────────────────
     tier3_result: Tier3Extraction | None = None
@@ -698,6 +710,17 @@ def build_arxiv_note_item(
                 )
             except LCMAError:
                 _log.warning("Tier 3 extraction failed for %s", item.arxiv_id)
+                repair_needed = True
+            except Exception:
+                # Defensive: same rationale as the Tier 1 catch — a
+                # validator bug or unforeseen response shape must not
+                # turn a single bad paper into a run-level abort
+                # (staging incident 2026-05-01).
+                _log.warning(
+                    "Tier 3 extraction crashed unexpectedly for %s",
+                    item.arxiv_id,
+                    exc_info=True,
+                )
                 repair_needed = True
 
     # influx:deep-extracted iff all four Tier 3 sections exist.

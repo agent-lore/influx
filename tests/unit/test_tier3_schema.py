@@ -142,6 +142,29 @@ class TestTier3ExtractionNegative:
         with pytest.raises(ValidationError):
             Tier3Extraction(**_valid(potential_connections=[""]))
 
+    def test_dict_element_in_claims_raises_validation_error(self) -> None:
+        """Non-string list elements (e.g. dict per item from a model that
+        emitted structured output) must raise ``ValidationError`` rather
+        than ``AttributeError`` so callers see the standard Pydantic
+        contract.  Staging incident 2026-05-01.
+        """
+        with pytest.raises(ValidationError):
+            Tier3Extraction(**_valid(claims=[{"claim": "x", "score": 0.8}]))  # type: ignore[arg-type]
+
+    def test_dict_element_in_builds_on_raises_validation_error(self) -> None:
+        with pytest.raises(ValidationError):
+            Tier3Extraction(
+                **_valid(builds_on=[{"title": "FooNet", "arxiv_id": "2412.12345"}])  # type: ignore[arg-type]
+            )
+
+    def test_dict_element_in_potential_connections_raises_validation_error(
+        self,
+    ) -> None:
+        with pytest.raises(ValidationError):
+            Tier3Extraction(
+                **_valid(potential_connections=[{"title": "Foo"}])  # type: ignore[arg-type]
+            )
+
     def test_missing_claims(self) -> None:
         with pytest.raises(ValidationError):
             Tier3Extraction(

@@ -13,8 +13,21 @@ _FILTER_MAX_TAGS = 5
 
 
 def _trim_and_truncate(values: list[str]) -> list[str]:
-    """Trim whitespace and truncate each element to 500 chars (FR-ENR-5)."""
-    return [v.strip()[:_TIER3_MAX_CHARS] for v in values]
+    """Trim whitespace and truncate each element to 500 chars (FR-ENR-5).
+
+    Raises ``ValueError`` when an element is not a string so Pydantic
+    surfaces the failure as ``ValidationError`` rather than letting an
+    ``AttributeError`` escape — the latter bypasses ``LCMAError``-only
+    callers and aborts the whole run (staging incident 2026-05-01).
+    """
+    out: list[str] = []
+    for v in values:
+        if not isinstance(v, str):
+            raise ValueError(
+                f"List element must be a string, got {type(v).__name__}: {v!r:.100}"
+            )
+        out.append(v.strip()[:_TIER3_MAX_CHARS])
+    return out
 
 
 def _check_non_empty(values: list[str]) -> list[str]:
