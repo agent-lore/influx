@@ -73,6 +73,23 @@ def _first_non_empty_str(body: dict[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
+# Lithos currently bundles slug collisions into ``status="error"`` with a
+# message of the shape ``Slug '<slug>' already in use by document '<id>'``
+# (staging incident 2026-05-01).  The existing ``slug_collision`` retry
+# path in ``write_note`` recovers automatically once the parser routes
+# these responses to that branch.  Drop this shim once Lithos is updated
+# to emit ``status="slug_collision"`` directly.
+_SLUG_COLLISION_DETAIL_RE = re.compile(
+    r"slug\s+'[^']+'\s+already in use",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_slug_collision(detail: str) -> bool:
+    """Return ``True`` when the Lithos error message describes a slug clash."""
+    return bool(detail) and _SLUG_COLLISION_DETAIL_RE.search(detail) is not None
+
+
 @dataclasses.dataclass(frozen=True)
 class WriteResult:
     """Result of a ``write_note`` call after envelope handling (FR-MCP-7).
@@ -700,6 +717,30 @@ class LithosClient:
         # is root-causable from logs alone — see staging incident
         # 2026-04-30 where a bare ``status=error`` left no breadcrumb.
         detail = _first_non_empty_str(body, ("reason", "detail", "error", "message"))
+
+        # Stopgap: Lithos returns slug collisions inside ``status="error"``
+        # rather than the documented ``status="slug_collision"``.  Re-route
+        # so the existing slug-collision retry (FR-MCP-7, AC-05-D) engages
+        # instead of skipping the write forever (staging incident
+        # 2026-05-01).  Remove once Lithos emits the proper status.
+        if _looks_like_slug_collision(detail):
+            logger.warning(
+                "lithos_write returned slug-collision masquerading as error for %s: %s",
+                source_url,
+                detail,
+                extra={
+                    "lithos_status": status,
+                    "source_url": source_url,
+                    "detail": detail,
+                    "rerouted_to": "slug_collision",
+                },
+            )
+            return WriteResult(
+                status="slug_collision",
+                source_url=source_url,
+                detail=detail,
+            )
+
         body_excerpt = "" if detail else json.dumps(body, default=str)[:500]
         logger.warning(
             "lithos_write returned non-success status=%s for %s: %s",

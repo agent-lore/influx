@@ -1077,6 +1077,59 @@ class TestWriteEnvelopeUnknownStatus:
         finally:
             await client.close()
 
+    async def test_slug_collision_masqueraded_as_error_is_rerouted(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A ``status='error'`` body whose ``reason`` describes a slug clash
+        must be re-routed through the existing slug-collision retry, so the
+        write succeeds with a disambiguated title (staging incident
+        2026-05-01).
+        """
+        import logging
+
+        slug_msg = (
+            "Slug 'attention-is-all-you-need' already in use by "
+            "document 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'"
+        )
+        fake_lithos_server.write_responses.extend(
+            [
+                f'{{"status": "error", "reason": "{slug_msg}"}}',
+                '{"status": "created"}',
+            ]
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with caplog.at_level(logging.WARNING, logger="influx.lithos_client"):
+                result = await client.write_note(
+                    title="Attention Is All You Need",
+                    content="# Summary\nTransformer paper.",
+                    path="papers/arxiv/2026/03",
+                    source_url="https://arxiv.org/abs/1706.03762",
+                    tags=["profile:ml-research"],
+                    confidence=0.9,
+                )
+            assert result.status == "created"
+            # Retry must have run with the disambiguating title suffix.
+            write_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
+            ]
+            assert len(write_calls) == 2
+            assert write_calls[1][1]["title"] == (
+                "Attention Is All You Need [arXiv 1706.03762]"
+            )
+            # The reroute itself is logged so operators can spot Lithos
+            # still mis-classifying these.
+            assert any(
+                "slug-collision masquerading as error" in r.getMessage()
+                for r in caplog.records
+            )
+        finally:
+            await client.close()
+
 
 # ── Write envelopes — slug_collision (FR-MCP-7, AC-05-D) ──────────
 
