@@ -360,6 +360,15 @@ class ModelSlotConfig(BaseModel):
     request_timeout: int = 30
     max_retries: int = 2
     json_mode: bool = False
+    # When true, the slot's caller (e.g. ``tier3_extract``) sends the
+    # OpenAI ``response_format = {"type": "json_schema", "strict": true}``
+    # variant pinning its Pydantic output schema.  Constrains the model
+    # to emit conforming JSON or fail at the API boundary, eliminating
+    # the validate-stage failures that PR #11/#13 were forced to absorb
+    # downstream (issue #16).  Requires an OpenAI-compatible provider
+    # that supports structured outputs; falls back to ``json_object``
+    # mode automatically when the slot has no associated schema class.
+    json_schema_strict: bool = False
 
 
 # ── Prompts ──────────────────────────────────────────────────────────

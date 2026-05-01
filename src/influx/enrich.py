@@ -17,13 +17,17 @@ import logging
 import os
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from influx.config import AppConfig
 from influx.errors import LCMAError, NetworkError
 from influx.http_client import guarded_post_json_fetch
 from influx.prompts import load_prompt
-from influx.schemas import Tier1Enrichment, Tier3Extraction
+from influx.schemas import (
+    Tier1Enrichment,
+    Tier3Extraction,
+    openai_strict_response_format,
+)
 
 __all__ = [
     "tier1_enrich",
@@ -40,12 +44,20 @@ def _call_json_model(
     config: AppConfig,
     slot_name: str,
     prompt: str,
+    *,
+    schema_class: type[BaseModel] | None = None,
 ) -> dict[str, Any]:
     """Call a JSON-mode model slot and return the parsed response dict.
 
     Resolves the model slot and provider from *config*, constructs an
     OpenAI-compatible ``/chat/completions`` request, and parses the
     JSON content from the response.
+
+    When *schema_class* is provided AND the slot has
+    ``json_schema_strict = true``, sends the OpenAI structured-outputs
+    ``response_format = {"type": "json_schema", "strict": true, ...}``
+    variant so the model is constrained to emit JSON conforming to
+    *schema_class*.  Falls back to plain ``json_object`` mode otherwise.
 
     Provider compatibility
     ----------------------
@@ -93,7 +105,9 @@ def _call_json_model(
     }
     if slot.max_tokens is not None:
         body["max_tokens"] = slot.max_tokens
-    if slot.json_mode:
+    if slot.json_schema_strict and schema_class is not None:
+        body["response_format"] = openai_strict_response_format(schema_class)
+    elif slot.json_mode:
         body["response_format"] = {"type": "json_object"}
 
     attempts = slot.max_retries + 1
@@ -202,7 +216,7 @@ def tier1_enrich(
         profile_summary=profile_summary,
     )
 
-    raw = _call_json_model(config, "enrich", rendered)
+    raw = _call_json_model(config, "enrich", rendered, schema_class=Tier1Enrichment)
 
     try:
         return Tier1Enrichment.model_validate(raw)
@@ -261,7 +275,7 @@ def tier3_extract(
         full_text=full_text,
     )
 
-    raw = _call_json_model(config, "extract", rendered)
+    raw = _call_json_model(config, "extract", rendered, schema_class=Tier3Extraction)
 
     try:
         return Tier3Extraction.model_validate(raw)
