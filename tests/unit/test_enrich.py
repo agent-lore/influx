@@ -23,8 +23,9 @@ from unittest.mock import patch
 import pytest
 
 from influx.config import AppConfig, load_config
-from influx.enrich import tier1_enrich, tier3_extract
+from influx.enrich import _call_json_model, tier1_enrich, tier3_extract
 from influx.errors import LCMAError
+from influx.http_client import FetchResult
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 
 
@@ -197,7 +198,9 @@ class TestTier1EnrichPromptRendering:
         payload = _valid_tier1_response()
         captured_prompt: list[str] = []
 
-        def fake_call(cfg: Any, slot: str, prompt: str) -> dict[str, Any]:
+        def fake_call(
+            cfg: Any, slot: str, prompt: str, **kwargs: Any
+        ) -> dict[str, Any]:
             captured_prompt.append(prompt)
             return payload
 
@@ -223,7 +226,9 @@ class TestTier1EnrichPromptRendering:
         payload = _valid_tier1_response()
         captured: list[str] = []
 
-        def fake_call(cfg: Any, slot: str, prompt: str) -> dict[str, Any]:
+        def fake_call(
+            cfg: Any, slot: str, prompt: str, **kwargs: Any
+        ) -> dict[str, Any]:
             captured.append(prompt)
             return payload
 
@@ -247,7 +252,9 @@ class TestTier1EnrichModelSlot:
         payload = _valid_tier1_response()
         captured_slot: list[str] = []
 
-        def fake_call(cfg: Any, slot: str, prompt: str) -> dict[str, Any]:
+        def fake_call(
+            cfg: Any, slot: str, prompt: str, **kwargs: Any
+        ) -> dict[str, Any]:
             captured_slot.append(slot)
             return payload
 
@@ -268,7 +275,9 @@ class TestTier1EnrichModelSlot:
         payload = _valid_tier1_response()
         captured_cfg: list[AppConfig] = []
 
-        def fake_call(cfg: Any, slot: str, prompt: str) -> dict[str, Any]:
+        def fake_call(
+            cfg: Any, slot: str, prompt: str, **kwargs: Any
+        ) -> dict[str, Any]:
             captured_cfg.append(cfg)
             return payload
 
@@ -500,7 +509,9 @@ class TestTier3ExtractPromptRendering:
         payload = _valid_tier3_response()
         captured_prompt: list[str] = []
 
-        def fake_call(cfg: Any, slot: str, prompt: str) -> dict[str, Any]:
+        def fake_call(
+            cfg: Any, slot: str, prompt: str, **kwargs: Any
+        ) -> dict[str, Any]:
             captured_prompt.append(prompt)
             return payload
 
@@ -523,7 +534,9 @@ class TestTier3ExtractPromptRendering:
         payload = _valid_tier3_response()
         captured: list[str] = []
 
-        def fake_call(cfg: Any, slot: str, prompt: str) -> dict[str, Any]:
+        def fake_call(
+            cfg: Any, slot: str, prompt: str, **kwargs: Any
+        ) -> dict[str, Any]:
             captured.append(prompt)
             return payload
 
@@ -546,7 +559,9 @@ class TestTier3ExtractModelSlot:
         payload = _valid_tier3_response()
         captured_slot: list[str] = []
 
-        def fake_call(cfg: Any, slot: str, prompt: str) -> dict[str, Any]:
+        def fake_call(
+            cfg: Any, slot: str, prompt: str, **kwargs: Any
+        ) -> dict[str, Any]:
             captured_slot.append(slot)
             return payload
 
@@ -566,7 +581,9 @@ class TestTier3ExtractModelSlot:
         payload = _valid_tier3_response()
         captured_cfg: list[AppConfig] = []
 
-        def fake_call(cfg: Any, slot: str, prompt: str) -> dict[str, Any]:
+        def fake_call(
+            cfg: Any, slot: str, prompt: str, **kwargs: Any
+        ) -> dict[str, Any]:
             captured_cfg.append(cfg)
             return payload
 
@@ -600,3 +617,149 @@ class TestTier3ExtractTransportFailure:
                 full_text="F",
                 config=config,
             )
+
+
+# ── OpenAI structured-outputs response_format wiring (issue #16) ────
+
+
+def _make_post_result(content_dict: dict[str, Any]) -> FetchResult:
+    """Build a minimal ``FetchResult`` mimicking an OpenAI chat-completions
+    success response."""
+    body = json.dumps(_make_chat_response(content_dict)).encode("utf-8")
+    return FetchResult(
+        body=body,
+        status_code=200,
+        content_type="application/json",
+        final_url="https://api.openai.com/v1/chat/completions",
+    )
+
+
+class TestCallJsonModelResponseFormat:
+    """``_call_json_model`` selects the right ``response_format`` shape based
+    on the slot's ``json_schema_strict`` flag.
+    """
+
+    def _capture_post(
+        self, response_dict: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """Patch ``guarded_post_json_fetch`` and return (captured-bodies, ctx)."""
+        captured: list[dict[str, Any]] = []
+
+        def fake_post(
+            url: str,
+            payload: dict[str, Any],
+            **kwargs: Any,
+        ) -> FetchResult:
+            captured.append(payload)
+            return _make_post_result(response_dict)
+
+        return captured, patch(
+            "influx.enrich.guarded_post_json_fetch", side_effect=fake_post
+        )
+
+    def test_json_object_when_strict_disabled(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Default (json_mode=true, json_schema_strict=false) sends the loose
+        ``json_object`` response_format that callers shipped with."""
+        config = load_config()
+        config.models["extract"].json_schema_strict = False
+
+        captured, ctx = self._capture_post(_valid_tier3_response())
+        with ctx:
+            _call_json_model(config, "extract", "prompt", schema_class=Tier3Extraction)
+
+        assert len(captured) == 1
+        body = captured[0]
+        assert body["response_format"] == {"type": "json_object"}
+
+    def test_json_schema_strict_when_enabled(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """When the slot opts in, the body carries the strict json_schema
+        response_format pinning the Pydantic class."""
+        config = load_config()
+        config.models["extract"].json_schema_strict = True
+
+        captured, ctx = self._capture_post(_valid_tier3_response())
+        with ctx:
+            _call_json_model(config, "extract", "prompt", schema_class=Tier3Extraction)
+
+        body = captured[0]
+        rf = body["response_format"]
+        assert rf["type"] == "json_schema"
+        assert rf["json_schema"]["strict"] is True
+        assert rf["json_schema"]["name"] == "Tier3Extraction"
+
+        schema = rf["json_schema"]["schema"]
+        # OpenAI strict mode requirements.
+        assert schema["additionalProperties"] is False
+        assert set(schema["required"]) == {
+            "claims",
+            "datasets",
+            "builds_on",
+            "open_questions",
+            "potential_connections",
+        }
+        # Per-element type pinned to string for every list field — the
+        # whole point of the change for issue #16.
+        for field in ("claims", "datasets", "builds_on", "open_questions"):
+            assert schema["properties"][field]["type"] == "array"
+            assert schema["properties"][field]["items"]["type"] == "string"
+
+    def test_strict_mode_falls_back_when_no_schema_class(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Strict flag without a schema class can't build a json_schema
+        body; falls back to plain json_object so the request still flies."""
+        config = load_config()
+        config.models["extract"].json_schema_strict = True
+
+        captured, ctx = self._capture_post(_valid_tier3_response())
+        with ctx:
+            _call_json_model(config, "extract", "prompt", schema_class=None)
+
+        assert captured[0]["response_format"] == {"type": "json_object"}
+
+
+class TestTier3ExtractStrictResponseFormat:
+    """End-to-end check that ``tier3_extract`` propagates ``Tier3Extraction``
+    into the request body when the slot opts in.
+    """
+
+    def test_strict_request_carries_tier3_schema(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        config = load_config()
+        config.models["extract"].json_schema_strict = True
+
+        captured: list[dict[str, Any]] = []
+
+        def fake_post(url: str, payload: dict[str, Any], **kwargs: Any) -> FetchResult:
+            captured.append(payload)
+            return _make_post_result(_valid_tier3_response())
+
+        with patch("influx.enrich.guarded_post_json_fetch", side_effect=fake_post):
+            tier3_extract(title="T", full_text="F", config=config)
+
+        rf = captured[0]["response_format"]
+        assert rf["type"] == "json_schema"
+        assert rf["json_schema"]["name"] == "Tier3Extraction"
+
+    def test_strict_request_carries_tier1_schema(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        config = load_config()
+        config.models["enrich"].json_schema_strict = True
+
+        captured: list[dict[str, Any]] = []
+
+        def fake_post(url: str, payload: dict[str, Any], **kwargs: Any) -> FetchResult:
+            captured.append(payload)
+            return _make_post_result(_valid_tier1_response())
+
+        with patch("influx.enrich.guarded_post_json_fetch", side_effect=fake_post):
+            tier1_enrich(title="T", abstract="A", profile_summary="P", config=config)
+
+        rf = captured[0]["response_format"]
+        assert rf["json_schema"]["name"] == "Tier1Enrichment"

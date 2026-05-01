@@ -189,6 +189,12 @@ temperature = 0.2
 request_timeout = 30
 max_retries = 2
 json_mode = true
+# OpenAI's structured-outputs mode pins the response shape to the
+# `Tier1Enrichment` Pydantic schema, so the model can't return
+# unexpected element types (e.g. dicts in `contributions`).  Only set
+# this `true` for OpenAI models that explicitly support structured
+# outputs; OpenRouter routes to non-OpenAI backends may reject it.
+json_schema_strict = true
 
 [models.extract]
 provider = "openrouter"
@@ -197,6 +203,11 @@ temperature = 0.2
 request_timeout = 60
 max_retries = 2
 json_mode = true
+# Leave `json_schema_strict` off when routing through OpenRouter to
+# non-OpenAI models — Claude via OpenRouter doesn't accept the strict
+# `json_schema` response_format.  Switch to true if you point this slot
+# at a native OpenAI model that supports structured outputs (e.g.
+# `provider = "openai"`, `model = "gpt-4.1"`).
 
 # ---------------------------------------------------------------------------
 # Prompts (filter / tier1_enrich / tier3_extract)
@@ -240,7 +251,12 @@ From the full text of the paper, extract structured information.
 Title: {title}
 Full text: {full_text}
 
-Return JSON with: claims, datasets, builds_on, open_questions, potential_connections.
+Return JSON with five keys: claims, datasets, builds_on, open_questions,
+potential_connections.  Every value must be a list of plain strings —
+do NOT wrap items as objects with sub-fields like {{"claim": "...",
+"score": 0.8}}.  Use natural-language sentences as the list elements.
+For builds_on, include arXiv references in the form "arXiv:<id>" when
+known; for example "Attention is all you need (arXiv:1706.03762)".
 """
 
 # ---------------------------------------------------------------------------

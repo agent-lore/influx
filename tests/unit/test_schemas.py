@@ -189,3 +189,99 @@ class TestTier3Extraction:
     def test_too_many_datasets(self) -> None:
         with pytest.raises(ValidationError):
             Tier3Extraction(claims=["c"], datasets=[f"d{i}" for i in range(11)])
+
+
+# ── OpenAI structured-outputs response_format builder ────────────────
+
+
+from influx.schemas import openai_strict_response_format  # noqa: E402
+
+
+class TestOpenAIStrictResponseFormat:
+    """``openai_strict_response_format`` produces a body that satisfies
+    OpenAI's structured-outputs ``strict`` schema requirements.
+    """
+
+    def test_top_level_envelope_shape(self) -> None:
+        rf = openai_strict_response_format(Tier3Extraction)
+        assert rf["type"] == "json_schema"
+        spec = rf["json_schema"]
+        assert spec["strict"] is True
+        assert spec["name"] == "Tier3Extraction"
+        assert "schema" in spec
+
+    def test_explicit_name_override(self) -> None:
+        rf = openai_strict_response_format(Tier3Extraction, name="MyAlias")
+        assert rf["json_schema"]["name"] == "MyAlias"
+
+    def test_object_required_lists_all_properties(self) -> None:
+        """Strict mode requires every property to be in ``required``."""
+        rf = openai_strict_response_format(Tier3Extraction)
+        schema = rf["json_schema"]["schema"]
+        assert set(schema["required"]) == set(schema["properties"].keys())
+
+    def test_object_additional_properties_false(self) -> None:
+        rf = openai_strict_response_format(Tier3Extraction)
+        assert rf["json_schema"]["schema"]["additionalProperties"] is False
+
+    def test_array_items_typed_as_string(self) -> None:
+        """Per-list-element type pinning is the durable fix for the
+        dict-where-string-expected failures (issue #16).
+        """
+        rf = openai_strict_response_format(Tier3Extraction)
+        schema = rf["json_schema"]["schema"]
+        for field_name in (
+            "claims",
+            "datasets",
+            "builds_on",
+            "open_questions",
+            "potential_connections",
+        ):
+            field_schema = schema["properties"][field_name]
+            assert field_schema["type"] == "array"
+            assert field_schema["items"]["type"] == "string"
+
+    def test_unsupported_keywords_stripped(self) -> None:
+        """OpenAI strict mode rejects ``minLength``/``maxItems``/``default``
+        and similar — Pydantic emits them, the builder must strip them.
+        """
+        rf = openai_strict_response_format(Tier3Extraction)
+
+        def _walk(node: object) -> None:
+            if not isinstance(node, dict):
+                return
+            for forbidden in (
+                "minLength",
+                "maxLength",
+                "minItems",
+                "maxItems",
+                "minimum",
+                "maximum",
+                "pattern",
+                "format",
+                "default",
+                "examples",
+                "title",
+            ):
+                assert forbidden not in node, (
+                    f"strict schema must not carry {forbidden!r}: {node}"
+                )
+            for v in node.values():
+                if isinstance(v, list):
+                    for item in v:
+                        _walk(item)
+                else:
+                    _walk(v)
+
+        _walk(rf["json_schema"]["schema"])
+
+    def test_tier1_envelope(self) -> None:
+        """Same hardening applies to Tier1Enrichment."""
+        rf = openai_strict_response_format(Tier1Enrichment)
+        schema = rf["json_schema"]["schema"]
+        assert schema["additionalProperties"] is False
+        assert "contributions" in schema["required"]
+        assert schema["properties"]["contributions"]["items"]["type"] == "string"
+        # method/result/relevance pinned to string.
+        for field in ("method", "result", "relevance"):
+            assert schema["properties"][field]["type"] == "string"
