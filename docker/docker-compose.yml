@@ -31,3 +31,8 @@ services:
       - OTEL_BSP_SCHEDULE_DELAY=${OTEL_BSP_SCHEDULE_DELAY:-30000}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      # Webhook auth tokens — referenced by influx.toml `auth_token_env` /
+      # `rfc_password_env` for the openclaw-agent and agent-zero-inbox-rfc
+      # outbound webhooks (FR-NOT-*).
+      - OPENCLAW_TOKEN=${OPENCLAW_TOKEN:-}
+      - AGENT_ZERO_RFC_PASSWORD=${AGENT_ZERO_RFC_PASSWORD:-}

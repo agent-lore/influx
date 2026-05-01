@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from influx.config import AppConfig, RepairConfig
-from influx.errors import LCMAError, LithosError
+from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.repair import ContentTooLargeSkipped, SweepHooks, SweepWriteError, sweep
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -1056,6 +1056,182 @@ class TestSweepCapCounterAndTerminalFlip:
             client=client,
             config=config,
             hooks=SweepHooks(tier3_extract=spy),
+        )
+
+        assert call_count == 0
+
+
+class TestSweepArchiveTerminalCap:
+    """Repeated counted-class archive failures (e.g. oversize) flip
+    ``influx:archive-terminal`` so the sweep stops re-attempting a
+    download that will never succeed.
+    """
+
+    @staticmethod
+    def _note_for_archive(note_id: str) -> dict[str, Any]:
+        # influx:archive-missing tagged so archive_retry is selected.
+        body = (
+            "---\n"
+            f"source_url: https://arxiv.org/abs/{note_id}\n"
+            "tags: []\n"
+            "confidence: 0.9\n"
+            "---\n"
+            "# Paper\n\n"
+            "## Archive\n\n"
+            "## Summary\nSummary\n\n"
+            "## Profile Relevance\n"
+            "### ai-robotics\nScore: 9/10\nRelevant\n\n"
+            "## User Notes\n"
+        )
+        return {
+            "id": note_id,
+            "title": "Paper",
+            "content": body,
+            "tags": ["influx:repair-needed", "influx:archive-missing"],
+            "source_url": f"https://arxiv.org/abs/{note_id}",
+            "confidence": 0.9,
+        }
+
+    @staticmethod
+    def _last_write_args(client: AsyncMock) -> dict[str, Any]:
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        return dict(write_calls[-1].args[1])
+
+    async def test_oversize_failure_bumps_archive_counter(self) -> None:
+        """One counted oversize failure increments archive_attempts."""
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_archive("n1")
+
+        def failing(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                "Response body exceeds 100000000 bytes",
+                url="https://arxiv.org/pdf/x.pdf",
+                stage="oversize",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=failing),
+        )
+
+        rewritten = self._last_write_args(client)
+        content = rewritten["content"]
+        assert "## Repair" in content
+        assert "archive_attempts: 1" in content
+        assert 'archive_last_kind: "oversize"' in content
+        assert "influx:archive-terminal" not in rewritten["tags"]
+
+    async def test_transient_archive_failure_does_not_bump_counter(self) -> None:
+        """LithosError-class archive failures (transport flakes) must NOT
+        advance the cap counter — they may heal on retry.
+        """
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_archive("n1")
+
+        def failing(note: dict[str, object]) -> str:
+            del note
+            raise LithosError("connection refused", operation="archive_download")
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=failing),
+        )
+
+        rewritten = self._last_write_args(client)
+        content = rewritten["content"]
+        if "## Repair" in content:
+            assert "archive_attempts: 0" in content
+        assert "influx:archive-terminal" not in rewritten["tags"]
+
+    async def test_third_oversize_failure_flips_archive_terminal(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """At cap=3, ``influx:archive-terminal`` is added and a WARNING is logged."""
+        import logging
+
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_archive("n1")
+        note["content"] = note["content"].replace(
+            "## User Notes\n",
+            (
+                "## Repair\n"
+                "- archive_attempts: 2\n"
+                '- archive_last_kind: "oversize"\n'
+                '- archive_last_error: "earlier failure"\n\n'
+                "## User Notes\n"
+            ),
+        )
+
+        def failing(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                "Response body exceeds 100000000 bytes",
+                url="https://arxiv.org/pdf/x.pdf",
+                stage="oversize",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        with caplog.at_level(logging.WARNING, logger="influx.repair"):
+            await sweep(
+                "ai-robotics",
+                client=client,
+                config=config,
+                hooks=SweepHooks(archive_download=failing),
+            )
+
+        rewritten = self._last_write_args(client)
+        assert "influx:archive-terminal" in rewritten["tags"]
+        assert "archive_attempts: 3" in rewritten["content"]
+
+        flip_logs = [
+            r
+            for r in caplog.records
+            if getattr(r, "sweep_stage", None) == "archive_terminal_flip"
+        ]
+        assert flip_logs, "expected archive_terminal_flip log"
+        rec = flip_logs[0]
+        assert getattr(rec, "archive_attempts", None) == 3
+        assert getattr(rec, "kind", None) == "oversize"
+
+    async def test_archive_terminal_present_skips_archive_retry(self) -> None:
+        """Once ``influx:archive-terminal`` is set, archive_download is not called."""
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_archive("n1")
+        note["tags"] = list(note["tags"]) + ["influx:archive-terminal"]
+
+        call_count = 0
+
+        def spy(note: dict[str, object]) -> str:
+            nonlocal call_count
+            del note
+            call_count += 1
+            return "x.pdf"
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=spy),
         )
 
         assert call_count == 0

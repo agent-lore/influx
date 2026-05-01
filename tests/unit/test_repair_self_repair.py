@@ -159,6 +159,22 @@ class TestRenderRepairSection:
         assert "- tier3_attempts: 2" in rendered
         assert '- tier3_last_stage: "validate"' in rendered
         assert '- tier3_last_error: "bad json"' in rendered
+        # Archive fields are always rendered, even when zero, so the
+        # bullet schema stays stable across notes.
+        assert "- archive_attempts: 0" in rendered
+        assert '- archive_last_kind: ""' in rendered
+
+    def test_renders_archive_fields(self) -> None:
+        rendered = render_repair_section(
+            RepairCounters(
+                archive_attempts=2,
+                archive_last_kind="oversize",
+                archive_last_error="exceeds 100000000 bytes",
+            )
+        )
+        assert "- archive_attempts: 2" in rendered
+        assert '- archive_last_kind: "oversize"' in rendered
+        assert '- archive_last_error: "exceeds 100000000 bytes"' in rendered
 
     def test_strips_newlines_in_last_error(self) -> None:
         rendered = render_repair_section(
@@ -209,9 +225,26 @@ class TestUpsertRepairSection:
             tier3_attempts=1,
             tier3_last_stage="validate",
             tier3_last_error="bad",
+            archive_attempts=2,
+            archive_last_kind="oversize",
+            archive_last_error="too big",
         )
         roundtripped = parse_repair_section(upsert_repair_section(original, counters))
         assert roundtripped == counters
+
+    def test_archive_fields_round_trip_through_parse(self) -> None:
+        body = (
+            "## Repair\n"
+            "- tier2_attempts: 0\n"
+            "- tier3_attempts: 0\n"
+            "- archive_attempts: 2\n"
+            '- archive_last_kind: "oversize"\n'
+            '- archive_last_error: "exceeds 100000000 bytes"\n'
+        )
+        c = parse_repair_section(body)
+        assert c.archive_attempts == 2
+        assert c.archive_last_kind == "oversize"
+        assert c.archive_last_error == "exceeds 100000000 bytes"
 
 
 # ── Counter mutation ─────────────────────────────────────────────────
@@ -235,3 +268,44 @@ class TestRepairCountersBump:
         assert c2.tier3_attempts == 3
         assert c2.tier3_last_stage == "validate"
         assert c2.tier3_last_error == "mismatch"
+
+    def test_bump_archive_returns_new_instance_with_incremented_count(self) -> None:
+        c = RepairCounters(archive_attempts=1)
+        c2 = c.bump_archive(kind="oversize", error="exceeds 100000000 bytes")
+        assert c is not c2
+        assert c.archive_attempts == 1
+        assert c2.archive_attempts == 2
+        assert c2.archive_last_kind == "oversize"
+        assert c2.archive_last_error.startswith("exceeds")
+
+
+class TestClassifyArchiveFailure:
+    """``classify_failure`` treats oversize archive failures as counted —
+    a 200 MB PDF will not shrink on retry, so the cap should engage.
+    """
+
+    def test_extraction_oversize_stage_is_counted(self) -> None:
+        assert (
+            classify_failure(
+                ExtractionError("too big", url="http://x", stage="oversize")
+            )
+            == "counted"
+        )
+
+    def test_extraction_archive_read_stage_is_transient(self) -> None:
+        # archive_read covers transient filesystem / IO errors that may
+        # heal on retry — must NOT bump the cap.
+        assert (
+            classify_failure(
+                ExtractionError("io error", url="http://x", stage="archive_read")
+            )
+            == "transient"
+        )
+
+    def test_lithos_error_during_archive_is_transient(self) -> None:
+        assert (
+            classify_failure(
+                LithosError("transport flake", operation="archive_download")
+            )
+            == "transient"
+        )
