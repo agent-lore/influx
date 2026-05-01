@@ -29,6 +29,7 @@ __all__ = [
     "InfluxTracer",
     "SourceAcquisitionError",
     "SpanWrapper",
+    "current_archive_terminal_arxiv_ids",
     "current_run_id",
     "current_source_acquisition_errors",
     "get_tracer",
@@ -57,6 +58,20 @@ SourceAcquisitionError = dict[str, str]
 # longer indistinguishable from a quiet window.
 current_source_acquisition_errors: ContextVar[list[SourceAcquisitionError] | None] = (
     ContextVar("current_source_acquisition_errors", default=None)
+)
+
+
+# Per-run set of arxiv-ids whose Lithos notes carry
+# ``influx:archive-terminal``.  Populated once at the start of each
+# scheduled / manual run by ``_run_profile_body`` after the LithosClient
+# is connected; consulted by ``build_arxiv_note_item`` so that papers
+# whose archive download has already been terminal-flipped (per the
+# repair sweep cap added in PR #15) are not re-downloaded on every
+# run (issue #14).  Defaults to the empty frozenset so behaviour
+# outside a run context (CLI smoke commands, unit tests) is unchanged.
+current_archive_terminal_arxiv_ids: ContextVar[frozenset[str]] = ContextVar(
+    "current_archive_terminal_arxiv_ids",
+    default=frozenset(),
 )
 
 

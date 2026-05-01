@@ -2120,3 +2120,129 @@ class TestFeedbackTagIntegrity:
             assert "source:arxiv" in retry_tags
         finally:
             await client.close()
+
+
+# ── Inspector pre-check: list_archive_terminal_arxiv_ids (issue #14) ─
+
+
+class TestListArchiveTerminalArxivIds:
+    """``list_archive_terminal_arxiv_ids`` returns the set of arxiv-ids
+    whose Lithos notes are tagged ``influx:archive-terminal`` for a
+    given profile.  Used by ``_run_profile_body`` to populate the
+    ``current_archive_terminal_arxiv_ids`` contextvar so the inspector
+    can short-circuit ``download_archive`` for permanently-unfetchable
+    papers (issue #14).
+    """
+
+    async def test_extracts_arxiv_ids_from_tags(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        import json as _json
+
+        # Fake server returns two terminal-tagged notes.  Only the
+        # ``arxiv-id:`` tag is parsed; other tags are ignored.
+        fake_lithos_server.list_responses.append(
+            _json.dumps(
+                {
+                    "items": [
+                        {
+                            "id": "n1",
+                            "title": "Big paper 1",
+                            "tags": [
+                                "profile:ai-robotics",
+                                "arxiv-id:2604.27929",
+                                "influx:archive-missing",
+                                "influx:archive-terminal",
+                            ],
+                        },
+                        {
+                            "id": "n2",
+                            "title": "Big paper 2",
+                            "tags": [
+                                "profile:ai-robotics",
+                                "arxiv-id:2604.27792",
+                                "influx:archive-terminal",
+                            ],
+                        },
+                    ]
+                }
+            )
+        )
+
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.list_archive_terminal_arxiv_ids(profile="ai-robotics")
+        finally:
+            await client.close()
+
+        assert result == frozenset({"2604.27929", "2604.27792"})
+        # Confirm the right tag filter was sent.
+        list_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_list"]
+        assert len(list_calls) == 1
+        assert list_calls[0][1]["tags"] == [
+            "influx:archive-terminal",
+            "profile:ai-robotics",
+        ]
+
+    async def test_empty_response_returns_empty_set(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.list_archive_terminal_arxiv_ids(profile="ai-robotics")
+        finally:
+            await client.close()
+
+        # Default fake response is empty items list.
+        assert result == frozenset()
+
+    async def test_items_without_arxiv_id_tag_are_skipped(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Notes that happen to be archive-terminal but lack an
+        ``arxiv-id:`` tag (e.g. RSS-sourced notes) don't pollute the
+        returned set."""
+        import json as _json
+
+        fake_lithos_server.list_responses.append(
+            _json.dumps(
+                {
+                    "items": [
+                        {
+                            "id": "n1",
+                            "title": "RSS thing",
+                            "tags": [
+                                "profile:ai-robotics",
+                                "source:rss",
+                                "influx:archive-terminal",
+                            ],
+                        },
+                        {
+                            "id": "n2",
+                            "title": "Arxiv thing",
+                            "tags": [
+                                "arxiv-id:2604.27929",
+                                "influx:archive-terminal",
+                            ],
+                        },
+                    ]
+                }
+            )
+        )
+
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.list_archive_terminal_arxiv_ids(profile="ai-robotics")
+        finally:
+            await client.close()
+
+        assert result == frozenset({"2604.27929"})

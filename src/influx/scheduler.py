@@ -48,6 +48,7 @@ from influx.repair import SweepWriteError
 from influx.repair import sweep as repair_sweep
 from influx.run_ledger import RunLedger
 from influx.telemetry import (
+    current_archive_terminal_arxiv_ids,
     current_run_id,
     current_source_acquisition_errors,
     get_tracer,
@@ -353,7 +354,20 @@ async def _run_profile_body(
                 filter_prompt = prompt_text
 
             # 3. Source acquisition (PRD 04 plugs in arXiv + RSS).
-            items = list(await provider(profile, kind, run_range, filter_prompt))
+            #    Pre-fetch the set of arxiv-ids whose Lithos notes are
+            #    tagged ``influx:archive-terminal`` so the inspector can
+            #    skip ``download_archive`` for permanently-unfetchable
+            #    papers (issue #14).  One Lithos query per run, even
+            #    when the set is empty, so the contextvar contract is
+            #    consistent.
+            terminal_ids = await client.list_archive_terminal_arxiv_ids(
+                profile=profile,
+            )
+            terminal_token = current_archive_terminal_arxiv_ids.set(terminal_ids)
+            try:
+                items = list(await provider(profile, kind, run_range, filter_prompt))
+            finally:
+                current_archive_terminal_arxiv_ids.reset(terminal_token)
             logger.info(
                 "source acquisition completed profile=%s kind=%s candidates=%d",
                 profile,

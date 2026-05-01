@@ -44,6 +44,7 @@ from influx.notes import ProfileRelevanceEntry, render_note
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 from influx.storage import download_archive
 from influx.telemetry import (
+    current_archive_terminal_arxiv_ids,
     current_run_id,
     get_tracer,
     record_source_acquisition_error,
@@ -594,32 +595,49 @@ def build_arxiv_note_item(
     archive_path: str | None = None
     pdf_url = f"https://arxiv.org/pdf/{item.arxiv_id}.pdf"
     tracer = get_tracer()
-    with tracer.span(
-        "influx.archive.download",
-        attributes={
-            "influx.profile": profile_name,
-            "influx.run_id": current_run_id.get() or "",
-            "influx.source": "arxiv",
-        },
-    ):
-        archive_result = download_archive(
-            url=pdf_url,
-            archive_root=Path(config.storage.archive_dir),
-            source="arxiv",
-            item_id=item.arxiv_id,
-            published_year=item.published.year,
-            published_month=item.published.month,
-            ext=".pdf",
-            allow_private_ips=config.security.allow_private_ips,
-            max_download_bytes=config.storage.max_download_bytes,
-            timeout_seconds=config.storage.download_timeout_seconds,
-            expected_content_type="pdf",
-        )
-    if archive_result.ok:
-        archive_path = archive_result.rel_posix_path
-    else:
+    archive_terminal_ids = current_archive_terminal_arxiv_ids.get()
+    is_archive_terminal = item.arxiv_id in archive_terminal_ids
+
+    if is_archive_terminal:
+        # Issue #14: this paper's archive download has been terminal-flipped
+        # by an earlier repair sweep (or hand-set by an operator).  Skip the
+        # download attempt entirely; the existing Lithos note's tags will
+        # be preserved by the canonical merge_tags path on rewrite.
         tags.append("influx:archive-missing")
+        tags.append("influx:archive-terminal")
         repair_needed = True
+        _log.info(
+            "archive download skipped (terminal) profile=%s arxiv_id=%s",
+            profile_name,
+            item.arxiv_id,
+        )
+    else:
+        with tracer.span(
+            "influx.archive.download",
+            attributes={
+                "influx.profile": profile_name,
+                "influx.run_id": current_run_id.get() or "",
+                "influx.source": "arxiv",
+            },
+        ):
+            archive_result = download_archive(
+                url=pdf_url,
+                archive_root=Path(config.storage.archive_dir),
+                source="arxiv",
+                item_id=item.arxiv_id,
+                published_year=item.published.year,
+                published_month=item.published.month,
+                ext=".pdf",
+                allow_private_ips=config.security.allow_private_ips,
+                max_download_bytes=config.storage.max_download_bytes,
+                timeout_seconds=config.storage.download_timeout_seconds,
+                expected_content_type="pdf",
+            )
+        if archive_result.ok:
+            archive_path = archive_result.rel_posix_path
+        else:
+            tags.append("influx:archive-missing")
+            repair_needed = True
 
     # ── Extraction cascade ────────────────────────────────────────
     extracted_text: str | None = None

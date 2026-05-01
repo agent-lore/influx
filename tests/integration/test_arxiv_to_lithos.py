@@ -488,9 +488,10 @@ class TestNegativeExamples:
         assert "Rejected Paper B" in prompt
         assert "Rejected Paper C" in prompt
 
-        # lithos_list was called: first by repair sweep, then by feedback.
+        # lithos_list was called: first by repair sweep, then by feedback,
+        # then by the inspector's archive-terminal pre-fetch (issue #14).
         list_calls = [c for c in fake_lithos.calls if c[0] == "lithos_list"]
-        assert len(list_calls) == 2
+        assert len(list_calls) == 3
         # First call: repair sweep (influx:repair-needed).
         assert list_calls[0][1]["tags"] == [
             "influx:repair-needed",
@@ -498,6 +499,11 @@ class TestNegativeExamples:
         ]
         # Second call: feedback rejection list.
         assert list_calls[1][1]["tags"] == ["influx:rejected:ai-robotics"]
+        # Third call: inspector's archive-terminal pre-fetch (issue #14).
+        assert list_calls[2][1]["tags"] == [
+            "influx:archive-terminal",
+            "profile:ai-robotics",
+        ]
 
 
 # ── AC-05-I: webhook fires for non-backfill, skips backfill ──────

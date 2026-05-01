@@ -752,6 +752,71 @@ class LithosClient:
             args["limit"] = limit
         return await self.call_tool("lithos_list", args)
 
+    async def list_archive_terminal_arxiv_ids(
+        self,
+        *,
+        profile: str,
+    ) -> frozenset[str]:
+        """Return the arxiv-ids of notes tagged ``influx:archive-terminal``
+        for *profile* (issue #14).
+
+        Used by the inspector to short-circuit ``download_archive`` for
+        papers whose archive is known to be permanently unfetchable
+        (e.g. >100 MB PDFs that already accumulated the cap of counted
+        download failures during the repair sweep).  Returns an empty
+        frozenset when Lithos is unreachable or returns no items so the
+        run continues at worst as today.
+        """
+        try:
+            result = await self.list_notes(
+                tags=["influx:archive-terminal", f"profile:{profile}"],
+            )
+        except (LithosError, McpError):
+            logger.warning(
+                "list_archive_terminal_arxiv_ids: lithos_list failed for "
+                "profile %r; assuming empty terminal set",
+                profile,
+                exc_info=True,
+            )
+            return frozenset()
+
+        if getattr(result, "isError", False) is True:
+            logger.warning(
+                "list_archive_terminal_arxiv_ids: lithos_list returned "
+                "isError=True for profile %r; assuming empty terminal set",
+                profile,
+            )
+            return frozenset()
+
+        try:
+            text = result.content[0].text  # type: ignore[union-attr]
+            body = json.loads(text)
+        except (AttributeError, IndexError, json.JSONDecodeError, KeyError):
+            logger.warning(
+                "list_archive_terminal_arxiv_ids: malformed lithos_list "
+                "response for profile %r; assuming empty terminal set",
+                profile,
+                exc_info=True,
+            )
+            return frozenset()
+
+        items = body.get("items") if isinstance(body, dict) else None
+        if not isinstance(items, list):
+            return frozenset()
+
+        ids: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tags = item.get("tags")
+            if not isinstance(tags, list):
+                continue
+            for tag in tags:
+                if isinstance(tag, str) and tag.startswith("arxiv-id:"):
+                    ids.add(tag[len("arxiv-id:") :])
+                    break
+        return frozenset(ids)
+
     # ── LCMA wrappers (PRD 08) ──────────────────────────────────────
 
     async def _call_lcma_tool(
