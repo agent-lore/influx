@@ -16,24 +16,31 @@ Subcommands
     run RUN_ID      Show ledger entry + matching log lines for one run
     warnings        WARNING/ERROR docker log lines (filterable by run_id)
     terminal-flips  Per-stage terminal-flip log events with note IDs
+    squatters       Find Lithos docs squatting slugs that block Influx
+                    writes; optionally delete them with --apply --yes
     cancel          Print the curl line for cancelling an in-flight run
                     (this script never sends destructive HTTP itself)
 
-The script is read-only: no HTTP POSTs, no docker exec, no ledger
-writes.  Every command it emits is an inspection.
+Posture
+-------
+Subcommands default to read-only: no HTTP POSTs, no docker exec, no
+ledger writes.  The ``squatters`` subcommand can delete Lithos
+documents but only when ``--apply`` is combined with an explicit
+per-id ``--yes <doc-id>`` confirmation (or ``--yes-to-all``); the
+default invocation is a pure log scan.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
-
 
 # ── env-file loader (mirrors scripts/influx-report.py) ──────────────
 
@@ -59,10 +66,7 @@ def _load_env(name: str) -> dict[str, str]:
 def _state_dir(env: dict[str, str]) -> Path:
     state = env.get("INFLUX_STATE_PATH")
     if not state:
-        sys.exit(
-            "INFLUX_STATE_PATH not set in env file; "
-            "cannot locate runs.jsonl"
-        )
+        sys.exit("INFLUX_STATE_PATH not set in env file; cannot locate runs.jsonl")
     return Path(state)
 
 
@@ -177,13 +181,9 @@ def _docker_logs_iter(
         text=True,
     )
     if proc.returncode != 0:
-        sys.exit(
-            f"docker logs failed (exit={proc.returncode}): "
-            f"{proc.stderr.strip()}"
-        )
+        sys.exit(f"docker logs failed (exit={proc.returncode}): {proc.stderr.strip()}")
     # docker mixes streams; emit both.
-    for line in (proc.stdout + proc.stderr).splitlines():
-        yield line
+    yield from (proc.stdout + proc.stderr).splitlines()
 
 
 def _parse_json_log(line: str) -> dict[str, Any] | None:
@@ -389,6 +389,274 @@ def cmd_terminal_flips(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── slug-collision squatter discovery ───────────────────────────────
+
+
+# Slug-collision WARNINGs from ``influx.scheduler`` carry the lithos
+# diagnostic in their ``detail`` extra (PR #30).  Two shapes are
+# possible: today only the suffix-retry's response surfaces (covered
+# by the ``existing_id=<uuid>; Slug '<slug>' …`` form); a future
+# follow-up (#32) will enumerate both attempts in a single detail
+# string.  The regexes match on substrings so either shape works.
+_SQUATTER_ID_RE = re.compile(
+    # Match bare ``existing_id=<uuid>`` (PR #30 shape) and any
+    # ``*_existing_id=<uuid>`` prefix variant that #32 may introduce
+    # (e.g. ``first_existing_id=`` / ``retry_existing_id=``).
+    r"(?:^|[^a-zA-Z0-9])(?:[a-zA-Z]+_)?existing_id=([0-9a-fA-F-]{8,})"
+)
+_SQUATTER_SLUG_RE = re.compile(r"Slug '([^']+)' already in use")
+
+
+def _extract_squatters_from_logs(
+    records: Iterable[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Scan WARNING records for slug_collision squatters.
+
+    Returns a dict keyed by squatter doc-id.  Each value carries the
+    slug, the colliding incoming source_url + title (if present in the
+    log record's ``extra`` fields), and first/last/total seen counts.
+
+    Pure function: no I/O.  Unit-tested without docker by feeding it a
+    list of dicts shaped like ``InfluxJsonFormatter`` output.
+    """
+    squatters: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        if rec.get("level") != "WARNING":
+            continue
+        if rec.get("status") != "slug_collision" and (
+            "slug_collision" not in str(rec.get("message", ""))
+        ):
+            continue
+        # The structured ``detail`` field carries the diagnostic; fall
+        # back to the message text if a slimmer log shape ever appears.
+        detail = str(rec.get("detail") or "")
+        if not detail:
+            detail = str(rec.get("message", ""))
+        # A single detail string may reference multiple squatters once
+        # #32 lands; iterate every match so both ids are captured.
+        ids = _SQUATTER_ID_RE.findall(detail)
+        slugs = _SQUATTER_SLUG_RE.findall(detail)
+        ts = rec.get("timestamp") or ""
+        source_url = str(rec.get("source_url") or "")
+        title = str(rec.get("title") or "")
+        for idx, doc_id in enumerate(ids):
+            entry = squatters.setdefault(
+                doc_id,
+                {
+                    "doc_id": doc_id,
+                    "slugs": [],
+                    "source_urls": set(),
+                    "titles": set(),
+                    "first_seen": ts,
+                    "last_seen": ts,
+                    "count": 0,
+                },
+            )
+            slug = slugs[idx] if idx < len(slugs) else ""
+            if slug and slug not in entry["slugs"]:
+                entry["slugs"].append(slug)
+            if source_url:
+                entry["source_urls"].add(source_url)
+            if title:
+                entry["titles"].add(title)
+            if ts:
+                if not entry["first_seen"] or ts < entry["first_seen"]:
+                    entry["first_seen"] = ts
+                if ts > entry["last_seen"]:
+                    entry["last_seen"] = ts
+            entry["count"] += 1
+    return squatters
+
+
+def _print_squatter(entry: dict[str, Any]) -> None:
+    print(f"SQUATTER doc_id={entry['doc_id']}")
+    for slug in entry["slugs"]:
+        print(f"   slug={slug!r}")
+    if entry["first_seen"] or entry["last_seen"]:
+        print(
+            f"   seen {entry['count']}x  "
+            f"first={entry['first_seen']}  last={entry['last_seen']}"
+        )
+    for url in sorted(entry["source_urls"]):
+        print(f"   colliding source_url={url}")
+    for title in sorted(entry["titles"]):
+        print(f"   colliding title={title!r}")
+
+
+def _read_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str:
+    """Resolve the Lithos MCP/SSE URL for ``--apply`` mode.
+
+    Resolution order:
+      1. ``--lithos-url`` CLI flag (explicit override).
+      2. ``LITHOS_URL`` env var on the host.
+      3. ``[lithos] url`` in ``${INFLUX_DATA_PATH}/influx.toml``.
+    """
+    if getattr(args, "lithos_url", None):
+        return str(args.lithos_url)
+    import os
+
+    if "LITHOS_URL" in os.environ:
+        return os.environ["LITHOS_URL"]
+    data_path = env.get("INFLUX_DATA_PATH")
+    if data_path:
+        toml_path = Path(data_path) / "influx.toml"
+        if toml_path.exists():
+            try:
+                import tomllib
+            except ImportError:  # pragma: no cover — Python < 3.11
+                sys.exit("tomllib unavailable; pass --lithos-url explicitly")
+            with toml_path.open("rb") as fh:
+                cfg = tomllib.load(fh)
+            url = cfg.get("lithos", {}).get("url")
+            if isinstance(url, str) and url:
+                return url
+    sys.exit(
+        "Lithos URL not resolved.  Pass --lithos-url, set $LITHOS_URL, "
+        "or ensure [lithos] url is set in $INFLUX_DATA_PATH/influx.toml."
+    )
+
+
+async def _delete_squatter(
+    *,
+    lithos_url: str,
+    doc_id: str,
+    agent: str,
+    require_influx_authored: bool,
+) -> tuple[bool, str]:
+    """Read-then-delete one squatter.  Returns ``(deleted, reason)``."""
+    # Imported lazily so the read-only invocation never pays the cost.
+    from influx.lithos_client import LithosClient
+
+    client = LithosClient(url=lithos_url)
+    try:
+        try:
+            doc = await client.read_note(note_id=doc_id)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"read failed: {type(exc).__name__}: {exc}"
+
+        tags = list(doc.get("tags") or [])
+        if require_influx_authored and "ingested-by:influx" not in tags:
+            return (
+                False,
+                "refused: doc is not influx-authored "
+                "(missing 'ingested-by:influx' tag); "
+                "pass --no-require-influx-authored to override",
+            )
+
+        try:
+            result = await client.call_tool(
+                "lithos_delete",
+                {"id": doc_id, "agent": agent},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"delete failed: {type(exc).__name__}: {exc}"
+
+        # Lithos returns either the bare success envelope or an error
+        # envelope with ``status="error"``; surface either back to the
+        # caller for printing.
+        try:
+            body = json.loads(result.content[0].text)  # type: ignore[union-attr]
+        except (AttributeError, IndexError, TypeError, json.JSONDecodeError):
+            body = {"status": "deleted"}
+        if body.get("status") == "error":
+            return False, f"lithos_delete error: {body.get('message', body)}"
+        return True, "deleted"
+    finally:
+        await client.close()
+
+
+def cmd_squatters(args: argparse.Namespace) -> int:
+    env = _load_env(args.env)
+    container = _container_name(env)
+
+    records = list(
+        _filter_log_records(
+            _docker_logs_iter(container, since=args.since, tail=args.tail),
+            levels={"WARNING"},
+            message_substr="slug_collision",
+        )
+    )
+    squatters = _extract_squatters_from_logs(records)
+
+    if not squatters:
+        print(
+            f"No slug_collision squatters found in container {container!r} "
+            f"(window: --since {args.since} --tail {args.tail})."
+        )
+        return 0
+
+    print(
+        f"{len(squatters)} squatter(s) found in container {container!r} "
+        f"(window: --since {args.since} --tail {args.tail}):\n"
+    )
+    # Sorted by last_seen desc so the freshest pain is at the top.
+    ordered = sorted(
+        squatters.values(),
+        key=lambda e: str(e.get("last_seen") or ""),
+        reverse=True,
+    )
+    for entry in ordered:
+        _print_squatter(entry)
+        print()
+
+    if not args.apply:
+        print(
+            "Default mode is read-only.  To delete a squatter, re-run with:\n"
+            "    --apply --yes <doc-id>     (per-id confirmation, repeatable)\n"
+            "    --apply --yes-to-all       (delete every squatter listed above)\n"
+            "Pre-delete safety: each doc is fetched and its tags checked to\n"
+            "ensure it carries 'ingested-by:influx' before deletion."
+        )
+        return 0
+
+    confirmed: set[str] = set(args.yes or [])
+    if args.yes_to_all:
+        confirmed.update(squatters.keys())
+    if not confirmed:
+        sys.exit(
+            "--apply requires at least one --yes <doc-id> (or --yes-to-all).  Aborted."
+        )
+    unknown = confirmed - set(squatters.keys())
+    if unknown:
+        print(
+            "Warning: --yes ids not present in the log scan results: "
+            + ", ".join(sorted(unknown))
+        )
+        confirmed -= unknown
+    if not confirmed:
+        sys.exit("No matching --yes ids; nothing to delete.")
+
+    lithos_url = _read_lithos_url(args, env)
+    print(
+        f"Apply mode: deleting {len(confirmed)} squatter(s) via "
+        f"lithos_delete on {lithos_url}\n"
+    )
+
+    import asyncio
+
+    deleted = 0
+    refused = 0
+    for doc_id in sorted(confirmed):
+        deleted_ok, reason = asyncio.run(
+            _delete_squatter(
+                lithos_url=lithos_url,
+                doc_id=doc_id,
+                agent=args.agent,
+                require_influx_authored=not args.no_require_influx_authored,
+            )
+        )
+        if deleted_ok:
+            print(f"DELETED  doc_id={doc_id}  ({reason})")
+            deleted += 1
+        else:
+            print(f"REFUSED  doc_id={doc_id}  reason={reason}")
+            refused += 1
+
+    print()
+    print(f"Summary: deleted={deleted} refused={refused}")
+    return 0 if refused == 0 else 1
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     env = _load_env(args.env)
     host = env.get("INFLUX_ADMIN_BIND_HOST", "127.0.0.1")
@@ -406,7 +674,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         "(see run_ledger.abandon_active)."
     )
     print()
-    print(f"Inspect the active ledger first: cat {_state_dir(env) / 'active-runs.json'}")
+    print(
+        f"Inspect the active ledger first: cat {_state_dir(env) / 'active-runs.json'}"
+    )
     print(
         f"Restart command: cd $(git rev-parse --show-toplevel) && "
         f"./docker/run.sh {args.env} restart"
@@ -437,7 +707,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_recent.set_defaults(func=cmd_recent)
 
-    p_failures = sub.add_parser("failures", help="recent failed/abandoned/degraded runs")
+    p_failures = sub.add_parser(
+        "failures", help="recent failed/abandoned/degraded runs"
+    )
     p_failures.add_argument("--profile")
     p_failures.add_argument("--limit", type=int, default=20)
     p_failures.set_defaults(func=cmd_failures)
@@ -476,6 +748,71 @@ def _build_parser() -> argparse.ArgumentParser:
     p_flips.add_argument("--since", default="7d")
     p_flips.add_argument("--tail", type=int, default=50000)
     p_flips.set_defaults(func=cmd_terminal_flips)
+
+    p_squatters = sub.add_parser(
+        "squatters",
+        help=(
+            "find Lithos docs squatting slugs that block influx writes; "
+            "default is read-only (log scan), --apply enables deletion"
+        ),
+    )
+    p_squatters.add_argument(
+        "--since",
+        default="7d",
+        help="docker logs --since window (default: 7d)",
+    )
+    p_squatters.add_argument(
+        "--tail",
+        type=int,
+        default=50000,
+        help="docker logs --tail (default: 50000)",
+    )
+    p_squatters.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "actually delete squatters (default: dry-run / log scan only). "
+            "Must be combined with --yes <doc-id> or --yes-to-all."
+        ),
+    )
+    p_squatters.add_argument(
+        "--yes",
+        action="append",
+        metavar="DOC_ID",
+        help=(
+            "confirm deletion of a specific squatter (repeatable). "
+            "Required with --apply unless --yes-to-all is set."
+        ),
+    )
+    p_squatters.add_argument(
+        "--yes-to-all",
+        action="store_true",
+        help=("with --apply, delete every squatter listed in the scan. Use with care."),
+    )
+    p_squatters.add_argument(
+        "--agent",
+        default="influx-diagnose",
+        help=(
+            "agent name passed to lithos_delete for the audit trail "
+            "(default: influx-diagnose)"
+        ),
+    )
+    p_squatters.add_argument(
+        "--lithos-url",
+        help=(
+            "override the Lithos MCP/SSE URL.  Default resolution: "
+            "$LITHOS_URL, then [lithos] url in $INFLUX_DATA_PATH/influx.toml."
+        ),
+    )
+    p_squatters.add_argument(
+        "--no-require-influx-authored",
+        action="store_true",
+        help=(
+            "skip the safety check that refuses to delete docs that lack "
+            "the 'ingested-by:influx' tag.  Use only after manual review."
+        ),
+    )
+    p_squatters.set_defaults(func=cmd_squatters)
 
     p_cancel = sub.add_parser(
         "cancel",
