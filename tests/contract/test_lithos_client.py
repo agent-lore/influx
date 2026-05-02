@@ -145,6 +145,11 @@ class FakeLithosServer:
                 return read_responses.pop(0)
             return '{"id": "", "content": "", "tags": [], "version": 1}'
 
+        @self._mcp.tool(name="lithos_delete")
+        async def lithos_delete(id: str = "", agent: str = "") -> str:
+            calls.append(("lithos_delete", {"id": id, "agent": agent}))
+            return '{"status": "deleted"}'
+
         @self._mcp.tool(name="lithos_list")
         async def lithos_list(
             tags: list[str] | None = None,
@@ -1228,6 +1233,11 @@ class TestWriteEnvelopeSlugCollision:
         round-trip into ``WriteResult.detail`` so the operator-facing
         WARNING in scheduler.py names the squatting note rather than
         logging an empty string (2026-05-02 staging incident).
+
+        Both squatters here are distinct real notes (own ``arxiv-id``
+        and ``source_url``), so the recovery chain falls through to the
+        AC-05-D suffix retry; the suffixed write also collides; the
+        final ``detail`` carries the second squatter's id.
         """
         fake_lithos_server.write_responses.extend(
             [
@@ -1247,6 +1257,17 @@ class TestWriteEnvelopeSlugCollision:
                     " already in use by document 'doc-squatter-456'\","
                     ' "warnings": []}'
                 ),
+            ]
+        )
+        # Both squatters look like genuinely-distinct papers so the
+        # recovery dispatch falls through to the suffix retry rather
+        # than reclaiming or treating as duplicate.
+        fake_lithos_server.read_responses.extend(
+            [
+                '{"id": "doc-squatter-123", "title": "Other A",'
+                ' "content": "real body", "tags": ["arxiv-id:9999.11111"]}',
+                '{"id": "doc-squatter-456", "title": "Other B",'
+                ' "content": "real body", "tags": ["arxiv-id:9999.22222"]}',
             ]
         )
         client = LithosClient(url=fake_lithos_url)
@@ -1270,6 +1291,246 @@ class TestWriteEnvelopeSlugCollision:
         assert "doc-squatter-456" in result.detail
         assert "existing_id=" in result.detail
         assert "already in use" in result.detail
+
+
+class TestWriteSlugCollisionRecovery:
+    """#31: squatter-shape dispatch (duplicate / reclaim / distinct)."""
+
+    async def test_recovers_as_duplicate_when_squatter_has_matching_arxiv_id(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """If the squatter carries ``arxiv-id:<id>`` matching the incoming
+        write, treat as ``duplicate`` (Lithos's URL-dedup missed it).
+        """
+        fake_lithos_server.write_responses.append(
+            '{"status": "slug_collision",'
+            ' "existing_id": "doc-dup-1",'
+            ' "message": "Slug already in use",'
+            ' "warnings": []}'
+        )
+        # Squatter carries the same arxiv-id, no source_url.
+        fake_lithos_server.read_responses.append(
+            '{"id": "doc-dup-1", "title": "Different Title",'
+            ' "content": "real content here",'
+            ' "tags": ["arxiv-id:2604.28197", "source:arxiv"]}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="OmniRobotHome",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2604.28197",
+                tags=["profile:staging-robotics"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == "duplicate"
+        assert "arxiv-id:2604.28197" in result.detail
+        # Only ONE lithos_write — no suffix retry was needed because
+        # the duplicate path returns immediately.
+        write_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1
+
+    async def test_reclaims_empty_squatter_then_retries_original_slug(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """If the squatter is an empty residue (no tags, no source_url,
+        empty body) — like the OmniRobotHome ``006bbcb8-…`` case — delete
+        it and re-issue the original write with the same slug.
+        """
+        fake_lithos_server.write_responses.extend(
+            [
+                # Initial collision.
+                '{"status": "slug_collision", "existing_id": "doc-stale-1",'
+                ' "message": "Slug already in use", "warnings": []}',
+                # Re-issue after reclaim succeeds.
+                '{"status": "created", "note_id": "note-reclaimed"}',
+            ]
+        )
+        fake_lithos_server.read_responses.append(
+            '{"id": "doc-stale-1", "title": "OmniRobotHome", "content": "", "tags": []}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="OmniRobotHome",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2604.28197",
+                tags=["profile:staging-robotics"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == "created"
+        assert result.note_id == "note-reclaimed"
+        # Two writes (initial + reclaim retry) plus one delete in between.
+        tools_called = [c[0] for c in fake_lithos_server.calls]
+        assert tools_called.count("lithos_write") == 2
+        assert tools_called.count("lithos_delete") == 1
+        # The delete must target the squatter id.
+        delete_call = next(
+            c for c in fake_lithos_server.calls if c[0] == "lithos_delete"
+        )
+        assert delete_call[1]["id"] == "doc-stale-1"
+
+    async def test_distinct_squatter_falls_back_to_suffix_retry(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """If the squatter is a real, different doc — same slugified title
+        but different paper — fall back to the AC-05-D suffix retry.
+        """
+        fake_lithos_server.write_responses.extend(
+            [
+                # Initial collision.
+                '{"status": "slug_collision", "existing_id": "doc-other-1",'
+                ' "message": "Slug already in use", "warnings": []}',
+                # Suffixed retry succeeds.
+                '{"status": "created", "note_id": "note-suffixed"}',
+            ]
+        )
+        # Squatter has its own metadata — different paper, same slug.
+        fake_lithos_server.read_responses.append(
+            '{"id": "doc-other-1", "title": "Some Other Paper",'
+            ' "content": "real body text", "tags": ["arxiv-id:9999.99999"],'
+            ' "source_url": "https://arxiv.org/abs/9999.99999"}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="OmniRobotHome",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2604.28197",
+                tags=["profile:staging-robotics"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == "created"
+        assert result.note_id == "note-suffixed"
+        write_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_write"]
+        # Initial + suffix retry; no delete.
+        assert len(write_calls) == 2
+        assert all(c[0] != "lithos_delete" for c in fake_lithos_server.calls)
+        # Suffixed write must carry the ``[arXiv …]`` suffix.
+        assert "[arXiv 2604.28197]" in write_calls[1][1]["title"]
+
+    async def test_stacked_residues_recovered_in_round_two(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Squatter A is distinct → suffix retry; suffixed slug is itself a
+        reclaimable residue → delete B, re-issue suffixed write.
+
+        This is the worst real-world case for the OmniRobotHome shape:
+        residues at both the natural and suffixed slugs.
+        """
+        fake_lithos_server.write_responses.extend(
+            [
+                # Initial collision (squatter A — distinct).
+                '{"status": "slug_collision", "existing_id": "doc-a",'
+                ' "message": "Slug already in use", "warnings": []}',
+                # Suffix retry collides (squatter B — reclaimable).
+                '{"status": "slug_collision", "existing_id": "doc-b-residue",'
+                ' "message": "Slug already in use", "warnings": []}',
+                # After reclaiming B, the suffixed write succeeds.
+                '{"status": "created", "note_id": "note-after-reclaim"}',
+            ]
+        )
+        fake_lithos_server.read_responses.extend(
+            [
+                # Squatter A — real distinct paper.
+                '{"id": "doc-a", "title": "Other Paper", "content": "real",'
+                ' "tags": ["arxiv-id:9999.99999"]}',
+                # Squatter B — empty residue.
+                '{"id": "doc-b-residue", "title": "OmniRobotHome",'
+                ' "content": "", "tags": []}',
+            ]
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="OmniRobotHome",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2604.28197",
+                tags=["profile:staging-robotics"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == "created"
+        assert result.note_id == "note-after-reclaim"
+        tools_called = [c[0] for c in fake_lithos_server.calls]
+        # Initial + suffix + reclaim-retry = 3 writes; 1 delete (of B only).
+        assert tools_called.count("lithos_write") == 3
+        assert tools_called.count("lithos_delete") == 1
+        delete_call = next(
+            c for c in fake_lithos_server.calls if c[0] == "lithos_delete"
+        )
+        assert delete_call[1]["id"] == "doc-b-residue"
+
+    async def test_unrecoverable_collision_returns_slug_collision(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Both attempts collide with distinct real notes — chain exhausted.
+
+        The result must remain ``slug_collision`` so the scheduler routes
+        the write to the unresolved-collisions backlog.
+        """
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "slug_collision", "existing_id": "doc-a",'
+                ' "message": "Slug A in use", "warnings": []}',
+                '{"status": "slug_collision", "existing_id": "doc-b",'
+                ' "message": "Slug B in use", "warnings": []}',
+            ]
+        )
+        fake_lithos_server.read_responses.extend(
+            [
+                '{"id": "doc-a", "title": "Real A", "content": "real",'
+                ' "tags": ["arxiv-id:9999.11111"]}',
+                '{"id": "doc-b", "title": "Real B", "content": "real",'
+                ' "tags": ["arxiv-id:9999.22222"]}',
+            ]
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="OmniRobotHome",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2604.28197",
+                tags=["profile:staging-robotics"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == "slug_collision"
+        # No deletes attempted (both squatters were 'distinct').
+        assert all(c[0] != "lithos_delete" for c in fake_lithos_server.calls)
 
 
 # ── Write envelopes — version_conflict (FR-MCP-7, AC-05-E) ────────

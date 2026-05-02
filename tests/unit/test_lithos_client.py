@@ -76,3 +76,158 @@ class TestListNotes:
             "lithos_list",
             {"tags": ["influx:repair-needed", "profile:staging-ai"], "limit": 25},
         )
+
+
+class TestClassifySquatter:
+    """#31 squatter-shape dispatch is a pure function — exhaustively cover."""
+
+    def _make_doc(
+        self,
+        *,
+        tags: list[str] | None = None,
+        source_url: str | None = None,
+        content: str = "",
+        title: str = "Some Title",
+    ) -> dict[str, object]:
+        doc: dict[str, object] = {
+            "id": "doc-x",
+            "title": title,
+            "content": content,
+            "tags": list(tags or []),
+        }
+        if source_url is not None:
+            doc["source_url"] = source_url
+        return doc
+
+    def test_arxiv_id_match_classifies_as_duplicate(self) -> None:
+        from influx.lithos_client import _classify_squatter
+
+        doc = self._make_doc(
+            tags=["arxiv-id:2604.28197", "source:arxiv"],
+            content="real body text",
+        )
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://arxiv.org/abs/2604.28197",
+        )
+        assert result.kind == "duplicate"
+        assert "arxiv-id:2604.28197" in result.reason
+
+    def test_source_url_match_classifies_as_duplicate(self) -> None:
+        from influx.lithos_client import _classify_squatter
+
+        doc = self._make_doc(
+            tags=["source:rss"],
+            source_url="https://example.com/article-x",
+            content="real body",
+        )
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://example.com/article-x",
+        )
+        assert result.kind == "duplicate"
+        assert "source_url" in result.reason
+
+    def test_empty_residue_classifies_as_reclaimable(self) -> None:
+        from influx.lithos_client import _classify_squatter
+
+        doc = self._make_doc(tags=[], content="")
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://arxiv.org/abs/2604.28197",
+        )
+        assert result.kind == "reclaimable"
+        assert "stale residue" in result.reason
+
+    def test_residue_with_any_tag_is_distinct_not_reclaimable(self) -> None:
+        """Conservative: a single tag (e.g. an operator-added one) is
+        enough to refuse reclaim, even with no source_url and empty body.
+        """
+        from influx.lithos_client import _classify_squatter
+
+        doc = self._make_doc(tags=["bookmark"], content="")
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://arxiv.org/abs/2604.28197",
+        )
+        assert result.kind == "distinct"
+
+    def test_residue_with_body_is_distinct_not_reclaimable(self) -> None:
+        from influx.lithos_client import _classify_squatter
+
+        doc = self._make_doc(tags=[], content="user notes here")
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://arxiv.org/abs/2604.28197",
+        )
+        assert result.kind == "distinct"
+
+    def test_different_arxiv_id_classifies_as_distinct(self) -> None:
+        """Same slug, different arxiv id = different paper that happens
+        to slugify the same.  Suffix retry territory.
+        """
+        from influx.lithos_client import _classify_squatter
+
+        doc = self._make_doc(
+            tags=["arxiv-id:9999.99999"],
+            content="real body",
+        )
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://arxiv.org/abs/2604.28197",
+        )
+        assert result.kind == "distinct"
+
+    def test_metadata_nested_tags_are_recognised(self) -> None:
+        """Tags can live under ``metadata.tags`` per lithos_read shape;
+        the helper must read both top-level and nested.
+        """
+        from influx.lithos_client import _classify_squatter
+
+        doc = {
+            "id": "doc-x",
+            "title": "T",
+            "content": "real",
+            "metadata": {"tags": ["arxiv-id:2604.28197"]},
+        }
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://arxiv.org/abs/2604.28197",
+        )
+        assert result.kind == "duplicate"
+
+
+class TestExistingIdParsing:
+    """``_existing_id_from_detail`` extracts the squatter id from PR-#30 detail."""
+
+    def test_parses_uuid_form(self) -> None:
+        from influx.lithos_client import _existing_id_from_detail
+
+        detail = (
+            "existing_id=006bbcb8-ee01-4616-aa43-473f292eba0e; "
+            "Slug 'omnirobothome-…' already in use"
+        )
+        assert (
+            _existing_id_from_detail(detail) == "006bbcb8-ee01-4616-aa43-473f292eba0e"
+        )
+
+    def test_parses_friendly_test_id(self) -> None:
+        from influx.lithos_client import _existing_id_from_detail
+
+        assert (
+            _existing_id_from_detail("existing_id=doc-test-1; Slug 'x' in use")
+            == "doc-test-1"
+        )
+
+    def test_returns_none_for_missing(self) -> None:
+        from influx.lithos_client import _existing_id_from_detail
+
+        assert _existing_id_from_detail("") is None
+        assert _existing_id_from_detail("no id here") is None

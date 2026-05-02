@@ -45,6 +45,9 @@ __all__ = [
     "run_completions",
     "run_duration",
     "run_starts",
+    "slug_collision_dedup_recovery",
+    "slug_collision_reclaimed",
+    "slug_collision_unresolved",
     "source_acquisition_errors",
 ]
 
@@ -184,6 +187,72 @@ def archive_missing() -> Any:
     return get_meter().counter(
         "influx_archive_missing_total",
         description="Items tagged influx:archive-missing during a run.",
+    )
+
+
+def slug_collision_dedup_recovery() -> Any:
+    """Counter of slug collisions recovered as duplicates (#31).
+
+    Increments when a ``slug_collision`` envelope's squatter doc was
+    actually the same paper as the incoming write — Lithos's URL or
+    cache dedup missed it (typically because the squatter lacks a
+    matching ``source_url`` or ``arxiv-id`` tag), and Influx routed
+    the write through the ``duplicate`` path instead of creating a
+    near-duplicate note.
+
+    No labels: this is a low-volume signal that mostly tracks the
+    quality of upstream dedup.  When non-zero in steady state, file
+    a Lithos-side issue (see agent-lore/lithos#222).
+    """
+    return get_meter().counter(
+        "influx_slug_collision_dedup_recovery_total",
+        description=(
+            "slug_collision events recovered as duplicates after squatter "
+            "inspection (the squatter shares arxiv-id or source_url with "
+            "the incoming write)"
+        ),
+    )
+
+
+def slug_collision_reclaimed() -> Any:
+    """Counter of slug collisions resolved by reclaiming an empty squatter (#31).
+
+    Increments when ``slug_collision`` was caused by a stale residue
+    (no tags, no source_url, empty body — typically an aborted prior
+    write that committed a slug but never landed metadata).  Influx
+    deletes the residue and re-issues the write.
+
+    No labels: low-volume operational signal.  Sustained non-zero
+    means there's a write-path bug somewhere upstream that's
+    repeatedly leaving residues; investigate.
+    """
+    return get_meter().counter(
+        "influx_slug_collision_reclaimed_total",
+        description=(
+            "slug_collision events resolved by deleting an empty stale "
+            "squatter and re-issuing the write"
+        ),
+    )
+
+
+def slug_collision_unresolved() -> Any:
+    """Counter of slug collisions that exhausted the recovery chain (#31).
+
+    A non-zero value here means even after squatter inspection +
+    suffix retry the write was permanently dropped from this run.
+    The scheduler also persists each unresolved entry to the local
+    backlog file (``${state_dir}/unresolved-slug-collisions.jsonl``)
+    so operators can intervene via
+    ``./scripts/influx-diagnose.py slug-collision-backlog``.
+
+    Labels: ``profile``, ``source``.
+    """
+    return get_meter().counter(
+        "influx_slug_collision_unresolved_total",
+        description=(
+            "slug collisions that exhausted the recovery chain "
+            "(inspect + reclaim + suffix retry) and dropped the write"
+        ),
     )
 
 
