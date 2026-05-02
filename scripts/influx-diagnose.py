@@ -680,19 +680,38 @@ def _ensure_project_runtime_or_reexec() -> None:
     )
 
 
+# Outcomes for ``_delete_squatter``.  Distinguishing ``already_gone``
+# from ``refused`` matters: a doc that vanished between scan and delete
+# (e.g. cleaned up by a parallel run, or by the operator outside this
+# script) is effectively the success state for our caller, not a fault
+# requiring intervention.
+DELETE_OK = "deleted"
+DELETE_ALREADY_GONE = "already_gone"
+DELETE_REFUSED = "refused"
+
+
+def _is_doc_not_found(message: str) -> bool:
+    """Match Lithos's ``doc_not_found`` shapes from delete + read paths."""
+    if not message:
+        return False
+    needle = message.lower()
+    return "document not found" in needle or "doc_not_found" in needle
+
+
 async def _delete_squatter(
     *,
     lithos_url: str,
     doc_id: str,
     agent: str,
     require_influx_authored: bool,
-) -> tuple[bool, str]:
-    """Read-then-delete one squatter.  Returns ``(deleted, reason)``.
+) -> tuple[str, str]:
+    """Read-then-delete one squatter.
 
-    Caller is responsible for invoking
-    :func:`_ensure_project_runtime_or_reexec` before calling this — see
-    ``cmd_squatters``.  We don't re-check here because the import would
-    have already succeeded (or re-execed) at that point.
+    Returns ``(outcome, reason)`` where ``outcome`` is one of
+    :data:`DELETE_OK`, :data:`DELETE_ALREADY_GONE`, or
+    :data:`DELETE_REFUSED`.  The caller is responsible for invoking
+    :func:`_ensure_project_runtime_or_reexec` first — see
+    ``cmd_squatters``.
     """
     from influx.lithos_client import LithosClient
 
@@ -701,7 +720,13 @@ async def _delete_squatter(
         try:
             doc = await client.read_note(note_id=doc_id)
         except BaseException as exc:  # noqa: BLE001
-            return False, f"read failed: {_format_exception_chain(exc)}"
+            chain = _format_exception_chain(exc)
+            if _is_doc_not_found(chain):
+                # The doc vanished before we could even read it — most
+                # likely a parallel cleanup or out-of-band delete.
+                # Effective success for our caller.
+                return DELETE_ALREADY_GONE, "doc not found at read time"
+            return DELETE_REFUSED, f"read failed: {chain}"
 
         tags = list(doc.get("tags") or [])
         if require_influx_authored and "ingested-by:influx" not in tags:
@@ -711,8 +736,8 @@ async def _delete_squatter(
             # user/other-agent note (must NOT be deleted).
             preview = _summarise_doc_for_refusal(doc)
             return (
-                False,
-                "refused: doc is not influx-authored "
+                DELETE_REFUSED,
+                "doc is not influx-authored "
                 "(missing 'ingested-by:influx' tag).  "
                 f"Preview: {preview}  "
                 "If safe to delete after review, re-run with "
@@ -725,18 +750,24 @@ async def _delete_squatter(
                 {"id": doc_id, "agent": agent},
             )
         except BaseException as exc:  # noqa: BLE001
-            return False, f"delete failed: {_format_exception_chain(exc)}"
+            return DELETE_REFUSED, f"delete failed: {_format_exception_chain(exc)}"
 
-        # Lithos returns either the bare success envelope or an error
-        # envelope with ``status="error"``; surface either back to the
-        # caller for printing.
+        # Lithos returns either a success envelope or an error envelope
+        # with ``status="error"`` (and ``code`` / ``message``).  The
+        # ``doc_not_found`` shape happens when the read succeeded but
+        # the doc was deleted between the read and the delete — treat
+        # that as ``already_gone`` rather than ``refused``.
         try:
             body = json.loads(result.content[0].text)  # type: ignore[union-attr]
         except (AttributeError, IndexError, TypeError, json.JSONDecodeError):
             body = {"status": "deleted"}
         if body.get("status") == "error":
-            return False, f"lithos_delete error: {body.get('message', body)}"
-        return True, "deleted"
+            code = body.get("code", "")
+            message = body.get("message", body)
+            if code == "doc_not_found" or _is_doc_not_found(str(message)):
+                return DELETE_ALREADY_GONE, "doc not found at delete time"
+            return DELETE_REFUSED, f"lithos_delete error: {message}"
+        return DELETE_OK, "deleted"
     finally:
         await client.close()
 
@@ -817,9 +848,10 @@ def cmd_squatters(args: argparse.Namespace) -> int:
     import asyncio
 
     deleted = 0
+    already_gone = 0
     refused = 0
     for doc_id in sorted(confirmed):
-        deleted_ok, reason = asyncio.run(
+        outcome, reason = asyncio.run(
             _delete_squatter(
                 lithos_url=lithos_url,
                 doc_id=doc_id,
@@ -827,15 +859,28 @@ def cmd_squatters(args: argparse.Namespace) -> int:
                 require_influx_authored=not args.no_require_influx_authored,
             )
         )
-        if deleted_ok:
-            print(f"DELETED  doc_id={doc_id}  ({reason})")
+        if outcome == DELETE_OK:
+            print(f"DELETED      doc_id={doc_id}  ({reason})")
             deleted += 1
+        elif outcome == DELETE_ALREADY_GONE:
+            # Effective success — the squatter is no longer in Lithos.
+            # Logged separately so a parallel cleanup is observable.
+            print(f"ALREADY GONE doc_id={doc_id}  ({reason})")
+            already_gone += 1
         else:
-            print(f"REFUSED  doc_id={doc_id}  reason={reason}")
+            print(f"REFUSED      doc_id={doc_id}  reason={reason}")
             refused += 1
 
     print()
-    print(f"Summary: deleted={deleted} refused={refused}")
+    print(f"Summary: deleted={deleted} already_gone={already_gone} refused={refused}")
+    if already_gone:
+        print(
+            "Note: 'already gone' squatters are still surfacing because the "
+            "log scan reads historical WARNINGs from the docker buffer; the "
+            "doc itself has been removed from Lithos.  The next sweep will "
+            "either succeed cleanly or surface a fresh squatter."
+        )
+    # Exit non-zero only on genuine refusals; ``already_gone`` is success.
     return 0 if refused == 0 else 1
 
 

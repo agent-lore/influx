@@ -197,6 +197,40 @@ class TestFormatExceptionChain:
         assert "(no title)" in rendered
         assert "(no ingested-by tag)" in rendered
 
+
+class TestIsDocNotFound:
+    """Match Lithos's ``doc_not_found`` message variants."""
+
+    def test_matches_lithos_message(self) -> None:
+        assert _DIAGNOSE._is_doc_not_found(
+            "Document not found: 006bbcb8-ee01-4616-aa43-473f292eba0e"
+        )
+
+    def test_matches_envelope_code(self) -> None:
+        assert _DIAGNOSE._is_doc_not_found("error code=doc_not_found")
+
+    def test_negative_cases(self) -> None:
+        assert not _DIAGNOSE._is_doc_not_found("")
+        assert not _DIAGNOSE._is_doc_not_found("connection refused")
+        assert not _DIAGNOSE._is_doc_not_found("authentication failed")
+
+
+class TestDeleteOutcomes:
+    """The three outcome constants are stable and distinct."""
+
+    def test_outcome_constants_distinct(self) -> None:
+        outcomes = {
+            _DIAGNOSE.DELETE_OK,
+            _DIAGNOSE.DELETE_ALREADY_GONE,
+            _DIAGNOSE.DELETE_REFUSED,
+        }
+        # Three distinct string values; no accidental aliasing.
+        assert len(outcomes) == 3
+        # Operator-facing labels — guard the wire format.
+        assert _DIAGNOSE.DELETE_OK == "deleted"
+        assert _DIAGNOSE.DELETE_ALREADY_GONE == "already_gone"
+        assert _DIAGNOSE.DELETE_REFUSED == "refused"
+
     def test_caps_long_chains(self) -> None:
         # Ten nested causes — output must stay readable.
         excs: list[BaseException] = [ValueError(f"layer-{i}") for i in range(10)]
