@@ -638,7 +638,31 @@ Readiness is degraded when:
 
 ### 13.2 Telemetry
 
-When telemetry is enabled, spans are emitted for run, source fetch, archive download, enrichment, Lithos write, and Lithos retrieve operations. The service name and export interval are configured under `[telemetry]`.
+When telemetry is enabled (`INFLUX_OTEL_ENABLED=true`), Influx exports OTEL traces and metrics. Both signals share the same toggle, the same OTLP endpoint configuration (`OTEL_EXPORTER_OTLP_ENDPOINT`), and the same resource attributes (`service.name=influx`, `deployment.environment=<INFLUX_ENVIRONMENT>`).
+
+Spans are emitted for run, source fetch, archive download, enrichment, Lithos write, and Lithos retrieve operations.
+
+Metric instruments cover run lifecycle, the source funnel, write outcomes, and failure modes. Label values are bounded by construction — per-item identifiers (`run_id`, `note_id`, `arxiv_id`, `source_url`, `title`) are never used as labels.
+
+| Instrument | Type | Labels |
+|---|---|---|
+| `influx_run_starts_total` | Counter | `profile`, `run_type` |
+| `influx_run_completions_total` | Counter | `profile`, `run_type`, `outcome` (`success` \| `failure` \| `degraded`) |
+| `influx_run_duration_seconds` | Histogram (s) | `profile`, `run_type` |
+| `influx_active_runs` | UpDownCounter | `profile` |
+| `influx_source_candidates_fetched_total` | Counter | `profile`, `source` |
+| `influx_articles_filtered_total` | Counter | `profile`, `decision` (`pass` \| `drop`) |
+| `influx_articles_inspected_total` | Counter | `profile`, `source` |
+| `influx_cache_hits_total` | Counter | `profile`, `source` |
+| `influx_lithos_writes_total` | Counter | `profile`, `source`, `status` |
+| `influx_repair_candidates_total` | Counter | `profile`, `kind` (`archive` \| `text_extraction` \| `tier2` \| `tier3`) |
+| `influx_llm_validation_failures_total` | Counter | `profile`, `tier` (`1` \| `3`) |
+| `influx_archive_missing_total` | Counter | `profile`, `source` |
+| `influx_source_acquisition_errors_total` | Counter | `profile`, `source`, `kind` |
+
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is set the OTLP HTTP exporter is used. With `INFLUX_OTEL_CONSOLE_FALLBACK=true` and no endpoint configured, both spans and metrics are written to stdout for local development.
+
+OTEL log export remains stdout-only in this revision; structured-log OTEL export is tracked separately.
 
 ### 13.3 Logging
 

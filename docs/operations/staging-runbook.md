@@ -201,7 +201,32 @@ note after fixing the underlying cause:
 The full per-stage cap contract lives in
 [`docs/SPECIFICATION.md` §11.1](../SPECIFICATION.md#111-per-stage-cap-and-self-repair).
 
-## 7. Reference
+## 7. Reading metrics from the OTEL backend
+
+When the staging deployment has `INFLUX_OTEL_ENABLED=true` and an OTLP
+endpoint configured, Influx exports metrics alongside spans. Use these
+to answer "is the run progressing?" without `docker logs`.
+
+| Question | Instrument |
+| -------- | ---------- |
+| Is anything actually running right now? | `sum(influx_active_runs)` per `profile`. |
+| When did the last run start / finish? | `rate(influx_run_starts_total[15m])` and `rate(influx_run_completions_total[15m])` filtered by `outcome`. |
+| How long are runs taking? | `histogram_quantile(0.95, influx_run_duration_seconds_bucket)` by `profile`. |
+| Are runs degrading? | `sum by (profile, outcome) (rate(influx_run_completions_total[1h]))` — non-zero `outcome="degraded"` means swallowed source-fetch errors. |
+| Is the source funnel narrowing as expected? | `rate(influx_source_candidates_fetched_total[1h])` → `rate(influx_articles_filtered_total{decision="pass"}[1h])` → `rate(influx_articles_inspected_total[1h])` → `rate(influx_lithos_writes_total{status=~"created\\|updated"}[1h])`. |
+| Are writes failing silently? | `rate(influx_lithos_writes_total{status!~"created\\|updated"}[15m])` by `status`. |
+| Is the LLM pipeline degrading? | `rate(influx_llm_validation_failures_total[1h])` by `tier`. |
+| Is the repair sweep stuck on one stage? | `rate(influx_repair_candidates_total[1h])` by `kind`. |
+| Are upstream sources flapping? | `rate(influx_source_acquisition_errors_total[1h])` by `source, kind`. |
+
+Resource attributes on every metric: `service.name=influx` plus
+`deployment.environment=<INFLUX_ENVIRONMENT>` (e.g. `staging`). Filter
+by these on the collector if multiple environments share a backend.
+
+OTEL log export is **not** wired in this revision; the runbook still
+relies on `docker logs` (and `influx-diagnose.py`) for log inspection.
+
+## 8. Reference
 
 - Run ledger schema: `src/influx/run_ledger.py` (`RunEntry` TypedDict).
 - Admin endpoints: `src/influx/http_api.py` (`/live`, `/ready`,
@@ -210,6 +235,8 @@ The full per-stage cap contract lives in
   in `src/influx/`. The `terminal-flips` and `warnings` subcommands
   pull these structured fields without forcing operators to remember
   the JSON keys.
+- Metric instruments: `src/influx/metrics.py` (helper per instrument)
+  and `docs/SPECIFICATION.md` §13.2 for the label contract.
 - Master spec for the sweep: `docs/SPECIFICATION.md` §11.
 - Terminal cap rationale and prior incident notes: PR #11 (initial
   data layer), PR #15 (archive cap), PR #25 (archive_download hook),

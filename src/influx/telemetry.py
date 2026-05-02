@@ -1,7 +1,7 @@
 """Opt-in OTEL telemetry wrapper.
 
-Provides a thin API for span creation and attribute setting that is a
-complete no-op when:
+Provides a thin API for span creation, metric recording, and attribute
+setting that is a complete no-op when:
 
 * ``INFLUX_OTEL_ENABLED`` is unset or ``false`` (FR-OBS-2, AC-10-A), OR
 * the ``opentelemetry`` optional packages are not installed (AC-M4-3).
@@ -26,12 +26,14 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "InfluxMeter",
     "InfluxTracer",
     "SourceAcquisitionError",
     "SpanWrapper",
     "current_archive_terminal_arxiv_ids",
     "current_run_id",
     "current_source_acquisition_errors",
+    "get_meter",
     "get_tracer",
     "record_source_acquisition_error",
 ]
@@ -163,6 +165,26 @@ class SpanWrapper:
 _NOOP_SPAN_WRAPPER = SpanWrapper(_NOOP_SPAN)
 
 
+class _NoOpInstrument:
+    """Shared no-op metric instrument.
+
+    Mirrors :class:`_NoOpSpan`: when OTEL is disabled the meter returns
+    this singleton so that increment / record sites do zero work and
+    allocate no objects (AC-10-A discipline extended to metrics).
+    """
+
+    __slots__ = ()
+
+    def add(self, value: float, attributes: dict[str, Any] | None = None) -> None:  # noqa: ARG002
+        pass
+
+    def record(self, value: float, attributes: dict[str, Any] | None = None) -> None:  # noqa: ARG002
+        pass
+
+
+_NOOP_INSTRUMENT = _NoOpInstrument()
+
+
 class InfluxTracer:
     """Tracer that wraps OTEL or falls back to no-op.
 
@@ -232,6 +254,24 @@ def _parse_resource_attributes(value: str) -> dict[str, str]:
     return attrs
 
 
+def _build_resource_attributes() -> dict[str, str]:
+    """Build the OTEL resource attributes shared by traces and metrics.
+
+    The attribute set is identical for every signal so dashboards can
+    correlate runs, spans, and metrics by ``service.name`` /
+    ``deployment.environment`` without per-signal divergence.
+    """
+    service_name = os.environ.get("OTEL_SERVICE_NAME", "influx")
+    resource_attrs = _parse_resource_attributes(
+        os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
+    )
+    resource_attrs["service.name"] = service_name
+    environment = os.environ.get("INFLUX_ENVIRONMENT", "")
+    if environment and "deployment.environment" not in resource_attrs:
+        resource_attrs["deployment.environment"] = environment
+    return resource_attrs
+
+
 def _build_tracer() -> InfluxTracer:
     """Construct an ``InfluxTracer`` based on current env + package state."""
     if not _otel_enabled():
@@ -245,14 +285,7 @@ def _build_tracer() -> InfluxTracer:
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 
-    service_name = os.environ.get("OTEL_SERVICE_NAME", "influx")
-    resource_attrs = _parse_resource_attributes(
-        os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
-    )
-    resource_attrs["service.name"] = service_name
-    environment = os.environ.get("INFLUX_ENVIRONMENT", "")
-    if environment and "deployment.environment" not in resource_attrs:
-        resource_attrs["deployment.environment"] = environment
+    resource_attrs = _build_resource_attributes()
     provider = TracerProvider(resource=Resource.create(resource_attrs))
 
     if _otlp_endpoint_configured():
@@ -288,9 +321,170 @@ def _build_tracer() -> InfluxTracer:
     return InfluxTracer(enabled=True, tracer=tracer)
 
 
-# Module-level singleton — rebuilt by ``get_tracer(force_rebuild=True)``
-# or by tests that need to toggle OTEL on/off.
+class InfluxMeter:
+    """Meter that wraps OTEL or falls back to no-op.
+
+    Mirrors :class:`InfluxTracer`.  Instruments are created lazily and
+    cached, so the second call to ``counter("influx_run_starts_total")``
+    returns the same underlying OTEL ``Counter`` — required by the OTEL
+    SDK, which raises if the same instrument name is registered twice
+    on a meter.
+
+    When disabled the meter returns the shared :data:`_NOOP_INSTRUMENT`
+    so increment sites pay only a hash lookup, not an OTEL SDK call.
+    """
+
+    __slots__ = (
+        "_counters",
+        "_enabled",
+        "_histograms",
+        "_meter",
+        "_resource",
+        "_up_down_counters",
+    )
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        meter: Any = None,
+        resource: Any = None,
+    ) -> None:
+        self._enabled = enabled
+        self._meter = meter
+        self._resource = resource
+        self._counters: dict[str, Any] = {}
+        self._up_down_counters: dict[str, Any] = {}
+        self._histograms: dict[str, Any] = {}
+
+    @property
+    def resource(self) -> Any:
+        """OTEL ``Resource`` attached to this meter (or ``None`` when disabled).
+
+        Exposed so tests can verify ``service.name`` /
+        ``deployment.environment`` without poking at private SDK
+        attributes.
+        """
+        return self._resource
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def counter(self, name: str, *, unit: str = "1", description: str = "") -> Any:
+        """Return (and cache) a monotonic counter instrument."""
+        if not self._enabled:
+            return _NOOP_INSTRUMENT
+        cached = self._counters.get(name)
+        if cached is not None:
+            return cached
+        instrument = self._meter.create_counter(
+            name=name,
+            unit=unit,
+            description=description,
+        )
+        self._counters[name] = instrument
+        return instrument
+
+    def up_down_counter(
+        self, name: str, *, unit: str = "1", description: str = ""
+    ) -> Any:
+        """Return (and cache) an up-down counter instrument."""
+        if not self._enabled:
+            return _NOOP_INSTRUMENT
+        cached = self._up_down_counters.get(name)
+        if cached is not None:
+            return cached
+        instrument = self._meter.create_up_down_counter(
+            name=name,
+            unit=unit,
+            description=description,
+        )
+        self._up_down_counters[name] = instrument
+        return instrument
+
+    def histogram(self, name: str, *, unit: str = "1", description: str = "") -> Any:
+        """Return (and cache) a histogram instrument."""
+        if not self._enabled:
+            return _NOOP_INSTRUMENT
+        cached = self._histograms.get(name)
+        if cached is not None:
+            return cached
+        instrument = self._meter.create_histogram(
+            name=name,
+            unit=unit,
+            description=description,
+        )
+        self._histograms[name] = instrument
+        return instrument
+
+
+def _build_meter() -> InfluxMeter:
+    """Construct an ``InfluxMeter`` based on current env + package state.
+
+    Parallels :func:`_build_tracer`: shares the ``INFLUX_OTEL_ENABLED``
+    toggle, the ``OTEL_EXPORTER_OTLP_ENDPOINT`` configuration, and the
+    same resource-attribute set, so traces and metrics always describe
+    the same service from the collector's point of view.
+    """
+    if not _otel_enabled():
+        return InfluxMeter(enabled=False)
+    if not _otel_packages_available():
+        return InfluxMeter(enabled=False)
+
+    try:
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+        from opentelemetry.sdk.resources import Resource
+    except ImportError:
+        logger.warning("OTEL metrics SDK not installed; metrics will not be exported")
+        return InfluxMeter(enabled=False)
+
+    resource_attrs = _build_resource_attributes()
+    readers: list[Any] = []
+
+    if _otlp_endpoint_configured():
+        try:
+            from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+                OTLPMetricExporter,
+            )
+        except ImportError:
+            if not _console_fallback_enabled():
+                logger.warning(
+                    "OTEL enabled but OTLP HTTP metric exporter is not installed; "
+                    "metrics will not be exported"
+                )
+        else:
+            readers.append(PeriodicExportingMetricReader(OTLPMetricExporter()))
+            logger.info(
+                "OTEL OTLP metric exporter configured endpoint=%s metrics_endpoint=%s",
+                os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+                os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", ""),
+            )
+
+    if _console_fallback_enabled() and not _otlp_endpoint_configured():
+        from opentelemetry.sdk.metrics.export import ConsoleMetricExporter
+
+        readers.append(PeriodicExportingMetricReader(ConsoleMetricExporter()))
+        logger.info("OTEL console metric exporter configured")
+
+    resource = Resource.create(resource_attrs)
+    provider = MeterProvider(
+        resource=resource,
+        metric_readers=readers,
+    )
+    return InfluxMeter(
+        enabled=True,
+        meter=provider.get_meter("influx"),
+        resource=resource,
+    )
+
+
+# Module-level singletons — rebuilt by ``get_tracer(force_rebuild=True)``
+# / ``get_meter(force_rebuild=True)`` or by tests that need to toggle
+# OTEL on/off between cases.
 _tracer: InfluxTracer | None = None
+_meter: InfluxMeter | None = None
 
 
 def get_tracer(*, force_rebuild: bool = False) -> InfluxTracer:
@@ -307,3 +501,15 @@ def get_tracer(*, force_rebuild: bool = False) -> InfluxTracer:
     if _tracer is None or force_rebuild:
         _tracer = _build_tracer()
     return _tracer
+
+
+def get_meter(*, force_rebuild: bool = False) -> InfluxMeter:
+    """Return the module-level ``InfluxMeter`` singleton.
+
+    Mirrors :func:`get_tracer` so tests that toggle OTEL on/off can
+    rebuild both signals from the same environment in one place.
+    """
+    global _meter  # noqa: PLW0603
+    if _meter is None or force_rebuild:
+        _meter = _build_meter()
+    return _meter
