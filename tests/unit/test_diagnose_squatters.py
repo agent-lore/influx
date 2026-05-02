@@ -179,6 +179,24 @@ class TestFormatExceptionChain:
         assert "RuntimeError: transport setup failed" in rendered
         assert "OSError: dns lookup failed: host.docker.internal" in rendered
 
+    def test_summarise_doc_for_refusal_renders_useful_signals(self) -> None:
+        doc = {
+            "title": "OmniRobotHome: A Multi-Camera Platform",
+            "source_url": "https://arxiv.org/abs/2604.28197",
+            "author": "operator@example.com",
+            "tags": ["profile:staging-robotics", "source:arxiv", "ingested-by:loom"],
+        }
+        rendered = _DIAGNOSE._summarise_doc_for_refusal(doc)
+        assert "OmniRobotHome" in rendered
+        assert "operator@example.com" in rendered
+        assert "ingested_by=loom" in rendered
+        assert "https://arxiv.org/abs/2604.28197" in rendered
+
+    def test_summarise_doc_for_refusal_handles_missing_fields(self) -> None:
+        rendered = _DIAGNOSE._summarise_doc_for_refusal({})
+        assert "(no title)" in rendered
+        assert "(no ingested-by tag)" in rendered
+
     def test_caps_long_chains(self) -> None:
         # Ten nested causes — output must stay readable.
         excs: list[BaseException] = [ValueError(f"layer-{i}") for i in range(10)]

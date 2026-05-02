@@ -571,6 +571,32 @@ def _read_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str:
     )
 
 
+def _summarise_doc_for_refusal(doc: dict[str, Any]) -> str:
+    """Concise one-line preview of a Lithos doc for the safety-check refusal.
+
+    The operator needs four signals to triage a non-Influx-authored
+    squatter without a separate ``lithos_read`` round trip: the
+    title, the source URL (if any), the ingester / author tag, and
+    the full tag list.  Render those compactly on a single message.
+    """
+    title = str(doc.get("title") or "(no title)")[:80]
+    source_url = str(doc.get("source_url") or "")
+    tags = list(doc.get("tags") or [])
+    author = str(doc.get("author") or "")
+    ingester = next(
+        (t.split(":", 1)[1] for t in tags if t.startswith("ingested-by:")),
+        "(no ingested-by tag)",
+    )
+    parts = [
+        f"title={title!r}",
+        f"author={author!r}" if author else None,
+        f"ingested_by={ingester}",
+        f"source_url={source_url}" if source_url else None,
+        f"tags={tags}",
+    ]
+    return " ".join(p for p in parts if p)
+
+
 def _format_exception_chain(exc: BaseException) -> str:
     """Render an exception (and its causes / sub-exceptions) compactly.
 
@@ -679,11 +705,18 @@ async def _delete_squatter(
 
         tags = list(doc.get("tags") or [])
         if require_influx_authored and "ingested-by:influx" not in tags:
+            # Surface enough of the doc to let the operator decide
+            # whether the squatter is an old Influx note that just lost
+            # its tag (safe to delete after manual review) or a genuine
+            # user/other-agent note (must NOT be deleted).
+            preview = _summarise_doc_for_refusal(doc)
             return (
                 False,
                 "refused: doc is not influx-authored "
-                "(missing 'ingested-by:influx' tag); "
-                "pass --no-require-influx-authored to override",
+                "(missing 'ingested-by:influx' tag).  "
+                f"Preview: {preview}  "
+                "If safe to delete after review, re-run with "
+                "--no-require-influx-authored.",
             )
 
         try:
