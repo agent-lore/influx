@@ -640,6 +640,8 @@ Readiness is degraded when:
 - Repair sweep terminal write failure is latched.
 - LCMA unknown-tool failure is latched.
 
+When the Lithos probe has been ``degraded`` for **3 consecutive cycles** (default; see `ProbeLoop.lithos_circuit_open`), `run_profile` short-circuits — the run is recorded as ``status="skipped", error="lithos_unhealthy"`` in the run ledger, the `influx_runs_skipped_total{profile, reason="lithos_unhealthy"}` metric ticks, and no source-fetch / LLM-filter / write work is performed.  The breaker closes automatically on the first ``ok`` probe; subsequent runs proceed normally.  This prevents an extended Lithos outage from burning LLM tokens against a write path that will fail (#40).
+
 ### 13.2 Telemetry
 
 When telemetry is enabled (`INFLUX_OTEL_ENABLED=true`), Influx exports OTEL traces and metrics. Both signals share the same toggle, the same OTLP endpoint configuration (`OTEL_EXPORTER_OTLP_ENDPOINT`), and the same resource attributes (`service.name=influx`, `deployment.environment=<INFLUX_ENVIRONMENT>`).
@@ -666,6 +668,7 @@ Metric instruments cover run lifecycle, the source funnel, write outcomes, and f
 | `influx_slug_collision_dedup_recovery_total` | Counter | _(no labels)_ |
 | `influx_slug_collision_reclaimed_total` | Counter | _(no labels)_ |
 | `influx_slug_collision_unresolved_total` | Counter | `profile`, `source` |
+| `influx_runs_skipped_total` | Counter | `profile`, `reason` |
 
 When `OTEL_EXPORTER_OTLP_ENDPOINT` is set the OTLP HTTP exporter is used. With `INFLUX_OTEL_CONSOLE_FALLBACK=true` and no endpoint configured, both spans and metrics are written to stdout for local development.
 

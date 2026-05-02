@@ -237,6 +237,12 @@ class ProbeLoop:
         # LCMA unknown_tool failure latch (PRD 08 FR-LCMA-6).
         self._lcma_unknown_tool_failure = False
         self._lcma_unknown_tool_failure_detail = ""
+        # Consecutive count of degraded Lithos probes (#40 circuit breaker).
+        # Reset to 0 on the first ``ok`` probe; ``lithos_circuit_open``
+        # returns True once it crosses the configured threshold so the
+        # scheduler can short-circuit further runs and stop burning LLM
+        # tokens against a write path that will fail.
+        self._lithos_unhealthy_consecutive = 0
         self._state = ProbeState(max_age=self._max_age)
         self._task: asyncio.Task[None] | None = None
 
@@ -251,8 +257,16 @@ class ProbeLoop:
         Useful for tests and for running an initial probe before the
         background loop starts.
         """
+        lithos_result = _probe_lithos(self._config.lithos.url)
+        # Update the consecutive-degraded counter (#40 circuit breaker).
+        # Reset to 0 on the first ``ok`` so the breaker closes
+        # automatically the moment Lithos is reachable again.
+        if lithos_result.status == "ok":
+            self._lithos_unhealthy_consecutive = 0
+        else:
+            self._lithos_unhealthy_consecutive += 1
         self._state = ProbeState(
-            lithos=_probe_lithos(self._config.lithos.url),
+            lithos=lithos_result,
             llm_credentials=_probe_llm_credentials(self._config.providers),
             max_age=self._max_age,
             repair_write_failure=self._repair_write_failure,
@@ -260,6 +274,27 @@ class ProbeLoop:
             lcma_unknown_tool_failure=self._lcma_unknown_tool_failure,
             lcma_unknown_tool_failure_detail=self._lcma_unknown_tool_failure_detail,
         )
+
+    @property
+    def lithos_unhealthy_consecutive(self) -> int:
+        """Consecutive ``degraded`` Lithos probes since the last ``ok`` (#40)."""
+        return self._lithos_unhealthy_consecutive
+
+    def lithos_circuit_open(self, *, threshold: int = 3) -> bool:
+        """Return ``True`` when Lithos has been unhealthy for ``threshold+`` probes.
+
+        The scheduler consults this before kicking off ``_run_profile_body``;
+        when the breaker is open, the run is recorded as ``skipped`` with
+        ``reason="lithos_unhealthy"`` and no source-fetch / LLM-filter /
+        write work is done.  As soon as a probe returns ``ok`` the
+        counter resets and the breaker closes automatically.
+
+        ``threshold=3`` with the default 30-second probe interval gives
+        ~90 seconds of sustained Lithos failure before the breaker
+        opens — long enough to weather a Lithos restart or transient
+        network blip without spuriously skipping a sweep.
+        """
+        return self._lithos_unhealthy_consecutive >= threshold
 
     def mark_repair_write_failure(
         self,

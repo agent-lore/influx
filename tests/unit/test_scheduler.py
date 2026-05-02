@@ -824,3 +824,127 @@ class TestNegativeExampleMaxTitleCharsWired:
 
         assert captured_kwargs, "build_negative_examples_block was not called"
         assert captured_kwargs[0]["max_title_chars"] == 42
+
+
+# ── #40: Lithos circuit breaker short-circuit ─────────────────────────
+
+
+class TestLithosCircuitBreakerShortCircuit:
+    """``run_profile`` short-circuits when ``probe_loop.lithos_circuit_open()``."""
+
+    async def test_short_circuits_without_calling_provider(self, tmp_path: Any) -> None:
+        """Open breaker → no provider invocation, ledger entry is ``skipped``."""
+        from influx.run_ledger import RunLedger
+
+        config = _make_config(profiles=["staging-robotics"])
+        # Override storage so the ledger writes under tmp_path.
+        config = config.model_copy(
+            update={
+                "storage": config.storage.model_copy(
+                    update={"state_dir": str(tmp_path)}
+                )
+            }
+        )
+
+        provider_called = False
+
+        async def spy_provider(
+            profile: str,
+            kind: RunKind,
+            run_range: dict[str, str | int] | None,
+            filter_prompt: str,
+        ) -> list[dict[str, Any]]:
+            nonlocal provider_called
+            provider_called = True
+            return []
+
+        # Stub probe loop reporting the breaker open.
+        class StubProbeLoop:
+            lithos_unhealthy_consecutive = 5
+
+            def lithos_circuit_open(self, *, threshold: int = 3) -> bool:
+                return True
+
+        ledger = RunLedger(tmp_path)
+        result = await run_profile(
+            "staging-robotics",
+            RunKind.SCHEDULED,
+            config=config,
+            item_provider=spy_provider,
+            probe_loop=StubProbeLoop(),
+            run_ledger=ledger,
+        )
+
+        assert result is None
+        assert provider_called is False, (
+            "Lithos circuit breaker must short-circuit BEFORE the item "
+            "provider runs — otherwise we burn LLM tokens against a "
+            "write path that will fail"
+        )
+        # The ledger entry must reflect the skip.
+        entries = ledger.recent()
+        assert len(entries) == 1
+        assert entries[0]["status"] == "skipped"
+        assert entries[0]["error"] == "lithos_unhealthy"
+
+    async def test_breaker_closed_proceeds_normally(self, tmp_path: Any) -> None:
+        """Closed breaker → provider IS called (existing path unchanged)."""
+        from influx.run_ledger import RunLedger
+
+        config = _make_config(profiles=["staging-robotics"])
+        config = config.model_copy(
+            update={
+                "storage": config.storage.model_copy(
+                    update={"state_dir": str(tmp_path)}
+                )
+            }
+        )
+
+        provider_called = False
+
+        async def spy_provider(
+            profile: str,
+            kind: RunKind,
+            run_range: dict[str, str | int] | None,
+            filter_prompt: str,
+        ) -> list[dict[str, Any]]:
+            nonlocal provider_called
+            provider_called = True
+            return []
+
+        class StubProbeLoop:
+            lithos_unhealthy_consecutive = 0
+
+            def lithos_circuit_open(self, *, threshold: int = 3) -> bool:
+                return False
+
+        ledger = RunLedger(tmp_path)
+        # The body still calls into LithosClient; the test would need
+        # full mocking to run end-to-end.  Here we only assert the
+        # short-circuit DOES NOT fire — the body's normal failure path
+        # is exercised in the fuller integration tests.
+        import contextlib
+
+        from influx.errors import ConfigError, LCMAError, LithosError
+
+        # Expected: the body tries to connect to a real Lithos URL which
+        # isn't available in this unit test.  Either of the raised types
+        # is acceptable; what matters is that we got past the breaker.
+        with contextlib.suppress(
+            ConfigError, LCMAError, LithosError, ConnectionError, OSError
+        ):
+            await run_profile(
+                "staging-robotics",
+                RunKind.SCHEDULED,
+                config=config,
+                item_provider=spy_provider,
+                probe_loop=StubProbeLoop(),
+                run_ledger=ledger,
+            )
+
+        # The ledger entry exists and is NOT skipped (the short-circuit
+        # would have written a ``skipped`` row before any error).
+        entries = ledger.recent()
+        # Either a failed entry or no terminal entry yet — neither
+        # should be ``skipped``.
+        assert all(e.get("status") != "skipped" for e in entries)

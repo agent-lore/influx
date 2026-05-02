@@ -516,3 +516,89 @@ class TestRepairWriteFailureLatch:
 
         loop.clear_repair_write_failure()
         assert loop.state.repair_write_failure is False
+
+
+# ── #40: Lithos circuit breaker ──────────────────────────────────────
+
+
+class TestLithosCircuitBreaker:
+    """ProbeLoop tracks consecutive degraded Lithos probes (#40)."""
+
+    def test_starts_closed(self, fake_lithos_sse_url: str) -> None:
+        cfg = _make_config(lithos_url=fake_lithos_sse_url)
+        loop = ProbeLoop(cfg, interval=30.0)
+        assert loop.lithos_unhealthy_consecutive == 0
+        assert loop.lithos_circuit_open() is False
+
+    def test_increments_on_degraded_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each degraded probe bumps the consecutive counter."""
+        from influx import probes as _probes
+
+        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")  # unreachable
+        # Stub the lithos probe so we don't pay an actual TCP timeout.
+        monkeypatch.setattr(
+            _probes,
+            "_probe_lithos",
+            lambda url: ProbeResult(status="degraded", detail="stub", timestamp=1.0),
+        )
+        loop = ProbeLoop(cfg, interval=30.0)
+        for expected in (1, 2, 3):
+            loop.run_once()
+            assert loop.lithos_unhealthy_consecutive == expected
+
+    def test_opens_at_threshold(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default threshold of 3 — breaker stays closed at 2, opens at 3."""
+        from influx import probes as _probes
+
+        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+        monkeypatch.setattr(
+            _probes,
+            "_probe_lithos",
+            lambda url: ProbeResult(status="degraded", detail="stub", timestamp=1.0),
+        )
+        loop = ProbeLoop(cfg, interval=30.0)
+        loop.run_once()
+        loop.run_once()
+        assert loop.lithos_circuit_open() is False
+        loop.run_once()
+        assert loop.lithos_circuit_open() is True
+
+    def test_threshold_is_configurable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from influx import probes as _probes
+
+        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+        monkeypatch.setattr(
+            _probes,
+            "_probe_lithos",
+            lambda url: ProbeResult(status="degraded", detail="stub", timestamp=1.0),
+        )
+        loop = ProbeLoop(cfg, interval=30.0)
+        loop.run_once()
+        assert loop.lithos_circuit_open(threshold=1) is True
+        assert loop.lithos_circuit_open(threshold=2) is False
+
+    def test_resets_on_first_ok_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Breaker closes automatically on the first ``ok`` probe."""
+        from influx import probes as _probes
+
+        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+        # Three degraded probes, then one ok — counter must reset.
+        responses = iter(
+            [
+                ProbeResult(status="degraded", detail="x", timestamp=1.0),
+                ProbeResult(status="degraded", detail="x", timestamp=2.0),
+                ProbeResult(status="degraded", detail="x", timestamp=3.0),
+                ProbeResult(status="ok", detail="", timestamp=4.0),
+            ]
+        )
+        monkeypatch.setattr(_probes, "_probe_lithos", lambda url: next(responses))
+        loop = ProbeLoop(cfg, interval=30.0)
+        loop.run_once()
+        loop.run_once()
+        loop.run_once()
+        assert loop.lithos_circuit_open() is True
+        loop.run_once()
+        assert loop.lithos_unhealthy_consecutive == 0
+        assert loop.lithos_circuit_open() is False

@@ -175,6 +175,40 @@ async def run_profile(
     provider = item_provider if item_provider is not None else default_item_provider
     run_id = run_id or str(uuid.uuid4())
     ledger = run_ledger or RunLedger(Path(config.storage.state_dir))
+
+    # #40 circuit breaker: when Lithos has been unhealthy for
+    # ``threshold`` consecutive probes, short-circuit the run before
+    # any source-fetch / LLM-filter / write work happens.  Burning
+    # tokens against a write path that will fail is worse than a
+    # skipped sweep.  The breaker closes automatically as soon as
+    # ProbeLoop reports ``ok`` again.
+    if (
+        probe_loop is not None
+        and hasattr(probe_loop, "lithos_circuit_open")
+        and probe_loop.lithos_circuit_open()
+    ):
+        ledger.start(
+            run_id=run_id,
+            profile=profile,
+            kind=kind.value,
+            run_range=run_range,
+        )
+        ledger.skip(run_id=run_id, reason="lithos_unhealthy")
+        metrics.runs_skipped().add(
+            1,
+            {"profile": profile, "reason": "lithos_unhealthy"},
+        )
+        consecutive = getattr(probe_loop, "lithos_unhealthy_consecutive", "?")
+        logger.warning(
+            "run skipped profile=%s kind=%s run_id=%s "
+            "reason=lithos_unhealthy lithos_unhealthy_consecutive=%s",
+            profile,
+            kind.value,
+            run_id,
+            consecutive,
+        )
+        return None
+
     ledger.start(
         run_id=run_id,
         profile=profile,

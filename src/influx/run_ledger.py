@@ -118,6 +118,25 @@ class RunLedger:
             source_acquisition_errors=[],
         )
 
+    def skip(self, *, run_id: str, reason: str) -> None:
+        """Mark an active run as ``skipped`` and append it to history (#40).
+
+        Distinct from ``fail``: ``failed`` means the run started and
+        crashed; ``skipped`` means the run never started any
+        source-fetch / LLM / write work because a circuit breaker (e.g.
+        Lithos extended outage) opened first.  ``reason`` is recorded
+        so dashboards can distinguish skip causes.
+        """
+        self._finish(
+            run_id=run_id,
+            status="skipped",
+            sources_checked=None,
+            ingested=None,
+            error=reason,
+            degraded=False,
+            source_acquisition_errors=[],
+        )
+
     def record_unresolved_slug_collision(
         self,
         *,
