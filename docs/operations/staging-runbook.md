@@ -39,8 +39,16 @@ Three quick signals, all read-only:
   duration, and source-acquisition errors. Active runs (if any) appear
   above the list.
 - **`failures`** filters to `failed`, `abandoned`, and `degraded` runs
-  in one go. A `degraded` run completed but had at least one swallowed
-  source-fetch failure (issue #20); the body of the run still landed.
+  in one go. A `degraded` run completed but is flagged for at least
+  one structured reason in `degraded_reasons`:
+  - `source_acquisition` (issue #20) — at least one source-fetch
+    failure was swallowed; the body of the run still landed.
+  - `ingestion_stall` (issue #36) — this and the prior scheduled
+    run for the same profile both inspected items but ingested
+    zero; typical cause is every candidate hitting `slug_collision`
+    / `duplicate`, the LLM filter rejecting everything, or an
+    upstream content shift.  The diagnose row prints the reason
+    list so you can triage without parsing the JSON.
   A `skipped` run (#40) means the Lithos circuit breaker fired:
   ProbeLoop saw 3+ consecutive `degraded` Lithos probes, so the
   scheduler short-circuited to avoid burning LLM tokens against a

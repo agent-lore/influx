@@ -70,6 +70,7 @@ class RunLedger:
             "ingested": None,
             "error": None,
             "degraded": False,
+            "degraded_reasons": [],
             "source_acquisition_errors": [],
         }
         try:
@@ -86,25 +87,94 @@ class RunLedger:
         sources_checked: int | None,
         ingested: int | None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
-    ) -> None:
+    ) -> list[str]:
         """Mark an active run as completed and append it to history.
 
-        *source_acquisition_errors* records source-fetch failures that
-        were swallowed during the run (e.g. arxiv HTTP 5xx, RSS
-        timeout).  When non-empty the run is flagged ``degraded=True``
-        in the ledger so dashboards can distinguish a partial-failure
-        run from a genuinely quiet window (issue #20).
+        Returns the structured ``degraded_reasons`` list that was
+        recorded — one of: ``[]`` (clean run), ``["source_acquisition"]``
+        (issue #20: swallowed source-fetch failures), or
+        ``["ingestion_stall"]`` (issue #36: this and the immediately
+        prior scheduled run for the same profile both saw
+        ``ingested == 0`` despite ``sources_checked > 0`` — typically a
+        slug-collision squatter, all-duplicate writes, etc.).  When
+        both apply the list contains both reasons.
+
+        Returning the reasons lets the caller (the scheduler) emit
+        per-reason metrics without re-deriving the logic.
         """
         errors = list(source_acquisition_errors or [])
+        reasons: list[str] = []
+        if errors:
+            reasons.append("source_acquisition")
+
+        # #36 ingestion-stall detection: only meaningful when the run
+        # actually inspected something.  Backfills are excluded — they
+        # legitimately ingest 0 when every candidate is a cache hit.
+        if (
+            isinstance(ingested, int)
+            and ingested == 0
+            and isinstance(sources_checked, int)
+            and sources_checked > 0
+        ):
+            # Look up the *currently-active* entry to learn this run's
+            # profile + kind, then count consecutive prior scheduled runs
+            # for the same profile that match the stall shape.  We add
+            # 1 for *this* run since it hasn't been written yet.
+            active = self._read_active()
+            entry = active.get(run_id, {})
+            profile = entry.get("profile")
+            kind = entry.get("kind")
+            if isinstance(profile, str) and kind == "scheduled":
+                consecutive = 1 + self._consecutive_zero_ingestion_runs(
+                    profile=profile, exclude_run_id=run_id
+                )
+                if consecutive >= 2:
+                    reasons.append("ingestion_stall")
+
         self._finish(
             run_id=run_id,
             status="completed",
             sources_checked=sources_checked,
             ingested=ingested,
             error=None,
-            degraded=bool(errors),
+            degraded=bool(reasons),
             source_acquisition_errors=errors,
+            degraded_reasons=reasons,
         )
+        return reasons
+
+    def _consecutive_zero_ingestion_runs(
+        self, *, profile: str, exclude_run_id: str
+    ) -> int:
+        """Count consecutive prior scheduled runs that match the stall shape.
+
+        Walks ``recent()`` newest-first, counting runs where
+        ``ingested == 0 AND sources_checked > 0`` for *profile* of kind
+        ``scheduled``.  Stops at the first run that doesn't match.  Used
+        by :meth:`complete` to compute the ``ingestion_stall`` degraded
+        reason (#36).
+        """
+        count = 0
+        for prior in self.recent(limit=20, profile=profile):
+            if prior.get("run_id") == exclude_run_id:
+                continue
+            if prior.get("kind") != "scheduled":
+                # Backfills don't count — their ingest pattern is
+                # different.  But they shouldn't break the streak
+                # either; skip silently.
+                continue
+            ingested = prior.get("ingested")
+            sources_checked = prior.get("sources_checked")
+            if (
+                isinstance(ingested, int)
+                and ingested == 0
+                and isinstance(sources_checked, int)
+                and sources_checked > 0
+            ):
+                count += 1
+                continue
+            break
+        return count
 
     def fail(self, *, run_id: str, error: str) -> None:
         """Mark an active run as failed and append it to history."""
@@ -230,6 +300,7 @@ class RunLedger:
                         ),
                         "error": reason,
                         "degraded": entry.get("degraded", False),
+                        "degraded_reasons": list(entry.get("degraded_reasons") or []),
                         "source_acquisition_errors": list(
                             entry.get("source_acquisition_errors") or []
                         ),
@@ -289,6 +360,7 @@ class RunLedger:
         error: str | None,
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
+        degraded_reasons: list[str] | None = None,
     ) -> None:
         try:
             active = self._read_active()
@@ -317,6 +389,7 @@ class RunLedger:
                     "ingested": ingested,
                     "error": error,
                     "degraded": degraded,
+                    "degraded_reasons": list(degraded_reasons or []),
                     "source_acquisition_errors": list(source_acquisition_errors or []),
                 }
             )
