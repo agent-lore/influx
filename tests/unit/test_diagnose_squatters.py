@@ -29,6 +29,33 @@ def _load_script() -> Any:
 
 _DIAGNOSE = _load_script()
 _extract = _DIAGNOSE._extract_squatters_from_logs
+_normalise_since = _DIAGNOSE._normalise_since
+
+
+class TestNormaliseSince:
+    """Docker rejects day units in ``--since``; we translate at the boundary."""
+
+    def test_days_translated_to_hours(self) -> None:
+        assert _normalise_since("7d") == "168h"
+        assert _normalise_since("1d") == "24h"
+        assert _normalise_since("30d") == "720h"
+
+    def test_passes_through_native_docker_units(self) -> None:
+        assert _normalise_since("24h") == "24h"
+        assert _normalise_since("90m") == "90m"
+        assert _normalise_since("45s") == "45s"
+
+    def test_passes_through_absolute_timestamp(self) -> None:
+        # docker accepts RFC3339 / unix-epoch timestamps too — leave alone.
+        assert _normalise_since("2026-04-25T00:00:00") == "2026-04-25T00:00:00"
+
+    def test_handles_none_and_empty(self) -> None:
+        assert _normalise_since(None) is None
+        assert _normalise_since("") == ""
+
+    def test_tolerates_whitespace_and_case(self) -> None:
+        assert _normalise_since(" 7d ") == "168h"
+        assert _normalise_since("7D") == "168h"
 
 
 def _record(
