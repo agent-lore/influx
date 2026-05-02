@@ -146,9 +146,7 @@ def _collect(reader: Any) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
-def _has_label_set(
-    points: list[dict[str, Any]], expected: dict[str, str]
-) -> bool:
+def _has_label_set(points: list[dict[str, Any]], expected: dict[str, str]) -> bool:
     """Return True iff at least one data point matches every expected label."""
     return any(
         all(point["attributes"].get(k) == v for k, v in expected.items())
@@ -275,9 +273,7 @@ class TestRunLifecycleAndFunnelMetrics:
         # the up_down counter is a sum aggregation that nets to 0 — but
         # the point must still exist for the profile dimension.
         assert "influx_active_runs" in points
-        assert _has_label_set(
-            points["influx_active_runs"], {"profile": "ai-robotics"}
-        )
+        assert _has_label_set(points["influx_active_runs"], {"profile": "ai-robotics"})
 
         # Source funnel
         assert "influx_source_candidates_fetched_total" in points
@@ -376,18 +372,12 @@ class TestOtelDisabledZeroMetrics:
             patch("influx.scheduler.get_tracer", return_value=tracer),
             patch("influx.sources.arxiv.get_tracer", return_value=tracer),
             patch("influx.lcma.get_tracer", return_value=tracer),
-            patch(
-                "influx.scheduler.metrics.get_meter", return_value=disabled_meter
-            ),
+            patch("influx.scheduler.metrics.get_meter", return_value=disabled_meter),
             patch(
                 "influx.sources.arxiv.metrics.get_meter", return_value=disabled_meter
             ),
-            patch(
-                "influx.sources.rss.metrics.get_meter", return_value=disabled_meter
-            ),
-            patch(
-                "influx.repair.metrics.get_meter", return_value=disabled_meter
-            ),
+            patch("influx.sources.rss.metrics.get_meter", return_value=disabled_meter),
+            patch("influx.repair.metrics.get_meter", return_value=disabled_meter),
             patch("influx.sources.arxiv.fetch_arxiv", return_value=arxiv_items),
             patch(
                 "influx.sources.arxiv.extract_arxiv_text",

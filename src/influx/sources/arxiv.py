@@ -607,9 +607,7 @@ def build_arxiv_note_item(
         tags.append("influx:archive-missing")
         tags.append("influx:archive-terminal")
         repair_needed = True
-        metrics.archive_missing().add(
-            1, {"profile": profile_name, "source": "arxiv"}
-        )
+        metrics.archive_missing().add(1, {"profile": profile_name, "source": "arxiv"})
         _log.info(
             "archive download skipped (terminal) profile=%s arxiv_id=%s",
             profile_name,

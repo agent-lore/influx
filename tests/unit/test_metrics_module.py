@@ -111,9 +111,7 @@ class TestEnabledMeterCachesInstruments:
 class TestInstrumentNames:
     """Instrument names follow the documented contract (issue #6 plan §2)."""
 
-    def test_instrument_names_match_plan(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_instrument_names_match_plan(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _enable(monkeypatch)
         for helper_name, expected_metric_name in HELPERS.items():
             instrument = getattr(metrics, helper_name)()
@@ -143,11 +141,7 @@ class TestCardinalityDiscipline:
 
         for name in HELPERS:
             sig = inspect.signature(getattr(metrics, name))
-            forbidden = [
-                p
-                for p in sig.parameters
-                if p in HIGH_CARDINALITY_FIELDS
-            ]
+            forbidden = [p for p in sig.parameters if p in HIGH_CARDINALITY_FIELDS]
             assert not forbidden, (
                 f"helper {name!r} exposes high-cardinality kwargs: {forbidden}"
             )
