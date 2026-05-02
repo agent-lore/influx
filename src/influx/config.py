@@ -261,7 +261,14 @@ class ArxivSourceConfig(BaseModel):
         ]
     )
     max_results_per_category: int = 200
-    lookback_days: int = 1
+    # Default 3 (not 1): arxiv has natural release gaps (weekends,
+    # holidays, low-activity days).  A 1-day window returns zero
+    # candidates for ~2 days every week which is rarely intended; a
+    # 3-day window tolerates that without changing the throttling
+    # story for the deep-extract path (cache-dedup catches re-fetched
+    # items so the LLM cost is paid once per item).  See #49 / the
+    # 2026-05-02 staging investigation.
+    lookback_days: int = 3
 
 
 class RssSourceEntry(BaseModel):

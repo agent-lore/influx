@@ -1103,3 +1103,33 @@ class TestConftestFixture:
         assert "enrich" in cfg.models
         assert "extract" in cfg.models
         assert cfg.repair.max_items_per_run == 100
+
+
+class TestArxivSourceConfigDefaults:
+    """#49: defaults must tolerate arxiv's natural release gaps."""
+
+    def test_lookback_days_default_is_three(self) -> None:
+        """``lookback_days`` defaults to 3, not 1.
+
+        With 1 day, profiles that omit ``[profiles.sources.arxiv]`` go
+        silent across arxiv's weekend / holiday gaps (no new papers
+        for 24-48h is normal).  3 days covers the common gap shape
+        without changing per-item LLM cost (cache-dedup catches re-fetched
+        items).  See #49 / 2026-05-02 staging investigation.
+        """
+        from influx.config import ArxivSourceConfig
+
+        cfg = ArxivSourceConfig()
+        assert cfg.lookback_days == 3, (
+            "default lookback_days must be 3 to tolerate arxiv release gaps; "
+            "narrower defaults silently dropped staging-ai for entire weekends"
+        )
+
+    def test_other_arxiv_defaults_unchanged(self) -> None:
+        """Pin the rest of the default surface so this PR's intent is clear."""
+        from influx.config import ArxivSourceConfig
+
+        cfg = ArxivSourceConfig()
+        assert cfg.enabled is True
+        assert cfg.max_results_per_category == 200
+        assert "cs.AI" in cfg.categories
