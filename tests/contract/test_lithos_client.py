@@ -1218,6 +1218,59 @@ class TestWriteEnvelopeSlugCollision:
         finally:
             await client.close()
 
+    async def test_slug_collision_envelope_surfaces_existing_id(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """``slug_collision`` envelope's ``existing_id`` and ``message``
+        round-trip into ``WriteResult.detail`` so the operator-facing
+        WARNING in scheduler.py names the squatting note rather than
+        logging an empty string (2026-05-02 staging incident).
+        """
+        fake_lithos_server.write_responses.extend(
+            [
+                # First attempt collides — lithos returns the diagnostic envelope.
+                (
+                    '{"status": "slug_collision",'
+                    ' "existing_id": "doc-squatter-123",'
+                    ' "message": "Slug \'omnirobothome-...\' already in use'
+                    " by document 'doc-squatter-123'\","
+                    ' "warnings": []}'
+                ),
+                # Suffix retry collides as well — same diagnostic shape.
+                (
+                    '{"status": "slug_collision",'
+                    ' "existing_id": "doc-squatter-456",'
+                    ' "message": "Slug \'omnirobothome-...-arxiv-2601-77777\''
+                    " already in use by document 'doc-squatter-456'\","
+                    ' "warnings": []}'
+                ),
+            ]
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Diagnostic Slug",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.77777",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == "slug_collision"
+        # The diagnostic from the *retry* response wins (it is the value
+        # actually returned to the scheduler), and it must include both
+        # the colliding doc id and lithos's human-readable message.
+        assert result.detail
+        assert "doc-squatter-456" in result.detail
+        assert "existing_id=" in result.detail
+        assert "already in use" in result.detail
+
 
 # ── Write envelopes — version_conflict (FR-MCP-7, AC-05-E) ────────
 
