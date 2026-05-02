@@ -132,16 +132,15 @@ def _print_runs(runs_payload: dict[str, object]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "environment",
-        nargs="?",
-        default="dev",
-        help="environment name matching docker/.env.<name>",
+        "--env",
+        default="staging",
+        help="environment name matching docker/.env.<name> (default: staging)",
     )
     parser.add_argument("--base-url", help="override admin API base URL")
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
 
-    env_path = _repo_root() / "docker" / f".env.{args.environment}"
+    env_path = _repo_root() / "docker" / f".env.{args.env}"
     if not env_path.exists():
         print(f"Environment file not found: {env_path}", file=sys.stderr)
         return 2
@@ -165,7 +164,7 @@ def main() -> int:
         print(f"Failed to query {base_url}: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Influx Report: {args.environment}")
+    print(f"Influx Report: {args.env}")
     print(f"Admin API: {base_url}")
     _print_status(status)
     _print_runs(runs)

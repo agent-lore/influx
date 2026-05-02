@@ -226,7 +226,53 @@ by these on the collector if multiple environments share a backend.
 OTEL log export is **not** wired in this revision; the runbook still
 relies on `docker logs` (and `influx-diagnose.py`) for log inspection.
 
-## 8. Reference
+## 8. Cleaning up slug-collision squatters
+
+When ``lithos_write`` returns ``slug_collision`` and the suffix retry
+also fails, Influx logs a WARNING but otherwise drops the article.
+The same paper will hit the same collision on every subsequent sweep
+until the squatting Lithos document is removed (see
+[#31](https://github.com/agent-lore/influx/issues/31) for the planned
+self-healing path).
+
+The ``squatters`` subcommand surfaces them and offers a confirmed
+deletion path:
+
+```
+# 1. Read-only scan — list every squatter from the WARNING stream.
+./scripts/influx-diagnose.py squatters --since 7d
+
+# 2. Inspect the squatting doc body (recommended before deletion).
+#    The output of step 1 prints `doc_id=<uuid>`; pass it to lithos_read
+#    via your usual MCP client / influx admin path.
+
+# 3. Delete one squatter, with audit trail.
+./scripts/influx-diagnose.py squatters --apply --yes <doc-id>
+
+# 4. Or wipe every squatter the scan found (use with care).
+./scripts/influx-diagnose.py squatters --apply --yes-to-all
+```
+
+Safety properties:
+- Default mode is a pure log scan — no Lithos connection.
+- ``--apply`` requires either ``--yes <doc-id>`` (per-id confirmation,
+  repeatable) or ``--yes-to-all``; passing ``--apply`` alone aborts.
+- Before deleting, the script reads the doc and refuses unless its
+  tags include ``ingested-by:influx``.  Pass
+  ``--no-require-influx-authored`` to override (use only after manual
+  review).
+- Each delete is recorded in Lithos with ``agent=influx-diagnose``
+  (override with ``--agent <name>``).
+
+Today only the **second** collision (the suffix retry) appears in the
+WARNING ``detail`` field, so cleaning the listed squatter unblocks
+*one* of the two squatted slugs.  The next sweep typically exposes
+the unsuffixed-slug squatter, which can be removed the same way.
+[#32](https://github.com/agent-lore/influx/issues/32) tracks
+surfacing both squatters in a single WARNING so they can be cleaned
+in one pass.
+
+## 9. Reference
 
 - Run ledger schema: `src/influx/run_ledger.py` (`RunEntry` TypedDict).
 - Admin endpoints: `src/influx/http_api.py` (`/live`, `/ready`,
