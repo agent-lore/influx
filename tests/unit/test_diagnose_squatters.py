@@ -58,6 +58,63 @@ class TestNormaliseSince:
         assert _normalise_since("7D") == "168h"
 
 
+class TestDirectInvocationImports:
+    """``./scripts/influx-diagnose.py --apply`` must work without uv run.
+
+    The squatter delete path imports ``influx.lithos_client``, which
+    transitively pulls in ``mcp`` from the project venv.  When the
+    script is invoked as ``./scripts/influx-diagnose.py …`` (system
+    Python, no venv on sys.path), neither symbol is importable.
+
+    ``_ensure_project_runtime_or_reexec`` detects the gap and
+    ``os.execvp``-replaces this process under ``uv run`` so the
+    operator's argv reaches the venv-backed interpreter unchanged.
+    These tests pin the helper's contract so a future refactor cannot
+    silently regress to the original ``ModuleNotFoundError`` shape that
+    bit the 2026-05-02 incident.
+    """
+
+    def test_helper_exists_and_attempts_import_then_reexec(self) -> None:
+        import inspect
+
+        assert hasattr(_DIAGNOSE, "_ensure_project_runtime_or_reexec")
+        source = inspect.getsource(_DIAGNOSE._ensure_project_runtime_or_reexec)
+        # Must try the import first ...
+        assert "import influx.lithos_client" in source
+        # ... and re-exec via uv run when it fails.
+        assert "os.execvp" in source
+        assert '"uv"' in source and '"run"' in source
+
+    def test_helper_is_called_from_apply_path_in_cmd_squatters(self) -> None:
+        import inspect
+
+        source = inspect.getsource(_DIAGNOSE.cmd_squatters)
+        # The call must live AFTER the read-only return so dry-run
+        # invocations never trigger a ``uv run`` re-exec.
+        assert "_ensure_project_runtime_or_reexec" in source
+        idx_dry_return = source.index("return 0")
+        idx_reexec = source.index("_ensure_project_runtime_or_reexec")
+        assert idx_reexec > idx_dry_return, (
+            "_ensure_project_runtime_or_reexec must be called only on "
+            "the --apply path, not for read-only scans"
+        )
+
+    def test_helper_avoids_infinite_reexec_loop(self) -> None:
+        import inspect
+
+        source = inspect.getsource(_DIAGNOSE._ensure_project_runtime_or_reexec)
+        assert "INFLUX_DIAGNOSE_REEXECED" in source, (
+            "the helper must guard against an infinite re-exec loop "
+            "if uv run somehow yields an environment without the deps"
+        )
+
+    def test_lithos_client_importable_under_uv_run(self) -> None:
+        # Sanity check that the import chain still works under the test
+        # runner (``uv run pytest``).  Catches a future ``src/`` rename
+        # or ``LithosClient`` symbol move that would defeat the re-exec.
+        from influx.lithos_client import LithosClient  # noqa: F401
+
+
 def _record(
     *,
     timestamp: str,

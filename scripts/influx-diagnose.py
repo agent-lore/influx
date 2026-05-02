@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -537,6 +538,56 @@ def _read_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str:
     )
 
 
+def _ensure_project_runtime_or_reexec() -> None:
+    """Re-exec the script under ``uv run`` if project deps are missing.
+
+    The script is operator-facing and meant to be invoked as
+    ``./scripts/influx-diagnose.py …`` rather than
+    ``uv run scripts/influx-diagnose.py …``.  Read-only subcommands do
+    not import any project module, so the bare invocation works under
+    the system Python.  ``squatters --apply`` does need
+    ``influx.lithos_client``, which transitively pulls in ``mcp`` from
+    the project venv.
+
+    Detect the gap by attempting an import inside this current
+    interpreter.  If it fails, ``os.execvp`` ourselves under
+    ``uv run`` so the operator's argv reaches the venv-backed
+    interpreter unchanged.  No-op when the imports already succeed
+    (``uv run …`` invocation, or ``PYTHONPATH`` already set).
+    """
+    src_path = str(_repo_root() / "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+    try:
+        import influx.lithos_client  # noqa: F401
+
+        return  # already runnable
+    except ImportError:
+        pass
+
+    if not shutil.which("uv"):
+        sys.exit(
+            "Project dependencies are not importable and 'uv' is not on "
+            "PATH.  Install uv (https://docs.astral.sh/uv/) or run the "
+            f"script as: uv run {sys.argv[0]} {' '.join(sys.argv[1:])}"
+        )
+
+    if os.environ.get("INFLUX_DIAGNOSE_REEXECED") == "1":
+        # Defensive: avoid an infinite re-exec loop if uv run somehow
+        # still produces an environment without the project deps.
+        sys.exit(
+            "uv run did not provide importable project dependencies.  "
+            "Check that this directory contains a valid pyproject.toml + "
+            "uv.lock and that 'uv sync' has been run."
+        )
+
+    os.environ["INFLUX_DIAGNOSE_REEXECED"] = "1"
+    os.execvp(
+        "uv",
+        ["uv", "run", "--project", str(_repo_root()), sys.argv[0], *sys.argv[1:]],
+    )
+
+
 async def _delete_squatter(
     *,
     lithos_url: str,
@@ -544,8 +595,13 @@ async def _delete_squatter(
     agent: str,
     require_influx_authored: bool,
 ) -> tuple[bool, str]:
-    """Read-then-delete one squatter.  Returns ``(deleted, reason)``."""
-    # Imported lazily so the read-only invocation never pays the cost.
+    """Read-then-delete one squatter.  Returns ``(deleted, reason)``.
+
+    Caller is responsible for invoking
+    :func:`_ensure_project_runtime_or_reexec` before calling this — see
+    ``cmd_squatters``.  We don't re-check here because the import would
+    have already succeeded (or re-execed) at that point.
+    """
     from influx.lithos_client import LithosClient
 
     client = LithosClient(url=lithos_url)
@@ -629,6 +685,12 @@ def cmd_squatters(args: argparse.Namespace) -> int:
             "ensure it carries 'ingested-by:influx' before deletion."
         )
         return 0
+
+    # ``--apply`` needs the project deps (LithosClient → mcp).  Re-exec
+    # under ``uv run`` if we are not already in the project venv so the
+    # operator can keep using the bare ``./scripts/influx-diagnose.py``
+    # invocation without thinking about the runtime.
+    _ensure_project_runtime_or_reexec()
 
     confirmed: set[str] = set(args.yes or [])
     if args.yes_to_all:
