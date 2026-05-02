@@ -215,6 +215,37 @@ class TestIsDocNotFound:
         assert not _DIAGNOSE._is_doc_not_found("authentication failed")
 
 
+class TestSlugCollisionBacklog:
+    """``slug-collision-backlog`` reads the JSONL the daemon writes on #31 exhaust."""
+
+    def test_returns_empty_list_when_file_missing(self, tmp_path: Any) -> None:
+        assert _DIAGNOSE._read_slug_collision_backlog(tmp_path) == []
+
+    def test_reads_one_entry(self, tmp_path: Any) -> None:
+        path = tmp_path / "unresolved-slug-collisions.jsonl"
+        path.write_text(
+            '{"timestamp": "2026-05-02T13:00:00+00:00", '
+            '"run_id": "r-1", "profile": "staging-robotics", "source": "arxiv", '
+            '"source_url": "https://arxiv.org/abs/2604.28197", '
+            '"title": "OmniRobotHome", '
+            '"detail": "attempt=1 existing_id=doc-A"}\n',
+            encoding="utf-8",
+        )
+        entries = _DIAGNOSE._read_slug_collision_backlog(tmp_path)
+        assert len(entries) == 1
+        assert entries[0]["title"] == "OmniRobotHome"
+        assert entries[0]["profile"] == "staging-robotics"
+
+    def test_skips_malformed_lines(self, tmp_path: Any) -> None:
+        path = tmp_path / "unresolved-slug-collisions.jsonl"
+        path.write_text(
+            '{"title": "ok"}\nthis is not json\n\n{"title": "also ok"}\n',
+            encoding="utf-8",
+        )
+        entries = _DIAGNOSE._read_slug_collision_backlog(tmp_path)
+        assert [e["title"] for e in entries] == ["ok", "also ok"]
+
+
 class TestDeleteOutcomes:
     """The three outcome constants are stable and distinct."""
 

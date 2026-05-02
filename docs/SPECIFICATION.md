@@ -515,7 +515,7 @@ Backfills skip cache hits entirely. Scheduled/manual runs still attempt a write 
 - `created` / `updated`: success; note ID is used for LCMA hooks.
 - `duplicate`: treated as already-ingested.
 - `invalid_input`: logged and skipped.
-- `slug_collision`: retried once with a disambiguating title suffix.
+- `slug_collision`: retried with a chain of disambiguating title suffixes — `[arXiv <id>]`, `[arXiv <id> (2)]`, `[arXiv <id> (3)]`, … up to a cap (currently 5).  This self-heals the common case where stale Influx remnants squat one or more variants.  When every attempt collides the write is dropped, the chain's cumulative diagnostic (every `existing_id` from every attempt) is logged, and the entry is appended to `${storage.state_dir}/unresolved-slug-collisions.jsonl` for operator follow-up via `./scripts/influx-diagnose.py slug-collision-backlog`.
 - `version_conflict`: re-read existing note, merge tags, preserve `## User Notes`, merge Profile Relevance, then retry once.
 - `content_too_large`: drop `## Full Text` and retry. On a second failure, create-path writes are skipped; repair-path writes retry with Tier 1 only and `influx:repair-needed`.
 - Any other status (e.g. an undocumented `error` envelope): the response body's `reason` / `detail` / `error` / `message` field is captured into `WriteResult.detail` and a `WARNING`-level log is emitted with `lithos_status`, `source_url`, and `detail` so the failure is diagnosable from logs.
@@ -659,6 +659,8 @@ Metric instruments cover run lifecycle, the source funnel, write outcomes, and f
 | `influx_llm_validation_failures_total` | Counter | `profile`, `tier` (`1` \| `3`) |
 | `influx_archive_missing_total` | Counter | `profile`, `source` |
 | `influx_source_acquisition_errors_total` | Counter | `profile`, `source`, `kind` |
+| `influx_slug_collision_retries_total` | Counter | `attempt` (`"1"` … chain cap) |
+| `influx_slug_collision_unresolved_total` | Counter | `profile`, `source` |
 
 When `OTEL_EXPORTER_OTLP_ENDPOINT` is set the OTLP HTTP exporter is used. With `INFLUX_OTEL_CONSOLE_FALLBACK=true` and no endpoint configured, both spans and metrics are written to stdout for local development.
 

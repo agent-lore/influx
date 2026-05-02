@@ -884,6 +884,66 @@ def cmd_squatters(args: argparse.Namespace) -> int:
     return 0 if refused == 0 else 1
 
 
+def _read_slug_collision_backlog(state_dir: Path) -> list[dict[str, Any]]:
+    """Read ``state_dir/unresolved-slug-collisions.jsonl`` (#31 backlog).
+
+    Pure helper so unit tests can drive it without a Lithos client or
+    docker.  Mirrors ``RunLedger.unresolved_slug_collisions`` so this
+    script and the daemon agree on the on-disk format without taking
+    a runtime dependency on ``influx.run_ledger``.
+    """
+    path = state_dir / "unresolved-slug-collisions.jsonl"
+    if not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            entries.append(obj)
+    return entries
+
+
+def cmd_slug_collision_backlog(args: argparse.Namespace) -> int:
+    env = _load_env(args.env)
+    state = _state_dir(env)
+    entries = _read_slug_collision_backlog(state)
+    if not entries:
+        print(
+            f"No unresolved slug collisions found "
+            f"({state / 'unresolved-slug-collisions.jsonl'})."
+        )
+        return 0
+    print(
+        f"{len(entries)} unresolved slug collision(s) "
+        f"({state / 'unresolved-slug-collisions.jsonl'}):\n"
+    )
+    for entry in entries:
+        print(
+            f"  {entry.get('timestamp', '?')}  "
+            f"profile={entry.get('profile', '?')}  "
+            f"source={entry.get('source', '?')}  "
+            f"run_id={entry.get('run_id', '?')}"
+        )
+        print(f"      title={entry.get('title', '?')!r}")
+        print(f"      source_url={entry.get('source_url', '?')}")
+        detail = entry.get("detail", "")
+        if detail:
+            print(f"      detail={detail}")
+        print()
+    print(
+        "To clean up the squatters that caused these collisions, run:\n"
+        "    ./scripts/influx-diagnose.py squatters --apply --yes <doc-id>\n"
+        "(the doc ids are embedded in the 'detail' field above)."
+    )
+    return 0
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     env = _load_env(args.env)
     host = env.get("INFLUX_ADMIN_BIND_HOST", "127.0.0.1")
@@ -1040,6 +1100,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_squatters.set_defaults(func=cmd_squatters)
+
+    p_backlog = sub.add_parser(
+        "slug-collision-backlog",
+        help=(
+            "list unresolved slug collisions (the backlog of papers the "
+            "self-healing retry chain in lithos_client could not land)"
+        ),
+    )
+    p_backlog.set_defaults(func=cmd_slug_collision_backlog)
 
     p_cancel = sub.add_parser(
         "cancel",

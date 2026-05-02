@@ -157,3 +157,50 @@ def test_failed_run_has_degraded_false(tmp_path: Path) -> None:
     entry = ledger.recent()[0]
     assert entry["degraded"] is False
     assert entry["source_acquisition_errors"] == []
+
+
+def test_unresolved_slug_collisions_starts_empty(tmp_path: Path) -> None:
+    """Backlog read returns ``[]`` when the file does not yet exist."""
+    ledger = RunLedger(tmp_path / "state")
+    assert ledger.unresolved_slug_collisions() == []
+
+
+def test_record_unresolved_slug_collision_appends_entry(tmp_path: Path) -> None:
+    """One ``record_unresolved_slug_collision`` writes one structured line."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.record_unresolved_slug_collision(
+        profile="staging-robotics",
+        source="arxiv",
+        source_url="https://arxiv.org/abs/2604.28197",
+        title="OmniRobotHome",
+        detail="attempt=1 existing_id=doc-A; attempt=2 existing_id=doc-B",
+        run_id="run-xyz",
+    )
+    entries = ledger.unresolved_slug_collisions()
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["profile"] == "staging-robotics"
+    assert e["source"] == "arxiv"
+    assert e["source_url"] == "https://arxiv.org/abs/2604.28197"
+    assert e["title"] == "OmniRobotHome"
+    assert "doc-A" in e["detail"] and "doc-B" in e["detail"]
+    assert e["run_id"] == "run-xyz"
+    # Timestamp present and ISO-formatted.
+    assert "T" in e["timestamp"] and e["timestamp"].endswith(("Z", "+00:00"))
+
+
+def test_record_unresolved_slug_collision_is_append_only(tmp_path: Path) -> None:
+    """Multiple records accumulate; existing entries are not rewritten."""
+    ledger = RunLedger(tmp_path / "state")
+    for i in range(3):
+        ledger.record_unresolved_slug_collision(
+            profile="p",
+            source="arxiv",
+            source_url=f"https://arxiv.org/abs/2601.0000{i}",
+            title=f"paper-{i}",
+            detail=f"squatter-{i}",
+            run_id=f"run-{i}",
+        )
+    entries = ledger.unresolved_slug_collisions()
+    assert len(entries) == 3
+    assert [e["title"] for e in entries] == ["paper-0", "paper-1", "paper-2"]

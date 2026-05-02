@@ -1154,18 +1154,23 @@ class TestWriteEnvelopeSlugCollision:
         finally:
             await client.close()
 
-    async def test_second_slug_collision_skips(
+    async def test_exhausted_slug_collision_chain_skips(
         self,
         fake_lithos_url: str,
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
     ) -> None:
-        """Second slug_collision: skip item, no further retry."""
+        """Five consecutive slug_collisions: chain exhausted, skip item.
+
+        #31 self-heal: the original AC-05-D ""one suffix retry"" widened
+        to a chain of disambiguating numeric variants up to
+        ``_SLUG_COLLISION_MAX_ATTEMPTS``.  Only when every attempt
+        collides does the client return ``slug_collision`` to the caller.
+        """
+        from influx.lithos_client import _SLUG_COLLISION_MAX_ATTEMPTS
+
         fake_lithos_server.write_responses.extend(
-            [
-                '{"status": "slug_collision"}',
-                '{"status": "slug_collision"}',
-            ]
+            ['{"status": "slug_collision"}'] * (_SLUG_COLLISION_MAX_ATTEMPTS + 1)
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1179,28 +1184,28 @@ class TestWriteEnvelopeSlugCollision:
             )
             assert result.status == "slug_collision"
 
+            # Initial attempt + every retry up to the cap.  No retry beyond.
             write_calls = [
                 c for c in fake_lithos_server.calls if c[0] == "lithos_write"
             ]
-            assert len(write_calls) == 2  # No third attempt
+            assert len(write_calls) == 1 + _SLUG_COLLISION_MAX_ATTEMPTS
         finally:
             await client.close()
 
-    async def test_second_slug_collision_logs(
+    async def test_exhausted_slug_collision_chain_logs(
         self,
         fake_lithos_url: str,
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Second slug_collision: warning logged with source_url."""
+        """Exhausted chain logs ONE warning naming the source_url."""
         import logging
 
+        from influx.lithos_client import _SLUG_COLLISION_MAX_ATTEMPTS
+
         fake_lithos_server.write_responses.extend(
-            [
-                '{"status": "slug_collision"}',
-                '{"status": "slug_collision"}',
-            ]
+            ['{"status": "slug_collision"}'] * (_SLUG_COLLISION_MAX_ATTEMPTS + 1)
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1215,8 +1220,51 @@ class TestWriteEnvelopeSlugCollision:
                 )
             assert "slug_collision" in caplog.text
             assert "2601.88888" in caplog.text
+            # Operator-facing message must call out that the chain was
+            # exhausted, not just that ""retry failed"".
+            assert "exhausted" in caplog.text
         finally:
             await client.close()
+
+    async def test_numeric_suffix_retry_lands_when_first_squatter_alone(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """#31 self-heal: numeric variant succeeds when only ``[arXiv id]``
+        is squatted but ``[arXiv id (2)]`` is free.
+        """
+        fake_lithos_server.write_responses.extend(
+            [
+                # Initial unsuffixed write collides.
+                '{"status": "slug_collision"}',
+                # First retry with bare ``[arXiv …]`` collides too.
+                '{"status": "slug_collision"}',
+                # Second retry with ``(2)`` lands.
+                '{"status": "created", "id": "note-self-healed"}',
+            ]
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Self-Healed Slug",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.55555",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == "created"
+        write_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_write"]
+        # Three lithos_write calls in total: initial + two retries.
+        assert len(write_calls) == 3
+        # The third attempt must carry the ``(2)`` numeric suffix.
+        third_attempt_args = write_calls[2][1]
+        assert "(2)" in third_attempt_args["title"]
 
     async def test_slug_collision_envelope_surfaces_existing_id(
         self,
@@ -1224,31 +1272,27 @@ class TestWriteEnvelopeSlugCollision:
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
     ) -> None:
-        """``slug_collision`` envelope's ``existing_id`` and ``message``
-        round-trip into ``WriteResult.detail`` so the operator-facing
-        WARNING in scheduler.py names the squatting note rather than
-        logging an empty string (2026-05-02 staging incident).
+        """Exhausted slug_collision chain enumerates every squatter in detail.
+
+        After #30 the bare suffix retry surfaced ``existing_id`` from
+        the second collision; after #31 the chain extends to numeric
+        variants and the final ``WriteResult.detail`` enumerates every
+        squatter the chain encountered.
         """
-        fake_lithos_server.write_responses.extend(
-            [
-                # First attempt collides — lithos returns the diagnostic envelope.
-                (
-                    '{"status": "slug_collision",'
-                    ' "existing_id": "doc-squatter-123",'
-                    ' "message": "Slug \'omnirobothome-...\' already in use'
-                    " by document 'doc-squatter-123'\","
-                    ' "warnings": []}'
-                ),
-                # Suffix retry collides as well — same diagnostic shape.
-                (
-                    '{"status": "slug_collision",'
-                    ' "existing_id": "doc-squatter-456",'
-                    ' "message": "Slug \'omnirobothome-...-arxiv-2601-77777\''
-                    " already in use by document 'doc-squatter-456'\","
-                    ' "warnings": []}'
-                ),
-            ]
-        )
+        from influx.lithos_client import _SLUG_COLLISION_MAX_ATTEMPTS
+
+        # Every attempt collides — the chain of 1 + N envelopes drives
+        # the assertion that detail enumerates each squatter.
+        envelopes = []
+        for i in range(_SLUG_COLLISION_MAX_ATTEMPTS + 1):
+            envelopes.append(
+                f'{{"status": "slug_collision",'
+                f' "existing_id": "doc-squatter-{i:03d}",'
+                f' "message": "Slug \'sluga-{i}\' already in use'
+                f" by document 'doc-squatter-{i:03d}'\","
+                f' "warnings": []}}'
+            )
+        fake_lithos_server.write_responses.extend(envelopes)
         client = LithosClient(url=fake_lithos_url)
         try:
             result = await client.write_note(
@@ -1263,13 +1307,15 @@ class TestWriteEnvelopeSlugCollision:
             await client.close()
 
         assert result.status == "slug_collision"
-        # The diagnostic from the *retry* response wins (it is the value
-        # actually returned to the scheduler), and it must include both
-        # the colliding doc id and lithos's human-readable message.
+        # The chained detail must enumerate every squatter encountered
+        # so the operator-facing WARNING (and the unresolved-collision
+        # backlog) carry every doc-id worth cleaning up in one pass.
         assert result.detail
-        assert "doc-squatter-456" in result.detail
-        assert "existing_id=" in result.detail
-        assert "already in use" in result.detail
+        for i in range(1, _SLUG_COLLISION_MAX_ATTEMPTS + 1):
+            assert f"doc-squatter-{i:03d}" in result.detail, (
+                f"missing squatter from attempt {i} in detail: {result.detail}"
+            )
+            assert f"attempt={i}" in result.detail
 
 
 # ── Write envelopes — version_conflict (FR-MCP-7, AC-05-E) ────────

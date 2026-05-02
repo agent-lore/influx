@@ -102,17 +102,44 @@ class WriteResult:
 _ARXIV_ID_RE = re.compile(r"arxiv\.org/abs/([^\s?#]+)")
 
 
-def _extract_slug_suffix(source_url: str) -> str:
+# Cap on the number of disambiguating-suffix attempts ``_retry_slug_collision``
+# will make before giving up and returning ``slug_collision`` to the
+# scheduler.  Five was chosen empirically: even one squatted slug per
+# paper is rare; five squatters for the same paper requires either a
+# hand-curated collision (intentional) or a deeply pathological
+# previous-Influx-state (operator backlog territory).  Tunable via
+# ``[resilience].slug_collision_max_attempts`` in a follow-up if real
+# usage needs it.
+_SLUG_COLLISION_MAX_ATTEMPTS = 5
+
+
+def _extract_slug_suffix(source_url: str, *, attempt: int = 1) -> str:
     """Compute disambiguating title suffix for slug_collision retry.
 
     arXiv URLs get `` [arXiv <id>]``; all others get `` [<host>]``
     (FR-MCP-7, AC-05-D).
+
+    *attempt* selects between successive disambiguating variants used
+    by :meth:`LithosClient._retry_slug_collision`:
+
+    * ``attempt=1`` → bare suffix (the original AC-05-D form).
+    * ``attempt>=2`` → suffix with ``(N)`` appended, e.g.
+      `` [arXiv 2604.28197 (2)]``, so the slug becomes
+      ``…-arxiv-260428197-2``.
+
+    The numeric variant is what makes #31 self-healing: when the bare
+    suffix is also squatted (typically by a stale Influx remnant from
+    an earlier abandoned write), the next attempt's slug is distinct.
     """
     m = _ARXIV_ID_RE.search(source_url)
     if m:
-        return f" [arXiv {m.group(1)}]"
-    host = urlparse(source_url).hostname or urlparse(source_url).netloc
-    return f" [{host}]"
+        base = f"arXiv {m.group(1)}"
+    else:
+        host = urlparse(source_url).hostname or urlparse(source_url).netloc
+        base = host
+    if attempt <= 1:
+        return f" [{base}]"
+    return f" [{base} ({attempt})]"
 
 
 def _merge_tags(existing_tags: list[str], new_tags: list[str]) -> list[str]:
@@ -481,17 +508,57 @@ class LithosClient:
         *,
         source_url: str,
     ) -> WriteResult:
-        """Retry once with a disambiguating title suffix (AC-05-D)."""
-        suffix = _extract_slug_suffix(source_url)
-        retry_args = {**args, "title": args["title"] + suffix}
-        result = await self.call_tool("lithos_write", retry_args)
-        parsed = self._parse_write_response(result, source_url=source_url)
-        if parsed.status == "slug_collision":
-            logger.warning(
-                "lithos_write slug_collision retry failed for %s",
-                source_url,
-            )
-        return parsed
+        """Retry with disambiguating title suffixes until one lands (#31).
+
+        Chain of attempts:
+
+        1. ``[arXiv <id>]`` (the original AC-05-D suffix).
+        2. ``[arXiv <id> (2)]``, ``[arXiv <id> (3)]``, … up to
+           :data:`_SLUG_COLLISION_MAX_ATTEMPTS`.
+
+        Self-heals the common case where a stale Influx remnant
+        squats both the unsuffixed and suffixed slugs (#31, observed
+        live in staging on 2026-05-02 with arXiv 2604.28197).  When
+        every variant collides we still return ``slug_collision`` so
+        the scheduler can record the unresolved write to its local
+        backlog file; lazy-imported here to avoid a metrics ↔ client
+        cycle.
+        """
+        from influx import metrics
+
+        original_title = args["title"]
+        details: list[str] = []
+        last_parsed: WriteResult | None = None
+        for attempt in range(1, _SLUG_COLLISION_MAX_ATTEMPTS + 1):
+            suffix = _extract_slug_suffix(source_url, attempt=attempt)
+            retry_args = {**args, "title": original_title + suffix}
+            metrics.slug_collision_retries().add(1, {"attempt": str(attempt)})
+            result = await self.call_tool("lithos_write", retry_args)
+            parsed = self._parse_write_response(result, source_url=source_url)
+            last_parsed = parsed
+            if parsed.status != "slug_collision":
+                # Either the write landed (created / updated / duplicate /
+                # other terminal status) or hit a different envelope we
+                # should not auto-recover from here.  Return immediately.
+                return parsed
+            if parsed.detail:
+                details.append(f"attempt={attempt} {parsed.detail}")
+        # All attempts exhausted.  Compose a detail string that names
+        # every squatter the chain encountered so the operator-facing
+        # WARNING in scheduler.py can trigger cleanup of all of them in
+        # one pass (mirrors #32's intent for the chained case).
+        logger.warning(
+            "lithos_write slug_collision exhausted %d retries for %s",
+            _SLUG_COLLISION_MAX_ATTEMPTS,
+            source_url,
+        )
+        assert last_parsed is not None
+        # Preserve the WriteResult shape but enrich detail with the
+        # full attempt chain.  ``WriteResult`` is frozen, so rebuild.
+        return dataclasses.replace(
+            last_parsed,
+            detail="; ".join(details) if details else last_parsed.detail,
+        )
 
     # ── Version-conflict retry (AC-05-E) ────────────────────────────
 

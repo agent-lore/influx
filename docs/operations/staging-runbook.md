@@ -228,12 +228,21 @@ relies on `docker logs` (and `influx-diagnose.py`) for log inspection.
 
 ## 8. Cleaning up slug-collision squatters
 
-When ``lithos_write`` returns ``slug_collision`` and the suffix retry
-also fails, Influx logs a WARNING but otherwise drops the article.
-The same paper will hit the same collision on every subsequent sweep
-until the squatting Lithos document is removed (see
-[#31](https://github.com/agent-lore/influx/issues/31) for the planned
-self-healing path).
+`lithos_write` collisions self-heal via a chain of disambiguating
+title suffixes (`[arXiv <id>]`, `[arXiv <id> (2)]`, `[arXiv <id> (3)]`,
+… up to 5 attempts).  Most collisions are caught and recovered
+silently; only when every variant is squatted does Influx drop the
+article and log a WARNING.  These exhaust cases are also persisted to
+`${storage.state_dir}/unresolved-slug-collisions.jsonl`:
+
+```bash
+# Operator-friendly view of the backlog (read-only).
+./scripts/influx-diagnose.py --env staging slug-collision-backlog
+```
+
+Each backlog entry carries the `detail` field from the exhausted
+chain — every squatting `existing_id` is listed so a single cleanup
+pass via `squatters --apply` can remove all of them.
 
 The ``squatters`` subcommand surfaces them and offers a confirmed
 deletion path:

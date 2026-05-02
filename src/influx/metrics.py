@@ -45,6 +45,8 @@ __all__ = [
     "run_completions",
     "run_duration",
     "run_starts",
+    "slug_collision_retries",
+    "slug_collision_unresolved",
     "source_acquisition_errors",
 ]
 
@@ -184,6 +186,47 @@ def archive_missing() -> Any:
     return get_meter().counter(
         "influx_archive_missing_total",
         description="Items tagged influx:archive-missing during a run.",
+    )
+
+
+def slug_collision_retries() -> Any:
+    """Counter of slug-collision retry attempts (#31).
+
+    Increments once per ``lithos_write`` retry triggered by a
+    ``slug_collision`` envelope.  ``attempt`` is the 1-indexed attempt
+    number within the retry chain — ``attempt=2`` and above mean the
+    self-healing numeric suffix path was needed.
+
+    Labels: ``attempt`` (``"1"`` | ``"2"`` | ... up to the chain cap).
+    Profile is intentionally omitted: collision pressure tracks the
+    Lithos slug space, not the calling profile.
+    """
+    return get_meter().counter(
+        "influx_slug_collision_retries_total",
+        description=(
+            "lithos_write retries triggered by slug_collision envelopes, "
+            "broken down by attempt number in the retry chain"
+        ),
+    )
+
+
+def slug_collision_unresolved() -> Any:
+    """Counter of slug collisions that exhausted the retry chain (#31).
+
+    A non-zero value here means even the numeric-suffix self-heal
+    failed and a paper was *permanently* dropped from this run.  The
+    scheduler also persists each unresolved entry to the local backlog
+    file (see :class:`influx.run_ledger.RunLedger` for sibling layout)
+    so operators can intervene.
+
+    Labels: ``profile``, ``source``.
+    """
+    return get_meter().counter(
+        "influx_slug_collision_unresolved_total",
+        description=(
+            "slug collisions that exhausted the retry chain and dropped "
+            "the incoming write"
+        ),
     )
 
 

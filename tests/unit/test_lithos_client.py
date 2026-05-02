@@ -76,3 +76,53 @@ class TestListNotes:
             "lithos_list",
             {"tags": ["influx:repair-needed", "profile:staging-ai"], "limit": 25},
         )
+
+
+class TestExtractSlugSuffixAttempt:
+    """``_extract_slug_suffix`` produces distinct slugs across attempts (#31)."""
+
+    def test_attempt_1_is_bare_suffix(self) -> None:
+        from influx.lithos_client import _extract_slug_suffix
+
+        assert (
+            _extract_slug_suffix("https://arxiv.org/abs/2604.28197", attempt=1)
+            == " [arXiv 2604.28197]"
+        )
+
+    def test_attempt_2_appends_numeric_marker(self) -> None:
+        from influx.lithos_client import _extract_slug_suffix
+
+        assert (
+            _extract_slug_suffix("https://arxiv.org/abs/2604.28197", attempt=2)
+            == " [arXiv 2604.28197 (2)]"
+        )
+
+    def test_attempt_higher_appends_n(self) -> None:
+        from influx.lithos_client import _extract_slug_suffix
+
+        assert (
+            _extract_slug_suffix("https://arxiv.org/abs/2604.28197", attempt=5)
+            == " [arXiv 2604.28197 (5)]"
+        )
+
+    def test_non_arxiv_uses_host(self) -> None:
+        from influx.lithos_client import _extract_slug_suffix
+
+        assert (
+            _extract_slug_suffix("https://example.com/article", attempt=1)
+            == " [example.com]"
+        )
+        assert (
+            _extract_slug_suffix("https://example.com/article", attempt=2)
+            == " [example.com (2)]"
+        )
+
+    def test_default_attempt_is_one(self) -> None:
+        from influx.lithos_client import _extract_slug_suffix
+
+        # Backwards compat: callers that don't pass ``attempt`` get the
+        # original AC-05-D behaviour.
+        assert (
+            _extract_slug_suffix("https://arxiv.org/abs/2604.28197")
+            == " [arXiv 2604.28197]"
+        )

@@ -35,6 +35,18 @@ class RunLedger:
     def active_path(self) -> Path:
         return self.state_dir / "active-runs.json"
 
+    @property
+    def unresolved_slug_collisions_path(self) -> Path:
+        """JSONL of slug collisions that exhausted ``_retry_slug_collision`` (#31).
+
+        Each line is one entry with ``timestamp``, ``run_id``,
+        ``profile``, ``source``, ``source_url``, ``title``, ``detail``.
+        Append-only; the ``squatters`` diagnose subcommand consumes it
+        so an operator can see every still-unresolved collision in one
+        place rather than scraping log buffers.
+        """
+        return self.state_dir / "unresolved-slug-collisions.jsonl"
+
     def start(
         self,
         *,
@@ -105,6 +117,71 @@ class RunLedger:
             degraded=False,
             source_acquisition_errors=[],
         )
+
+    def record_unresolved_slug_collision(
+        self,
+        *,
+        profile: str,
+        source: str,
+        source_url: str,
+        title: str,
+        detail: str,
+        run_id: str,
+    ) -> None:
+        """Append one unresolved slug-collision entry to the backlog (#31).
+
+        Called by the scheduler when ``_retry_slug_collision`` exhausts
+        its chain.  Each entry is a self-contained JSON object so the
+        diagnose script can stream the file without parsing run-ledger
+        context.  Best-effort: a write error is logged but does not
+        propagate, mirroring the run-ledger discipline.
+        """
+        entry = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "run_id": run_id,
+            "profile": profile,
+            "source": source,
+            "source_url": source_url,
+            "title": title,
+            "detail": detail,
+        }
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            with self.unresolved_slug_collisions_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, sort_keys=True) + "\n")
+        except OSError:
+            logger.warning(
+                "failed to append unresolved slug-collision entry",
+                exc_info=True,
+            )
+
+    def unresolved_slug_collisions(self) -> list[dict[str, Any]]:
+        """Return every unresolved slug-collision entry from the backlog (#31).
+
+        Newest-last to match the on-disk order.  Returns an empty list
+        when the backlog file does not yet exist.
+        """
+        path = self.unresolved_slug_collisions_path
+        if not path.exists():
+            return []
+        entries: list[dict[str, Any]] = []
+        try:
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    entries.append(obj)
+        except OSError:
+            logger.warning(
+                "failed to read unresolved slug-collision backlog",
+                exc_info=True,
+            )
+        return entries
 
     def active_runs(self) -> list[RunEntry]:
         """Return currently active runs ordered by start time."""
