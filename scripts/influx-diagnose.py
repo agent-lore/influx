@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -504,20 +505,46 @@ def _print_squatter(entry: dict[str, Any]) -> None:
         print(f"   colliding title={title!r}")
 
 
+def _running_inside_docker() -> bool:
+    """Detect whether we're inside a docker container.
+
+    The ``[lithos] url`` in ``influx.toml`` resolves
+    ``host.docker.internal`` to the docker host from inside the influx
+    container, but that hostname is not resolvable on the host.  When
+    the script is invoked from the host we have to swap in the
+    loopback address that the docker port mapping exposes.
+    """
+    return Path("/.dockerenv").exists()
+
+
+def _rewrite_url_for_host(url: str) -> str:
+    """Substitute ``host.docker.internal`` → ``127.0.0.1`` when on the host.
+
+    Operator-friendly default: the staging / dev influx.toml stores the
+    URL the **container** uses (``host.docker.internal:<port>``), so the
+    bare diagnose script invoked from the host would otherwise fail with
+    a DNS error.  Pass ``--lithos-url`` to override this rewrite.
+    """
+    if _running_inside_docker():
+        return url
+    if "host.docker.internal" not in url:
+        return url
+    return url.replace("host.docker.internal", "127.0.0.1")
+
+
 def _read_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str:
     """Resolve the Lithos MCP/SSE URL for ``--apply`` mode.
 
     Resolution order:
-      1. ``--lithos-url`` CLI flag (explicit override).
-      2. ``LITHOS_URL`` env var on the host.
-      3. ``[lithos] url`` in ``${INFLUX_DATA_PATH}/influx.toml``.
+      1. ``--lithos-url`` CLI flag (explicit override; never rewritten).
+      2. ``LITHOS_URL`` env var on the host (rewritten if needed).
+      3. ``[lithos] url`` in ``${INFLUX_DATA_PATH}/influx.toml``
+         (rewritten if needed — see :func:`_rewrite_url_for_host`).
     """
     if getattr(args, "lithos_url", None):
         return str(args.lithos_url)
-    import os
-
     if "LITHOS_URL" in os.environ:
-        return os.environ["LITHOS_URL"]
+        return _rewrite_url_for_host(os.environ["LITHOS_URL"])
     data_path = env.get("INFLUX_DATA_PATH")
     if data_path:
         toml_path = Path(data_path) / "influx.toml"
@@ -530,11 +557,145 @@ def _read_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str:
                 cfg = tomllib.load(fh)
             url = cfg.get("lithos", {}).get("url")
             if isinstance(url, str) and url:
-                return url
+                rewritten = _rewrite_url_for_host(url)
+                if rewritten != url:
+                    print(
+                        f"note: rewrote container-only host "
+                        f"{url!r} -> {rewritten!r} for host invocation; "
+                        "pass --lithos-url to override"
+                    )
+                return rewritten
     sys.exit(
         "Lithos URL not resolved.  Pass --lithos-url, set $LITHOS_URL, "
         "or ensure [lithos] url is set in $INFLUX_DATA_PATH/influx.toml."
     )
+
+
+def _summarise_doc_for_refusal(doc: dict[str, Any]) -> str:
+    """Concise one-line preview of a Lithos doc for the safety-check refusal.
+
+    The operator needs four signals to triage a non-Influx-authored
+    squatter without a separate ``lithos_read`` round trip: the
+    title, the source URL (if any), the ingester / author tag, and
+    the full tag list.  Render those compactly on a single message.
+    """
+    title = str(doc.get("title") or "(no title)")[:80]
+    source_url = str(doc.get("source_url") or "")
+    tags = list(doc.get("tags") or [])
+    author = str(doc.get("author") or "")
+    ingester = next(
+        (t.split(":", 1)[1] for t in tags if t.startswith("ingested-by:")),
+        "(no ingested-by tag)",
+    )
+    parts = [
+        f"title={title!r}",
+        f"author={author!r}" if author else None,
+        f"ingested_by={ingester}",
+        f"source_url={source_url}" if source_url else None,
+        f"tags={tags}",
+    ]
+    return " ".join(p for p in parts if p)
+
+
+def _format_exception_chain(exc: BaseException) -> str:
+    """Render an exception (and its causes / sub-exceptions) compactly.
+
+    The MCP client uses ``anyio`` task groups under the hood, so a
+    transport-level failure surfaces as
+    ``ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)``
+    by default — the actual diagnostic (DNS error, connection refused)
+    lives inside ``exc.exceptions[0]``.  Walk the chain and surface
+    every distinct ``type(exc).__name__: <str>`` so the operator can
+    diagnose without re-running with ``--verbose``.
+    """
+    seen: list[str] = []
+
+    def _walk(e: BaseException) -> None:
+        rendered = f"{type(e).__name__}: {e}"
+        if rendered not in seen:
+            seen.append(rendered)
+        # ExceptionGroup (PEP 654) carries siblings on .exceptions
+        sub = getattr(e, "exceptions", None)
+        if isinstance(sub, (list, tuple)):
+            for child in sub:
+                if isinstance(child, BaseException):
+                    _walk(child)
+        # Regular cause / context chain
+        for nxt in (e.__cause__, e.__context__):
+            if isinstance(nxt, BaseException):
+                _walk(nxt)
+
+    _walk(exc)
+    # Cap the rendered chain so a deep cause stack stays readable.
+    return " | ".join(seen[:6])
+
+
+def _ensure_project_runtime_or_reexec() -> None:
+    """Re-exec the script under ``uv run`` if project deps are missing.
+
+    The script is operator-facing and meant to be invoked as
+    ``./scripts/influx-diagnose.py …`` rather than
+    ``uv run scripts/influx-diagnose.py …``.  Read-only subcommands do
+    not import any project module, so the bare invocation works under
+    the system Python.  ``squatters --apply`` does need
+    ``influx.lithos_client``, which transitively pulls in ``mcp`` from
+    the project venv.
+
+    Detect the gap by attempting an import inside this current
+    interpreter.  If it fails, ``os.execvp`` ourselves under
+    ``uv run`` so the operator's argv reaches the venv-backed
+    interpreter unchanged.  No-op when the imports already succeed
+    (``uv run …`` invocation, or ``PYTHONPATH`` already set).
+    """
+    src_path = str(_repo_root() / "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+    try:
+        import influx.lithos_client  # noqa: F401
+
+        return  # already runnable
+    except ImportError:
+        pass
+
+    if not shutil.which("uv"):
+        sys.exit(
+            "Project dependencies are not importable and 'uv' is not on "
+            "PATH.  Install uv (https://docs.astral.sh/uv/) or run the "
+            f"script as: uv run {sys.argv[0]} {' '.join(sys.argv[1:])}"
+        )
+
+    if os.environ.get("INFLUX_DIAGNOSE_REEXECED") == "1":
+        # Defensive: avoid an infinite re-exec loop if uv run somehow
+        # still produces an environment without the project deps.
+        sys.exit(
+            "uv run did not provide importable project dependencies.  "
+            "Check that this directory contains a valid pyproject.toml + "
+            "uv.lock and that 'uv sync' has been run."
+        )
+
+    os.environ["INFLUX_DIAGNOSE_REEXECED"] = "1"
+    os.execvp(
+        "uv",
+        ["uv", "run", "--project", str(_repo_root()), sys.argv[0], *sys.argv[1:]],
+    )
+
+
+# Outcomes for ``_delete_squatter``.  Distinguishing ``already_gone``
+# from ``refused`` matters: a doc that vanished between scan and delete
+# (e.g. cleaned up by a parallel run, or by the operator outside this
+# script) is effectively the success state for our caller, not a fault
+# requiring intervention.
+DELETE_OK = "deleted"
+DELETE_ALREADY_GONE = "already_gone"
+DELETE_REFUSED = "refused"
+
+
+def _is_doc_not_found(message: str) -> bool:
+    """Match Lithos's ``doc_not_found`` shapes from delete + read paths."""
+    if not message:
+        return False
+    needle = message.lower()
+    return "document not found" in needle or "doc_not_found" in needle
 
 
 async def _delete_squatter(
@@ -543,25 +704,44 @@ async def _delete_squatter(
     doc_id: str,
     agent: str,
     require_influx_authored: bool,
-) -> tuple[bool, str]:
-    """Read-then-delete one squatter.  Returns ``(deleted, reason)``."""
-    # Imported lazily so the read-only invocation never pays the cost.
+) -> tuple[str, str]:
+    """Read-then-delete one squatter.
+
+    Returns ``(outcome, reason)`` where ``outcome`` is one of
+    :data:`DELETE_OK`, :data:`DELETE_ALREADY_GONE`, or
+    :data:`DELETE_REFUSED`.  The caller is responsible for invoking
+    :func:`_ensure_project_runtime_or_reexec` first — see
+    ``cmd_squatters``.
+    """
     from influx.lithos_client import LithosClient
 
     client = LithosClient(url=lithos_url)
     try:
         try:
             doc = await client.read_note(note_id=doc_id)
-        except Exception as exc:  # noqa: BLE001
-            return False, f"read failed: {type(exc).__name__}: {exc}"
+        except BaseException as exc:  # noqa: BLE001
+            chain = _format_exception_chain(exc)
+            if _is_doc_not_found(chain):
+                # The doc vanished before we could even read it — most
+                # likely a parallel cleanup or out-of-band delete.
+                # Effective success for our caller.
+                return DELETE_ALREADY_GONE, "doc not found at read time"
+            return DELETE_REFUSED, f"read failed: {chain}"
 
         tags = list(doc.get("tags") or [])
         if require_influx_authored and "ingested-by:influx" not in tags:
+            # Surface enough of the doc to let the operator decide
+            # whether the squatter is an old Influx note that just lost
+            # its tag (safe to delete after manual review) or a genuine
+            # user/other-agent note (must NOT be deleted).
+            preview = _summarise_doc_for_refusal(doc)
             return (
-                False,
-                "refused: doc is not influx-authored "
-                "(missing 'ingested-by:influx' tag); "
-                "pass --no-require-influx-authored to override",
+                DELETE_REFUSED,
+                "doc is not influx-authored "
+                "(missing 'ingested-by:influx' tag).  "
+                f"Preview: {preview}  "
+                "If safe to delete after review, re-run with "
+                "--no-require-influx-authored.",
             )
 
         try:
@@ -569,19 +749,25 @@ async def _delete_squatter(
                 "lithos_delete",
                 {"id": doc_id, "agent": agent},
             )
-        except Exception as exc:  # noqa: BLE001
-            return False, f"delete failed: {type(exc).__name__}: {exc}"
+        except BaseException as exc:  # noqa: BLE001
+            return DELETE_REFUSED, f"delete failed: {_format_exception_chain(exc)}"
 
-        # Lithos returns either the bare success envelope or an error
-        # envelope with ``status="error"``; surface either back to the
-        # caller for printing.
+        # Lithos returns either a success envelope or an error envelope
+        # with ``status="error"`` (and ``code`` / ``message``).  The
+        # ``doc_not_found`` shape happens when the read succeeded but
+        # the doc was deleted between the read and the delete — treat
+        # that as ``already_gone`` rather than ``refused``.
         try:
             body = json.loads(result.content[0].text)  # type: ignore[union-attr]
         except (AttributeError, IndexError, TypeError, json.JSONDecodeError):
             body = {"status": "deleted"}
         if body.get("status") == "error":
-            return False, f"lithos_delete error: {body.get('message', body)}"
-        return True, "deleted"
+            code = body.get("code", "")
+            message = body.get("message", body)
+            if code == "doc_not_found" or _is_doc_not_found(str(message)):
+                return DELETE_ALREADY_GONE, "doc not found at delete time"
+            return DELETE_REFUSED, f"lithos_delete error: {message}"
+        return DELETE_OK, "deleted"
     finally:
         await client.close()
 
@@ -630,6 +816,12 @@ def cmd_squatters(args: argparse.Namespace) -> int:
         )
         return 0
 
+    # ``--apply`` needs the project deps (LithosClient → mcp).  Re-exec
+    # under ``uv run`` if we are not already in the project venv so the
+    # operator can keep using the bare ``./scripts/influx-diagnose.py``
+    # invocation without thinking about the runtime.
+    _ensure_project_runtime_or_reexec()
+
     confirmed: set[str] = set(args.yes or [])
     if args.yes_to_all:
         confirmed.update(squatters.keys())
@@ -656,9 +848,10 @@ def cmd_squatters(args: argparse.Namespace) -> int:
     import asyncio
 
     deleted = 0
+    already_gone = 0
     refused = 0
     for doc_id in sorted(confirmed):
-        deleted_ok, reason = asyncio.run(
+        outcome, reason = asyncio.run(
             _delete_squatter(
                 lithos_url=lithos_url,
                 doc_id=doc_id,
@@ -666,15 +859,28 @@ def cmd_squatters(args: argparse.Namespace) -> int:
                 require_influx_authored=not args.no_require_influx_authored,
             )
         )
-        if deleted_ok:
-            print(f"DELETED  doc_id={doc_id}  ({reason})")
+        if outcome == DELETE_OK:
+            print(f"DELETED      doc_id={doc_id}  ({reason})")
             deleted += 1
+        elif outcome == DELETE_ALREADY_GONE:
+            # Effective success — the squatter is no longer in Lithos.
+            # Logged separately so a parallel cleanup is observable.
+            print(f"ALREADY GONE doc_id={doc_id}  ({reason})")
+            already_gone += 1
         else:
-            print(f"REFUSED  doc_id={doc_id}  reason={reason}")
+            print(f"REFUSED      doc_id={doc_id}  reason={reason}")
             refused += 1
 
     print()
-    print(f"Summary: deleted={deleted} refused={refused}")
+    print(f"Summary: deleted={deleted} already_gone={already_gone} refused={refused}")
+    if already_gone:
+        print(
+            "Note: 'already gone' squatters are still surfacing because the "
+            "log scan reads historical WARNINGs from the docker buffer; the "
+            "doc itself has been removed from Lithos.  The next sweep will "
+            "either succeed cleanly or surface a fresh squatter."
+        )
+    # Exit non-zero only on genuine refusals; ``already_gone`` is success.
     return 0 if refused == 0 else 1
 
 

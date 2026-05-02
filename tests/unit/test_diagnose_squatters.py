@@ -58,6 +58,189 @@ class TestNormaliseSince:
         assert _normalise_since("7D") == "168h"
 
 
+class TestDirectInvocationImports:
+    """``./scripts/influx-diagnose.py --apply`` must work without uv run.
+
+    The squatter delete path imports ``influx.lithos_client``, which
+    transitively pulls in ``mcp`` from the project venv.  When the
+    script is invoked as ``./scripts/influx-diagnose.py …`` (system
+    Python, no venv on sys.path), neither symbol is importable.
+
+    ``_ensure_project_runtime_or_reexec`` detects the gap and
+    ``os.execvp``-replaces this process under ``uv run`` so the
+    operator's argv reaches the venv-backed interpreter unchanged.
+    These tests pin the helper's contract so a future refactor cannot
+    silently regress to the original ``ModuleNotFoundError`` shape that
+    bit the 2026-05-02 incident.
+    """
+
+    def test_helper_exists_and_attempts_import_then_reexec(self) -> None:
+        import inspect
+
+        assert hasattr(_DIAGNOSE, "_ensure_project_runtime_or_reexec")
+        source = inspect.getsource(_DIAGNOSE._ensure_project_runtime_or_reexec)
+        # Must try the import first ...
+        assert "import influx.lithos_client" in source
+        # ... and re-exec via uv run when it fails.
+        assert "os.execvp" in source
+        assert '"uv"' in source and '"run"' in source
+
+    def test_helper_is_called_from_apply_path_in_cmd_squatters(self) -> None:
+        import inspect
+
+        source = inspect.getsource(_DIAGNOSE.cmd_squatters)
+        # The call must live AFTER the read-only return so dry-run
+        # invocations never trigger a ``uv run`` re-exec.
+        assert "_ensure_project_runtime_or_reexec" in source
+        idx_dry_return = source.index("return 0")
+        idx_reexec = source.index("_ensure_project_runtime_or_reexec")
+        assert idx_reexec > idx_dry_return, (
+            "_ensure_project_runtime_or_reexec must be called only on "
+            "the --apply path, not for read-only scans"
+        )
+
+    def test_helper_avoids_infinite_reexec_loop(self) -> None:
+        import inspect
+
+        source = inspect.getsource(_DIAGNOSE._ensure_project_runtime_or_reexec)
+        assert "INFLUX_DIAGNOSE_REEXECED" in source, (
+            "the helper must guard against an infinite re-exec loop "
+            "if uv run somehow yields an environment without the deps"
+        )
+
+    def test_lithos_client_importable_under_uv_run(self) -> None:
+        # Sanity check that the import chain still works under the test
+        # runner (``uv run pytest``).  Catches a future ``src/`` rename
+        # or ``LithosClient`` symbol move that would defeat the re-exec.
+        from influx.lithos_client import LithosClient  # noqa: F401
+
+
+class TestRewriteUrlForHost:
+    """``host.docker.internal`` is unresolvable from the host."""
+
+    def test_rewrites_host_docker_internal_when_not_in_docker(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(_DIAGNOSE, "_running_inside_docker", lambda: False)
+        assert (
+            _DIAGNOSE._rewrite_url_for_host("http://host.docker.internal:8766/sse")
+            == "http://127.0.0.1:8766/sse"
+        )
+
+    def test_no_rewrite_when_inside_docker(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(_DIAGNOSE, "_running_inside_docker", lambda: True)
+        assert (
+            _DIAGNOSE._rewrite_url_for_host("http://host.docker.internal:8766/sse")
+            == "http://host.docker.internal:8766/sse"
+        )
+
+    def test_no_rewrite_for_unrelated_urls(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(_DIAGNOSE, "_running_inside_docker", lambda: False)
+        assert (
+            _DIAGNOSE._rewrite_url_for_host("http://lithos.internal:8765/sse")
+            == "http://lithos.internal:8765/sse"
+        )
+        assert (
+            _DIAGNOSE._rewrite_url_for_host("http://127.0.0.1:8766/sse")
+            == "http://127.0.0.1:8766/sse"
+        )
+
+
+class TestFormatExceptionChain:
+    """Anyio TaskGroup exceptions hide the actual cause; we unwrap them."""
+
+    def test_plain_exception(self) -> None:
+        try:
+            raise ValueError("nope")
+        except ValueError as exc:
+            rendered = _DIAGNOSE._format_exception_chain(exc)
+        assert rendered == "ValueError: nope"
+
+    def test_unwraps_exception_group(self) -> None:
+        # Mimic the anyio TaskGroup wrap shape:
+        #   ExceptionGroup(..., [ConnectionRefusedError(...), ...])
+        cause = ConnectionRefusedError("connect failed: 111")
+        group = BaseExceptionGroup(
+            "unhandled errors in a TaskGroup",
+            [cause],
+        )
+        rendered = _DIAGNOSE._format_exception_chain(group)
+        assert "ConnectionRefusedError" in rendered
+        assert "connect failed: 111" in rendered
+
+    def test_unwraps_chained_cause(self) -> None:
+        try:
+            try:
+                raise OSError("dns lookup failed: host.docker.internal")
+            except OSError as inner:
+                raise RuntimeError("transport setup failed") from inner
+        except RuntimeError as exc:
+            rendered = _DIAGNOSE._format_exception_chain(exc)
+        assert "RuntimeError: transport setup failed" in rendered
+        assert "OSError: dns lookup failed: host.docker.internal" in rendered
+
+    def test_summarise_doc_for_refusal_renders_useful_signals(self) -> None:
+        doc = {
+            "title": "OmniRobotHome: A Multi-Camera Platform",
+            "source_url": "https://arxiv.org/abs/2604.28197",
+            "author": "operator@example.com",
+            "tags": ["profile:staging-robotics", "source:arxiv", "ingested-by:loom"],
+        }
+        rendered = _DIAGNOSE._summarise_doc_for_refusal(doc)
+        assert "OmniRobotHome" in rendered
+        assert "operator@example.com" in rendered
+        assert "ingested_by=loom" in rendered
+        assert "https://arxiv.org/abs/2604.28197" in rendered
+
+    def test_summarise_doc_for_refusal_handles_missing_fields(self) -> None:
+        rendered = _DIAGNOSE._summarise_doc_for_refusal({})
+        assert "(no title)" in rendered
+        assert "(no ingested-by tag)" in rendered
+
+
+class TestIsDocNotFound:
+    """Match Lithos's ``doc_not_found`` message variants."""
+
+    def test_matches_lithos_message(self) -> None:
+        assert _DIAGNOSE._is_doc_not_found(
+            "Document not found: 006bbcb8-ee01-4616-aa43-473f292eba0e"
+        )
+
+    def test_matches_envelope_code(self) -> None:
+        assert _DIAGNOSE._is_doc_not_found("error code=doc_not_found")
+
+    def test_negative_cases(self) -> None:
+        assert not _DIAGNOSE._is_doc_not_found("")
+        assert not _DIAGNOSE._is_doc_not_found("connection refused")
+        assert not _DIAGNOSE._is_doc_not_found("authentication failed")
+
+
+class TestDeleteOutcomes:
+    """The three outcome constants are stable and distinct."""
+
+    def test_outcome_constants_distinct(self) -> None:
+        outcomes = {
+            _DIAGNOSE.DELETE_OK,
+            _DIAGNOSE.DELETE_ALREADY_GONE,
+            _DIAGNOSE.DELETE_REFUSED,
+        }
+        # Three distinct string values; no accidental aliasing.
+        assert len(outcomes) == 3
+        # Operator-facing labels — guard the wire format.
+        assert _DIAGNOSE.DELETE_OK == "deleted"
+        assert _DIAGNOSE.DELETE_ALREADY_GONE == "already_gone"
+        assert _DIAGNOSE.DELETE_REFUSED == "refused"
+
+    def test_caps_long_chains(self) -> None:
+        # Ten nested causes — output must stay readable.
+        excs: list[BaseException] = [ValueError(f"layer-{i}") for i in range(10)]
+        for i in range(1, len(excs)):
+            excs[i].__cause__ = excs[i - 1]
+        rendered = _DIAGNOSE._format_exception_chain(excs[-1])
+        # Capped at 6 distinct entries by ``_format_exception_chain``.
+        assert rendered.count("|") <= 5
+
+
 def _record(
     *,
     timestamp: str,
