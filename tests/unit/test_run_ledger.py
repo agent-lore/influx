@@ -219,3 +219,170 @@ def test_skip_records_skipped_status_with_reason(tmp_path: Path) -> None:
     assert entry["degraded"] is False
     assert entry["sources_checked"] is None
     assert entry["ingested"] is None
+
+
+# ── #36: ingestion-stall detection ──────────────────────────────────
+
+
+def _start_complete(
+    ledger: RunLedger,
+    *,
+    run_id: str,
+    profile: str,
+    kind: str = "scheduled",
+    sources_checked: int | None,
+    ingested: int | None,
+    source_acquisition_errors: list[dict[str, str]] | None = None,
+) -> list[str]:
+    """Helper: start + complete a run, return the degraded_reasons list."""
+    ledger.start(run_id=run_id, profile=profile, kind=kind, run_range=None)
+    return ledger.complete(
+        run_id=run_id,
+        sources_checked=sources_checked,
+        ingested=ingested,
+        source_acquisition_errors=source_acquisition_errors,
+    )
+
+
+def test_complete_returns_empty_reasons_for_clean_run(tmp_path: Path) -> None:
+    """A clean run has no degraded_reasons and degraded=False."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=5,
+        ingested=3,
+    )
+    assert reasons == []
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is False
+    assert entry["degraded_reasons"] == []
+
+
+def test_complete_returns_source_acquisition_reason(tmp_path: Path) -> None:
+    """source_acquisition_errors → degraded_reasons=['source_acquisition']."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=5,
+        ingested=2,
+        source_acquisition_errors=[
+            {"source": "arxiv", "kind": "timeout", "detail": "x"}
+        ],
+    )
+    assert reasons == ["source_acquisition"]
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is True
+    assert entry["degraded_reasons"] == ["source_acquisition"]
+
+
+def test_single_zero_ingestion_run_is_not_yet_a_stall(tmp_path: Path) -> None:
+    """One zero-ingestion run alone doesn't trigger the stall flag.
+
+    The signal must require TWO consecutive matching runs so a single
+    quiet sweep doesn't generate noise.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=5,
+        ingested=0,
+    )
+    assert reasons == []
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is False
+
+
+def test_two_consecutive_zero_ingestion_runs_flag_stall(tmp_path: Path) -> None:
+    """Second consecutive zero-ingest scheduled run flips degraded=True."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(ledger, run_id="r-1", profile="p", sources_checked=5, ingested=0)
+    reasons = _start_complete(
+        ledger, run_id="r-2", profile="p", sources_checked=4, ingested=0
+    )
+    assert reasons == ["ingestion_stall"]
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is True
+    assert entry["degraded_reasons"] == ["ingestion_stall"]
+
+
+def test_zero_sources_checked_does_not_count_as_stall(tmp_path: Path) -> None:
+    """sources_checked=0 means a quiet window, not a stall — don't flag."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(ledger, run_id="r-1", profile="p", sources_checked=0, ingested=0)
+    reasons = _start_complete(
+        ledger, run_id="r-2", profile="p", sources_checked=0, ingested=0
+    )
+    assert reasons == []
+
+
+def test_successful_ingest_resets_the_stall_streak(tmp_path: Path) -> None:
+    """A run that ingested anything resets the streak."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(ledger, run_id="r-1", profile="p", sources_checked=5, ingested=0)
+    _start_complete(ledger, run_id="r-2", profile="p", sources_checked=5, ingested=2)
+    reasons = _start_complete(
+        ledger, run_id="r-3", profile="p", sources_checked=5, ingested=0
+    )
+    # r-3 is the first zero-run after a successful one; not yet a stall.
+    assert reasons == []
+
+
+def test_stall_is_per_profile(tmp_path: Path) -> None:
+    """Different profiles don't share a stall streak."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(ledger, run_id="r-1", profile="ai", sources_checked=5, ingested=0)
+    # Different profile zero-runs in between don't count toward 'ai'.
+    _start_complete(
+        ledger,
+        run_id="r-2",
+        profile="robotics",
+        sources_checked=5,
+        ingested=0,
+    )
+    reasons = _start_complete(
+        ledger, run_id="r-3", profile="ai", sources_checked=5, ingested=0
+    )
+    assert reasons == ["ingestion_stall"]
+
+
+def test_backfill_kind_does_not_trigger_stall(tmp_path: Path) -> None:
+    """Backfills legitimately ingest 0 (cache hits) — never flag stall."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        kind="backfill",
+        sources_checked=10,
+        ingested=0,
+    )
+    reasons = _start_complete(
+        ledger,
+        run_id="r-2",
+        profile="p",
+        kind="backfill",
+        sources_checked=10,
+        ingested=0,
+    )
+    assert reasons == []
+
+
+def test_combined_source_acquisition_and_stall(tmp_path: Path) -> None:
+    """Both reasons can apply at once — both must appear in the list."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(ledger, run_id="r-1", profile="p", sources_checked=5, ingested=0)
+    reasons = _start_complete(
+        ledger,
+        run_id="r-2",
+        profile="p",
+        sources_checked=4,
+        ingested=0,
+        source_acquisition_errors=[{"source": "arxiv", "kind": "x", "detail": "y"}],
+    )
+    assert reasons == ["source_acquisition", "ingestion_stall"]

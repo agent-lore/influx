@@ -267,7 +267,7 @@ async def run_profile(
                     run_id,
                     elapsed,
                 )
-                ledger.complete(
+                degraded_reasons = ledger.complete(
                     run_id=run_id,
                     sources_checked=None,
                     ingested=None,
@@ -285,11 +285,29 @@ async def run_profile(
                     result.stats.ingested,
                     bool(source_errors),
                 )
-                ledger.complete(
+                degraded_reasons = ledger.complete(
                     run_id=run_id,
                     sources_checked=result.stats.sources_checked,
                     ingested=result.stats.ingested,
                     source_acquisition_errors=source_errors,
+                )
+            # #36: when the ledger flagged this run as ingestion-stalled
+            # (this and the prior scheduled run both inspected items but
+            # ingested zero), tick the per-profile counter so dashboards
+            # have an early-warning signal independent of source-fetch
+            # errors.  Update the run-completions outcome to ``degraded``
+            # in this case too, so the existing alerting paths see it.
+            if "ingestion_stall" in degraded_reasons:
+                metrics.ingestion_stalls().add(1, {"profile": profile})
+                if outcome == "success":
+                    outcome = "degraded"
+                logger.warning(
+                    "run flagged ingestion_stall profile=%s kind=%s run_id=%s "
+                    "(this + prior scheduled run both ingested 0 with "
+                    "sources_checked > 0)",
+                    profile,
+                    kind.value,
+                    run_id,
                 )
             metrics.run_duration().record(elapsed, run_metric_attrs)
             metrics.run_completions().add(1, {**run_metric_attrs, "outcome": outcome})

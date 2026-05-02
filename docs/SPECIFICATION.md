@@ -642,6 +642,13 @@ Readiness is degraded when:
 
 When the Lithos probe has been ``degraded`` for **3 consecutive cycles** (default; see `ProbeLoop.lithos_circuit_open`), `run_profile` short-circuits — the run is recorded as ``status="skipped", error="lithos_unhealthy"`` in the run ledger, the `influx_runs_skipped_total{profile, reason="lithos_unhealthy"}` metric ticks, and no source-fetch / LLM-filter / write work is performed.  The breaker closes automatically on the first ``ok`` probe; subsequent runs proceed normally.  This prevents an extended Lithos outage from burning LLM tokens against a write path that will fail (#40).
 
+Run-ledger entries carry a structured `degraded_reasons` field listing why a completed run was marked `degraded=True`.  Today the values are:
+
+- `"source_acquisition"` — at least one source-fetch failure was swallowed during the run (issue #20).
+- `"ingestion_stall"` — this and the immediately prior scheduled run for the same profile both saw `ingested == 0` despite `sources_checked > 0` (issue #36).  Typical causes: every candidate hit `slug_collision`/`duplicate`, the LLM filter rejected everything, or upstream sources started returning content the profile no longer accepts.  Backfills are excluded from this check (their ingest pattern is fundamentally different — they legitimately ingest 0 when every candidate is a cache hit).
+
+Both reasons can apply to a single run.  `influx_ingestion_stall_runs_total{profile}` ticks once per stall-flagged run so dashboards have an alertable counter independent of source-fetch errors.
+
 ### 13.2 Telemetry
 
 When telemetry is enabled (`INFLUX_OTEL_ENABLED=true`), Influx exports OTEL traces and metrics. Both signals share the same toggle, the same OTLP endpoint configuration (`OTEL_EXPORTER_OTLP_ENDPOINT`), and the same resource attributes (`service.name=influx`, `deployment.environment=<INFLUX_ENVIRONMENT>`).
@@ -669,6 +676,7 @@ Metric instruments cover run lifecycle, the source funnel, write outcomes, and f
 | `influx_slug_collision_reclaimed_total` | Counter | _(no labels)_ |
 | `influx_slug_collision_unresolved_total` | Counter | `profile`, `source` |
 | `influx_runs_skipped_total` | Counter | `profile`, `reason` |
+| `influx_ingestion_stall_runs_total` | Counter | `profile` |
 
 When `OTEL_EXPORTER_OTLP_ENDPOINT` is set the OTLP HTTP exporter is used. With `INFLUX_OTEL_CONSOLE_FALLBACK=true` and no endpoint configured, both spans and metrics are written to stdout for local development.
 

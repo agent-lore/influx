@@ -44,6 +44,7 @@ __all__ = [
     "repair_candidates",
     "run_completions",
     "run_duration",
+    "ingestion_stalls",
     "run_starts",
     "runs_skipped",
     "slug_collision_dedup_recovery",
@@ -188,6 +189,32 @@ def archive_missing() -> Any:
     return get_meter().counter(
         "influx_archive_missing_total",
         description="Items tagged influx:archive-missing during a run.",
+    )
+
+
+def ingestion_stalls() -> Any:
+    """Counter of runs flagged ``degraded_reasons=['ingestion_stall']`` (#36).
+
+    Increments once per scheduled run that completes with
+    ``ingested == 0 AND sources_checked > 0`` AND the immediately
+    prior scheduled run for the same profile also matched that
+    shape — i.e. a profile has now seen TWO consecutive
+    inspect-something-but-write-nothing sweeps.
+
+    Typical causes: every candidate hits ``slug_collision`` /
+    ``duplicate``, or the LLM filter is rejecting everything.
+    Sustained non-zero rate is the early-warning signal that
+    ``degraded`` (which today only fires for source-acquisition
+    errors) was missing.
+
+    Labels: ``profile``.
+    """
+    return get_meter().counter(
+        "influx_ingestion_stall_runs_total",
+        description=(
+            "scheduled runs flagged ingestion_stall (this and the prior "
+            "scheduled run both inspected items but ingested zero)"
+        ),
     )
 
 
