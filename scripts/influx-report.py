@@ -131,36 +131,16 @@ def _print_runs(runs_payload: dict[str, object]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    # Standardised on ``--env <name>`` to match scripts/influx-diagnose.py.
-    # The legacy positional is preserved as a backwards-compat alias so
-    # existing operator muscle memory (``./scripts/influx-report.py dev``)
-    # keeps working; ``--env`` wins if both are given.
     parser.add_argument(
         "--env",
-        dest="env",
         default="staging",
         help="environment name matching docker/.env.<name> (default: staging)",
-    )
-    parser.add_argument(
-        "environment",
-        nargs="?",
-        default=None,
-        help=argparse.SUPPRESS,  # legacy positional alias for --env
     )
     parser.add_argument("--base-url", help="override admin API base URL")
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
 
-    # ``--env`` wins when explicitly set; otherwise honour the legacy
-    # positional.  We can't directly tell whether ``--env`` was passed
-    # (argparse hides that), so we fall back to the positional only when
-    # ``--env`` still holds the default and a positional was given.
-    environment = (
-        args.environment
-        if args.environment is not None and args.env == "staging"
-        else args.env
-    )
-    env_path = _repo_root() / "docker" / f".env.{environment}"
+    env_path = _repo_root() / "docker" / f".env.{args.env}"
     if not env_path.exists():
         print(f"Environment file not found: {env_path}", file=sys.stderr)
         return 2
@@ -184,7 +164,7 @@ def main() -> int:
         print(f"Failed to query {base_url}: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Influx Report: {environment}")
+    print(f"Influx Report: {args.env}")
     print(f"Admin API: {base_url}")
     _print_status(status)
     _print_runs(runs)

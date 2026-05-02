@@ -131,19 +131,19 @@ Each environment can set:
 Use the report script to summarize a running Influx environment:
 
 ```bash
-scripts/influx-report.py staging --limit 10
+scripts/influx-report.py --env staging --limit 10
 ```
 
-The positional environment name maps to `docker/.env.<env>`. The script reads
-that file to find the admin URL, archive path, and state path, then calls
-`/status` and `/runs/recent`.
+`--env <name>` maps to `docker/.env.<name>` (default: `staging`). The script
+reads that file to find the admin URL, archive path, and state path, then
+calls `/status` and `/runs/recent`.
 
 Useful options:
 
 ```bash
-scripts/influx-report.py dev
-scripts/influx-report.py staging --limit 50
-scripts/influx-report.py staging --base-url http://127.0.0.1:18080
+scripts/influx-report.py --env dev
+scripts/influx-report.py --env staging --limit 50
+scripts/influx-report.py --env staging --base-url http://127.0.0.1:18080
 ```
 
 The report includes service readiness, package version, per-profile scheduler
