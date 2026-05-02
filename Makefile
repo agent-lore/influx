@@ -5,11 +5,11 @@ install:
 	uv sync
 
 fmt:
-	uv run ruff format src/ tests/
+	uv run ruff format src/ tests/ scripts/
 
 lint:
-	uv run ruff check src/ tests/
-	uv run ruff format --check src/ tests/
+	uv run ruff check src/ tests/ scripts/
+	uv run ruff format --check src/ tests/ scripts/
 
 typecheck:
 	uv run pyright
