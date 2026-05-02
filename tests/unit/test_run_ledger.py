@@ -200,3 +200,22 @@ def test_record_unresolved_slug_collision_is_append_only(tmp_path: Path) -> None
         )
     entries = ledger.unresolved_slug_collisions()
     assert [e["title"] for e in entries] == ["paper-0", "paper-1", "paper-2"]
+
+
+def test_skip_records_skipped_status_with_reason(tmp_path: Path) -> None:
+    """``skip`` produces a ``skipped`` ledger entry with the reason captured."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="staging-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.skip(run_id="run-1", reason="lithos_unhealthy")
+
+    entry = ledger.recent()[0]
+    assert entry["status"] == "skipped"
+    assert entry["error"] == "lithos_unhealthy"
+    assert entry["degraded"] is False
+    assert entry["sources_checked"] is None
+    assert entry["ingested"] is None

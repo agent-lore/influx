@@ -45,6 +45,7 @@ __all__ = [
     "run_completions",
     "run_duration",
     "run_starts",
+    "runs_skipped",
     "slug_collision_dedup_recovery",
     "slug_collision_reclaimed",
     "slug_collision_unresolved",
@@ -187,6 +188,26 @@ def archive_missing() -> Any:
     return get_meter().counter(
         "influx_archive_missing_total",
         description="Items tagged influx:archive-missing during a run.",
+    )
+
+
+def runs_skipped() -> Any:
+    """Counter of runs short-circuited before any work was done (#40).
+
+    Increments once per cron-tick run that the Lithos circuit breaker
+    refused.  ``reason`` distinguishes skip causes so future short-
+    circuit paths (e.g. provider-credential outage) can share the
+    metric without label collisions.
+
+    Labels: ``profile``, ``reason`` (``"lithos_unhealthy"`` today; new
+    values added under-test only when the breaker grows new arms).
+    """
+    return get_meter().counter(
+        "influx_runs_skipped_total",
+        description=(
+            "runs short-circuited before any source-fetch / LLM / write "
+            "work was done, broken down by reason"
+        ),
     )
 
 

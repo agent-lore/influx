@@ -313,12 +313,20 @@ def cmd_failures(args: argparse.Namespace) -> int:
         profile=args.profile,
         statuses={"failed", "abandoned"},
     )
+    skipped = _filter_runs(runs, profile=args.profile, statuses={"skipped"})
     degraded = _filter_runs(runs, profile=args.profile, degraded_only=True)
 
     print(f"Failed/abandoned runs ({len(failed)}):")
     for run in failed[-args.limit :]:
         _print_run_row(run)
     if not failed:
+        print("  (none)")
+
+    print()
+    print(f"Skipped runs ({len(skipped)}):  # circuit-breaker short-circuit (#40)")
+    for run in skipped[-args.limit :]:
+        _print_run_row(run)
+    if not skipped:
         print("  (none)")
 
     print()

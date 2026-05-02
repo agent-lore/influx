@@ -41,6 +41,12 @@ Three quick signals, all read-only:
 - **`failures`** filters to `failed`, `abandoned`, and `degraded` runs
   in one go. A `degraded` run completed but had at least one swallowed
   source-fetch failure (issue #20); the body of the run still landed.
+  A `skipped` run (#40) means the Lithos circuit breaker fired:
+  ProbeLoop saw 3+ consecutive `degraded` Lithos probes, so the
+  scheduler short-circuited to avoid burning LLM tokens against a
+  write path that would fail.  Look at `/ready` and `/status` to
+  confirm Lithos health; the breaker closes automatically on the
+  first `ok` probe.
 - **`influx-report.py`** queries `/status` + `/runs/recent` over HTTP
   for an at-a-glance view; useful when the container is unreachable
   from the ledger path (e.g. running on a remote host).
