@@ -670,7 +670,25 @@ class LithosClient:
             )
 
         if status == "slug_collision":
-            return WriteResult(status="slug_collision", source_url=source_url)
+            # Lithos's slug_collision envelope carries ``existing_id`` and
+            # ``message`` (lithos/server.py); preserve them as ``detail`` so
+            # the operator-facing WARNING in scheduler.py can name the
+            # squatting note rather than logging an empty string.  See the
+            # 2026-05-02 staging incident: the only signal of the colliding
+            # doc was thrown away here.
+            existing_id = body.get("existing_id", "")
+            message = body.get("message", "")
+            if existing_id and message:
+                detail = f"existing_id={existing_id}; {message}"
+            elif existing_id:
+                detail = f"existing_id={existing_id}"
+            else:
+                detail = message
+            return WriteResult(
+                status="slug_collision",
+                source_url=source_url,
+                detail=detail,
+            )
 
         if status == "version_conflict":
             note_id = body.get("note_id", "")
