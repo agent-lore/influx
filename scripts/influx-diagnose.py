@@ -154,6 +154,26 @@ def _have_docker() -> bool:
     return shutil.which("docker") is not None
 
 
+_SINCE_DAYS_RE = re.compile(r"^\s*(\d+)\s*d\s*$", re.IGNORECASE)
+
+
+def _normalise_since(since: str | None) -> str | None:
+    """Translate ``Nd`` (days) into ``(N*24)h`` for ``docker logs --since``.
+
+    Docker's duration parser only understands Go's ``time.ParseDuration``
+    units (``s``/``m``/``h``), so a friendly ``--since 7d`` produces
+    ``invalid value for "since"``.  We translate at the boundary so the
+    operator-facing CLI can keep using day units.  Mixed-unit strings
+    (``2d12h``) are out of scope; pass them as ``60h`` directly.
+    """
+    if not since:
+        return since
+    m = _SINCE_DAYS_RE.match(since)
+    if not m:
+        return since
+    return f"{int(m.group(1)) * 24}h"
+
+
 def _docker_logs_iter(
     container: str,
     *,
@@ -169,6 +189,7 @@ def _docker_logs_iter(
     if not _have_docker():
         sys.exit("'docker' not on PATH; cannot read container logs")
     cmd = ["docker", "logs"]
+    since = _normalise_since(since)
     if since:
         cmd += ["--since", since]
     if tail is not None:
