@@ -115,6 +115,80 @@ class TestDirectInvocationImports:
         from influx.lithos_client import LithosClient  # noqa: F401
 
 
+class TestRewriteUrlForHost:
+    """``host.docker.internal`` is unresolvable from the host."""
+
+    def test_rewrites_host_docker_internal_when_not_in_docker(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(_DIAGNOSE, "_running_inside_docker", lambda: False)
+        assert (
+            _DIAGNOSE._rewrite_url_for_host("http://host.docker.internal:8766/sse")
+            == "http://127.0.0.1:8766/sse"
+        )
+
+    def test_no_rewrite_when_inside_docker(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(_DIAGNOSE, "_running_inside_docker", lambda: True)
+        assert (
+            _DIAGNOSE._rewrite_url_for_host("http://host.docker.internal:8766/sse")
+            == "http://host.docker.internal:8766/sse"
+        )
+
+    def test_no_rewrite_for_unrelated_urls(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(_DIAGNOSE, "_running_inside_docker", lambda: False)
+        assert (
+            _DIAGNOSE._rewrite_url_for_host("http://lithos.internal:8765/sse")
+            == "http://lithos.internal:8765/sse"
+        )
+        assert (
+            _DIAGNOSE._rewrite_url_for_host("http://127.0.0.1:8766/sse")
+            == "http://127.0.0.1:8766/sse"
+        )
+
+
+class TestFormatExceptionChain:
+    """Anyio TaskGroup exceptions hide the actual cause; we unwrap them."""
+
+    def test_plain_exception(self) -> None:
+        try:
+            raise ValueError("nope")
+        except ValueError as exc:
+            rendered = _DIAGNOSE._format_exception_chain(exc)
+        assert rendered == "ValueError: nope"
+
+    def test_unwraps_exception_group(self) -> None:
+        # Mimic the anyio TaskGroup wrap shape:
+        #   ExceptionGroup(..., [ConnectionRefusedError(...), ...])
+        cause = ConnectionRefusedError("connect failed: 111")
+        group = BaseExceptionGroup(
+            "unhandled errors in a TaskGroup",
+            [cause],
+        )
+        rendered = _DIAGNOSE._format_exception_chain(group)
+        assert "ConnectionRefusedError" in rendered
+        assert "connect failed: 111" in rendered
+
+    def test_unwraps_chained_cause(self) -> None:
+        try:
+            try:
+                raise OSError("dns lookup failed: host.docker.internal")
+            except OSError as inner:
+                raise RuntimeError("transport setup failed") from inner
+        except RuntimeError as exc:
+            rendered = _DIAGNOSE._format_exception_chain(exc)
+        assert "RuntimeError: transport setup failed" in rendered
+        assert "OSError: dns lookup failed: host.docker.internal" in rendered
+
+    def test_caps_long_chains(self) -> None:
+        # Ten nested causes — output must stay readable.
+        excs: list[BaseException] = [ValueError(f"layer-{i}") for i in range(10)]
+        for i in range(1, len(excs)):
+            excs[i].__cause__ = excs[i - 1]
+        rendered = _DIAGNOSE._format_exception_chain(excs[-1])
+        # Capped at 6 distinct entries by ``_format_exception_chain``.
+        assert rendered.count("|") <= 5
+
+
 def _record(
     *,
     timestamp: str,

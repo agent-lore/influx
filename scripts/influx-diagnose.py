@@ -505,20 +505,46 @@ def _print_squatter(entry: dict[str, Any]) -> None:
         print(f"   colliding title={title!r}")
 
 
+def _running_inside_docker() -> bool:
+    """Detect whether we're inside a docker container.
+
+    The ``[lithos] url`` in ``influx.toml`` resolves
+    ``host.docker.internal`` to the docker host from inside the influx
+    container, but that hostname is not resolvable on the host.  When
+    the script is invoked from the host we have to swap in the
+    loopback address that the docker port mapping exposes.
+    """
+    return Path("/.dockerenv").exists()
+
+
+def _rewrite_url_for_host(url: str) -> str:
+    """Substitute ``host.docker.internal`` → ``127.0.0.1`` when on the host.
+
+    Operator-friendly default: the staging / dev influx.toml stores the
+    URL the **container** uses (``host.docker.internal:<port>``), so the
+    bare diagnose script invoked from the host would otherwise fail with
+    a DNS error.  Pass ``--lithos-url`` to override this rewrite.
+    """
+    if _running_inside_docker():
+        return url
+    if "host.docker.internal" not in url:
+        return url
+    return url.replace("host.docker.internal", "127.0.0.1")
+
+
 def _read_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str:
     """Resolve the Lithos MCP/SSE URL for ``--apply`` mode.
 
     Resolution order:
-      1. ``--lithos-url`` CLI flag (explicit override).
-      2. ``LITHOS_URL`` env var on the host.
-      3. ``[lithos] url`` in ``${INFLUX_DATA_PATH}/influx.toml``.
+      1. ``--lithos-url`` CLI flag (explicit override; never rewritten).
+      2. ``LITHOS_URL`` env var on the host (rewritten if needed).
+      3. ``[lithos] url`` in ``${INFLUX_DATA_PATH}/influx.toml``
+         (rewritten if needed — see :func:`_rewrite_url_for_host`).
     """
     if getattr(args, "lithos_url", None):
         return str(args.lithos_url)
-    import os
-
     if "LITHOS_URL" in os.environ:
-        return os.environ["LITHOS_URL"]
+        return _rewrite_url_for_host(os.environ["LITHOS_URL"])
     data_path = env.get("INFLUX_DATA_PATH")
     if data_path:
         toml_path = Path(data_path) / "influx.toml"
@@ -531,11 +557,51 @@ def _read_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str:
                 cfg = tomllib.load(fh)
             url = cfg.get("lithos", {}).get("url")
             if isinstance(url, str) and url:
-                return url
+                rewritten = _rewrite_url_for_host(url)
+                if rewritten != url:
+                    print(
+                        f"note: rewrote container-only host "
+                        f"{url!r} -> {rewritten!r} for host invocation; "
+                        "pass --lithos-url to override"
+                    )
+                return rewritten
     sys.exit(
         "Lithos URL not resolved.  Pass --lithos-url, set $LITHOS_URL, "
         "or ensure [lithos] url is set in $INFLUX_DATA_PATH/influx.toml."
     )
+
+
+def _format_exception_chain(exc: BaseException) -> str:
+    """Render an exception (and its causes / sub-exceptions) compactly.
+
+    The MCP client uses ``anyio`` task groups under the hood, so a
+    transport-level failure surfaces as
+    ``ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)``
+    by default — the actual diagnostic (DNS error, connection refused)
+    lives inside ``exc.exceptions[0]``.  Walk the chain and surface
+    every distinct ``type(exc).__name__: <str>`` so the operator can
+    diagnose without re-running with ``--verbose``.
+    """
+    seen: list[str] = []
+
+    def _walk(e: BaseException) -> None:
+        rendered = f"{type(e).__name__}: {e}"
+        if rendered not in seen:
+            seen.append(rendered)
+        # ExceptionGroup (PEP 654) carries siblings on .exceptions
+        sub = getattr(e, "exceptions", None)
+        if isinstance(sub, (list, tuple)):
+            for child in sub:
+                if isinstance(child, BaseException):
+                    _walk(child)
+        # Regular cause / context chain
+        for nxt in (e.__cause__, e.__context__):
+            if isinstance(nxt, BaseException):
+                _walk(nxt)
+
+    _walk(exc)
+    # Cap the rendered chain so a deep cause stack stays readable.
+    return " | ".join(seen[:6])
 
 
 def _ensure_project_runtime_or_reexec() -> None:
@@ -608,8 +674,8 @@ async def _delete_squatter(
     try:
         try:
             doc = await client.read_note(note_id=doc_id)
-        except Exception as exc:  # noqa: BLE001
-            return False, f"read failed: {type(exc).__name__}: {exc}"
+        except BaseException as exc:  # noqa: BLE001
+            return False, f"read failed: {_format_exception_chain(exc)}"
 
         tags = list(doc.get("tags") or [])
         if require_influx_authored and "ingested-by:influx" not in tags:
@@ -625,8 +691,8 @@ async def _delete_squatter(
                 "lithos_delete",
                 {"id": doc_id, "agent": agent},
             )
-        except Exception as exc:  # noqa: BLE001
-            return False, f"delete failed: {type(exc).__name__}: {exc}"
+        except BaseException as exc:  # noqa: BLE001
+            return False, f"delete failed: {_format_exception_chain(exc)}"
 
         # Lithos returns either the bare success envelope or an error
         # envelope with ``status="error"``; surface either back to the
