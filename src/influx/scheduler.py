@@ -219,6 +219,7 @@ async def run_profile(
                 config=config,
                 item_provider=provider,
                 probe_loop=probe_loop,
+                ledger=ledger,
             )
             elapsed = (datetime.now(UTC) - started_at).total_seconds()
             source_errors = current_source_acquisition_errors.get() or []
@@ -286,8 +287,16 @@ async def _run_profile_body(
     config: AppConfig,
     item_provider: ItemProvider,
     probe_loop: Any | None = None,
+    ledger: RunLedger | None = None,
 ) -> ProfileRunResult | None:
-    """Inner implementation body of :func:`run_profile`."""
+    """Inner implementation body of :func:`run_profile`.
+
+    *ledger* is passed through so the slug-collision recovery exhaust
+    path can persist unresolved entries to the local backlog (#31).
+    ``None`` is permitted for tests that exercise the body without a
+    real ledger; when ``None`` the unresolved-collision write is
+    skipped (the metric still fires).
+    """
     provider = item_provider
     profile_cfg = next((p for p in config.profiles if p.name == profile), None)
 
@@ -627,6 +636,27 @@ async def _run_profile_body(
                             "cache_hit": False,
                         },
                     )
+                    # #31: a slug_collision that survives the recovery
+                    # chain (squatter-shape dispatch + suffix retry)
+                    # means the write was permanently dropped.  Persist
+                    # the entry to the backlog and bump the metric so
+                    # the operator has both a queryable file and an
+                    # alertable counter — instead of just a WARNING
+                    # buried in the docker log buffer.
+                    if write_result.status == "slug_collision":
+                        metrics.slug_collision_unresolved().add(
+                            1,
+                            {"profile": profile, "source": item_source},
+                        )
+                        if ledger is not None:
+                            ledger.record_unresolved_slug_collision(
+                                profile=profile,
+                                source=item_source,
+                                source_url=source_url,
+                                title=title,
+                                detail=write_result.detail,
+                                run_id=current_run_id.get() or "",
+                            )
 
             # 5. Build result + fire post-run webhook hook (FR-NOT-1..6, AC-05-I).
             result = ProfileRunResult(

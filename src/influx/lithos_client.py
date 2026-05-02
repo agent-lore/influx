@@ -100,6 +100,11 @@ class WriteResult:
 # ── Pure helpers ────────────────────────────────────────────────────
 
 _ARXIV_ID_RE = re.compile(r"arxiv\.org/abs/([^\s?#]+)")
+# Matcher for parsing ``existing_id=<id>`` out of the slug_collision
+# diagnostic.  Lithos returns UUIDs in production (``[0-9a-f-]+``) but
+# tests use friendlier ids like ``doc-dup-1``; accept anything up to a
+# whitespace, semicolon, or comma terminator.
+_EXISTING_ID_RE = re.compile(r"existing_id=([^\s;,]+)")
 
 
 def _extract_slug_suffix(source_url: str) -> str:
@@ -113,6 +118,137 @@ def _extract_slug_suffix(source_url: str) -> str:
         return f" [arXiv {m.group(1)}]"
     host = urlparse(source_url).hostname or urlparse(source_url).netloc
     return f" [{host}]"
+
+
+def _arxiv_id_from_url(source_url: str) -> str | None:
+    """Return the arxiv id from a URL like ``https://arxiv.org/abs/2604.28197``."""
+    m = _ARXIV_ID_RE.search(source_url)
+    return m.group(1) if m else None
+
+
+def _existing_id_from_detail(detail: str) -> str | None:
+    """Parse ``existing_id=<uuid>`` out of a slug_collision detail string (#30)."""
+    if not detail:
+        return None
+    m = _EXISTING_ID_RE.search(detail)
+    return m.group(1) if m else None
+
+
+def _doc_tags(doc: dict[str, Any]) -> list[str]:
+    """Extract the tag list from a ``lithos_read`` response.
+
+    Tags live under ``metadata`` in the canonical envelope but some
+    code paths (and the diagnose-script preview) read them at the top
+    level — be tolerant of both shapes.
+    """
+    direct = doc.get("tags")
+    if isinstance(direct, list):
+        return [str(t) for t in direct]
+    meta = doc.get("metadata")
+    if isinstance(meta, dict):
+        nested = meta.get("tags")
+        if isinstance(nested, list):
+            return [str(t) for t in nested]
+    return []
+
+
+def _doc_source_url(doc: dict[str, Any]) -> str | None:
+    """Extract source_url from a ``lithos_read`` response (top-level or metadata)."""
+    direct = doc.get("source_url")
+    if isinstance(direct, str) and direct:
+        return direct
+    meta = doc.get("metadata")
+    if isinstance(meta, dict):
+        nested = meta.get("source_url")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class SquatterClassification:
+    """Outcome of inspecting the doc that owns a colliding slug (#31)."""
+
+    kind: str  # "duplicate" | "reclaimable" | "distinct"
+    squatter_id: str
+    reason: str  # human-readable explanation, surfaced in detail / logs
+
+
+def _classify_squatter(
+    doc: dict[str, Any],
+    *,
+    squatter_id: str,
+    incoming_source_url: str,
+) -> SquatterClassification:
+    """Classify a slug-squatting Lithos doc against an incoming write (#31).
+
+    Returns one of three outcomes:
+
+    * ``"duplicate"`` — the squatter already represents the same paper
+      as the incoming write (matching ``arxiv-id:<id>`` tag, or
+      matching ``source_url``).  Lithos's URL/cache dedup should have
+      caught this; surfacing it here recovers from that miss.
+    * ``"reclaimable"`` — the squatter is an empty residue from an
+      aborted prior write (no tags AND no source_url AND no body).
+      Safe to delete and retry the original write.
+    * ``"distinct"`` — the squatter is a real, distinct doc that
+      happens to slugify the same.  The caller should fall back to
+      the suffix-retry path; if THAT also collides, the entry goes
+      to the unresolved-collisions backlog.
+
+    This function is pure: I/O lives in :meth:`LithosClient._retry_slug_collision`.
+    """
+    tags = _doc_tags(doc)
+    sq_source_url = _doc_source_url(doc)
+    body = str(doc.get("content") or "").strip()
+
+    incoming_arxiv_id = _arxiv_id_from_url(incoming_source_url)
+
+    # Match #1: explicit arxiv-id tag equality.
+    if incoming_arxiv_id:
+        for tag in tags:
+            if tag == f"arxiv-id:{incoming_arxiv_id}":
+                return SquatterClassification(
+                    kind="duplicate",
+                    squatter_id=squatter_id,
+                    reason=(
+                        f"squatter carries arxiv-id:{incoming_arxiv_id} — "
+                        "treat as duplicate of the same paper"
+                    ),
+                )
+
+    # Match #2: source_url equality.
+    if sq_source_url and sq_source_url == incoming_source_url:
+        return SquatterClassification(
+            kind="duplicate",
+            squatter_id=squatter_id,
+            reason=(
+                f"squatter source_url matches incoming ({sq_source_url}) — "
+                "treat as duplicate of the same paper"
+            ),
+        )
+
+    # Reclaim path: empty residue.  Conservative: ALL of the following
+    # must hold so we never delete a real note that just shares a slug.
+    if not tags and not sq_source_url and not body:
+        return SquatterClassification(
+            kind="reclaimable",
+            squatter_id=squatter_id,
+            reason=(
+                "squatter has no tags, no source_url, and empty body — "
+                "stale residue from an aborted prior write"
+            ),
+        )
+
+    # Genuinely-distinct paper that happens to slugify the same.
+    return SquatterClassification(
+        kind="distinct",
+        squatter_id=squatter_id,
+        reason=(
+            f"squatter has its own metadata "
+            f"(tags={len(tags)}, source_url={sq_source_url!r}, body_len={len(body)})"
+        ),
+    )
 
 
 def _merge_tags(existing_tags: list[str], new_tags: list[str]) -> list[str]:
@@ -454,7 +590,9 @@ class LithosClient:
         parsed = self._parse_write_response(result, source_url=source_url)
 
         if parsed.status == "slug_collision":
-            return await self._retry_slug_collision(args, source_url=source_url)
+            return await self._retry_slug_collision(
+                args, source_url=source_url, initial_collision=parsed
+            )
 
         if parsed.status == "version_conflict":
             return await self._retry_version_conflict(
@@ -480,18 +618,144 @@ class LithosClient:
         args: dict[str, Any],
         *,
         source_url: str,
+        initial_collision: WriteResult,
     ) -> WriteResult:
-        """Retry once with a disambiguating title suffix (AC-05-D)."""
+        """Recover from slug_collision by inspecting the squatter (#31).
+
+        Strategy (replaces the original AC-05-D ""one suffix retry"" form):
+
+        1. Read the squatter via the ``existing_id`` lithos returned in
+           the initial collision envelope.
+        2. Classify (:func:`_classify_squatter`):
+
+           * ``duplicate`` — squatter shares the incoming write's
+             ``arxiv-id`` or ``source_url``.  Return as ``duplicate``.
+           * ``reclaimable`` — squatter is empty residue (no tags, no
+             source_url, no body).  Delete it then re-issue the original
+             write.
+           * ``distinct`` — squatter is a real, different doc that
+             happens to slugify the same.  Try the AC-05-D suffix once.
+             If THAT also collides, recurse the inspection (in case the
+             suffixed slug is itself residue) — once.
+
+        Anything still ``slug_collision`` after the recovery chain is
+        returned to the caller, which (in the scheduler) appends to the
+        unresolved-collisions backlog file.
+        """
+        from influx import metrics
+
+        # Round 1: inspect the squatter named in the initial collision.
+        recovered = await self._try_recover_collision(
+            args,
+            source_url=source_url,
+            collision=initial_collision,
+            metrics_module=metrics,
+        )
+
+        if recovered.status != "slug_collision":
+            return recovered
+
+        # Round 2: the suffix retry collided too.  One more inspection in
+        # case the suffixed-slug squatter is itself a reclaimable residue.
+        suffix = _extract_slug_suffix(source_url)
+        suffixed_args = {**args, "title": args["title"] + suffix}
+        recovered = await self._try_recover_collision(
+            suffixed_args,
+            source_url=source_url,
+            collision=recovered,
+            metrics_module=metrics,
+            allow_suffix_retry=False,
+        )
+
+        if recovered.status == "slug_collision":
+            logger.warning(
+                "lithos_write slug_collision unresolved after recovery for %s",
+                source_url,
+            )
+        return recovered
+
+    async def _try_recover_collision(
+        self,
+        args: dict[str, Any],
+        *,
+        source_url: str,
+        collision: WriteResult,
+        metrics_module: Any,
+        allow_suffix_retry: bool = True,
+    ) -> WriteResult:
+        """Single recovery round.  Returns the ``WriteResult`` to surface.
+
+        When ``allow_suffix_retry=True`` (round 1) and the squatter is
+        ``distinct``, this method issues the AC-05-D suffix retry and
+        returns its result (which may itself be a ``slug_collision``
+        for the outer to handle in round 2).
+        """
+        squatter_id = _existing_id_from_detail(collision.detail)
+        if not squatter_id:
+            # No squatter id to inspect (e.g. older lithos response shape).
+            # Fall through to the conservative AC-05-D suffix retry.
+            if allow_suffix_retry:
+                return await self._suffix_retry(args, source_url=source_url)
+            return collision
+
+        try:
+            doc = await self.read_note(note_id=squatter_id)
+        except Exception:  # noqa: BLE001 — read failure shouldn't crash the write loop
+            logger.warning(
+                "slug_collision squatter inspection failed for %s id=%s; "
+                "falling back to suffix retry",
+                source_url,
+                squatter_id,
+            )
+            if allow_suffix_retry:
+                return await self._suffix_retry(args, source_url=source_url)
+            return collision
+
+        classification = _classify_squatter(
+            doc, squatter_id=squatter_id, incoming_source_url=source_url
+        )
+
+        if classification.kind == "duplicate":
+            metrics_module.slug_collision_dedup_recovery().add(1)
+            logger.info(
+                "slug_collision recovered as duplicate for %s: %s",
+                source_url,
+                classification.reason,
+            )
+            return WriteResult(
+                status="duplicate",
+                source_url=source_url,
+                detail=f"recovered: {classification.reason}",
+            )
+
+        if classification.kind == "reclaimable":
+            metrics_module.slug_collision_reclaimed().add(1)
+            logger.warning(
+                "slug_collision reclaimed empty squatter for %s id=%s: %s",
+                source_url,
+                squatter_id,
+                classification.reason,
+            )
+            await self.call_tool(
+                "lithos_delete", {"id": squatter_id, "agent": "influx"}
+            )
+            # Re-issue the original write — the slug is now free.
+            result = await self.call_tool("lithos_write", args)
+            return self._parse_write_response(result, source_url=source_url)
+
+        # 'distinct' — fall back to the AC-05-D suffix retry.
+        if not allow_suffix_retry:
+            return collision
+        return await self._suffix_retry(args, source_url=source_url)
+
+    async def _suffix_retry(
+        self, args: dict[str, Any], *, source_url: str
+    ) -> WriteResult:
+        """Single AC-05-D suffix retry for the genuinely-distinct case."""
         suffix = _extract_slug_suffix(source_url)
         retry_args = {**args, "title": args["title"] + suffix}
         result = await self.call_tool("lithos_write", retry_args)
-        parsed = self._parse_write_response(result, source_url=source_url)
-        if parsed.status == "slug_collision":
-            logger.warning(
-                "lithos_write slug_collision retry failed for %s",
-                source_url,
-            )
-        return parsed
+        return self._parse_write_response(result, source_url=source_url)
 
     # ── Version-conflict retry (AC-05-E) ────────────────────────────
 

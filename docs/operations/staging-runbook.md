@@ -228,12 +228,28 @@ relies on `docker logs` (and `influx-diagnose.py`) for log inspection.
 
 ## 8. Cleaning up slug-collision squatters
 
-When ``lithos_write`` returns ``slug_collision`` and the suffix retry
-also fails, Influx logs a WARNING but otherwise drops the article.
-The same paper will hit the same collision on every subsequent sweep
-until the squatting Lithos document is removed (see
-[#31](https://github.com/agent-lore/influx/issues/31) for the planned
-self-healing path).
+Influx now self-heals most slug collisions automatically.  When
+``lithos_write`` returns ``slug_collision``, the client reads the
+squatting doc and dispatches:
+
+| Squatter shape | Action | Metric |
+|---|---|---|
+| Same paper (matching `arxiv-id` or `source_url`) | Treat as `duplicate` (Lithos's URL-dedup missed it) | `influx_slug_collision_dedup_recovery_total` |
+| Empty residue (no tags, no `source_url`, empty body) | Delete + re-issue original write | `influx_slug_collision_reclaimed_total` |
+| Different paper, same slug | Fall back to AC-05-D `[arXiv <id>]` suffix retry; if that also collides and the suffixed-slug squatter is also reclaimable, delete + retry once more | (no metric on the retry itself) |
+
+Anything still `slug_collision` after the chain is appended to
+`${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl` and surfaced
+via:
+
+```bash
+./scripts/influx-diagnose.py --env staging slug-collision-backlog
+```
+
+For the small minority of collisions that still need manual cleanup
+(e.g. an operator must decide whether to delete a non-Influx note
+that happens to share a slug), the existing `squatters` subcommand
+still applies:
 
 The ``squatters`` subcommand surfaces them and offers a confirmed
 deletion path:
