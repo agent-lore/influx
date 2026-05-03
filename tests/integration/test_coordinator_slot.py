@@ -185,6 +185,7 @@ class TestCoordinatorSlotIntegration:
 
         with (
             patch("influx.scheduler.repair_sweep", side_effect=_spy_sweep),
+            patch("influx.run.repair_sweep", side_effect=_spy_sweep),
             TestClient(app) as tc,
         ):
             resp = tc.post("/runs", json={"profile": "profile-a"})
@@ -226,7 +227,11 @@ class TestCoordinatorSlotIntegration:
 
         from unittest.mock import patch
 
-        with patch("influx.scheduler.repair_sweep", sweep_mock), TestClient(app) as tc:
+        with (
+            patch("influx.scheduler.repair_sweep", sweep_mock),
+            patch("influx.run.repair_sweep", sweep_mock),
+            TestClient(app) as tc,
+        ):
             resp = tc.post("/runs", json={"profile": "profile-a"})
             assert resp.status_code == 202
             _wait_for_idle(coordinator, "profile-a")
@@ -260,7 +265,11 @@ class TestCoordinatorSlotIntegration:
 
         from unittest.mock import patch
 
-        with patch("influx.scheduler.repair_sweep", sweep_mock), TestClient(app) as tc:
+        with (
+            patch("influx.scheduler.repair_sweep", sweep_mock),
+            patch("influx.run.repair_sweep", sweep_mock),
+            TestClient(app) as tc,
+        ):
             # Launch both profiles.
             resp_a = tc.post("/runs", json={"profile": "profile-a"})
             resp_b = tc.post("/runs", json={"profile": "profile-b"})

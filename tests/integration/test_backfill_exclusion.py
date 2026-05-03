@@ -149,8 +149,10 @@ class TestBackfillExclusion:
         config = _make_config(lithos_url=fake_lithos_url)
         app = _make_app(config)
 
+        # MANUAL runs dispatch through ``influx.run.Run.execute()`` since
+        # #59, so the sweep call lives at the ``influx.run`` binding.
         with patch(
-            "influx.scheduler.repair_sweep",
+            "influx.run.repair_sweep",
             new_callable=AsyncMock,
         ) as mock_sweep:
             with TestClient(app) as tc:
@@ -212,7 +214,7 @@ class TestBackfillExclusion:
         assert app.state.item_provider is not None
 
         with patch(
-            "influx.scheduler.repair_sweep",
+            "influx.run.repair_sweep",
             new_callable=AsyncMock,
         ) as mock_sweep:
             with TestClient(app) as tc:

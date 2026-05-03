@@ -1031,3 +1031,108 @@ class TestLcmaToolsUnavailableShortCircuit:
         assert len(entries) == 1
         assert entries[0]["status"] == "skipped"
         assert entries[0]["error"] == "lcma_tools_unavailable"
+
+
+class TestManualRunDispatchesToRunModule:
+    """Manual runs (#59) dispatch through ``influx.run.Run.execute()``.
+
+    Replaces the legacy ``_run_profile_body`` inline path for
+    ``RunKind.MANUAL``; the Run module's five-stage executor now owns
+    the body for both scheduled and manual runs.  Backfills stay on
+    the legacy path until #60.
+    """
+
+    async def test_manual_run_routes_through_run_module(self, tmp_path: Any) -> None:
+        """A manual run hits ``influx.run`` bindings, not the legacy body."""
+        from influx.run_ledger import RunLedger
+
+        config = _make_config(profiles=["alpha"])
+        config = config.model_copy(
+            update={
+                "storage": config.storage.model_copy(
+                    update={"state_dir": str(tmp_path)}
+                )
+            }
+        )
+
+        legacy_sweep_called = False
+        run_sweep_called = False
+
+        async def _legacy_sweep(*args: Any, **kwargs: Any) -> list[Any]:
+            nonlocal legacy_sweep_called
+            legacy_sweep_called = True
+            return []
+
+        async def _run_sweep(*args: Any, **kwargs: Any) -> list[Any]:
+            nonlocal run_sweep_called
+            run_sweep_called = True
+            return []
+
+        class _NoopClient:
+            async def close(self) -> None: ...
+
+            async def list_archive_terminal_arxiv_ids(
+                self, *, profile: str
+            ) -> frozenset[str]:
+                return frozenset()
+
+            async def task_create(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(
+                            type="text",
+                            text=_json.dumps({"task_id": "manual-task"}),
+                        ),
+                    ],
+                )
+
+            async def task_complete(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(
+                            type="text",
+                            text=_json.dumps({"status": "completed"}),
+                        ),
+                    ],
+                )
+
+        async def _empty_neg_block(*args: Any, **kwargs: Any) -> str:
+            return ""
+
+        ledger = RunLedger(tmp_path)
+        with (
+            patch("influx.scheduler.repair_sweep", side_effect=_legacy_sweep),
+            patch("influx.run.repair_sweep", side_effect=_run_sweep),
+            patch("influx.run.LithosClient", return_value=_NoopClient()),
+            patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch(
+                "influx.run.build_negative_examples_block",
+                side_effect=_empty_neg_block,
+            ),
+            patch("influx.service.post_run_webhook_hook"),
+        ):
+            await run_profile(
+                "alpha",
+                RunKind.MANUAL,
+                config=config,
+                item_provider=None,
+                run_ledger=ledger,
+            )
+
+        # The Run module's repair sweep ran; the legacy scheduler.repair_sweep
+        # was NOT called -- proving the dispatch routed manual runs through
+        # influx.run rather than the legacy inline body.
+        assert run_sweep_called is True, (
+            "Manual runs must dispatch through influx.run.Run.execute()"
+        )
+        assert legacy_sweep_called is False, (
+            "The legacy _run_profile_body path must not run for manual kind"
+        )

@@ -378,13 +378,15 @@ async def _run_profile_body(
     real ledger; when ``None`` the unresolved-collision write is
     skipped (the metric still fires).
 
-    For ``RunKind.SCHEDULED`` (#58) the body delegates to the
-    :class:`influx.run.Run` module — five named stages, typed
-    StageDiagnostics, ``RunAborted``-driven abort path.  Manual and
-    backfill kinds stay on the legacy inline body until #59 / #60
-    migrate them.
+    For ``RunKind.SCHEDULED`` (#58) and ``RunKind.MANUAL`` (#59) the
+    body delegates to the :class:`influx.run.Run` module — five named
+    stages, typed StageDiagnostics, ``RunAborted``-driven abort path.
+    The ``RunPlan`` flag values are identical (``skip_repair=False``,
+    ``skip_cache_hits=False``, ``notify=True``); only ``kind`` differs,
+    which is why one branch handles both.  Backfills stay on the
+    legacy inline body until #60 migrates them.
     """
-    if kind == RunKind.SCHEDULED:
+    if kind in (RunKind.SCHEDULED, RunKind.MANUAL):
         from influx.run import Run, RunDeps, RunPlan
 
         plan = RunPlan(
