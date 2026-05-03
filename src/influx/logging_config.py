@@ -4,6 +4,17 @@ Influx follows the same operational logging shape as Lithos: JSON logs
 by default with ``timestamp``, ``level``, ``logger``, and ``message``
 fields, plus any caller-provided ``extra`` fields.  Set
 ``INFLUX_LOG_FORMAT=text`` for local plain-text logs.
+
+When ``INFLUX_OTEL_ENABLED=true`` the same records are *also* forwarded
+to an OTEL ``LoggingHandler`` attached to the root logger, so the
+existing ``extra={...}`` fields (``run_id``, ``profile``, ``source_url``,
+``status``, ``detail``, …) become OTEL log attributes and ride alongside
+spans + metrics in the configured backend (issue #28).  The stderr JSON
+handler keeps running unchanged so ``docker logs`` and
+``scripts/influx-diagnose.py`` are unaffected.
+
+The OTEL path is strictly opt-in: when the toggle is unset / false, no
+OTEL imports run and no ``LoggingHandler`` is constructed (AC-10-A).
 """
 
 from __future__ import annotations
@@ -15,9 +26,12 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from influx.telemetry import _build_logger_provider
+
 __all__ = ["InfluxJsonFormatter", "setup_logging"]
 
 _HANDLER_MARKER = "_influx_json_handler"
+_OTEL_HANDLER_MARKER = "_influx_otel_log_handler"
 _STANDARD_LOG_RECORD_ATTRS = frozenset(
     {
         "args",
@@ -78,6 +92,12 @@ def setup_logging(level: int = logging.INFO, stream: Any = None) -> None:
     Repeated calls are idempotent unless the previously installed stream
     was closed, matching the Lithos closed-stream recovery behavior used
     by CLI tests.
+
+    When ``INFLUX_OTEL_ENABLED=true`` an OTEL ``LoggingHandler`` is
+    *additionally* attached to the root logger so the same records are
+    exported to the OTEL backend.  When OTEL is disabled, no OTEL
+    objects are constructed and no OTEL handler is installed
+    (AC-10-A discipline).
     """
     root = logging.getLogger()
 
@@ -92,11 +112,16 @@ def setup_logging(level: int = logging.INFO, stream: Any = None) -> None:
         survivors.append(handler)
     root.handlers = survivors
 
-    if not replace:
-        for handler in root.handlers:
-            if getattr(handler, _HANDLER_MARKER, False):
-                root.setLevel(level)
-                return
+    json_handler_present = any(
+        getattr(handler, _HANDLER_MARKER, False) for handler in root.handlers
+    )
+    if not replace and json_handler_present:
+        # Stderr handler is already installed.  Attach the OTEL handler
+        # if missing (so a subsequent ``setup_logging`` call after env
+        # changes can still wire OTEL), then bail.
+        _maybe_attach_otel_log_handler(root, level)
+        root.setLevel(level)
+        return
 
     if stream is None:
         stream = sys.stderr
@@ -116,3 +141,33 @@ def setup_logging(level: int = logging.INFO, stream: Any = None) -> None:
 
     root.setLevel(level)
     root.addHandler(handler)
+
+    _maybe_attach_otel_log_handler(root, level)
+
+
+def _maybe_attach_otel_log_handler(root: logging.Logger, level: int) -> None:
+    """Attach an OTEL ``LoggingHandler`` when (and only when) OTEL is enabled.
+
+    Strict AC-10-A discipline: the disabled path performs only a single
+    boolean check (``INFLUX_OTEL_ENABLED`` via :func:`_build_logger_provider`)
+    and never imports the OTEL SDK or constructs a handler object.
+    """
+    # Skip if an OTEL handler is already present (idempotent re-entry).
+    for handler in root.handlers:
+        if getattr(handler, _OTEL_HANDLER_MARKER, False):
+            return
+
+    provider = _build_logger_provider()
+    if provider is None:
+        # OTEL disabled or SDK unavailable — no handler attached
+        # (AC-10-A: no OTEL objects on the disabled path).
+        return
+
+    # Lazy import: this line only runs when OTEL is enabled and the
+    # SDK is installed (``_build_logger_provider`` would have returned
+    # ``None`` otherwise), so the disabled path never imports this.
+    from opentelemetry.sdk._logs import LoggingHandler
+
+    otel_handler = LoggingHandler(level=level, logger_provider=provider)
+    setattr(otel_handler, _OTEL_HANDLER_MARKER, True)
+    root.addHandler(otel_handler)
