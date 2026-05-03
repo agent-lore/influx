@@ -24,7 +24,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from mcp import types as mcp_types
 
 from influx.config import (
     AppConfig,
@@ -81,6 +80,8 @@ class _NoopClient:
         return frozenset()
 
     async def task_create(self, **kwargs: Any) -> Any:
+        from mcp import types as mcp_types
+
         self.calls.append(("task_create", kwargs))
         return mcp_types.CallToolResult(
             content=[
@@ -91,6 +92,8 @@ class _NoopClient:
         )
 
     async def task_complete(self, **kwargs: Any) -> Any:
+        from mcp import types as mcp_types
+
         self.calls.append(("task_complete", kwargs))
         return mcp_types.CallToolResult(
             content=[
@@ -347,6 +350,8 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
         profile: str, kind: RunKind, run_range: Any, filter_prompt: str
     ) -> list[dict[str, Any]]:
         return items
+
+    from mcp import types as mcp_types
 
     deps = RunDeps(config=config, item_provider=provider, probe_loop=None)
 
