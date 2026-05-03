@@ -619,7 +619,7 @@ class TestArchiveDownloadHookFailures:
         self, tmp_path: Path
     ) -> None:
         """Oversize is a counted failure — the stage must round-trip."""
-        from influx.repair import classify_failure
+        from influx.repair_counters import classify_failure
         from influx.storage import ArchiveResult
 
         config = _make_config(tmp_path)
@@ -641,7 +641,7 @@ class TestArchiveDownloadHookFailures:
 
     def test_http_error_raises_transient(self, tmp_path: Path) -> None:
         """HTTP 4xx/5xx is currently transient — the note retries next sweep."""
-        from influx.repair import classify_failure
+        from influx.repair_counters import classify_failure
         from influx.storage import ArchiveResult
 
         config = _make_config(tmp_path)
@@ -662,7 +662,7 @@ class TestArchiveDownloadHookFailures:
         assert classify_failure(exc_info.value) == "transient"
 
     def test_timeout_is_transient(self, tmp_path: Path) -> None:
-        from influx.repair import classify_failure
+        from influx.repair_counters import classify_failure
         from influx.storage import ArchiveResult
 
         config = _make_config(tmp_path)
@@ -685,7 +685,7 @@ class TestArchiveDownloadHookFailures:
 
 class TestArchiveDownloadHookMetadataRecovery:
     def test_missing_arxiv_id_tag_raises_resolve(self, tmp_path: Path) -> None:
-        from influx.repair import classify_failure
+        from influx.repair_counters import classify_failure
 
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
@@ -709,7 +709,7 @@ class TestArchiveDownloadHookMetadataRecovery:
         assert exc_info.value.stage == "resolve"
 
     def test_unsupported_source_raises_unsupported_source(self, tmp_path: Path) -> None:
-        from influx.repair import classify_failure
+        from influx.repair_counters import classify_failure
 
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
@@ -790,7 +790,7 @@ class TestTextExtractionHookSuccess:
 
 class TestTextExtractionHookFailures:
     def test_cascade_failure_propagates_extraction_error(self, tmp_path: Path) -> None:
-        from influx.repair import classify_failure
+        from influx.repair_counters import classify_failure
 
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
@@ -833,7 +833,7 @@ class TestTextExtractionHookFailures:
 
 class TestTextExtractionHookMetadataRecovery:
     def test_missing_arxiv_id_raises_resolve(self, tmp_path: Path) -> None:
-        from influx.repair import classify_failure
+        from influx.repair_counters import classify_failure
 
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
@@ -847,7 +847,7 @@ class TestTextExtractionHookMetadataRecovery:
         assert classify_failure(exc_info.value) == "transient"
 
     def test_unsupported_source_raises_unsupported_source(self, tmp_path: Path) -> None:
-        from influx.repair import classify_failure
+        from influx.repair_counters import classify_failure
 
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
