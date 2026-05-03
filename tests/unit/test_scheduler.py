@@ -486,7 +486,9 @@ class TestSweepWriteErrorMarksReadinessDegraded:
 
         with (
             patch("influx.scheduler.repair_sweep", side_effect=_failing_sweep),
+            patch("influx.run.repair_sweep", side_effect=_failing_sweep),
             patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch("influx.run.LithosClient", return_value=_NoopClient()),
             pytest.raises(SweepWriteError),
         ):
             await run_profile(
@@ -564,9 +566,15 @@ class TestSweepWriteErrorMarksReadinessDegraded:
 
         with (
             patch("influx.scheduler.repair_sweep", side_effect=_ok_sweep),
+            patch("influx.run.repair_sweep", side_effect=_ok_sweep),
             patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
                 "influx.scheduler.build_negative_examples_block",
+                side_effect=_empty_neg_block,
+            ),
+            patch(
+                "influx.run.build_negative_examples_block",
                 side_effect=_empty_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook"),
@@ -710,9 +718,15 @@ class TestScheduledFireInvokesRepairSweep:
 
         with (
             patch("influx.scheduler.repair_sweep", side_effect=spy_sweep),
+            patch("influx.run.repair_sweep", side_effect=spy_sweep),
             patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
                 "influx.scheduler.build_negative_examples_block",
+                side_effect=empty_neg_block,
+            ),
+            patch(
+                "influx.run.build_negative_examples_block",
                 side_effect=empty_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook"),
@@ -808,9 +822,15 @@ class TestNegativeExampleMaxTitleCharsWired:
 
         with (
             patch("influx.scheduler.repair_sweep", side_effect=_ok_sweep),
+            patch("influx.run.repair_sweep", side_effect=_ok_sweep),
             patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
                 "influx.scheduler.build_negative_examples_block",
+                side_effect=fake_neg_block,
+            ),
+            patch(
+                "influx.run.build_negative_examples_block",
                 side_effect=fake_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook"),

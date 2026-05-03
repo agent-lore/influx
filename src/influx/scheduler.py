@@ -377,7 +377,33 @@ async def _run_profile_body(
     ``None`` is permitted for tests that exercise the body without a
     real ledger; when ``None`` the unresolved-collision write is
     skipped (the metric still fires).
+
+    For ``RunKind.SCHEDULED`` (#58) the body delegates to the
+    :class:`influx.run.Run` module — five named stages, typed
+    StageDiagnostics, ``RunAborted``-driven abort path.  Manual and
+    backfill kinds stay on the legacy inline body until #59 / #60
+    migrate them.
     """
+    if kind == RunKind.SCHEDULED:
+        from influx.run import Run, RunDeps, RunPlan
+
+        plan = RunPlan(
+            profile=profile,
+            kind=kind,
+            date_window=run_range,
+            skip_repair=False,
+            skip_cache_hits=False,
+            notify=True,
+        )
+        deps = RunDeps(
+            config=config,
+            item_provider=item_provider,
+            probe_loop=probe_loop,
+            ledger=ledger,
+        )
+        outcome = await Run(plan, deps).execute()
+        return outcome.profile_run_result
+
     provider = item_provider
     profile_cfg = next((p for p in config.profiles if p.name == profile), None)
 

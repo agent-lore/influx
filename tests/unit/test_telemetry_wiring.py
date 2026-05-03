@@ -1139,9 +1139,16 @@ class TestInfluxLithosWriteSpan:
         try:
             with (
                 patch("influx.scheduler.get_tracer", return_value=tracer),
+                patch("influx.run.get_tracer", return_value=tracer),
                 patch("influx.scheduler.LithosClient") as mock_client_cls,
+                patch("influx.run.LithosClient") as mock_client_cls_run,
                 patch(
                     "influx.scheduler.build_negative_examples_block",
+                    new_callable=AsyncMock,
+                    return_value="",
+                ),
+                patch(
+                    "influx.run.build_negative_examples_block",
                     new_callable=AsyncMock,
                     return_value="",
                 ),
@@ -1150,7 +1157,16 @@ class TestInfluxLithosWriteSpan:
                     new_callable=AsyncMock,
                 ),
                 patch(
+                    "influx.run.repair_sweep",
+                    new_callable=AsyncMock,
+                ),
+                patch(
                     "influx.scheduler.lcma_wire",
+                    new_callable=AsyncMock,
+                    return_value=[],
+                ),
+                patch(
+                    "influx.run.lcma_wire",
                     new_callable=AsyncMock,
                     return_value=[],
                 ),
@@ -1158,6 +1174,7 @@ class TestInfluxLithosWriteSpan:
             ):
                 mock_client = AsyncMock()
                 mock_client_cls.return_value = mock_client
+                mock_client_cls_run.return_value = mock_client
                 # task_create returns a task_id
                 mock_client.task_create.return_value = MagicMock(
                     content=[MagicMock(text='{"task_id": "task-1"}')]
@@ -1219,15 +1236,28 @@ class TestInfluxLithosWriteSpan:
 
         with (
             patch("influx.scheduler.get_tracer", return_value=disabled_tracer),
+            patch("influx.run.get_tracer", return_value=disabled_tracer),
             patch("influx.scheduler.LithosClient") as mock_client_cls,
+            patch("influx.run.LithosClient") as mock_client_cls_run,
             patch(
                 "influx.scheduler.build_negative_examples_block",
                 new_callable=AsyncMock,
                 return_value="",
             ),
+            patch(
+                "influx.run.build_negative_examples_block",
+                new_callable=AsyncMock,
+                return_value="",
+            ),
             patch("influx.scheduler.repair_sweep", new_callable=AsyncMock),
+            patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch(
                 "influx.scheduler.lcma_wire",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "influx.run.lcma_wire",
                 new_callable=AsyncMock,
                 return_value=[],
             ),
@@ -1235,6 +1265,7 @@ class TestInfluxLithosWriteSpan:
         ):
             mock_client = AsyncMock()
             mock_client_cls.return_value = mock_client
+            mock_client_cls_run.return_value = mock_client
             mock_client.task_create.return_value = MagicMock(
                 content=[MagicMock(text='{"task_id": "task-1"}')]
             )
