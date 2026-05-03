@@ -41,6 +41,7 @@ from influx.http_client import guarded_post_json_fetch
 from influx.renderer import render
 from influx.schemas import FilterResponse
 from influx.slugs import slugify_feed_name
+from influx.source import Candidate, ScoredCandidate
 from influx.storage import download_archive
 from influx.telemetry import (
     current_run_id,
@@ -50,11 +51,12 @@ from influx.telemetry import (
 from influx.urls import normalise_url, url_hash
 
 if TYPE_CHECKING:
-    from influx.config import AppConfig, RssSourceEntry
+    from influx.config import AppConfig, ProfileConfig, RssSourceEntry
     from influx.sources import FetchCache
 
 __all__ = [
     "RssFeedItem",
+    "RssSource",
     "build_rss_note_item",
     "make_rss_item_provider",
     "parse_feed",
@@ -429,6 +431,94 @@ async def _score_rss_items(
 
 def _rss_filter_id(item: RssFeedItem) -> str:
     return url_hash(item.url)
+
+
+# ── Source adapter (issue #57) ──────────────────────────────────────
+
+
+class RssSource:
+    """RSS adapter conforming to :class:`influx.source.Source`.
+
+    Fans out across the profile's configured feeds in
+    :meth:`fetch_candidates`; per-feed filter scoring stays in the
+    legacy provider closure so :func:`_score_rss_items` retains its
+    test seam.
+    """
+
+    name = "rss"
+
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        fetch_cache: FetchCache | None = None,
+    ) -> None:
+        self._config = config
+        self._cache = fetch_cache
+
+    async def fetch_candidates(
+        self,
+        *,
+        profile_cfg: ProfileConfig,
+        kind: RunKind,
+        run_range: dict[str, str | int] | None,
+    ) -> list[Candidate]:
+        """Fetch every configured feed and flatten into a list of Candidates.
+
+        Each :class:`Candidate.payload` is the original
+        :class:`RssFeedItem`, so :meth:`acquire` can reconstruct the
+        feed-specific metadata (source_tag, feed_name) without a
+        secondary lookup.
+        """
+        del kind, run_range
+        config = self._config
+        candidates: list[Candidate] = []
+        for feed_entry in profile_cfg.sources.rss:
+            items = await _fetch_rss_feed(
+                feed_entry,
+                self._cache,
+                max_download_bytes=config.storage.max_download_bytes,
+                timeout_seconds=config.storage.download_timeout_seconds,
+                profile=profile_cfg.name,
+            )
+            metrics.candidates_fetched().add(
+                len(items), {"profile": profile_cfg.name, "source": "rss"}
+            )
+            for item in items:
+                candidates.append(
+                    Candidate(
+                        item_id=_rss_filter_id(item),
+                        title=item.title,
+                        abstract=item.summary,
+                        source_url=item.url,
+                        payload=item,
+                    )
+                )
+        return candidates
+
+    def acquire(
+        self,
+        scored: ScoredCandidate,
+        *,
+        profile_cfg: ProfileConfig,
+        config: AppConfig,
+    ) -> dict[str, Any]:
+        """Acquire stage: download archive + run cascade + render note."""
+        item = scored.candidate.payload
+        if not isinstance(item, RssFeedItem):
+            raise TypeError(
+                "RssSource.acquire requires Candidate.payload to be RssFeedItem; "
+                f"got {type(item).__name__}",
+            )
+        return build_rss_note_item(
+            item=item,
+            profile_name=profile_cfg.name,
+            config=config,
+            score=scored.score,
+            confidence=scored.confidence,
+            reason=scored.reason,
+            filter_tags=scored.filter_tags,
+        )
 
 
 # ── Production-default RSS item provider ────────────────────────────
