@@ -484,7 +484,7 @@ def _make_tier3(**overrides: object) -> Tier3Extraction:
 class TestTier1EnrichmentSuccess:
     """Score >= relevance + tier1_enrich succeeds → structured ## Summary."""
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     def test_summary_section_rendered_from_tier1(self, mock_t1: object) -> None:
         mock_t1.return_value = _make_tier1()  # type: ignore[union-attr]
         config = _make_config(relevance=7, deep_extract=100)
@@ -505,7 +505,7 @@ class TestTier1EnrichmentSuccess:
         assert "### Relevance" in result["content"]
         assert "Novel approach to task X" in result["content"]
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     def test_tier1_called_with_profile_summary(self, mock_t1: object) -> None:
         mock_t1.return_value = _make_tier1()  # type: ignore[union-attr]
         config = _make_config(relevance=7, deep_extract=100)
@@ -525,7 +525,7 @@ class TestTier1EnrichmentSuccess:
         assert call_kwargs["abstract"] == "This is the abstract of the test paper."
         assert call_kwargs["profile_summary"] == "AI and robotics research"
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     def test_no_repair_needed_when_tier1_succeeds(self, mock_t1: object) -> None:
         mock_t1.return_value = _make_tier1()  # type: ignore[union-attr]
         config = _make_config(relevance=7, deep_extract=100)
@@ -541,7 +541,7 @@ class TestTier1EnrichmentSuccess:
 
         assert "influx:repair-needed" not in result["tags"]
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     def test_tier1_not_called_below_relevance(self, mock_t1: object) -> None:
         config = _make_config(relevance=7)
 
@@ -579,7 +579,7 @@ class TestTier1EnrichmentSuccess:
 class TestTier1EnrichmentFailure:
     """Score >= relevance + tier1_enrich fails → no ## Summary + repair-needed."""
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     def test_no_summary_on_tier1_failure(self, mock_t1: object) -> None:
         """AC-07-A: note written WITHOUT ## Summary on tier1 failure."""
         mock_t1.side_effect = LCMAError(  # type: ignore[union-attr]
@@ -598,7 +598,7 @@ class TestTier1EnrichmentFailure:
 
         assert "## Summary" not in result["content"]
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     def test_repair_needed_on_tier1_failure(self, mock_t1: object) -> None:
         mock_t1.side_effect = LCMAError(  # type: ignore[union-attr]
             "validation failed", model="enrich", stage="validate"
@@ -616,7 +616,7 @@ class TestTier1EnrichmentFailure:
 
         assert "influx:repair-needed" in result["tags"]
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     def test_no_placeholder_text_on_tier1_failure(self, mock_t1: object) -> None:
         """FR-ENR-6: no placeholder text inserted on failure."""
         mock_t1.side_effect = LCMAError(  # type: ignore[union-attr]
@@ -644,8 +644,8 @@ class TestTier1EnrichmentFailure:
 class TestTier3ExtractionSuccess:
     """Score >= deep_extract + extraction succeeds + tier3 succeeds."""
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_tier3_sections_rendered(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -671,8 +671,8 @@ class TestTier3ExtractionSuccess:
         assert "## Builds On" in result["content"]
         assert "## Open Questions" in result["content"]
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_deep_extracted_tag_on_tier3_success(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -695,8 +695,8 @@ class TestTier3ExtractionSuccess:
 
         assert "influx:deep-extracted" in result["tags"]
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_no_repair_needed_all_succeed(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -719,8 +719,8 @@ class TestTier3ExtractionSuccess:
 
         assert "influx:repair-needed" not in result["tags"]
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_tier3_not_called_without_extracted_text(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -745,7 +745,7 @@ class TestTier3ExtractionSuccess:
 
         mock_t3.assert_not_called()  # type: ignore[union-attr]
 
-    @patch("influx.sources.arxiv.tier3_extract")
+    @patch("influx.cascade.tier3_extract")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_tier3_not_called_below_deep_extract_threshold(
         self, mock_ext: object, mock_t3: object
@@ -773,8 +773,8 @@ class TestTier3ExtractionSuccess:
 class TestTier3ExtractionFailure:
     """Score >= deep_extract + tier3_extract fails → no Tier 3 + repair-needed."""
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_no_tier3_sections_on_failure(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -802,8 +802,8 @@ class TestTier3ExtractionFailure:
         assert "## Builds On" not in result["content"]
         assert "## Open Questions" not in result["content"]
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_no_deep_extracted_tag_on_tier3_failure(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -828,8 +828,8 @@ class TestTier3ExtractionFailure:
 
         assert "influx:deep-extracted" not in result["tags"]
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_repair_needed_on_tier3_failure(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -854,8 +854,8 @@ class TestTier3ExtractionFailure:
 
         assert "influx:repair-needed" in result["tags"]
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_unexpected_tier3_exception_degrades_to_repair(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -888,7 +888,7 @@ class TestTier3ExtractionFailure:
         assert "influx:deep-extracted" not in result["tags"]
         assert "## Claims" not in result["content"]
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_unexpected_tier1_exception_degrades_to_repair(
         self, mock_ext: object, mock_t1: object
@@ -921,8 +921,8 @@ class TestTier3ExtractionFailure:
 class TestPerTierFailureIndependence:
     """Tier 1 success + Tier 3 failure → ## Summary present, no Tier 3."""
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_tier1_success_tier3_failure(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -955,8 +955,8 @@ class TestPerTierFailureIndependence:
         # repair-needed from Tier 3 failure
         assert "influx:repair-needed" in result["tags"]
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_tier1_failure_tier3_success(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -988,8 +988,8 @@ class TestPerTierFailureIndependence:
         # repair-needed from Tier 1 failure
         assert "influx:repair-needed" in result["tags"]
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_extraction_fail_tier1_success(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -1028,8 +1028,8 @@ class TestPerTierFailureIndependence:
 class TestTagDerivationInvariants:
     """Section-iff-tag invariant on initial write."""
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_full_text_tag_iff_section(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -1055,8 +1055,8 @@ class TestTagDerivationInvariants:
         has_tag = "full-text" in result["tags"]
         assert has_section == has_tag
 
-    @patch("influx.sources.arxiv.tier3_extract")
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier3_extract")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_deep_extracted_tag_iff_tier3_sections(
         self, mock_ext: object, mock_t1: object, mock_t3: object
@@ -1090,7 +1090,7 @@ class TestTagDerivationInvariants:
         has_tag = "influx:deep-extracted" in result["tags"]
         assert has_sections == has_tag
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_no_deep_extracted_without_tier3(
         self, mock_ext: object, mock_t1: object
@@ -1115,7 +1115,7 @@ class TestTagDerivationInvariants:
         assert "influx:deep-extracted" not in result["tags"]
         assert "## Claims" not in result["content"]
 
-    @patch("influx.sources.arxiv.tier1_enrich")
+    @patch("influx.cascade.tier1_enrich")
     @patch("influx.sources.arxiv.extract_arxiv_text")
     def test_repair_needed_set_exactly_once(
         self, mock_ext: object, mock_t1: object

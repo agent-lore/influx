@@ -838,6 +838,7 @@ class TestInfluxEnrichTier1Span:
         try:
             with (
                 patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch("influx.cascade.get_tracer", return_value=tracer),
                 patch(
                     "influx.sources.arxiv.extract_arxiv_text",
                     return_value=ArxivExtractionResult(
@@ -845,7 +846,7 @@ class TestInfluxEnrichTier1Span:
                     ),
                 ),
                 patch(
-                    "influx.sources.arxiv.tier1_enrich",
+                    "influx.cascade.tier1_enrich",
                     return_value=Tier1Enrichment(
                         contributions=["c1"],
                         method="m",
@@ -854,7 +855,7 @@ class TestInfluxEnrichTier1Span:
                     ),
                 ),
                 patch(
-                    "influx.sources.arxiv.tier3_extract",
+                    "influx.cascade.tier3_extract",
                     return_value=MagicMock(builds_on=["b"]),
                 ),
             ):
@@ -895,6 +896,7 @@ class TestInfluxEnrichTier2Span:
         try:
             with (
                 patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch("influx.cascade.get_tracer", return_value=tracer),
                 patch(
                     "influx.sources.arxiv.extract_arxiv_text",
                     return_value=ArxivExtractionResult(
@@ -902,7 +904,7 @@ class TestInfluxEnrichTier2Span:
                     ),
                 ),
                 patch(
-                    "influx.sources.arxiv.tier1_enrich",
+                    "influx.cascade.tier1_enrich",
                     return_value=MagicMock(contributions=["c"]),
                 ),
             ):
@@ -945,6 +947,7 @@ class TestInfluxEnrichTier3Span:
         try:
             with (
                 patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch("influx.cascade.get_tracer", return_value=tracer),
                 patch(
                     "influx.sources.arxiv.extract_arxiv_text",
                     return_value=ArxivExtractionResult(
@@ -952,11 +955,11 @@ class TestInfluxEnrichTier3Span:
                     ),
                 ),
                 patch(
-                    "influx.sources.arxiv.tier1_enrich",
+                    "influx.cascade.tier1_enrich",
                     return_value=MagicMock(contributions=["c"]),
                 ),
                 patch(
-                    "influx.sources.arxiv.tier3_extract",
+                    "influx.cascade.tier3_extract",
                     return_value=Tier3Extraction(
                         claims=["claim1"],
                         builds_on=["b1"],
@@ -1000,6 +1003,7 @@ class TestEnrichSpansAllThreeTiers:
         try:
             with (
                 patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch("influx.cascade.get_tracer", return_value=tracer),
                 patch(
                     "influx.sources.arxiv.extract_arxiv_text",
                     return_value=ArxivExtractionResult(
@@ -1007,13 +1011,13 @@ class TestEnrichSpansAllThreeTiers:
                     ),
                 ),
                 patch(
-                    "influx.sources.arxiv.tier1_enrich",
+                    "influx.cascade.tier1_enrich",
                     return_value=Tier1Enrichment(
                         contributions=["c"], method="m", result="r", relevance="rel"
                     ),
                 ),
                 patch(
-                    "influx.sources.arxiv.tier3_extract",
+                    "influx.cascade.tier3_extract",
                     return_value=Tier3Extraction(
                         claims=["claim"],
                         builds_on=["b"],
@@ -1064,13 +1068,13 @@ class TestEnrichSpansDisabled:
                 ),
             ),
             patch(
-                "influx.sources.arxiv.tier1_enrich",
+                "influx.cascade.tier1_enrich",
                 return_value=Tier1Enrichment(
                     contributions=["c"], method="m", result="r", relevance="rel"
                 ),
             ) as mock_tier1,
             patch(
-                "influx.sources.arxiv.tier3_extract",
+                "influx.cascade.tier3_extract",
                 return_value=Tier3Extraction(
                     claims=["claim"],
                     builds_on=["b"],

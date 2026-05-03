@@ -210,13 +210,13 @@ async def _run_arxiv_scenario(meter: InfluxMeter, config: Any) -> None:
             ),
         ),
         patch(
-            "influx.sources.arxiv.tier1_enrich",
+            "influx.cascade.tier1_enrich",
             return_value=Tier1Enrichment(
                 contributions=["c1"], method="m", result="r", relevance="rel"
             ),
         ),
         patch(
-            "influx.sources.arxiv.tier3_extract",
+            "influx.cascade.tier3_extract",
             return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
         ),
         patch("influx.scheduler.LithosClient", return_value=mock_client),
@@ -386,7 +386,7 @@ class TestOtelDisabledZeroMetrics:
                 ),
             ),
             patch(
-                "influx.sources.arxiv.tier1_enrich",
+                "influx.cascade.tier1_enrich",
                 return_value=Tier1Enrichment(
                     contributions=["c1"],
                     method="m",
@@ -395,7 +395,7 @@ class TestOtelDisabledZeroMetrics:
                 ),
             ),
             patch(
-                "influx.sources.arxiv.tier3_extract",
+                "influx.cascade.tier3_extract",
                 return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
             ),
             patch("influx.scheduler.LithosClient", return_value=mock_client),

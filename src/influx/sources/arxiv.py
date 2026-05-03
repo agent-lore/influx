@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from influx import metrics
+from influx.cascade import Acquired, Cascade, Tier2Result
 from influx.config import (
     AppConfig,
     ArxivSourceConfig,
@@ -36,13 +37,11 @@ from influx.config import (
     StorageConfig,
 )
 from influx.coordinator import RunKind
-from influx.enrich import tier1_enrich, tier3_extract
-from influx.errors import ExtractionError, LCMAError, NetworkError
+from influx.errors import NetworkError
 from influx.extraction.pipeline import extract_arxiv_text
 from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
 from influx.renderer import render
-from influx.schemas import Tier1Enrichment, Tier3Extraction
 from influx.storage import download_archive
 from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
@@ -583,30 +582,20 @@ def build_arxiv_note_item(
     source_url = f"https://arxiv.org/abs/{item.arxiv_id}"
     cat_tags = [f"cat:{c}" for c in item.categories]
 
-    tags: list[str] = [
-        f"profile:{profile_name}",
-        f"arxiv-id:{item.arxiv_id}",
-        "source:arxiv",
-        "ingested-by:influx",
-        f"schema:{config.influx.note_schema_version}",
-        *cat_tags,
-    ]
-
-    repair_needed = False
-    archive_path: str | None = None
-    pdf_url = f"https://arxiv.org/pdf/{item.arxiv_id}.pdf"
-    tracer = get_tracer()
+    # ── Acquire stage (arXiv-specific) ────────────────────────────
     archive_terminal_ids = current_archive_terminal_arxiv_ids.get()
     is_archive_terminal = item.arxiv_id in archive_terminal_ids
+    archive_path: str | None = None
+    archive_missing = False
+    pdf_url = f"https://arxiv.org/pdf/{item.arxiv_id}.pdf"
+    tracer = get_tracer()
 
     if is_archive_terminal:
         # Issue #14: this paper's archive download has been terminal-flipped
         # by an earlier repair sweep (or hand-set by an operator).  Skip the
         # download attempt entirely; the existing Lithos note's tags will
         # be preserved by the canonical merge_tags path on rewrite.
-        tags.append("influx:archive-missing")
-        tags.append("influx:archive-terminal")
-        repair_needed = True
+        archive_missing = True
         metrics.archive_missing().add(1, {"profile": profile_name, "source": "arxiv"})
         _log.info(
             "archive download skipped (terminal) profile=%s arxiv_id=%s",
@@ -638,143 +627,66 @@ def build_arxiv_note_item(
         if archive_result.ok:
             archive_path = archive_result.rel_posix_path
         else:
-            tags.append("influx:archive-missing")
-            repair_needed = True
+            archive_missing = True
             metrics.archive_missing().add(
                 1, {"profile": profile_name, "source": "arxiv"}
             )
 
-    # ── Extraction cascade ────────────────────────────────────────
-    extracted_text: str | None = None
-    text_tag = "text:abstract-only"
+    acquired = Acquired(
+        item_id=item.arxiv_id,
+        source_url=source_url,
+        title=item.title,
+        abstract=item.abstract,
+        identity_tags=tuple(cat_tags),
+        archive_path=archive_path,
+        archive_missing=archive_missing,
+        archive_terminal=is_archive_terminal,
+    )
 
-    if score >= thresholds.full_text:
-        # ── Telemetry: influx.enrich.tier2 span (FR-OBS-4) ──
-        _tracer = get_tracer()
-        with _tracer.span(
-            "influx.enrich.tier2",
-            attributes={
-                "influx.profile": profile_name,
-                "influx.run_id": current_run_id.get() or "",
-                "influx.item_count": 1,
-            },
-        ):
-            try:
-                result = extract_arxiv_text(item.arxiv_id, config)
-                extracted_text = result.text
-                text_tag = result.source_tag
-            except ExtractionError:
-                # Both HTML and PDF failed — abstract-only + repair-needed.
-                repair_needed = True
+    # ── Cascade ───────────────────────────────────────────────────
+    cascade = Cascade(
+        config=config,
+        profile_name=profile_name,
+        profile_summary=profile_cfg.description if profile_cfg else "",
+        thresholds=thresholds,
+        tier2_extractor=_make_arxiv_tier2_extractor(config),
+    )
+    sections = cascade.enrich(acquired, score)
 
-    tags.append(text_tag)
-
-    # full-text tag iff extraction succeeded AND above threshold.
-    full_text_for_note: str | None = None
-    if extracted_text is not None and score >= thresholds.full_text:
-        full_text_for_note = extracted_text
+    # ── Tag composition ───────────────────────────────────────────
+    tags: list[str] = [
+        f"profile:{profile_name}",
+        f"arxiv-id:{item.arxiv_id}",
+        "source:arxiv",
+        "ingested-by:influx",
+        f"schema:{config.influx.note_schema_version}",
+        *cat_tags,
+    ]
+    if archive_missing:
+        tags.append("influx:archive-missing")
+    if is_archive_terminal:
+        tags.append("influx:archive-terminal")
+    tags.append(sections.text_tag)
+    if sections.full_text is not None:
         tags.append("full-text")
-
-    if repair_needed:
+    # Archive-driven repair flag fires at the early position so a
+    # missing archive is visible in tags before the cascade's outcomes.
+    if archive_missing and "influx:repair-needed" not in tags:
         tags.append("influx:repair-needed")
-
-    # ── Tier 1 enrichment (FR-ENR-4) ─────────────────────────────
-    tier1_result: Tier1Enrichment | None = None
-    tier1_attempted = score >= thresholds.relevance
-    if tier1_attempted:
-        # ── Telemetry: influx.enrich.tier1 span (FR-OBS-4) ──
-        _tracer = get_tracer()
-        with _tracer.span(
-            "influx.enrich.tier1",
-            attributes={
-                "influx.profile": profile_name,
-                "influx.run_id": current_run_id.get() or "",
-                "influx.item_count": 1,
-            },
-        ):
-            profile_summary = profile_cfg.description if profile_cfg else ""
-            try:
-                tier1_result = tier1_enrich(
-                    title=item.title,
-                    abstract=item.abstract,
-                    profile_summary=profile_summary,
-                    config=config,
-                )
-            except LCMAError:
-                _log.warning("Tier 1 enrichment failed for %s", item.arxiv_id)
-                repair_needed = True
-                metrics.llm_validation_failures().add(
-                    1, {"profile": profile_name, "tier": "1"}
-                )
-            except Exception:
-                # Defensive: any unexpected failure during Tier 1
-                # (e.g. an LLM response shape that bypasses the schema's
-                # validators with an AttributeError, per staging incident
-                # 2026-05-01) must degrade to a per-paper repair, not
-                # take the whole scheduler run down.
-                _log.warning(
-                    "Tier 1 enrichment crashed unexpectedly for %s",
-                    item.arxiv_id,
-                    exc_info=True,
-                )
-                repair_needed = True
-                metrics.llm_validation_failures().add(
-                    1, {"profile": profile_name, "tier": "1"}
-                )
-
-    # ── Tier 3 deep extraction (FR-ENR-5) ─────────────────────────
-    tier3_result: Tier3Extraction | None = None
-    if score >= thresholds.deep_extract and extracted_text is not None:
-        # ── Telemetry: influx.enrich.tier3 span (FR-OBS-4) ──
-        _tracer = get_tracer()
-        with _tracer.span(
-            "influx.enrich.tier3",
-            attributes={
-                "influx.profile": profile_name,
-                "influx.run_id": current_run_id.get() or "",
-                "influx.item_count": 1,
-            },
-        ):
-            try:
-                tier3_result = tier3_extract(
-                    title=item.title,
-                    full_text=extracted_text,
-                    config=config,
-                )
-            except LCMAError:
-                _log.warning("Tier 3 extraction failed for %s", item.arxiv_id)
-                repair_needed = True
-                metrics.llm_validation_failures().add(
-                    1, {"profile": profile_name, "tier": "3"}
-                )
-            except Exception:
-                # Defensive: same rationale as the Tier 1 catch — a
-                # validator bug or unforeseen response shape must not
-                # turn a single bad paper into a run-level abort
-                # (staging incident 2026-05-01).
-                _log.warning(
-                    "Tier 3 extraction crashed unexpectedly for %s",
-                    item.arxiv_id,
-                    exc_info=True,
-                )
-                repair_needed = True
-                metrics.llm_validation_failures().add(
-                    1, {"profile": profile_name, "tier": "3"}
-                )
-
-    # influx:deep-extracted iff all four Tier 3 sections exist.
-    if tier3_result is not None:
+    if sections.tier3 is not None:
         tags.append("influx:deep-extracted")
-
-    # Ensure repair-needed is set exactly once.
-    if repair_needed and "influx:repair-needed" not in tags:
-        tags.append("influx:repair-needed")
+    for flag in sections.repair_flags:
+        if flag not in tags:
+            tags.append(flag)
+    for flag in sections.terminal_flags:
+        if flag not in tags:
+            tags.append(flag)
 
     # ── Render note ───────────────────────────────────────────────
     # When Tier 1 was attempted but failed, suppress the plain-text
     # summary so ## Summary is omitted entirely (AC-07-A / FR-ENR-6).
     summary_text = item.abstract
-    if tier1_attempted and tier1_result is None:
+    if sections.tier1_attempted and sections.tier1 is None:
         summary_text = ""
 
     content = render(
@@ -787,9 +699,9 @@ def build_arxiv_note_item(
         profile_name=profile_name,
         score=score,
         reason=reason,
-        full_text=full_text_for_note,
-        tier1_enrichment=tier1_result,
-        tier3_extraction=tier3_result,
+        full_text=sections.full_text,
+        tier1_enrichment=sections.tier1,
+        tier3_extraction=sections.tier3,
     )
 
     pub = item.published
@@ -808,9 +720,29 @@ def build_arxiv_note_item(
         "reason": reason,
         "path": path,
         "abstract_or_summary": item.abstract,
-        "contributions": tier1_result.contributions if tier1_result else None,
-        "builds_on": list(tier3_result.builds_on) if tier3_result else None,
+        "contributions": sections.tier1.contributions if sections.tier1 else None,
+        "builds_on": list(sections.tier3.builds_on) if sections.tier3 else None,
     }
+
+
+def _make_arxiv_tier2_extractor(
+    config: AppConfig,
+) -> Callable[[Acquired], Tier2Result]:
+    """Build a Tier-2 extractor closure for arXiv that the Cascade calls.
+
+    Wraps :func:`extract_arxiv_text` (HTML → PDF cascade) and adapts
+    its ``ArxivExtractionResult`` into the source-agnostic
+    :class:`Tier2Result` the Cascade consumes.
+    """
+
+    def _extractor(acquired: Acquired) -> Tier2Result:
+        result = extract_arxiv_text(acquired.item_id, config)
+        flavour = "html" if result.source_tag == "text:html" else "pdf"
+        return Tier2Result(
+            text=result.text, flavour=flavour, text_tag=result.source_tag
+        )
+
+    return _extractor
 
 
 # ── Production-default item provider (PRD 07 finding #1) ──────────────
