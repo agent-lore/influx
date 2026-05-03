@@ -32,6 +32,7 @@ from influx.cascade import Acquired, Cascade, Tier2Result
 from influx.config import (
     AppConfig,
     ArxivSourceConfig,
+    ProfileConfig,
     ProfileThresholds,
     ResilienceConfig,
     StorageConfig,
@@ -42,6 +43,7 @@ from influx.extraction.pipeline import extract_arxiv_text
 from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
 from influx.renderer import render
+from influx.source import Candidate, ScoredCandidate
 from influx.storage import download_archive
 from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
@@ -58,6 +60,7 @@ __all__ = [
     "ArxivItem",
     "ArxivScorer",
     "ArxivScoreResult",
+    "ArxivSource",
     "BackfillRange",
     "build_arxiv_note_item",
     "build_query_url",
@@ -745,6 +748,243 @@ def _make_arxiv_tier2_extractor(
     return _extractor
 
 
+# ── Source adapter (issue #57) ──────────────────────────────────────
+
+
+class ArxivSource:
+    """arXiv adapter conforming to :class:`influx.source.Source`.
+
+    Splits the legacy provider closure into the two stages CONTEXT.md
+    names: :meth:`fetch_candidates` and :meth:`acquire`.  Filter scoring
+    happens between them in :class:`influx.filter.Filter`; the cascade /
+    renderer run inside :meth:`acquire`.
+    """
+
+    name = "arxiv"
+
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        fetch_cache: FetchCache | None = None,
+    ) -> None:
+        self._config = config
+        self._cache = fetch_cache
+
+    async def fetch_candidates(
+        self,
+        *,
+        profile_cfg: ProfileConfig,
+        kind: RunKind,
+        run_range: dict[str, str | int] | None,
+    ) -> list[Candidate]:
+        """Fetch raw arXiv items and wrap them as :class:`Candidate` records.
+
+        Surfaces fetch failures via the run-ledger ``source_acquisition``
+        path (issue #20) and returns an empty list when the source is
+        disabled or fetch failed; the orchestrator then yields zero
+        items for arXiv.
+        """
+        config = self._config
+        profile = profile_cfg.name
+        if not profile_cfg.sources.arxiv.enabled:
+            _log.info("arxiv source skipped profile=%s reason=disabled", profile)
+            return []
+
+        arxiv_cfg = profile_cfg.sources.arxiv
+        backfill_range = (
+            resolve_backfill_range(run_range) if kind == RunKind.BACKFILL else None
+        )
+        cache_key = "arxiv:" + build_query_url(
+            categories=arxiv_cfg.categories,
+            max_results=arxiv_cfg.max_results_per_category,
+            backfill_range=backfill_range,
+        )
+
+        async def _do_fetch() -> list[ArxivItem]:
+            return await _fetch_arxiv_items(
+                profile=profile,
+                kind=kind,
+                arxiv_cfg=arxiv_cfg,
+                config=config,
+                backfill_range=backfill_range,
+            )
+
+        tracer = get_tracer()
+        with tracer.span(
+            "influx.fetch.arxiv",
+            attributes={
+                "influx.profile": profile,
+                "influx.run_id": current_run_id.get() or "",
+                "influx.source": "arxiv",
+            },
+        ) as fetch_span:
+            try:
+                if self._cache is not None:
+                    items = await self._cache.get_or_fetch(cache_key, _do_fetch)
+                else:
+                    items = await _do_fetch()
+            except NetworkError as exc:
+                _log.warning(
+                    "arxiv fetch failed for profile %r; yielding zero items",
+                    profile,
+                    exc_info=True,
+                )
+                record_source_acquisition_error(
+                    source="arxiv",
+                    kind=exc.kind or "unknown",
+                    detail=str(exc),
+                )
+                metrics.source_acquisition_errors().add(
+                    1,
+                    {
+                        "profile": profile,
+                        "source": "arxiv",
+                        "kind": exc.kind or "unknown",
+                    },
+                )
+                return []
+            fetch_span.set_attribute("influx.item_count", len(items))
+            metrics.candidates_fetched().add(
+                len(items), {"profile": profile, "source": "arxiv"}
+            )
+            _log.info(
+                "arxiv fetch completed profile=%s kind=%s items=%d",
+                profile,
+                kind.value,
+                len(items),
+            )
+
+        return [
+            Candidate(
+                item_id=item.arxiv_id,
+                title=item.title,
+                abstract=item.abstract,
+                source_url=f"https://arxiv.org/abs/{item.arxiv_id}",
+                payload=item,
+            )
+            for item in items
+        ]
+
+    def acquire(
+        self,
+        scored: ScoredCandidate,
+        *,
+        profile_cfg: ProfileConfig,
+        config: AppConfig,
+    ) -> dict[str, Any]:
+        """Acquire stage: download archive + run cascade + render note.
+
+        Delegates to :func:`build_arxiv_note_item`.  The legacy module
+        binding is preserved so existing tests that patch
+        ``influx.sources.arxiv.build_arxiv_note_item`` continue to work.
+        """
+        item = scored.candidate.payload
+        if not isinstance(item, ArxivItem):
+            raise TypeError(
+                "ArxivSource.acquire requires Candidate.payload to be ArxivItem; "
+                f"got {type(item).__name__}",
+            )
+        return build_arxiv_note_item(
+            item=item,
+            score=scored.score,
+            confidence=scored.confidence,
+            reason=scored.reason,
+            profile_name=profile_cfg.name,
+            config=config,
+            filter_tags=scored.filter_tags,
+        )
+
+
+async def _fetch_arxiv_items(
+    *,
+    profile: str,
+    kind: RunKind,
+    arxiv_cfg: ArxivSourceConfig,
+    config: AppConfig,
+    backfill_range: BackfillRange | None,
+) -> list[ArxivItem]:
+    """Run the (possibly per-day) arXiv fetch loop and return raw items.
+
+    Extracted from the legacy provider closure so :class:`ArxivSource`
+    and the legacy ``make_arxiv_item_provider`` share one fetch
+    implementation.
+    """
+    if kind != RunKind.BACKFILL or backfill_range is None:
+        _log.info(
+            "arxiv fetch started profile=%s kind=%s categories=%s "
+            "max_results=%d lookback_days=%d",
+            profile,
+            kind.value,
+            arxiv_cfg.categories,
+            arxiv_cfg.max_results_per_category,
+            arxiv_cfg.lookback_days,
+        )
+        return fetch_arxiv(
+            arxiv_config=arxiv_cfg,
+            resilience=config.resilience,
+            backfill_range=backfill_range,
+            max_download_bytes=config.storage.max_download_bytes,
+            timeout_seconds=config.storage.download_timeout_seconds,
+        )
+
+    n_categories = max(len(arxiv_cfg.categories), 1)
+    per_day_max = arxiv_cfg.max_results_per_category * n_categories
+    per_day_arxiv_cfg = ArxivSourceConfig(
+        enabled=arxiv_cfg.enabled,
+        categories=list(arxiv_cfg.categories),
+        max_results_per_category=per_day_max,
+        lookback_days=arxiv_cfg.lookback_days,
+    )
+    pacing = float(config.resilience.arxiv_request_min_interval_seconds)
+    collected: list[ArxivItem] = []
+    seen_ids: set[str] = set()
+    current = backfill_range.date_from
+    while current < backfill_range.date_to:
+        day_range = BackfillRange(
+            date_from=current,
+            date_to=current + timedelta(days=1),
+        )
+        _log.info(
+            "arxiv backfill day fetch started profile=%s day=%s "
+            "categories=%s max_results=%d",
+            profile,
+            current.isoformat(),
+            arxiv_cfg.categories,
+            per_day_max,
+        )
+        _sleep(pacing)
+        try:
+            day_items = fetch_arxiv(
+                arxiv_config=per_day_arxiv_cfg,
+                resilience=config.resilience,
+                backfill_range=day_range,
+                max_download_bytes=config.storage.max_download_bytes,
+                timeout_seconds=config.storage.download_timeout_seconds,
+            )
+        except NetworkError:
+            _log.warning(
+                "arxiv fetch failed for day %s; continuing backfill",
+                current.isoformat(),
+                exc_info=True,
+            )
+            day_items = []
+        for it in day_items:
+            if it.arxiv_id not in seen_ids:
+                seen_ids.add(it.arxiv_id)
+                collected.append(it)
+        _log.info(
+            "arxiv backfill day fetch completed profile=%s day=%s items=%d "
+            "collected=%d",
+            profile,
+            current.isoformat(),
+            len(day_items),
+            len(collected),
+        )
+        current = current + timedelta(days=1)
+    return collected
+
+
 # ── Production-default item provider (PRD 07 finding #1) ──────────────
 
 
@@ -803,330 +1043,148 @@ def make_arxiv_item_provider(
         if profile_cfg is None:
             _log.info("arxiv source skipped profile=%s reason=unknown_profile", profile)
             return ()
-        if not profile_cfg.sources.arxiv.enabled:
-            _log.info("arxiv source skipped profile=%s reason=disabled", profile)
+
+        # ── 1. Source.fetch_candidates ────────────────────────────
+        source = ArxivSource(config, fetch_cache=cache)
+        candidates = await source.fetch_candidates(
+            profile_cfg=profile_cfg,
+            kind=kind,
+            run_range=run_range,
+        )
+        if not candidates:
             return ()
 
-        # ── Cached fetch (R-8 dedup) ─────────────────────────────
-        # Backfill runs build a date-bounded query so the requested
-        # historical window is honoured (FR-BF-1).  The cache key
-        # includes the bounded URL so that two profiles requesting the
-        # same window dedup, but distinct windows do not collide.
-        arxiv_cfg = profile_cfg.sources.arxiv
-        thresholds = profile_cfg.thresholds
-        backfill_range = (
-            resolve_backfill_range(run_range) if kind == RunKind.BACKFILL else None
-        )
-        cache_key = "arxiv:" + build_query_url(
-            categories=arxiv_cfg.categories,
-            max_results=arxiv_cfg.max_results_per_category,
-            backfill_range=backfill_range,
+        # ── 2. Filter.score (per-item or batched seams) ───────────
+        scored_list = await _score_arxiv_candidates(
+            candidates,
+            profile_cfg=profile_cfg,
+            filter_prompt=filter_prompt,
+            batch_size=int(config.filter.batch_size),
+            scorer=scorer,
+            filter_scorer=filter_scorer,
         )
 
-        async def _do_fetch() -> list[ArxivItem]:
-            # FR-BF-3 / review finding 2: multi-day backfills MUST split
-            # into per-day windows so the run actually realizes the
-            # ``days × len(categories) × max_results_per_category``
-            # contract.  A single OR-joined query with ``max_results=N``
-            # returns at most N items total across all days/categories,
-            # so a 7-day backfill against ``cs.AI`` with
-            # ``max_results_per_category=10`` would only fetch 10 items
-            # — not 70.  Splitting per day also means
-            # ``arxiv_request_min_interval_seconds`` is applied between
-            # each request (not just one sleep up front), giving the
-            # required ~30s-per-day-of-backfill pacing budget.
-            #
-            # Scheduled / manual runs make a single fetch per category
-            # set, so pacing is irrelevant there.
-            if kind != RunKind.BACKFILL or backfill_range is None:
-                _log.info(
-                    "arxiv fetch started profile=%s kind=%s categories=%s "
-                    "max_results=%d lookback_days=%d",
-                    profile,
-                    kind.value,
-                    arxiv_cfg.categories,
-                    arxiv_cfg.max_results_per_category,
-                    arxiv_cfg.lookback_days,
-                )
-                return fetch_arxiv(
-                    arxiv_config=profile_cfg.sources.arxiv,
-                    resilience=config.resilience,
-                    backfill_range=backfill_range,
-                    max_download_bytes=config.storage.max_download_bytes,
-                    timeout_seconds=config.storage.download_timeout_seconds,
-                )
-
-            # Per-day fetch with pacing.  ``per_day_max`` widens
-            # ``max_results`` so the OR-joined query can return up to
-            # ``len(categories) * max_results_per_category`` items for
-            # one day, matching the estimator contract (Q-3 / FR-BF-6).
-            n_categories = max(len(arxiv_cfg.categories), 1)
-            per_day_max = arxiv_cfg.max_results_per_category * n_categories
-            per_day_arxiv_cfg = ArxivSourceConfig(
-                enabled=arxiv_cfg.enabled,
-                categories=list(arxiv_cfg.categories),
-                max_results_per_category=per_day_max,
-                lookback_days=arxiv_cfg.lookback_days,
-            )
-            pacing = float(config.resilience.arxiv_request_min_interval_seconds)
-            collected: list[ArxivItem] = []
-            seen_ids: set[str] = set()
-            current = backfill_range.date_from
-            while current < backfill_range.date_to:
-                day_range = BackfillRange(
-                    date_from=current,
-                    date_to=current + timedelta(days=1),
-                )
-                _log.info(
-                    "arxiv backfill day fetch started profile=%s day=%s "
-                    "categories=%s max_results=%d",
-                    profile,
-                    current.isoformat(),
-                    arxiv_cfg.categories,
-                    per_day_max,
-                )
-                # Pace BEFORE each request so the very first fetch also
-                # respects the spacing budget on a fresh fire.
-                _sleep(pacing)
-                try:
-                    day_items = fetch_arxiv(
-                        arxiv_config=per_day_arxiv_cfg,
-                        resilience=config.resilience,
-                        backfill_range=day_range,
-                        max_download_bytes=config.storage.max_download_bytes,
-                        timeout_seconds=config.storage.download_timeout_seconds,
-                    )
-                except NetworkError:
-                    _log.warning(
-                        "arxiv fetch failed for day %s; continuing backfill",
-                        current.isoformat(),
-                        exc_info=True,
-                    )
-                    day_items = []
-                for it in day_items:
-                    if it.arxiv_id not in seen_ids:
-                        seen_ids.add(it.arxiv_id)
-                        collected.append(it)
-                _log.info(
-                    "arxiv backfill day fetch completed profile=%s day=%s items=%d "
-                    "collected=%d",
-                    profile,
-                    current.isoformat(),
-                    len(day_items),
-                    len(collected),
-                )
-                current = current + timedelta(days=1)
-            return collected
-
-        # ── Telemetry: influx.fetch.arxiv span (FR-OBS-4) ──
-        _tracer = get_tracer()
-        with _tracer.span(
-            "influx.fetch.arxiv",
-            attributes={
-                "influx.profile": profile,
-                "influx.run_id": current_run_id.get() or "",
-                "influx.source": "arxiv",
-            },
-        ) as fetch_span:
-            try:
-                if cache is not None:
-                    items = await cache.get_or_fetch(cache_key, _do_fetch)
-                else:
-                    items = await _do_fetch()
-            except NetworkError as exc:
-                _log.warning(
-                    "arxiv fetch failed for profile %r; yielding zero items",
-                    profile,
-                    exc_info=True,
-                )
-                # Surface to the run ledger so a degraded run is no longer
-                # indistinguishable from a quiet window (issue #20).
-                record_source_acquisition_error(
-                    source="arxiv",
-                    kind=exc.kind or "unknown",
-                    detail=str(exc),
-                )
-                metrics.source_acquisition_errors().add(
-                    1,
-                    {
-                        "profile": profile,
-                        "source": "arxiv",
-                        "kind": exc.kind or "unknown",
-                    },
-                )
-                return ()
-            fetch_span.set_attribute("influx.item_count", len(items))
-            metrics.candidates_fetched().add(
-                len(items), {"profile": profile, "source": "arxiv"}
-            )
-            _log.info(
-                "arxiv fetch completed profile=%s kind=%s items=%d",
-                profile,
-                kind.value,
-                len(items),
-            )
-
-        # Batched LLM filter takes precedence as the production default.
-        # The per-item ``scorer`` seam stays available for tests that
-        # want deterministic, synchronous scoring without an LLM.
-        #
-        # A failed filter batch is skipped per FR-FLT-6. Items returned
-        # by the filter but below the profile relevance threshold are
-        # also discarded per FR-FLT-7.
-        batch_scores: dict[str, ArxivScoreResult] = {}
-        filter_failed = False
-        if scorer is None and filter_scorer is not None:
-            # ── Telemetry: influx.filter span (FR-OBS-4) ──
-            _tracer = get_tracer()
-            with _tracer.span(
-                "influx.filter",
-                attributes={
-                    "influx.profile": profile,
-                    "influx.run_id": current_run_id.get() or "",
-                    "influx.item_count": len(items),
-                },
-            ):
-                # ``filter.batch_size`` caps how many candidates are sent
-                # to the LLM filter in a single request so the configured
-                # tunable actually shapes runtime behaviour (AC-X-1).
-                batch_size = max(int(config.filter.batch_size), 1)
-                for chunk_start in range(0, len(items), batch_size):
-                    chunk = items[chunk_start : chunk_start + batch_size]
-                    _log.info(
-                        "arxiv filter batch started profile=%s batch_start=%d "
-                        "batch_size=%d",
-                        profile,
-                        chunk_start,
-                        len(chunk),
-                    )
-                    try:
-                        chunk_scores = await filter_scorer(
-                            chunk, profile, filter_prompt
-                        )
-                    except FilterScorerError:
-                        _log.warning(
-                            "filter_scorer failed for profile %r; skipping batch",
-                            profile,
-                            exc_info=True,
-                        )
-                        filter_failed = True
-                        break
-                    batch_scores.update(chunk_scores)
-                    _log.info(
-                        "arxiv filter batch completed profile=%s batch_start=%d "
-                        "batch_size=%d scores_returned=%d",
-                        profile,
-                        chunk_start,
-                        len(chunk),
-                        len(chunk_scores),
-                    )
-
-        results: list[dict[str, Any]] = []
-        drop_attrs = {"profile": profile, "decision": "drop"}
-        pass_attrs = {"profile": profile, "decision": "pass"}
-        for arxiv_item in items:
-            if scorer is not None:
-                score_result: ArxivScoreResult | None = scorer(arxiv_item, profile)
-                if score_result is None:
-                    metrics.articles_filtered().add(1, drop_attrs)
-                    _log.info(
-                        "article inspected source=arxiv profile=%s arxiv_id=%s "
-                        "published=%s score=none decision=drop reason=scorer_none "
-                        "title=%r",
-                        profile,
-                        arxiv_item.arxiv_id,
-                        arxiv_item.published.isoformat(),
-                        arxiv_item.title,
-                    )
-                    continue
-            elif filter_scorer is not None:
-                if filter_failed:
-                    metrics.articles_filtered().add(1, drop_attrs)
-                    _log.info(
-                        "article inspected source=arxiv profile=%s arxiv_id=%s "
-                        "published=%s score=none decision=drop reason=filter_failed "
-                        "title=%r",
-                        profile,
-                        arxiv_item.arxiv_id,
-                        arxiv_item.published.isoformat(),
-                        arxiv_item.title,
-                    )
-                    continue
-                elif arxiv_item.arxiv_id not in batch_scores:
-                    # Items absent from the LLM filter response are
-                    # dropped entirely — the filter explicitly chose not
-                    # to score them (typically because they fell below
-                    # ``filter.min_score_in_results``).
-                    metrics.articles_filtered().add(1, drop_attrs)
-                    _log.info(
-                        "article inspected source=arxiv profile=%s arxiv_id=%s "
-                        "published=%s score=none decision=drop "
-                        "reason=not_returned_by_filter title=%r",
-                        profile,
-                        arxiv_item.arxiv_id,
-                        arxiv_item.published.isoformat(),
-                        arxiv_item.title,
-                    )
-                    continue
-                else:
-                    score_result = batch_scores[arxiv_item.arxiv_id]
-            else:
-                metrics.articles_filtered().add(1, drop_attrs)
-                _log.info(
-                    "article inspected source=arxiv profile=%s arxiv_id=%s "
-                    "published=%s score=none decision=drop reason=no_scorer "
-                    "title=%r",
-                    profile,
-                    arxiv_item.arxiv_id,
-                    arxiv_item.published.isoformat(),
-                    arxiv_item.title,
-                )
-                continue
-
-            if score_result.score < thresholds.relevance:
-                metrics.articles_filtered().add(1, drop_attrs)
-                _log.info(
-                    "article inspected source=arxiv profile=%s arxiv_id=%s "
-                    "published=%s score=%d threshold=%d decision=drop "
-                    "reason=below_relevance title=%r",
-                    profile,
-                    arxiv_item.arxiv_id,
-                    arxiv_item.published.isoformat(),
-                    score_result.score,
-                    thresholds.relevance,
-                    arxiv_item.title,
-                )
-                continue
-
-            metrics.articles_filtered().add(1, pass_attrs)
-            _log.info(
-                "article inspected source=arxiv profile=%s arxiv_id=%s "
-                "published=%s score=%d threshold=%d decision=accept title=%r",
-                profile,
-                arxiv_item.arxiv_id,
-                arxiv_item.published.isoformat(),
-                score_result.score,
-                thresholds.relevance,
-                arxiv_item.title,
-            )
-            results.append(
-                build_arxiv_note_item(
-                    item=arxiv_item,
-                    score=score_result.score,
-                    confidence=score_result.confidence,
-                    reason=score_result.reason,
-                    profile_name=profile,
-                    config=config,
-                    filter_tags=score_result.filter_tags,
-                )
-            )
+        # ── 3. Source.acquire per scored candidate ────────────────
+        results: list[dict[str, Any]] = [
+            source.acquire(sc, profile_cfg=profile_cfg, config=config)
+            for sc in scored_list
+        ]
 
         _log.info(
             "arxiv source completed profile=%s fetched=%d accepted=%d",
             profile,
-            len(items),
+            len(candidates),
             len(results),
         )
         return results
 
     return provider
+
+
+# ── Score helper for the legacy provider seams ─────────────────────
+
+
+async def _score_arxiv_candidates(
+    candidates: list[Candidate],
+    *,
+    profile_cfg: ProfileConfig,
+    filter_prompt: str,
+    batch_size: int,
+    scorer: ArxivScorer | None,
+    filter_scorer: ArxivFilterScorer | None,
+) -> list[ScoredCandidate]:
+    """Score arXiv candidates via the per-item or batched legacy seams.
+
+    Mirrors the contract from PRD 07 §5.6:
+
+    - Per-item *scorer* takes precedence when supplied (test seam).
+    - Batched *filter_scorer* is the production default.  When the
+      scorer raises :class:`FilterScorerError`, the whole batch is
+      skipped (FR-FLT-6 / spec §7.1) — items are not ingested with a
+      default score.
+    - Items absent from the filter response are dropped (FR-FLT-7).
+    - Items below ``profile_cfg.thresholds.relevance`` are dropped.
+    - When NEITHER scorer is wired the function returns an empty list
+      so misconfigured deployments still complete the run cleanly.
+    """
+    profile = profile_cfg.name
+    threshold = profile_cfg.thresholds.relevance
+    drop_attrs = {"profile": profile, "decision": "drop"}
+    pass_attrs = {"profile": profile, "decision": "pass"}
+
+    # Per-item synchronous scorer (test seam)
+    if scorer is not None:
+        kept: list[ScoredCandidate] = []
+        for cand in candidates:
+            arxiv_item = cand.payload
+            score_result = scorer(arxiv_item, profile)
+            if score_result is None or score_result.score < threshold:
+                metrics.articles_filtered().add(1, drop_attrs)
+                continue
+            metrics.articles_filtered().add(1, pass_attrs)
+            kept.append(
+                ScoredCandidate(
+                    candidate=cand,
+                    score=score_result.score,
+                    confidence=score_result.confidence,
+                    reason=score_result.reason,
+                    filter_tags=score_result.filter_tags,
+                )
+            )
+        return kept
+
+    if filter_scorer is None:
+        # No scorer wired: drop every item rather than fabricating a score.
+        for _ in candidates:
+            metrics.articles_filtered().add(1, drop_attrs)
+        return []
+
+    # Batched scorer is the production default — chunk into
+    # ``filter.batch_size`` requests so the configured tunable shapes
+    # runtime behaviour (AC-X-1).
+    batch_size = max(batch_size, 1)
+    chunked_scores: dict[str, ArxivScoreResult] = {}
+    tracer = get_tracer()
+    with tracer.span(
+        "influx.filter",
+        attributes={
+            "influx.profile": profile,
+            "influx.run_id": current_run_id.get() or "",
+            "influx.item_count": len(candidates),
+        },
+    ):
+        for chunk_start in range(0, len(candidates), batch_size):
+            chunk = candidates[chunk_start : chunk_start + batch_size]
+            chunk_items = [c.payload for c in chunk]
+            try:
+                chunk_scores = await filter_scorer(chunk_items, profile, filter_prompt)
+            except FilterScorerError:
+                _log.warning(
+                    "filter_scorer failed for profile %r; skipping batch",
+                    profile,
+                    exc_info=True,
+                )
+                # FR-FLT-6 / spec §7.1: failed batch is skipped, not
+                # ingested with a default score.
+                for _ in candidates:
+                    metrics.articles_filtered().add(1, drop_attrs)
+                return []
+            chunked_scores.update(chunk_scores)
+
+    kept = []
+    for cand in candidates:
+        score_result = chunked_scores.get(cand.item_id)
+        if score_result is None or score_result.score < threshold:
+            metrics.articles_filtered().add(1, drop_attrs)
+            continue
+        metrics.articles_filtered().add(1, pass_attrs)
+        kept.append(
+            ScoredCandidate(
+                candidate=cand,
+                score=score_result.score,
+                confidence=score_result.confidence,
+                reason=score_result.reason,
+                filter_tags=score_result.filter_tags,
+            )
+        )
+    return kept
