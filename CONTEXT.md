@@ -48,17 +48,17 @@ Per-tier attempt counter persisted in the note's `## Repair` section. Read on ti
 ### Domain — execution
 
 **Run**:
-One end-to-end execution of the ingestion pipeline for one Profile. Constructed from a **RunPlan** plus dependencies; produces a **RunOutcome**. _(proposed as the deepened replacement for today's `_run_profile_body` orchestration)_
+One end-to-end execution of the ingestion pipeline for one Profile. Constructed from a **RunPlan** plus dependencies; produces a **RunOutcome**. Lives in `src/influx/run.py` as `Run.execute()`. Currently used by the scheduled-tick path; manual + backfill entry points migrate in #59 / #60.
 _Avoid_: job, task (Lithos has its own `lithos_task_*`), tick.
 
 **RunPlan**:
-The data-driven specification a Run executes: profile, kind, date window, `skip_repair`, `skip_cache_hits`, `notify`, ledger ID, request ID. Built once per request type by the scheduler. _(proposed)_
+The data-driven specification a Run executes: profile, kind, date window, `skip_repair`, `skip_cache_hits`, `notify`, ledger ID, request ID. Built once per request type by the scheduler.
 
 **RunKind**:
 One of `scheduled`, `manual`, `backfill`. Carried as a tag for ledger and metric labels even though behaviour is driven by the boolean flags on the RunPlan.
 
 **RunOutcome**:
-The post-execution record: `sources_checked`, `ingested`, `error`, `degraded`, `degraded_reasons`, `source_acquisition_errors`, plus the items needed for post-run notification dispatch. _(proposed)_
+The post-execution record: `sources_checked`, `ingested`, `error`, `degraded`, `degraded_reasons`, `source_acquisition_errors`, plus the items needed for post-run notification dispatch.
 
 **Repair sweep**:
 The per-Run stage that lists `influx:repair-needed` notes for the Profile and re-runs stage-specific recovery (archive re-extract, text re-extract, Tier 2, Tier 3). Skipped on backfills.

@@ -194,10 +194,12 @@ async def _run_arxiv_scenario(meter: InfluxMeter, config: Any) -> None:
 
     with (
         patch("influx.scheduler.get_tracer", return_value=tracer),
+        patch("influx.run.get_tracer", return_value=tracer),
         patch("influx.sources.arxiv.get_tracer", return_value=tracer),
         patch("influx.lcma.get_tracer", return_value=tracer),
         # Route every metric helper at the call sites through our test meter
         patch("influx.scheduler.metrics.get_meter", return_value=meter),
+        patch("influx.run.metrics.get_meter", return_value=meter),
         patch("influx.sources.arxiv.metrics.get_meter", return_value=meter),
         patch("influx.sources.rss.metrics.get_meter", return_value=meter),
         patch("influx.repair.metrics.get_meter", return_value=meter),
@@ -220,12 +222,19 @@ async def _run_arxiv_scenario(meter: InfluxMeter, config: Any) -> None:
             return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
         ),
         patch("influx.scheduler.LithosClient", return_value=mock_client),
+        patch("influx.run.LithosClient", return_value=mock_client),
         patch(
             "influx.scheduler.build_negative_examples_block",
             new_callable=AsyncMock,
             return_value="",
         ),
+        patch(
+            "influx.run.build_negative_examples_block",
+            new_callable=AsyncMock,
+            return_value="",
+        ),
         patch("influx.scheduler.repair_sweep", new_callable=AsyncMock),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock),
         patch("influx.service.post_run_webhook_hook"),
     ):
         from influx.scheduler import run_profile
@@ -370,9 +379,11 @@ class TestOtelDisabledZeroMetrics:
 
         with (
             patch("influx.scheduler.get_tracer", return_value=tracer),
+            patch("influx.run.get_tracer", return_value=tracer),
             patch("influx.sources.arxiv.get_tracer", return_value=tracer),
             patch("influx.lcma.get_tracer", return_value=tracer),
             patch("influx.scheduler.metrics.get_meter", return_value=disabled_meter),
+            patch("influx.run.metrics.get_meter", return_value=disabled_meter),
             patch(
                 "influx.sources.arxiv.metrics.get_meter", return_value=disabled_meter
             ),
@@ -399,12 +410,19 @@ class TestOtelDisabledZeroMetrics:
                 return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
             ),
             patch("influx.scheduler.LithosClient", return_value=mock_client),
+            patch("influx.run.LithosClient", return_value=mock_client),
             patch(
                 "influx.scheduler.build_negative_examples_block",
                 new_callable=AsyncMock,
                 return_value="",
             ),
+            patch(
+                "influx.run.build_negative_examples_block",
+                new_callable=AsyncMock,
+                return_value="",
+            ),
             patch("influx.scheduler.repair_sweep", new_callable=AsyncMock),
+            patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch("influx.service.post_run_webhook_hook"),
         ):
             from influx.scheduler import run_profile
