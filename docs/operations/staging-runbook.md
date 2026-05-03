@@ -115,8 +115,8 @@ The `extra=` fields hang directly off the top-level record.
 
 ### 4.2 `article write skipped`
 
-Emitted from `scheduler.py` when the per-article write fell through
-without producing a Lithos hit. Carries:
+Emitted from `run.py`'s Ingest stage when the per-article write
+fell through without producing a Lithos hit. Carries:
 
 | Field        | Meaning                                                 |
 | ------------ | ------------------------------------------------------- |

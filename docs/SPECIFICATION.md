@@ -58,8 +58,13 @@ Status: Aligned with Implementation
 |  single cron dispatcher           cached Lithos + credentials   |
 |        |                                                        |
 |        v                                                        |
-|  Coordinator + run_profile                                      |
-|  per-profile non-overlap, repair, feedback, dedup, write         |
+|  Coordinator + RunService                                       |
+|  per-profile non-overlap, build RunPlan, drive Run.execute()     |
+|        |                                                        |
+|        v                                                        |
+|  Run (five stages: repair, feedback, acquire, ingest, finalise)  |
+|  Source.fetch_candidates -> Filter.score -> Source.acquire ->    |
+|  Cascade.enrich -> Renderer.render -> LithosClient.write_note    |
 |        |                                                        |
 |        v                                                        |
 |  Source Providers                                                |
@@ -76,9 +81,10 @@ Status: Aligned with Implementation
 1. `serve` loads config, validates the local admin bind address, creates the FastAPI app, starts the probe loop, and starts the scheduler.
 2. The scheduler registers one `influx-tick` cron dispatcher job. Each tick creates a fresh source provider/cache pair and starts profile runs as background tasks.
 3. Manual `POST /runs` and `POST /backfills` requests acquire per-profile locks and spawn background run tasks.
-4. `run_profile` creates a Lithos task, runs the repair sweep for non-backfill runs, loads negative feedback examples, composes the filter prompt, calls the source provider, checks Lithos cache, writes notes, runs LCMA post-write hooks, and dispatches configured notifications for non-backfill runs.
-5. `run_profile` records start, completion, failure, and basic run counts in the local run ledger.
-6. Backfills use the same write path but skip repair sweep and skip already-ingested cache hits.
+4. The HTTP / scheduler entry points build a `RunPlan` and hand off to `RunService.execute()`. RunService checks the probe-time skip gates (`lithos_circuit_open`, `lcma_tools_unavailable`), opens the ledger entry + run-level metrics + tracer span, and delegates the body to `Run.execute()`.
+5. `Run.execute()` walks five named stages — repair (skipped on backfill), feedback (negative examples + filter prompt), acquire (`Source.fetch_candidates` → `Filter.score` → `Source.acquire`), ingest (per item: `cache_lookup` → `Cascade.enrich` → `Renderer.render` → `LithosClient.write_note` → `LcmaWiring.wire`), finalise (assemble outcome + fire notifications when `plan.notify`). The Lithos task lifecycle (`task_create` / `task_complete`) brackets the body via an inner CM.
+6. RunService records start, completion, failure, and basic run counts in the local run ledger and closes out lifecycle metrics.
+7. Backfills build a backfill-shaped `RunPlan` (`skip_repair=True`, `skip_cache_hits=True`, `notify=False`); the same Run / RunService machinery executes — backfill-specific gating lives in plan flags, not separate code paths.
 
 ### 2.3 In-Process State
 
@@ -640,7 +646,7 @@ Readiness is degraded when:
 - Repair sweep terminal write failure is latched.
 - LCMA unknown-tool failure is latched.
 
-When the Lithos probe has been ``degraded`` for **3 consecutive cycles** (default; see `ProbeLoop.lithos_circuit_open`), `run_profile` short-circuits — the run is recorded as ``status="skipped", error="lithos_unhealthy"`` in the run ledger, the `influx_runs_skipped_total{profile, reason="lithos_unhealthy"}` metric ticks, and no source-fetch / LLM-filter / write work is performed.  The breaker closes automatically on the first ``ok`` probe; subsequent runs proceed normally.  This prevents an extended Lithos outage from burning LLM tokens against a write path that will fail (#40).
+When the Lithos probe has been ``degraded`` for **3 consecutive cycles** (default; see `ProbeLoop.lithos_circuit_open`), `RunService.execute()` short-circuits — the run is recorded as ``status="skipped", error="lithos_unhealthy"`` in the run ledger, the `influx_runs_skipped_total{profile, reason="lithos_unhealthy"}` metric ticks, and no source-fetch / LLM-filter / write work is performed.  The breaker closes automatically on the first ``ok`` probe; subsequent runs proceed normally.  This prevents an extended Lithos outage from burning LLM tokens against a write path that will fail (#40).  The parallel LCMA-tools probe (#69) drives a sibling `lcma_tools_unavailable` gate with the same skip semantics.
 
 Run-ledger entries carry a structured `degraded_reasons` field listing why a completed run was marked `degraded=True`.  Today the values are:
 
