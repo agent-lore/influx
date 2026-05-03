@@ -129,11 +129,61 @@ def _arxiv_id_from_url(source_url: str) -> str | None:
 
 
 def _existing_id_from_detail(detail: str) -> str | None:
-    """Parse ``existing_id=<uuid>`` out of a slug_collision detail string (#30)."""
+    """Parse ``existing_id=<uuid>`` out of a slug_collision detail string (#30).
+
+    Tolerates both the original single-attempt shape
+    ``existing_id=<id>; ...`` and the issue-#32 enriched form
+    ``first_existing_id=<A>; ...; retry_existing_id=<B>; ...`` —
+    in the latter case the retry id wins because it is the squatter
+    that ultimately blocked the write.
+    """
     if not detail:
         return None
+    # Prefer the retry id when the issue-#32 enriched form is present.
+    retry = re.search(r"retry_existing_id=([^\s;,]+)", detail)
+    if retry:
+        return retry.group(1)
     m = _EXISTING_ID_RE.search(detail)
     return m.group(1) if m else None
+
+
+def _format_unresolved_detail(
+    *,
+    first_existing_id: str | None,
+    first_slug: str,
+    retry_existing_id: str | None,
+    retry_slug: str,
+    retry_detail: str,
+) -> str:
+    """Build the issue-#32 detail string enumerating BOTH squatters.
+
+    Format::
+
+        first_existing_id=<A>; first_slug='<unsuffixed>';
+        retry_existing_id=<B>; retry_slug='<suffixed>'; <retry message>
+
+    The retry envelope's human-readable ``message`` (everything after
+    ``existing_id=...; `` in *retry_detail*) is appended verbatim so the
+    operator-facing WARNING still carries Lithos's own diagnostic.
+    Either id may be missing on older Lithos response shapes — emit
+    ``<missing>`` rather than dropping the field so downstream parsers
+    see a stable schema.
+    """
+    parts: list[str] = [
+        f"first_existing_id={first_existing_id or '<missing>'}",
+        f"first_slug='{first_slug}'",
+        f"retry_existing_id={retry_existing_id or '<missing>'}",
+        f"retry_slug='{retry_slug}'",
+    ]
+    # Strip the leading ``existing_id=<id>; `` from retry_detail so the
+    # tail is just Lithos's message, avoiding a duplicated existing_id.
+    tail = retry_detail
+    if tail.startswith("existing_id="):
+        sep = tail.find("; ")
+        tail = tail[sep + 2 :] if sep != -1 else ""
+    if tail:
+        parts.append(tail)
+    return "; ".join(parts)
 
 
 def _doc_tags(doc: dict[str, Any]) -> list[str]:
@@ -646,6 +696,8 @@ class LithosClient:
         """
         from influx import metrics
 
+        first_title = args["title"]
+
         # Round 1: inspect the squatter named in the initial collision.
         recovered = await self._try_recover_collision(
             args,
@@ -660,7 +712,8 @@ class LithosClient:
         # Round 2: the suffix retry collided too.  One more inspection in
         # case the suffixed-slug squatter is itself a reclaimable residue.
         suffix = _extract_slug_suffix(source_url)
-        suffixed_args = {**args, "title": args["title"] + suffix}
+        retry_title = first_title + suffix
+        suffixed_args = {**args, "title": retry_title}
         recovered = await self._try_recover_collision(
             suffixed_args,
             source_url=source_url,
@@ -670,9 +723,28 @@ class LithosClient:
         )
 
         if recovered.status == "slug_collision":
+            # Issue #32: surface BOTH colliding squatters in the final
+            # detail so the operator-facing WARNING / unresolved-collision
+            # backlog enumerates the first AND the retry squatter — not
+            # just the retry's id.  An operator can then clean both with
+            # one command.  The per-attempt envelope details are otherwise
+            # lost because each retry overwrites the previous WriteResult.
+            recovered = dataclasses.replace(
+                recovered,
+                detail=_format_unresolved_detail(
+                    first_existing_id=_existing_id_from_detail(
+                        initial_collision.detail
+                    ),
+                    first_slug=first_title,
+                    retry_existing_id=_existing_id_from_detail(recovered.detail),
+                    retry_slug=retry_title,
+                    retry_detail=recovered.detail,
+                ),
+            )
             logger.warning(
-                "lithos_write slug_collision unresolved after recovery for %s",
+                "lithos_write slug_collision unresolved after recovery for %s: %s",
                 source_url,
+                recovered.detail,
             )
         return recovered
 
