@@ -15,13 +15,15 @@ from pathlib import Path
 import pytest
 
 from influx.notes import (
+    parse_note,
+    parse_profile_relevance,
+    recompute_confidence,
+)
+from influx.renderer import (
     ArchiveInvariantError,
     MissingIngestedByTagError,
     ProfileRelevanceEntry,
     build_profile_relevance_for_rewrite,
-    parse_note,
-    parse_profile_relevance,
-    recompute_confidence,
     render_note,
 )
 

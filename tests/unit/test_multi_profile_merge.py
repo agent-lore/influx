@@ -13,11 +13,13 @@ from influx.lithos_client import (
     _replace_profile_relevance_section,
 )
 from influx.notes import (
-    ProfileRelevanceEntry,
-    merge_profile_relevance_union,
     merge_tags,
     parse_note,
     parse_profile_relevance,
+)
+from influx.renderer import (
+    ProfileRelevanceEntry,
+    merge_profile_relevance_union,
     render_note,
 )
 

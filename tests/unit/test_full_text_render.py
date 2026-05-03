@@ -9,7 +9,7 @@ Covers:
 
 from __future__ import annotations
 
-from influx.notes import render_note
+from influx.renderer import render_note
 
 _BASE_TAGS = ["source:arxiv", "ingested-by:influx", "schema:1"]
 _BASE_KWARGS = {

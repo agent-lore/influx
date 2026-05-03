@@ -9,7 +9,7 @@ Covers:
 
 from __future__ import annotations
 
-from influx.notes import render_note
+from influx.renderer import render_note
 from influx.schemas import Tier3Extraction
 
 _BASE_TAGS = ["source:arxiv", "ingested-by:influx", "schema:1"]

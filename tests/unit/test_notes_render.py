@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from influx.notes import (
+from influx.notes import merge_tags, recompute_confidence
+from influx.renderer import (
     ArchiveInvariantError,
-    merge_tags,
-    recompute_confidence,
     render_archive_section,
     validate_archive_tag_invariant,
 )

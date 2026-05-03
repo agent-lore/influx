@@ -8,10 +8,10 @@ Relevance`` section is not created or refreshed for rejected profiles.
 
 from __future__ import annotations
 
-from influx.notes import (
+from influx.notes import merge_tags
+from influx.renderer import (
     ProfileRelevanceEntry,
     build_profile_relevance_for_rewrite,
-    merge_tags,
 )
 
 # ── Shared fixtures ──────────────────────────────────────────────────
