@@ -15,7 +15,7 @@ tag) is exercised in ``test_repair_sweep.py``.
 from __future__ import annotations
 
 from influx.errors import ExtractionError, InfluxError, LCMAError, LithosError
-from influx.repair import (
+from influx.repair_counters import (
     RepairCounters,
     classify_failure,
     parse_repair_section,
