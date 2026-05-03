@@ -38,7 +38,7 @@ from influx.extraction.article import extract_article
 from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch as _guarded_fetch
 from influx.http_client import guarded_post_json_fetch
-from influx.notes import ProfileRelevanceEntry, render_note
+from influx.renderer import render
 from influx.schemas import FilterResponse, Tier1Enrichment, Tier3Extraction
 from influx.slugs import slugify_feed_name
 from influx.storage import download_archive
@@ -308,23 +308,16 @@ def build_rss_note_item(
 
     summary_for_note = "" if score and tier1_result is None else summary
 
-    profile_entries = [
-        ProfileRelevanceEntry(
-            profile_name=profile_name,
-            score=score,
-            reason=reason,
-        ),
-    ]
-
-    content = render_note(
+    content = render(
         title=item.title,
         source_url=source_url,
         tags=tags,
         confidence=confidence,
         archive_path=archive_path,
         summary=summary_for_note,
-        keywords=[],
-        profile_entries=profile_entries,
+        profile_name=profile_name,
+        score=score,
+        reason=reason,
         tier1_enrichment=tier1_result,
         full_text=full_text_for_note,
         tier3_extraction=tier3_result,

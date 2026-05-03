@@ -41,7 +41,7 @@ from influx.errors import ExtractionError, LCMAError, NetworkError
 from influx.extraction.pipeline import extract_arxiv_text
 from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
-from influx.notes import ProfileRelevanceEntry, render_note
+from influx.renderer import render
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 from influx.storage import download_archive
 from influx.telemetry import (
@@ -550,7 +550,7 @@ def build_arxiv_note_item(
     Runs the HTML → PDF → abstract-only extraction cascade when the
     candidate's *score* crosses the ``full_text`` threshold, sets the
     appropriate ``text:*`` tier tag, and renders the canonical note via
-    :func:`~influx.notes.render_note`.
+    :func:`~influx.renderer.render`.
 
     Parameters
     ----------
@@ -777,23 +777,16 @@ def build_arxiv_note_item(
     if tier1_attempted and tier1_result is None:
         summary_text = ""
 
-    profile_entries = [
-        ProfileRelevanceEntry(
-            profile_name=profile_name,
-            score=score,
-            reason=reason,
-        ),
-    ]
-
-    content = render_note(
+    content = render(
         title=item.title,
         source_url=source_url,
         tags=tags,
         confidence=confidence,
         archive_path=archive_path,
         summary=summary_text,
-        keywords=[],
-        profile_entries=profile_entries,
+        profile_name=profile_name,
+        score=score,
+        reason=reason,
         full_text=full_text_for_note,
         tier1_enrichment=tier1_result,
         tier3_extraction=tier3_result,

@@ -35,8 +35,8 @@ from influx.config import (
 )
 from influx.coordinator import Coordinator, RunKind
 from influx.http_api import router
-from influx.notes import ProfileRelevanceEntry, render_note
 from influx.probes import ProbeLoop
+from influx.renderer import ProfileRelevanceEntry, render_note
 from influx.scheduler import InfluxScheduler
 from tests.contract.test_lithos_client import FakeLithosServer
 

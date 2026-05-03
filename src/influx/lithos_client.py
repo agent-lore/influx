@@ -29,16 +29,18 @@ from influx.dedup import compose_dedup_query
 from influx.errors import ConfigError, LCMAError, LithosError
 from influx.notes import (
     NoteParseError,
-    ProfileRelevanceEntry,
-    merge_profile_relevance_union,
     parse_note,
     parse_profile_relevance,
 )
 from influx.notes import (
-    _render_profile_relevance_body as _render_pr_body,
-)
-from influx.notes import (
     merge_tags as _canonical_merge_tags,
+)
+from influx.renderer import (
+    ProfileRelevanceEntry,
+    merge_profile_relevance_union,
+)
+from influx.renderer import (
+    _render_profile_relevance_body as _render_pr_body,
 )
 
 __all__ = ["LithosClient", "WriteResult"]
