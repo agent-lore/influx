@@ -1,7 +1,8 @@
 """Run module — score-gated ingestion executor (CONTEXT.md ``Run``).
 
-Body-only replacement for ``_run_profile_body`` on the scheduled-tick
-path (issue #58).
+The body of every Run.  Wrapped in a request-lifecycle by
+:class:`influx.run_service.RunService` (#61), which owns the ledger
+entry, run-level metrics, contextvars, tracer span, and skip gates.
 
 Architecture
 ------------
@@ -20,25 +21,10 @@ result type plus a shared :class:`StageDiagnostics`:
 Inner lifecycle uses :func:`lithos_task_lifecycle` — a context manager
 bracketing ``task_create`` on enter and ``task_complete`` on exit.
 
-The **outer** ledger-lifecycle CM described during grilling (open
-ledger entry + contextvars + tracer + metrics on enter;
-``ledger.complete`` + metric tick on exit) is **deferred to #61** so
-this slice can land without churning the existing test patches.
-``run_profile`` (in :mod:`influx.scheduler`) keeps the legacy
-prelude/postlude inline; only the body-with-task-lifecycle is
-extracted here.
-
-:class:`RunAborted` is caught at ``execute()`` (Q3 grilling) so
-abort-to-outcome translation lives in one place; the abort exception
-carries :class:`StageDiagnostics` so ``execute()`` can apply
-``health_actions`` from both success and abort paths uniformly.
-
-Scope of this slice
--------------------
-Migrate the **scheduled-tick path only**.  Manual (``POST /runs``) and
-backfill (``POST /backfills``) paths keep using ``_run_profile_body``
-until #59 and #60 migrate them.  ``_run_profile_body`` dispatches to
-``Run.execute()`` when ``kind == RunKind.SCHEDULED``.
+:class:`RunAborted` is caught at ``execute()`` so abort-to-outcome
+translation lives in one place; the abort exception carries
+:class:`StageDiagnostics` so ``execute()`` can apply ``health_actions``
+from both success and abort paths uniformly.
 """
 
 from __future__ import annotations
@@ -46,12 +32,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, Literal
 
 from influx import metrics
@@ -264,163 +248,6 @@ class RunDeps:
     probe_loop: Any | None = None
     ledger: RunLedger | None = None
     run_id: str | None = None
-
-
-# ── Two nested context managers (Q2 grilling — Option B) ────────────
-
-
-@dataclass(slots=True)
-class _LedgerSession:
-    """Mutable handle ``ledger_lifecycle`` yields to its body.
-
-    *Reserved for #61 when the outer ledger CM lands.*  In #58's slice
-    the legacy prelude/postlude in ``run_profile`` still owns the
-    ledger entry, so this dataclass is currently unused outside the
-    deferred-CM definition below.
-    """
-
-    run_id: str
-    started_at: datetime
-    skip_reason: str | None = None
-    outcome: RunOutcome | None = None
-    error: BaseException | None = None
-
-
-@asynccontextmanager
-async def ledger_lifecycle(
-    plan: RunPlan, deps: RunDeps
-) -> AsyncIterator[_LedgerSession]:
-    """Outer lifecycle CM — ledger entry + run-level metrics + contextvars.
-
-    Mirrors the prelude/postlude block from the legacy
-    ``run_profile``: ``ledger.start`` on enter, ``ledger.complete``
-    or ``ledger.fail`` on exit, with metrics ticked at both ends.
-    Skip-before-task cases (circuit breaker / LCMA tools unavailable)
-    set ``session.skip_reason`` and the CM writes a ``ledger.skip``
-    entry instead.
-    """
-    config = deps.config
-    profile = plan.profile
-    run_id = deps.run_id or str(uuid.uuid4())
-    ledger = deps.ledger or RunLedger(Path(config.storage.state_dir))
-
-    started_at = datetime.now(UTC)
-    session = _LedgerSession(run_id=run_id, started_at=started_at)
-    run_id_token = current_run_id.set(run_id)
-    source_errors_token = current_source_acquisition_errors.set([])
-    metric_attrs = {"profile": profile, "run_type": plan.kind.value}
-
-    ledger.start(
-        run_id=run_id,
-        profile=profile,
-        kind=plan.kind.value,
-        run_range=plan.date_window,
-    )
-    metrics.run_starts().add(1, metric_attrs)
-    metrics.active_runs().add(1, {"profile": profile})
-    logger.info(
-        "run started profile=%s kind=%s run_id=%s range=%s",
-        profile,
-        plan.kind.value,
-        run_id,
-        plan.date_window or {},
-    )
-
-    tracer = get_tracer()
-    try:
-        with tracer.span(
-            "influx.run",
-            attributes={
-                "influx.profile": profile,
-                "influx.run_id": run_id,
-                "influx.run_type": plan.kind.value,
-            },
-        ):
-            try:
-                yield session
-            except BaseException as exc:
-                session.error = exc
-                raise
-        # Telemetry span exited cleanly; finalise the ledger entry.
-        elapsed = (datetime.now(UTC) - started_at).total_seconds()
-        source_errors = current_source_acquisition_errors.get() or []
-
-        if session.skip_reason is not None:
-            ledger.skip(run_id=run_id, reason=session.skip_reason)
-            metrics.runs_skipped().add(
-                1, {"profile": profile, "reason": session.skip_reason}
-            )
-            metrics.run_duration().record(elapsed, metric_attrs)
-            metrics.run_completions().add(1, {**metric_attrs, "outcome": "skipped"})
-            return
-
-        outcome = session.outcome
-        sources_checked = outcome.sources_checked if outcome is not None else None
-        ingested = outcome.ingested if outcome is not None else None
-        degraded_reasons = ledger.complete(
-            run_id=run_id,
-            sources_checked=sources_checked,
-            ingested=ingested,
-            source_acquisition_errors=source_errors,
-        )
-        run_outcome = "degraded" if source_errors else "success"
-        if "ingestion_stall" in degraded_reasons:
-            metrics.ingestion_stalls().add(1, {"profile": profile})
-            if run_outcome == "success":
-                run_outcome = "degraded"
-            logger.warning(
-                "run flagged ingestion_stall profile=%s kind=%s run_id=%s "
-                "(this + prior scheduled run both ingested 0 with "
-                "sources_checked > 0)",
-                profile,
-                plan.kind.value,
-                run_id,
-            )
-        metrics.run_duration().record(elapsed, metric_attrs)
-        metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
-
-        if outcome is not None:
-            logger.info(
-                "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
-                "sources_checked=%d ingested=%d degraded=%s",
-                profile,
-                plan.kind.value,
-                run_id,
-                elapsed,
-                outcome.sources_checked,
-                outcome.ingested,
-                bool(source_errors),
-            )
-        else:
-            logger.info(
-                "run completed profile=%s kind=%s run_id=%s duration=%.1fs result=none",
-                profile,
-                plan.kind.value,
-                run_id,
-                elapsed,
-            )
-    except BaseException:
-        # The body raised — finalise as failure.
-        elapsed = (datetime.now(UTC) - started_at).total_seconds()
-        exc = session.error
-        logger.exception(
-            "run failed profile=%s kind=%s run_id=%s duration=%.1fs",
-            profile,
-            plan.kind.value,
-            run_id,
-            elapsed,
-        )
-        ledger.fail(
-            run_id=run_id,
-            error=f"{type(exc).__name__}: {exc}" if exc is not None else "unknown",
-        )
-        metrics.run_duration().record(elapsed, metric_attrs)
-        metrics.run_completions().add(1, {**metric_attrs, "outcome": "failure"})
-        raise
-    finally:
-        metrics.active_runs().add(-1, {"profile": profile})
-        current_run_id.reset(run_id_token)
-        current_source_acquisition_errors.reset(source_errors_token)
 
 
 @asynccontextmanager
