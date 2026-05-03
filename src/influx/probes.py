@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -31,9 +33,37 @@ __all__ = [
     "ProbeResult",
     "ProbeState",
     "ProbeLoop",
+    "ToolLister",
+    "REQUIRED_LCMA_TOOLS",
 ]
 
+logger = logging.getLogger(__name__)
+
 ProbeStatus = Literal["ok", "degraded"]
+
+
+# The five LCMA tools every Influx-compatible Lithos deployment must
+# expose.  Probed at startup + every probe interval; missing tools flip
+# the ``lcma_unknown_tool_failure`` latch so ``Run.execute()`` (and
+# today's ``run_profile``) can skip the run with
+# ``reason="lcma_tools_unavailable"`` — replacing the legacy per-call
+# ``LCMAError("unknown_tool")`` latch (issue #69).
+REQUIRED_LCMA_TOOLS: frozenset[str] = frozenset(
+    {
+        "lithos_retrieve",
+        "lithos_edge_upsert",
+        "lithos_cache_lookup",
+        "lithos_task_create",
+        "lithos_task_complete",
+    }
+)
+
+
+# Async callable returning the tool names the connected Lithos exposes.
+# Wired in production from :meth:`influx.lithos_client.LithosClient.list_tools`.
+# Unit tests inject a stub so the probe behaviour can be exercised
+# without standing up a real MCP transport.
+ToolLister = Callable[[], Awaitable[list[str]]]
 
 
 @dataclass(frozen=True)
@@ -178,6 +208,56 @@ def _probe_lithos(lithos_url: str) -> ProbeResult:
         )
 
 
+async def _probe_lcma_tools(tool_lister: ToolLister | None) -> ProbeResult:
+    """Probe the LCMA tool surface (issue #69).
+
+    Calls the injected *tool_lister* (typically
+    :meth:`LithosClient.list_tools`) and asserts every name in
+    :data:`REQUIRED_LCMA_TOOLS` is present.
+
+    Behaviour:
+    - ``tool_lister is None`` → probe is skipped.  Returns
+      ``status="ok"``, ``detail="skipped"`` so downstream readiness
+      checks treat a probe-less deployment (CLI, tests) the same as a
+      healthy one rather than blocking it.
+    - ``tool_lister`` raises → ``status="degraded"`` with the exception
+      kind in ``detail``.  This subsumes connectivity failures (the
+      existing ``_probe_lithos`` SSE check still runs in parallel and
+      drives the circuit breaker independently).
+    - Tool list missing one or more required names → ``status="degraded"``
+      with the missing names enumerated in ``detail``.
+    - All required names present → ``status="ok"``, ``detail="all
+      required LCMA tools present"``.
+
+    Unlike the previous mid-run latch, the result of this probe is
+    **non-sticky** — every cycle re-evaluates and the latch flips on
+    or off accordingly.
+    """
+    now = time.monotonic()
+    if tool_lister is None:
+        return ProbeResult(status="ok", detail="skipped", timestamp=now)
+    try:
+        tool_names = await tool_lister()
+    except Exception as exc:
+        return ProbeResult(
+            status="degraded",
+            detail=f"tools/list failed: {type(exc).__name__}: {exc}",
+            timestamp=now,
+        )
+    missing = sorted(REQUIRED_LCMA_TOOLS - set(tool_names))
+    if missing:
+        return ProbeResult(
+            status="degraded",
+            detail=f"missing LCMA tools: {', '.join(missing)}",
+            timestamp=now,
+        )
+    return ProbeResult(
+        status="ok",
+        detail="all required LCMA tools present",
+        timestamp=now,
+    )
+
+
 def _probe_llm_credentials(
     providers: dict[str, ProviderConfig],
 ) -> ProbeResult:
@@ -220,6 +300,7 @@ class ProbeLoop:
         *,
         interval: float = 30.0,
         max_age: float | None = None,
+        tool_lister: ToolLister | None = None,
     ) -> None:
         if interval < 30.0:
             raise ValueError("Probe interval must be >= 30 seconds")
@@ -234,9 +315,14 @@ class ProbeLoop:
         # is invoked by a successful sweep.
         self._repair_write_failure = False
         self._repair_write_failure_detail = ""
-        # LCMA unknown_tool failure latch (PRD 08 FR-LCMA-6).
+        # LCMA tools-availability latch (issue #69).  Driven each cycle
+        # by ``_probe_lcma_tools`` — non-sticky.  Replaces the legacy
+        # mid-run ``LCMAError("unknown_tool")`` latch.
         self._lcma_unknown_tool_failure = False
         self._lcma_unknown_tool_failure_detail = ""
+        # Async tool-lister wired by the service factory; ``None`` skips
+        # the LCMA-tools probe (e.g. CLI / tests with no MCP transport).
+        self._tool_lister = tool_lister
         # Consecutive count of degraded Lithos probes (#40 circuit breaker).
         # Reset to 0 on the first ``ok`` probe; ``lithos_circuit_open``
         # returns True once it crosses the configured threshold so the
@@ -252,10 +338,16 @@ class ProbeLoop:
         return self._state
 
     def run_once(self) -> None:
-        """Execute a single probe cycle (synchronous, no scheduling).
+        """Execute the synchronous portion of a probe cycle.
 
-        Useful for tests and for running an initial probe before the
-        background loop starts.
+        Refreshes the Lithos SSE probe + LLM-credentials probe.  The
+        async LCMA-tools probe is **not** run here — its cached latch
+        state is preserved.  Use :meth:`run_once_async` to refresh
+        every probe in one cycle.
+
+        Kept as a sync API for backward compatibility with tests that
+        drive the loop synchronously and for the legacy bootstrap path.
+        Production wiring uses :meth:`run_once_async` via :meth:`start`.
         """
         lithos_result = _probe_lithos(self._config.lithos.url)
         # Update the consecutive-degraded counter (#40 circuit breaker).
@@ -274,6 +366,52 @@ class ProbeLoop:
             lcma_unknown_tool_failure=self._lcma_unknown_tool_failure,
             lcma_unknown_tool_failure_detail=self._lcma_unknown_tool_failure_detail,
         )
+
+    async def run_once_async(self) -> None:
+        """Execute a full probe cycle including the async LCMA-tools probe.
+
+        Drives the LCMA tool-availability latch directly from the
+        probe result — non-sticky.  When ``tool_lister`` is ``None``
+        the LCMA latch state is left at its previous value (typically
+        cleared) so a probe-less deployment never spuriously reports
+        ``lcma_tools_unavailable``.
+        """
+        # Synchronous probes first so the Lithos SSE probe state and
+        # circuit-breaker counter are refreshed before the LCMA-tools
+        # probe runs.  ``_probe_lithos`` also catches transport
+        # failures, so a totally-down Lithos shows up as a degraded
+        # probe before the LCMA-tools probe reports its own failure.
+        self.run_once()
+        if self._tool_lister is not None:
+            lcma_result = await _probe_lcma_tools(self._tool_lister)
+            if lcma_result.status == "degraded":
+                self._lcma_unknown_tool_failure = True
+                self._lcma_unknown_tool_failure_detail = lcma_result.detail
+            else:
+                self._lcma_unknown_tool_failure = False
+                self._lcma_unknown_tool_failure_detail = ""
+            self._state = ProbeState(
+                lithos=self._state.lithos,
+                llm_credentials=self._state.llm_credentials,
+                max_age=self._max_age,
+                repair_write_failure=self._repair_write_failure,
+                repair_write_failure_detail=self._repair_write_failure_detail,
+                lcma_unknown_tool_failure=self._lcma_unknown_tool_failure,
+                lcma_unknown_tool_failure_detail=(
+                    self._lcma_unknown_tool_failure_detail
+                ),
+            )
+
+    def lcma_tools_unavailable(self) -> bool:
+        """Return ``True`` when the latest probe found the LCMA surface missing.
+
+        The scheduler / Run module consults this before kicking off
+        the body; when set, the run is recorded as ``skipped`` with
+        ``reason="lcma_tools_unavailable"`` and no source-fetch /
+        write work is done.  The latch is non-sticky — the next
+        probe cycle re-evaluates from a fresh ``tools/list`` call.
+        """
+        return self._lcma_unknown_tool_failure
 
     @property
     def lithos_unhealthy_consecutive(self) -> int:
@@ -323,39 +461,14 @@ class ProbeLoop:
         self._state.repair_write_failure = False
         self._state.repair_write_failure_detail = ""
 
-    def mark_lcma_unknown_tool_failure(
-        self,
-        *,
-        profile: str = "",
-        detail: str = "",
-    ) -> None:
-        """Latch an LCMA unknown_tool failure (PRD 08, FR-LCMA-6).
-
-        Called by ``run_profile`` when ``LCMAError("unknown_tool")``
-        propagates from an LCMA-dependent call.  Flips
-        ``ProbeState.lcma_unknown_tool_failure`` so ``/ready`` reports
-        degraded.
-        """
-        self._lcma_unknown_tool_failure = True
-        self._lcma_unknown_tool_failure_detail = detail or f"profile={profile!r}"
-        self._state.lcma_unknown_tool_failure = True
-        self._state.lcma_unknown_tool_failure_detail = (
-            self._lcma_unknown_tool_failure_detail
-        )
-
-    def clear_lcma_unknown_tool_failure(self) -> None:
-        """Clear the LCMA unknown_tool failure latch."""
-        self._lcma_unknown_tool_failure = False
-        self._lcma_unknown_tool_failure_detail = ""
-        self._state.lcma_unknown_tool_failure = False
-        self._state.lcma_unknown_tool_failure_detail = ""
-
     async def start(self) -> None:
         """Start the background probe loop as an ``asyncio.Task``."""
         if self._task is not None:
             return
-        # Run one probe cycle immediately so state is populated.
-        self.run_once()
+        # Run one full probe cycle (including the async LCMA-tools
+        # probe) so the latch state is populated before any HTTP
+        # handler reads ``/ready``.
+        await self.run_once_async()
         self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
@@ -368,7 +481,7 @@ class ProbeLoop:
         self._task = None
 
     async def _loop(self) -> None:
-        """Internal loop — runs ``run_once()`` at fixed intervals."""
+        """Internal loop — runs a full probe cycle at fixed intervals."""
         while True:
             await asyncio.sleep(self._interval)
-            self.run_once()
+            await self.run_once_async()

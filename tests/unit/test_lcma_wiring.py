@@ -1,13 +1,15 @@
 """Unit tests for the post-write LCMA wiring entry point (issue #54).
 
-Covers the three issue acceptance areas:
+Covers the two acceptance areas that remain after #69 lifted the
+unknown-tool latch out of the per-call path:
 
 - ``related_to`` edge_score threshold honoured by ``lithos_retrieve``
   scoring (FR-LCMA-3, AC-M2-5/6).
 - Tier 3 ``builds_on`` resolution path via ``lithos_cache_lookup``
   (FR-LCMA-4, AC-M2-7/8).
-- Unknown LCMA tool latches the ``lcma_unknown_tool_failure`` flag
-  (FR-LCMA-6) and re-raises so the run aborts.
+
+Mid-run ``LCMAError("unknown_tool")`` propagates as a plain exception
+now; latch flipping happens at probe time (see ``test_probes.py``).
 
 Lower-level retrieve / cache-lookup primitives are exercised in
 ``influx.lcma`` tests; these tests focus on the wiring seam.
@@ -55,14 +57,12 @@ def _make_deps(
     client: AsyncMock,
     *,
     lcma_edge_score: float = 0.75,
-    on_unknown_tool: Any = None,
 ) -> LcmaWiringDeps:
     return LcmaWiringDeps(
         client=client,
         profile="research",
         run_task_id="task-1",
         lcma_edge_score=lcma_edge_score,
-        on_unknown_tool=on_unknown_tool,
     )
 
 
@@ -261,93 +261,39 @@ class TestBuildsOnResolution:
         client.cache_lookup.assert_not_awaited()
 
 
-# ── Unknown LCMA tool latch ────────────────────────────────────────
+# ── LCMA error propagation (post-#69) ──────────────────────────────
 
 
-class TestUnknownToolLatch:
-    """Unknown LCMA tools latch the readiness flag and re-raise."""
+class TestLcmaErrorPropagation:
+    """``LCMAError`` propagates verbatim — no per-call latching here.
+
+    The probe loop drives the ``lcma_unknown_tool_failure`` latch via
+    ``tools/list`` (issue #69); ``wire`` is purely a tools-call seam
+    now.
+    """
 
     @pytest.mark.asyncio
-    async def test_unknown_tool_on_retrieve_latches(self) -> None:
+    async def test_unknown_tool_on_retrieve_propagates(self) -> None:
         client = _make_client()
         client.retrieve = AsyncMock(
             side_effect=LCMAError("unknown_tool", stage="lithos_retrieve")
         )
-        latched: list[dict[str, str]] = []
+        deps = _make_deps(client)
 
-        def fake_latch(*, profile: str, detail: str) -> None:
-            latched.append({"profile": profile, "detail": detail})
-
-        deps = _make_deps(client, on_unknown_tool=fake_latch)
-
-        with pytest.raises(LCMAError):
+        with pytest.raises(LCMAError, match="unknown_tool"):
             await wire(
                 written_note_id="note-new",
                 cascade=CascadeOutput(title="A Paper"),
                 deps=deps,
             )
 
-        assert latched == [
-            {"profile": "research", "detail": "tool='lithos_retrieve'"},
-        ]
-
     @pytest.mark.asyncio
-    async def test_unknown_tool_on_cache_lookup_latches(self) -> None:
-        client = _make_client()
-        client.cache_lookup = AsyncMock(
-            side_effect=LCMAError("unknown_tool", stage="lithos_cache_lookup")
-        )
-        latched: list[dict[str, str]] = []
-
-        def fake_latch(*, profile: str, detail: str) -> None:
-            latched.append({"profile": profile, "detail": detail})
-
-        deps = _make_deps(client, on_unknown_tool=fake_latch)
-
-        with pytest.raises(LCMAError):
-            await wire(
-                written_note_id="note-new",
-                cascade=CascadeOutput(
-                    title="A Paper",
-                    builds_on=["FooNet (arXiv:2412.12345)"],
-                ),
-                deps=deps,
-            )
-
-        assert latched == [
-            {"profile": "research", "detail": "tool='lithos_cache_lookup'"},
-        ]
-
-    @pytest.mark.asyncio
-    async def test_other_lcma_error_is_not_latched(self) -> None:
-        """Non-unknown_tool LCMA errors propagate without latching."""
+    async def test_other_lcma_error_propagates(self) -> None:
         client = _make_client()
         client.retrieve = AsyncMock(
             side_effect=LCMAError("transport refused", stage="http")
         )
-        latched: list[dict[str, str]] = []
-
-        def fake_latch(*, profile: str, detail: str) -> None:
-            latched.append({"profile": profile, "detail": detail})
-
-        deps = _make_deps(client, on_unknown_tool=fake_latch)
-
-        with pytest.raises(LCMAError):
-            await wire(
-                written_note_id="note-new",
-                cascade=CascadeOutput(title="A Paper"),
-                deps=deps,
-            )
-
-        assert latched == []  # no latch for non-unknown_tool error
-
-    @pytest.mark.asyncio
-    async def test_unknown_tool_without_latch_callback_still_reraises(self) -> None:
-        """The latch callback is optional; absence does not swallow the error."""
-        client = _make_client()
-        client.retrieve = AsyncMock(side_effect=LCMAError("unknown_tool"))
-
-        deps = _make_deps(client, on_unknown_tool=None)
+        deps = _make_deps(client)
 
         with pytest.raises(LCMAError):
             await wire(

@@ -28,6 +28,7 @@ from influx.coordinator import Coordinator, RunKind
 from influx.errors import ConfigError
 from influx.filter import make_default_arxiv_filter_scorer
 from influx.http_api import install_exception_handlers, router
+from influx.lithos_client import LithosClient
 from influx.notifications import ProfileRunResult, dispatch_notifications
 from influx.probes import ProbeLoop
 from influx.run_ledger import RunLedger
@@ -140,7 +141,24 @@ def create_app(
     # scheduler-fired — so that shutdown can await them within
     # ``schedule.shutdown_grace_seconds`` (US-008).
     active_tasks: set[asyncio.Task[Any]] = set()
-    probe_loop = ProbeLoop(config, interval=30.0)
+
+    # Tool-lister opens a transient MCP session per probe cycle and
+    # asks Lithos which tools it exposes (issue #69).  Probing each
+    # cycle keeps the latch non-sticky — the next cycle re-evaluates
+    # so a deployment that adds the missing tools recovers
+    # automatically without an Influx restart.
+    async def _list_lithos_tools() -> list[str]:
+        client = LithosClient(url=config.lithos.url, transport=config.lithos.transport)
+        try:
+            return await client.list_tools()
+        finally:
+            await client.close()
+
+    probe_loop = ProbeLoop(
+        config,
+        interval=30.0,
+        tool_lister=_list_lithos_tools,
+    )
 
     # Production default item provider — drives arXiv + RSS fetch with
     # shared FetchCache for per-fire dedup (R-8 mitigation, AC-09-D).

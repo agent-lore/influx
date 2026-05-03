@@ -1214,6 +1214,19 @@ class LithosClient:
         session = await self._ensure_connected()
         return await session.call_tool(name, arguments)
 
+    async def list_tools(self) -> list[str]:
+        """List the names of every tool the connected Lithos exposes.
+
+        Used by the probe loop to assert the LCMA tool surface is
+        present at deployment time (issue #69) — replacing the legacy
+        per-call ``LCMAError("unknown_tool")`` latch with a probe-time
+        gate.  Returns the tool names as an ordered list (MCP's
+        ``tools/list`` ordering preserved).
+        """
+        session = await self._ensure_connected()
+        result = await session.list_tools()
+        return [tool.name for tool in result.tools]
+
     async def close(self) -> None:
         """Close the SSE connection if open."""
         if self._exit_stack is not None:
