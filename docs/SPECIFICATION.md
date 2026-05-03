@@ -652,8 +652,9 @@ Run-ledger entries carry a structured `degraded_reasons` field listing why a com
 
 - `"source_acquisition"` — at least one source-fetch failure was swallowed during the run (issue #20).
 - `"ingestion_stall"` — this and the immediately prior scheduled run for the same profile both saw `ingested == 0` despite `sources_checked > 0` (issue #36).  Typical causes: every candidate hit `slug_collision`/`duplicate`, the LLM filter rejected everything, or upstream sources started returning content the profile no longer accepts.  Backfills are excluded from this check (their ingest pattern is fundamentally different — they legitimately ingest 0 when every candidate is a cache hit).
+- `"fetch_stall"` — this and the immediately prior scheduled run for the same profile both saw `sources_checked == 0`, AND the profile has historically seen `sources_checked > 0` within the recent ledger window (issue #50).  Catches the case `ingestion_stall` filters out: nothing reached the inspection loop at all (e.g. too-narrow `lookback_days`, upstream feed shape change).  The historical ratchet silences brand-new profiles and profiles that genuinely never receive items.  Mutually exclusive with `ingestion_stall` (different `sources_checked` conditions).  Backfills are excluded.
 
-Both reasons can apply to a single run.  `influx_ingestion_stall_runs_total{profile}` ticks once per stall-flagged run so dashboards have an alertable counter independent of source-fetch errors.
+Multiple reasons can apply to a single run.  `influx_ingestion_stall_runs_total{profile, reason}` ticks once per stall-flagged run, split by reason so dashboards can alert on each signal independently.
 
 ### 13.2 Telemetry
 
@@ -682,7 +683,7 @@ Metric instruments cover run lifecycle, the source funnel, write outcomes, and f
 | `influx_slug_collision_reclaimed_total` | Counter | _(no labels)_ |
 | `influx_slug_collision_unresolved_total` | Counter | `profile`, `source` |
 | `influx_runs_skipped_total` | Counter | `profile`, `reason` |
-| `influx_ingestion_stall_runs_total` | Counter | `profile` |
+| `influx_ingestion_stall_runs_total` | Counter | `profile`, `reason` (`ingestion_stall` \| `fetch_stall`) |
 
 When `OTEL_EXPORTER_OTLP_ENDPOINT` is set the OTLP HTTP exporter is used. With `INFLUX_OTEL_CONSOLE_FALLBACK=true` and no endpoint configured, both spans and metrics are written to stdout for local development.
 

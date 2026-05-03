@@ -193,27 +193,38 @@ def archive_missing() -> Any:
 
 
 def ingestion_stalls() -> Any:
-    """Counter of runs flagged ``degraded_reasons=['ingestion_stall']`` (#36).
+    """Counter of runs flagged with a stall ``degraded_reasons`` value.
 
-    Increments once per scheduled run that completes with
-    ``ingested == 0 AND sources_checked > 0`` AND the immediately
-    prior scheduled run for the same profile also matched that
-    shape — i.e. a profile has now seen TWO consecutive
-    inspect-something-but-write-nothing sweeps.
+    Combines the #36 ``ingestion_stall`` and #50 ``fetch_stall``
+    signals on a single instrument, split by the ``reason`` label so
+    dashboards can alert on each independently.
 
-    Typical causes: every candidate hits ``slug_collision`` /
-    ``duplicate``, or the LLM filter is rejecting everything.
-    Sustained non-zero rate is the early-warning signal that
-    ``degraded`` (which today only fires for source-acquisition
-    errors) was missing.
+    ``reason="ingestion_stall"`` (#36): increments once per scheduled
+    run that completes with ``ingested == 0 AND sources_checked > 0``
+    AND the immediately prior scheduled run for the same profile
+    also matched that shape — TWO consecutive
+    inspect-something-but-write-nothing sweeps.  Typical causes: every
+    candidate hits ``slug_collision`` / ``duplicate``, or the LLM
+    filter is rejecting everything.
 
-    Labels: ``profile``.
+    ``reason="fetch_stall"`` (#50): increments once per scheduled run
+    that completes with ``sources_checked == 0`` AND the immediately
+    prior scheduled run for the same profile also saw zero
+    sources_checked AND the profile has historically seen
+    ``sources_checked > 0`` within the recent ledger window.  Typical
+    cause: too-narrow ``lookback_days`` or an upstream feed shape
+    change leaving the inspection loop empty.
+
+    Labels: ``profile``, ``reason``
+    (``"ingestion_stall"`` | ``"fetch_stall"``).
     """
     return get_meter().counter(
         "influx_ingestion_stall_runs_total",
         description=(
-            "scheduled runs flagged ingestion_stall (this and the prior "
-            "scheduled run both inspected items but ingested zero)"
+            "scheduled runs flagged with a stall reason — "
+            "ingestion_stall (two consecutive runs inspected items but "
+            "ingested zero) or fetch_stall (two consecutive runs saw zero "
+            "sources_checked despite prior non-zero history)"
         ),
     )
 

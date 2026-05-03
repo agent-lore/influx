@@ -386,3 +386,125 @@ def test_combined_source_acquisition_and_stall(tmp_path: Path) -> None:
         source_acquisition_errors=[{"source": "arxiv", "kind": "x", "detail": "y"}],
     )
     assert reasons == ["source_acquisition", "ingestion_stall"]
+
+
+# ── #50: fetch-stall detection (zero sources_checked) ───────────────
+
+
+def test_two_consecutive_zero_fetch_runs_after_history_flag_fetch_stall(
+    tmp_path: Path,
+) -> None:
+    """Two consecutive zero-fetch runs after non-zero history → fetch_stall.
+
+    The historical-ratchet means the profile has previously seen
+    ``sources_checked > 0``, so the silence is degenerate, not just a
+    brand-new profile that hasn't started fetching yet.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    # Seed history: a normal run that did inspect items.
+    _start_complete(ledger, run_id="r-0", profile="p", sources_checked=5, ingested=2)
+    # Two consecutive zero-fetch sweeps.
+    _start_complete(ledger, run_id="r-1", profile="p", sources_checked=0, ingested=0)
+    reasons = _start_complete(
+        ledger, run_id="r-2", profile="p", sources_checked=0, ingested=0
+    )
+    assert reasons == ["fetch_stall"]
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is True
+    assert entry["degraded_reasons"] == ["fetch_stall"]
+
+
+def test_two_consecutive_zero_fetch_with_no_history_does_not_flag(
+    tmp_path: Path,
+) -> None:
+    """Brand-new profile with no prior non-zero sources_checked → no flag.
+
+    The ratchet exists precisely to silence this case: if the profile
+    has never had a non-zero fetch in the recent ledger window, we
+    can't distinguish "broken lookback" from "new profile coming online".
+    """
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(ledger, run_id="r-1", profile="p", sources_checked=0, ingested=0)
+    reasons = _start_complete(
+        ledger, run_id="r-2", profile="p", sources_checked=0, ingested=0
+    )
+    assert reasons == []
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is False
+    assert entry["degraded_reasons"] == []
+
+
+def test_fetch_stall_and_ingestion_stall_are_mutually_exclusive(
+    tmp_path: Path,
+) -> None:
+    """A single run can't be both — different sources_checked conditions.
+
+    ``ingestion_stall`` requires ``sources_checked > 0`` while
+    ``fetch_stall`` requires ``sources_checked == 0``; mutually
+    exclusive by construction.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    # Seed history so fetch_stall ratchet would be satisfied.
+    _start_complete(ledger, run_id="r-0", profile="p", sources_checked=5, ingested=2)
+    # Two consecutive zero-fetch runs → fetch_stall, not ingestion_stall.
+    _start_complete(ledger, run_id="r-1", profile="p", sources_checked=0, ingested=0)
+    reasons_fetch = _start_complete(
+        ledger, run_id="r-2", profile="p", sources_checked=0, ingested=0
+    )
+    assert "fetch_stall" in reasons_fetch
+    assert "ingestion_stall" not in reasons_fetch
+
+    # And vice versa: two consecutive zero-ingest (with sources_checked > 0)
+    # runs → ingestion_stall, not fetch_stall.
+    _start_complete(ledger, run_id="r-3", profile="q", sources_checked=5, ingested=0)
+    reasons_ingest = _start_complete(
+        ledger, run_id="r-4", profile="q", sources_checked=4, ingested=0
+    )
+    assert reasons_ingest == ["ingestion_stall"]
+    assert "fetch_stall" not in reasons_ingest
+
+
+def test_single_zero_fetch_run_is_not_yet_a_fetch_stall(tmp_path: Path) -> None:
+    """One zero-fetch run alone (even with history) doesn't flag — needs two."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(ledger, run_id="r-0", profile="p", sources_checked=5, ingested=2)
+    reasons = _start_complete(
+        ledger, run_id="r-1", profile="p", sources_checked=0, ingested=0
+    )
+    assert reasons == []
+
+
+def test_fetch_stall_streak_resets_on_non_zero_fetch(tmp_path: Path) -> None:
+    """A run that fetched anything resets the fetch-stall streak."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(ledger, run_id="r-0", profile="p", sources_checked=5, ingested=2)
+    _start_complete(ledger, run_id="r-1", profile="p", sources_checked=0, ingested=0)
+    _start_complete(ledger, run_id="r-2", profile="p", sources_checked=3, ingested=1)
+    reasons = _start_complete(
+        ledger, run_id="r-3", profile="p", sources_checked=0, ingested=0
+    )
+    # r-3 is the first zero-fetch after a non-zero one; not yet a stall.
+    assert reasons == []
+
+
+def test_fetch_stall_does_not_apply_to_backfills(tmp_path: Path) -> None:
+    """Backfills are excluded from fetch_stall (mirrors ingestion_stall)."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(ledger, run_id="r-0", profile="p", sources_checked=5, ingested=2)
+    _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        kind="backfill",
+        sources_checked=0,
+        ingested=0,
+    )
+    reasons = _start_complete(
+        ledger,
+        run_id="r-2",
+        profile="p",
+        kind="backfill",
+        sources_checked=0,
+        ingested=0,
+    )
+    assert reasons == []

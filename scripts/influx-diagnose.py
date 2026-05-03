@@ -134,9 +134,10 @@ def _filter_runs(
 def _print_run_row(run: dict[str, Any]) -> None:
     status = run.get("status", "?")
     if run.get("degraded"):
-        # #36: surface the structured degraded_reasons so an operator
-        # immediately sees WHY a run was flagged (source_acquisition vs
-        # ingestion_stall vs both) rather than just ``(degraded)``.
+        # #36 / #50: surface the structured degraded_reasons so an
+        # operator immediately sees WHY a run was flagged
+        # (source_acquisition / ingestion_stall / fetch_stall / a
+        # combination) rather than just ``(degraded)``.
         reasons = run.get("degraded_reasons") or []
         if reasons:
             status = f"{status} (degraded: {','.join(str(r) for r in reasons)})"
