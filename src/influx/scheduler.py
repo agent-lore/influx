@@ -39,8 +39,8 @@ from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.errors import LCMAError
 from influx.feedback import build_negative_examples_block
-from influx.lcma import after_write as lcma_after_write
-from influx.lcma import resolve_builds_on as lcma_resolve_builds_on
+from influx.lcma_wiring import CascadeOutput, LcmaWiringDeps
+from influx.lcma_wiring import wire as lcma_wire
 from influx.lithos_client import LithosClient
 from influx.notifications import HighlightItem, ProfileRunResult, RunStats
 from influx.rejection_rate import on_run_complete as rejection_rate_on_run_complete
@@ -394,7 +394,24 @@ async def _run_profile_body(
         task_body = json.loads(
             task_result.content[0].text  # type: ignore[union-attr]
         )
-        run_task_id = task_body["task_id"]
+        run_task_id = str(task_body["task_id"])
+
+        # ── Build LCMA wiring deps once per run (issue #54) ─────────
+        lcma_unknown_tool_latch = (
+            probe_loop.mark_lcma_unknown_tool_failure
+            if probe_loop is not None
+            and hasattr(probe_loop, "mark_lcma_unknown_tool_failure")
+            else None
+        )
+        lcma_deps = LcmaWiringDeps(
+            client=client,
+            profile=profile,
+            run_task_id=run_task_id,
+            lcma_edge_score=(
+                profile_cfg.thresholds.lcma_edge_score if profile_cfg else 0.75
+            ),
+            on_unknown_tool=lcma_unknown_tool_latch,
+        )
 
         outcome = "success"
         body_failed = False
@@ -563,22 +580,14 @@ async def _run_profile_body(
                         )
                         related_in_lithos: list[dict[str, Any]] = []
                         if run_task_id is not None:
-                            source_note_id = write_result.note_id
-                            related_in_lithos = await lcma_after_write(
-                                client=client,
-                                title=title,
-                                contributions=item.get("contributions"),
-                                run_task_id=run_task_id,
-                                profile=profile,
-                                lcma_edge_score=profile_cfg.thresholds.lcma_edge_score
-                                if profile_cfg
-                                else 0.75,
-                                source_note_id=source_note_id,
-                            )
-                            await lcma_resolve_builds_on(
-                                client=client,
-                                builds_on=item.get("builds_on"),
-                                source_note_id=source_note_id,
+                            related_in_lithos = await lcma_wire(
+                                written_note_id=write_result.note_id,
+                                cascade=CascadeOutput(
+                                    title=title,
+                                    contributions=item.get("contributions"),
+                                    builds_on=item.get("builds_on"),
+                                ),
+                                deps=lcma_deps,
                             )
                         ingested.append(
                             HighlightItem(
@@ -627,30 +636,17 @@ async def _run_profile_body(
                         write_result.status,
                         write_result.note_id,
                     )
-                    # ── LCMA post-write hook (FR-LCMA-2/3, AC-M2-5/6) ──
+                    # ── LCMA post-write hook (FR-LCMA-2/3/4, AC-M2-5..8) ──
                     related_in_lithos: list[dict[str, Any]] = []
                     if run_task_id is not None:
-                        # The just-written note's id is plumbed through
-                        # so LCMA edges carry a real source endpoint
-                        # rather than an empty string (PRD 08 graph
-                        # wiring; see finding 1).
-                        source_note_id = write_result.note_id
-                        related_in_lithos = await lcma_after_write(
-                            client=client,
-                            title=title,
-                            contributions=item.get("contributions"),
-                            run_task_id=run_task_id,
-                            profile=profile,
-                            lcma_edge_score=profile_cfg.thresholds.lcma_edge_score
-                            if profile_cfg
-                            else 0.75,
-                            source_note_id=source_note_id,
-                        )
-                        # ── Tier 3 builds_on resolver (FR-LCMA-4, AC-M2-7/8) ──
-                        await lcma_resolve_builds_on(
-                            client=client,
-                            builds_on=item.get("builds_on"),
-                            source_note_id=source_note_id,
+                        related_in_lithos = await lcma_wire(
+                            written_note_id=write_result.note_id,
+                            cascade=CascadeOutput(
+                                title=title,
+                                contributions=item.get("contributions"),
+                                builds_on=item.get("builds_on"),
+                            ),
+                            deps=lcma_deps,
                         )
 
                     ingested.append(
