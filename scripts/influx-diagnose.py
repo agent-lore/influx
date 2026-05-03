@@ -718,6 +718,77 @@ def _is_doc_not_found(message: str) -> bool:
     return "document not found" in needle or "doc_not_found" in needle
 
 
+def _make_lithos_client(url: str) -> Any:
+    """Construct a ``LithosClient`` for the given URL.
+
+    Indirected through this thin factory so unit tests can monkeypatch
+    the construction without having to install ``mcp`` (the transitive
+    dep that ``influx.lithos_client`` pulls in).  Production callers
+    use the factory the same way as a direct construction; the import
+    is local so the factory itself stays cheap to call from the
+    read-only paths that ``_ensure_project_runtime_or_reexec`` re-execs
+    for.
+    """
+    from influx.lithos_client import LithosClient
+
+    return LithosClient(url=url)
+
+
+def _squatters_from_id_list(ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """Build a ``squatters``-shaped dict from a flat list of doc ids.
+
+    Mirrors the dict ``_extract_squatters_from_logs`` returns but with
+    empty metadata: when the operator passes ``--id`` we have no log
+    context, so the slug / source_url / title fields are empty.  This
+    is the seam that lets ``cmd_squatters`` dispatch identically to
+    the log-scan and the ``--id`` paths once a candidate set exists.
+
+    Repeated ids collapse into a single entry — operators sometimes
+    paste the same id twice from a backlog list.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for doc_id in ids:
+        if doc_id in out:
+            continue
+        out[doc_id] = {
+            "doc_id": doc_id,
+            "slugs": [],
+            "source_urls": set(),
+            "titles": set(),
+            "first_seen": "",
+            "last_seen": "",
+            "count": 0,
+        }
+    return out
+
+
+async def _preview_squatter_by_id(
+    *,
+    lithos_url: str,
+    doc_id: str,
+) -> tuple[str, dict[str, Any] | None, str]:
+    """Read-only preview helper for the ``--id`` dry-run path.
+
+    Returns ``(outcome, doc_or_none, reason)`` where ``outcome`` is
+    one of :data:`DELETE_OK` (doc fetched, dry-run), :data:`DELETE_ALREADY_GONE`
+    (doc already deleted), or :data:`DELETE_REFUSED` (read failed for
+    another reason).  The doc dict (if any) is returned so the caller
+    can render the operator-facing preview without re-fetching.
+    """
+    client = _make_lithos_client(lithos_url)
+    try:
+        try:
+            doc = await client.read_note(note_id=doc_id)
+        except BaseException as exc:  # noqa: BLE001
+            chain = _format_exception_chain(exc)
+            if _is_doc_not_found(chain):
+                return DELETE_ALREADY_GONE, None, "doc not found at read time"
+            return DELETE_REFUSED, None, f"read failed: {chain}"
+        return DELETE_OK, doc, "doc read"
+    finally:
+        await client.close()
+
+
 async def _delete_squatter(
     *,
     lithos_url: str,
@@ -733,9 +804,7 @@ async def _delete_squatter(
     :func:`_ensure_project_runtime_or_reexec` first — see
     ``cmd_squatters``.
     """
-    from influx.lithos_client import LithosClient
-
-    client = LithosClient(url=lithos_url)
+    client = _make_lithos_client(lithos_url)
     try:
         try:
             doc = await client.read_note(note_id=doc_id)
@@ -792,72 +861,154 @@ async def _delete_squatter(
         await client.close()
 
 
+def _print_id_preview(doc_id: str, doc: dict[str, Any] | None, reason: str) -> None:
+    """Render a one-screen preview line for a ``--id`` dry-run candidate.
+
+    Surfaces title, tags, and source_url (the four operator signals
+    from the acceptance criteria) plus the planned deletion command.
+    """
+    print(f"SQUATTER doc_id={doc_id}")
+    if doc is None:
+        print(f"   read failed: {reason}")
+        return
+    title = str(doc.get("title") or "(no title)")
+    source_url = str(doc.get("source_url") or "")
+    tags = list(doc.get("tags") or [])
+    has_influx_tag = "ingested-by:influx" in tags
+    print(f"   title={title!r}")
+    if source_url:
+        print(f"   source_url={source_url}")
+    print(f"   tags={tags}")
+    if not has_influx_tag:
+        print(
+            "   WARNING: missing 'ingested-by:influx' tag — "
+            "delete will be REFUSED unless --no-require-influx-authored is set"
+        )
+
+
 def cmd_squatters(args: argparse.Namespace) -> int:
     env = _load_env(args.env)
     container = _container_name(env)
 
-    records = list(
-        _filter_log_records(
-            _docker_logs_iter(container, since=args.since, tail=args.tail),
-            levels={"WARNING"},
-            message_substr="slug_collision",
+    # ── Candidate-set seam ──
+    # Two ways to reach the read-then-delete pipeline:
+    #   1. ``--id <doc-id>`` (issue #34): direct, no docker scan.
+    #   2. log scan: original path, parses ``slug_collision`` WARNINGs.
+    # Both produce the same dict shape, so the apply path below is shared.
+    id_list = list(getattr(args, "id", None) or [])
+    via_id_flag = bool(id_list)
+
+    if via_id_flag:
+        squatters = _squatters_from_id_list(id_list)
+    else:
+        records = list(
+            _filter_log_records(
+                _docker_logs_iter(container, since=args.since, tail=args.tail),
+                levels={"WARNING"},
+                message_substr="slug_collision",
+            )
         )
-    )
-    squatters = _extract_squatters_from_logs(records)
+        squatters = _extract_squatters_from_logs(records)
 
     if not squatters:
+        # Only reachable on the log-scan path (``--id`` always seeds at
+        # least one candidate).  Keep the exact wording so the existing
+        # operator runbook stays accurate.
         print(
             f"No slug_collision squatters found in container {container!r} "
             f"(window: --since {args.since} --tail {args.tail})."
         )
         return 0
 
-    print(
-        f"{len(squatters)} squatter(s) found in container {container!r} "
-        f"(window: --since {args.since} --tail {args.tail}):\n"
-    )
-    # Sorted by last_seen desc so the freshest pain is at the top.
-    ordered = sorted(
-        squatters.values(),
-        key=lambda e: str(e.get("last_seen") or ""),
-        reverse=True,
-    )
-    for entry in ordered:
-        _print_squatter(entry)
-        print()
+    if not via_id_flag:
+        print(
+            f"{len(squatters)} squatter(s) found in container {container!r} "
+            f"(window: --since {args.since} --tail {args.tail}):\n"
+        )
+        # Sorted by last_seen desc so the freshest pain is at the top.
+        ordered = sorted(
+            squatters.values(),
+            key=lambda e: str(e.get("last_seen") or ""),
+            reverse=True,
+        )
+        for entry in ordered:
+            _print_squatter(entry)
+            print()
 
+    # ── Read-only paths ──
     if not args.apply:
+        if via_id_flag:
+            # Operator passed ``--id`` without ``--apply`` — fetch each
+            # doc via ``lithos_read`` and surface the preview signals
+            # plus the planned deletion command, per acceptance criteria.
+            _ensure_project_runtime_or_reexec()
+            lithos_url = _read_lithos_url(args, env)
+            print(
+                f"Read-only preview for {len(squatters)} doc-id(s) via "
+                f"lithos_read on {lithos_url}:\n"
+            )
+
+            import asyncio
+
+            for doc_id in sorted(squatters.keys()):
+                outcome, doc, reason = asyncio.run(
+                    _preview_squatter_by_id(
+                        lithos_url=lithos_url,
+                        doc_id=doc_id,
+                    )
+                )
+                _print_id_preview(doc_id, doc, reason)
+                if outcome == DELETE_ALREADY_GONE:
+                    print(f"   note: {reason}")
+                print()
+            print(
+                "To delete the docs above, re-run with:\n"
+                "    --apply --id <doc-id>      (repeatable; no extra --yes needed)\n"
+                "Pre-delete safety: each doc is fetched and its tags checked to\n"
+                "ensure it carries 'ingested-by:influx' before deletion."
+            )
+            return 0
+
         print(
             "Default mode is read-only.  To delete a squatter, re-run with:\n"
             "    --apply --yes <doc-id>     (per-id confirmation, repeatable)\n"
+            "    --apply --id <doc-id>      (skip log scan, repeatable)\n"
             "    --apply --yes-to-all       (delete every squatter listed above)\n"
             "Pre-delete safety: each doc is fetched and its tags checked to\n"
             "ensure it carries 'ingested-by:influx' before deletion."
         )
         return 0
 
+    # ── Apply path ──
     # ``--apply`` needs the project deps (LithosClient → mcp).  Re-exec
     # under ``uv run`` if we are not already in the project venv so the
     # operator can keep using the bare ``./scripts/influx-diagnose.py``
     # invocation without thinking about the runtime.
     _ensure_project_runtime_or_reexec()
 
-    confirmed: set[str] = set(args.yes or [])
-    if args.yes_to_all:
-        confirmed.update(squatters.keys())
-    if not confirmed:
-        sys.exit(
-            "--apply requires at least one --yes <doc-id> (or --yes-to-all).  Aborted."
-        )
-    unknown = confirmed - set(squatters.keys())
-    if unknown:
-        print(
-            "Warning: --yes ids not present in the log scan results: "
-            + ", ".join(sorted(unknown))
-        )
-        confirmed -= unknown
-    if not confirmed:
-        sys.exit("No matching --yes ids; nothing to delete.")
+    if via_id_flag:
+        # Per issue #34: ``--apply --id <X>`` already names the doc to
+        # delete; no additional ``--yes <X>`` is required.  The id list
+        # is already the confirmed set.
+        confirmed: set[str] = set(squatters.keys())
+    else:
+        confirmed = set(args.yes or [])
+        if args.yes_to_all:
+            confirmed.update(squatters.keys())
+        if not confirmed:
+            sys.exit(
+                "--apply requires at least one --yes <doc-id> "
+                "(or --yes-to-all, or --id <doc-id>).  Aborted."
+            )
+        unknown = confirmed - set(squatters.keys())
+        if unknown:
+            print(
+                "Warning: --yes ids not present in the log scan results: "
+                + ", ".join(sorted(unknown))
+            )
+            confirmed -= unknown
+        if not confirmed:
+            sys.exit("No matching --yes ids; nothing to delete.")
 
     lithos_url = _read_lithos_url(args, env)
     print(
@@ -893,7 +1044,7 @@ def cmd_squatters(args: argparse.Namespace) -> int:
 
     print()
     print(f"Summary: deleted={deleted} already_gone={already_gone} refused={refused}")
-    if already_gone:
+    if already_gone and not via_id_flag:
         print(
             "Note: 'already gone' squatters are still surfacing because the "
             "log scan reads historical WARNINGs from the docker buffer; the "
@@ -1079,7 +1230,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "actually delete squatters (default: dry-run / log scan only). "
-            "Must be combined with --yes <doc-id> or --yes-to-all."
+            "Must be combined with --yes <doc-id>, --yes-to-all, or --id."
         ),
     )
     p_squatters.add_argument(
@@ -1088,7 +1239,20 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="DOC_ID",
         help=(
             "confirm deletion of a specific squatter (repeatable). "
-            "Required with --apply unless --yes-to-all is set."
+            "Required with --apply unless --yes-to-all or --id is set."
+        ),
+    )
+    p_squatters.add_argument(
+        "--id",
+        action="append",
+        metavar="DOC_ID",
+        help=(
+            "act on a known squatter doc-id directly, bypassing the docker "
+            "log scan (repeatable; no --since/--tail required).  Without "
+            "--apply, fetches the doc via lithos_read and reports a preview.  "
+            "With --apply, deletes after the existing safety check.  "
+            "--id <X> is treated as both 'list this id' and 'confirm "
+            "deletion of X'; no additional --yes <X> is required."
         ),
     )
     p_squatters.add_argument(
