@@ -599,24 +599,50 @@ class TestUnknownToolAbort:
         assert len(complete_calls) == 1
         assert complete_calls[0]["outcome"] == "error"
 
-    def test_retrieve_unknown_tool_degrades_readiness(
+    def test_lcma_tools_probe_drives_readiness_latch(
         self,
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
     ) -> None:
-        """lithos_retrieve unknown_tool → readiness reports degraded (AC-M2-9)."""
+        """Probe-time tool-availability check drives the readiness latch (#69).
+
+        Replaces the legacy mid-run ``LCMAError("unknown_tool")``
+        latch.  When the probe's injected ``tool_lister`` reports a
+        truncated tool surface, the latch flips and ``Run.execute()``
+        (today: ``run_profile``) skips with
+        ``reason="lcma_tools_unavailable"`` rather than starting a
+        body that will fail on the very first ``lithos_task_create``.
+        """
         config = _make_config(fake_lithos_url)
-        probe_loop = ProbeLoop(config, interval=30.0)
-        probe_loop.run_once()
 
-        # Readiness is ok before the failure.
-        assert probe_loop.state.is_ready is True
+        async def _missing_retrieve_lister() -> list[str]:
+            # Simulates a Lithos that exposes the task tools but is
+            # missing the LCMA edge tools — the realistic deployment
+            # misconfiguration this latch was designed to catch.
+            return [
+                "lithos_write",
+                "lithos_task_create",
+                "lithos_task_complete",
+                "lithos_cache_lookup",
+                "lithos_edge_upsert",
+                # ``lithos_retrieve`` deliberately omitted
+            ]
 
-        fake_lithos.raise_on_retrieve = True
+        probe_loop = ProbeLoop(
+            config,
+            interval=30.0,
+            tool_lister=_missing_retrieve_lister,
+        )
+        asyncio.run(probe_loop.run_once_async())
+
+        assert probe_loop.lcma_tools_unavailable() is True
+        assert probe_loop.state.is_ready is False
+        assert probe_loop.state.overall_status == "degraded"
+        assert "lithos_retrieve" in probe_loop.state.lcma_unknown_tool_failure_detail
 
         items = [
             {
-                "title": "Paper Before Degraded",
+                "title": "Paper Skipped By Latch",
                 "source_url": "https://arxiv.org/abs/2601.00100",
                 "content": "# Summary\nPaper.",
                 "tags": ["profile:ai-robotics", "source:arxiv"],
@@ -625,18 +651,19 @@ class TestUnknownToolAbort:
             }
         ]
 
-        with pytest.raises(LCMAError, match="unknown_tool"):
-            asyncio.run(
-                run_profile(
-                    "ai-robotics",
-                    RunKind.MANUAL,
-                    config=config,
-                    item_provider=_single_item_provider(items),
-                    probe_loop=probe_loop,
-                )
+        # The run is skipped before any tool call — no LCMAError leaks.
+        result = asyncio.run(
+            run_profile(
+                "ai-robotics",
+                RunKind.MANUAL,
+                config=config,
+                item_provider=_single_item_provider(items),
+                probe_loop=probe_loop,
             )
+        )
+        assert result is None
 
-        # Readiness is now degraded.
-        assert probe_loop.state.is_ready is False
-        assert probe_loop.state.overall_status == "degraded"
-        assert probe_loop.state.lcma_unknown_tool_failure is True
+        # No retrieve / edge_upsert / task_complete calls were made.
+        assert _calls_by_tool(fake_lithos.calls, "lithos_retrieve") == []
+        assert _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert") == []
+        assert _calls_by_tool(fake_lithos.calls, "lithos_task_create") == []

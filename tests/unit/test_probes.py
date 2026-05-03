@@ -602,3 +602,99 @@ class TestLithosCircuitBreaker:
         loop.run_once()
         assert loop.lithos_unhealthy_consecutive == 0
         assert loop.lithos_circuit_open() is False
+
+
+# ── LCMA tool-availability probe (issue #69) ────────────────────────
+
+
+class TestLcmaToolsProbe:
+    """Probe-time LCMA tool-availability check (issue #69).
+
+    Replaces the legacy mid-run ``LCMAError("unknown_tool")`` latch
+    with a probe-driven, non-sticky latch flipped from ``tools/list``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_required_tools_present_clears_latch(self) -> None:
+        """Tool list containing every required name → latch cleared."""
+        from influx.probes import REQUIRED_LCMA_TOOLS
+
+        async def lister() -> list[str]:
+            return list(REQUIRED_LCMA_TOOLS) + ["lithos_write", "lithos_ping"]
+
+        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+        loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
+        await loop.run_once_async()
+
+        assert loop.lcma_tools_unavailable() is False
+        assert loop.state.lcma_unknown_tool_failure is False
+
+    @pytest.mark.asyncio
+    async def test_missing_required_tool_flips_latch(self) -> None:
+        """Tool list missing one required name → latch flips, detail names it."""
+
+        async def lister() -> list[str]:
+            return [
+                "lithos_write",
+                "lithos_task_create",
+                "lithos_task_complete",
+                "lithos_cache_lookup",
+                "lithos_edge_upsert",
+                # ``lithos_retrieve`` deliberately missing
+            ]
+
+        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+        loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
+        await loop.run_once_async()
+
+        assert loop.lcma_tools_unavailable() is True
+        assert loop.state.lcma_unknown_tool_failure is True
+        assert "lithos_retrieve" in loop.state.lcma_unknown_tool_failure_detail
+
+    @pytest.mark.asyncio
+    async def test_tools_list_transport_error_flips_latch(self) -> None:
+        """tools/list raising → latch set with degraded detail (transport error)."""
+
+        async def failing_lister() -> list[str]:
+            raise RuntimeError("MCP connection refused")
+
+        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+        loop = ProbeLoop(cfg, interval=30.0, tool_lister=failing_lister)
+        await loop.run_once_async()
+
+        assert loop.lcma_tools_unavailable() is True
+        assert "tools/list failed" in loop.state.lcma_unknown_tool_failure_detail
+
+    @pytest.mark.asyncio
+    async def test_no_tool_lister_skips_probe_and_clears_latch(self) -> None:
+        """``tool_lister=None`` → probe is a no-op, latch stays cleared."""
+        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+        loop = ProbeLoop(cfg, interval=30.0, tool_lister=None)
+        await loop.run_once_async()
+
+        assert loop.lcma_tools_unavailable() is False
+        assert loop.state.lcma_unknown_tool_failure is False
+
+    @pytest.mark.asyncio
+    async def test_latch_recovers_when_tools_become_available(self) -> None:
+        """Non-sticky behaviour: missing → present across cycles re-clears."""
+        from influx.probes import REQUIRED_LCMA_TOOLS
+
+        cycle_state = {"missing_retrieve": True}
+
+        async def lister() -> list[str]:
+            base = list(REQUIRED_LCMA_TOOLS)
+            if cycle_state["missing_retrieve"]:
+                return [t for t in base if t != "lithos_retrieve"]
+            return base
+
+        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+        loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
+        await loop.run_once_async()
+        assert loop.lcma_tools_unavailable() is True
+
+        # Deployment fixed mid-flight; next probe cycle clears the latch.
+        cycle_state["missing_retrieve"] = False
+        await loop.run_once_async()
+        assert loop.lcma_tools_unavailable() is False
+        assert loop.state.lcma_unknown_tool_failure is False

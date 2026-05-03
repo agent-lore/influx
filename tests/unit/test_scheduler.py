@@ -948,3 +948,66 @@ class TestLithosCircuitBreakerShortCircuit:
         # Either a failed entry or no terminal entry yet — neither
         # should be ``skipped``.
         assert all(e.get("status") != "skipped" for e in entries)
+
+
+class TestLcmaToolsUnavailableShortCircuit:
+    """``run_profile`` skips when the LCMA-tools probe latch is set (#69).
+
+    Probe-time tool-availability check (`lcma_tools_unavailable()`)
+    replaces the legacy mid-run `LCMAError("unknown_tool")` latch.
+    """
+
+    async def test_skips_when_lcma_tools_latch_set(self, tmp_path: Any) -> None:
+        """Latch set → no provider invocation, ledger reflects the skip."""
+        from influx.run_ledger import RunLedger
+
+        config = _make_config(profiles=["staging-robotics"])
+        config = config.model_copy(
+            update={
+                "storage": config.storage.model_copy(
+                    update={"state_dir": str(tmp_path)}
+                )
+            }
+        )
+
+        provider_called = False
+
+        async def spy_provider(
+            profile: str,
+            kind: RunKind,
+            run_range: dict[str, str | int] | None,
+            filter_prompt: str,
+        ) -> list[dict[str, Any]]:
+            nonlocal provider_called
+            provider_called = True
+            return []
+
+        class StubProbeLoop:
+            lithos_unhealthy_consecutive = 0
+
+            def lithos_circuit_open(self, *, threshold: int = 3) -> bool:
+                return False
+
+            def lcma_tools_unavailable(self) -> bool:
+                return True
+
+        ledger = RunLedger(tmp_path)
+        result = await run_profile(
+            "staging-robotics",
+            RunKind.SCHEDULED,
+            config=config,
+            item_provider=spy_provider,
+            probe_loop=StubProbeLoop(),
+            run_ledger=ledger,
+        )
+
+        assert result is None
+        assert provider_called is False, (
+            "LCMA-tools-unavailable latch must short-circuit BEFORE the "
+            "item provider runs — the deployment is misconfigured and any "
+            "lithos_task_create call would fail anyway."
+        )
+        entries = ledger.recent()
+        assert len(entries) == 1
+        assert entries[0]["status"] == "skipped"
+        assert entries[0]["error"] == "lcma_tools_unavailable"

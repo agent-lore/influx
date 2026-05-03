@@ -37,7 +37,6 @@ from apscheduler.triggers.cron import CronTrigger
 from influx import metrics
 from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
-from influx.errors import LCMAError
 from influx.feedback import build_negative_examples_block
 from influx.lcma_wiring import CascadeOutput, LcmaWiringDeps
 from influx.lcma_wiring import wire as lcma_wire
@@ -209,6 +208,36 @@ async def run_profile(
         )
         return None
 
+    # #69: skip the run when the LCMA tool surface is unavailable.
+    # Probe-time check replaces the legacy mid-run
+    # ``LCMAError("unknown_tool")`` latch — by the time we get here we
+    # already know the deployment lacks one or more of the five
+    # required LCMA tools, so there is no point starting a body that
+    # will fail on the very first ``lithos_task_create``.
+    if (
+        probe_loop is not None
+        and hasattr(probe_loop, "lcma_tools_unavailable")
+        and probe_loop.lcma_tools_unavailable()
+    ):
+        ledger.start(
+            run_id=run_id,
+            profile=profile,
+            kind=kind.value,
+            run_range=run_range,
+        )
+        ledger.skip(run_id=run_id, reason="lcma_tools_unavailable")
+        metrics.runs_skipped().add(
+            1,
+            {"profile": profile, "reason": "lcma_tools_unavailable"},
+        )
+        logger.warning(
+            "run skipped profile=%s kind=%s run_id=%s reason=lcma_tools_unavailable",
+            profile,
+            kind.value,
+            run_id,
+        )
+        return None
+
     ledger.start(
         run_id=run_id,
         profile=profile,
@@ -352,24 +381,6 @@ async def _run_profile_body(
     provider = item_provider
     profile_cfg = next((p for p in config.profiles if p.name == profile), None)
 
-    def _handle_lcma_unknown_tool(exc: LCMAError, *, fallback_tool: str) -> None:
-        """Log + latch readiness for an LCMA ``unknown_tool`` failure."""
-        tool = getattr(exc, "stage", "") or fallback_tool
-        logger.error(
-            "LCMA deployment error: unknown_tool for %s during profile %r run "
-            "— aborting run. Check that the connected Lithos deployment "
-            "supports the required LCMA tools.",
-            tool,
-            profile,
-        )
-        if probe_loop is not None and hasattr(
-            probe_loop, "mark_lcma_unknown_tool_failure"
-        ):
-            probe_loop.mark_lcma_unknown_tool_failure(
-                profile=profile,
-                detail=f"tool={tool!r}",
-            )
-
     client = LithosClient(url=config.lithos.url, transport=config.lithos.transport)
     try:
         # ── LCMA task bracketing (FR-LCMA-5, FR-BF-5, AC-M2-10) ──
@@ -377,32 +388,24 @@ async def _run_profile_body(
         # run.  The task tag depends on ``kind``:
         #   - scheduled / manual → ``influx:run``
         #   - backfill           → ``influx:backfill``
-        run_task_id: str | None = None
+        # ``LCMAError("unknown_tool")`` is no longer caught locally —
+        # the probe loop's tool-availability check (issue #69) gates
+        # the run before we get here.  A mid-run race is handled by
+        # the next probe cycle re-evaluating the latch.
         task_tag = "influx:backfill" if kind == RunKind.BACKFILL else "influx:run"
         run_date = datetime.now(UTC).date().isoformat()
         task_title = f"Influx run {profile} {run_date}"
-        try:
-            task_result = await client.task_create(
-                title=task_title,
-                agent="influx",
-                tags=[task_tag, f"profile:{profile}"],
-            )
-        except LCMAError as exc:
-            if str(exc) == "unknown_tool":
-                _handle_lcma_unknown_tool(exc, fallback_tool="lithos_task_create")
-            raise
+        task_result = await client.task_create(
+            title=task_title,
+            agent="influx",
+            tags=[task_tag, f"profile:{profile}"],
+        )
         task_body = json.loads(
             task_result.content[0].text  # type: ignore[union-attr]
         )
         run_task_id = str(task_body["task_id"])
 
         # ── Build LCMA wiring deps once per run (issue #54) ─────────
-        lcma_unknown_tool_latch = (
-            probe_loop.mark_lcma_unknown_tool_failure
-            if probe_loop is not None
-            and hasattr(probe_loop, "mark_lcma_unknown_tool_failure")
-            else None
-        )
         lcma_deps = LcmaWiringDeps(
             client=client,
             profile=profile,
@@ -410,7 +413,6 @@ async def _run_profile_body(
             lcma_edge_score=(
                 profile_cfg.thresholds.lcma_edge_score if profile_cfg else 0.75
             ),
-            on_unknown_tool=lcma_unknown_tool_latch,
         )
 
         outcome = "success"
@@ -733,12 +735,6 @@ async def _run_profile_body(
                 run_id=current_run_id.get() or None,
             )
             return result
-        except LCMAError as exc:
-            outcome = "error"
-            body_failed = True
-            if str(exc) == "unknown_tool":
-                _handle_lcma_unknown_tool(exc, fallback_tool="lcma_call")
-            raise
         except Exception:
             outcome = "error"
             body_failed = True
@@ -751,29 +747,20 @@ async def _run_profile_body(
                         agent="influx",
                         outcome=outcome,
                     )
-                except LCMAError as exc:
-                    if str(exc) == "unknown_tool":
-                        _handle_lcma_unknown_tool(
-                            exc, fallback_tool="lithos_task_complete"
-                        )
-                        # Only re-raise from finally when the body did
-                        # not already fail — otherwise the body's
-                        # exception propagates after this block.
-                        if not body_failed:
-                            raise
-                    else:
-                        logger.warning(
-                            "lithos_task_complete failed for profile %r: %s",
-                            profile,
-                            exc,
-                            exc_info=True,
-                        )
                 except Exception:
+                    # ``LCMAError("unknown_tool")`` is no longer caught
+                    # specially — the probe-time gate (#69) keeps it
+                    # off the runtime path in the steady state.  Any
+                    # mid-run race is logged and swallowed here so the
+                    # outer ledger.complete still records the body's
+                    # outcome.
                     logger.warning(
                         "lithos_task_complete failed for profile %r",
                         profile,
                         exc_info=True,
                     )
+                    if not body_failed:
+                        raise
     finally:
         await client.close()
 

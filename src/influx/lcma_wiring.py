@@ -9,8 +9,13 @@ the scheduler used to inline:
 - Resolving Tier 3 ``builds_on`` entries via ``lithos_cache_lookup`` and
   upserting ``builds_on`` edges only on exact ``source_url`` match
   (FR-LCMA-4, AC-M2-7/8).
-- Latching the ``lcma_unknown_tool_failure`` probe flag (FR-LCMA-6) when
-  Lithos returns ``unknown_tool`` for any of those calls.
+
+LCMA tool-availability checking has moved out of the per-call latch
+path (issue #69).  The probe loop now asserts the LCMA tool surface
+once per probe interval and gates the run with
+``reason="lcma_tools_unavailable"``; mid-run ``LCMAError("unknown_tool")``
+propagates as a normal failure here, and the next probe cycle
+re-evaluates the latch.
 
 The actual retrieve / cache-lookup / edge-upsert primitives still live
 in :mod:`influx.lcma`.  This module is the seam the scheduler (and,
@@ -20,11 +25,9 @@ later, the ``Run`` module) calls into after each successful write.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from influx.errors import LCMAError
 from influx.lcma import after_write, resolve_builds_on
 
 if TYPE_CHECKING:
@@ -32,18 +35,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CascadeOutput",
-    "LcmaUnknownToolLatch",
     "LcmaWiringDeps",
     "wire",
 ]
 
 logger = logging.getLogger(__name__)
-
-
-# Latch callback shape — typically ``ProbeLoop.mark_lcma_unknown_tool_failure``
-# (kwargs: ``profile``, ``detail``).  Any callable accepting those kwargs
-# is acceptable so unit tests can pass a plain capturing fake.
-LcmaUnknownToolLatch = Callable[..., None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +70,6 @@ class LcmaWiringDeps:
     profile: str
     run_task_id: str
     lcma_edge_score: float
-    on_unknown_tool: LcmaUnknownToolLatch | None = field(default=None)
 
 
 # ── Entry point ─────────────────────────────────────────────────────
@@ -98,7 +93,7 @@ async def wire(
         from the cascade output for this item.
     deps:
         Per-run wiring dependencies (Lithos client, profile, run task,
-        edge-score threshold, optional unknown-tool latch).
+        edge-score threshold).
 
     Returns
     -------
@@ -110,75 +105,23 @@ async def wire(
     Raises
     ------
     LCMAError
-        Propagated verbatim after latching ``lcma_unknown_tool_failure``
-        on ``unknown_tool``; other errors propagate unchanged.
+        Propagated verbatim.  ``unknown_tool`` failures are no longer
+        latched here — the probe loop's tool-availability check
+        (issue #69) drives the latch and the next probe cycle
+        re-evaluates.
     """
-    related: list[dict[str, Any]] = []
-    try:
-        related = await after_write(
-            client=deps.client,
-            title=cascade.title,
-            contributions=cascade.contributions,
-            run_task_id=deps.run_task_id,
-            profile=deps.profile,
-            lcma_edge_score=deps.lcma_edge_score,
-            source_note_id=written_note_id,
-        )
-    except LCMAError as exc:
-        _maybe_latch_unknown_tool(
-            exc=exc,
-            profile=deps.profile,
-            fallback_tool="lithos_retrieve",
-            on_unknown_tool=deps.on_unknown_tool,
-        )
-        raise
-
-    try:
-        await resolve_builds_on(
-            client=deps.client,
-            builds_on=cascade.builds_on,
-            source_note_id=written_note_id,
-        )
-    except LCMAError as exc:
-        _maybe_latch_unknown_tool(
-            exc=exc,
-            profile=deps.profile,
-            fallback_tool="lithos_cache_lookup",
-            on_unknown_tool=deps.on_unknown_tool,
-        )
-        raise
-
-    return related
-
-
-# ── Unknown-tool latch helper ──────────────────────────────────────
-
-
-def _maybe_latch_unknown_tool(
-    *,
-    exc: LCMAError,
-    profile: str,
-    fallback_tool: str,
-    on_unknown_tool: LcmaUnknownToolLatch | None,
-) -> None:
-    """Log + latch readiness when *exc* is an LCMA ``unknown_tool`` failure.
-
-    Mirrors the original ``_handle_lcma_unknown_tool`` behaviour from the
-    scheduler: an ERROR log line names the offending tool, and the
-    optional latch callback flips the probe flag so ``/ready`` reports
-    degraded.  Other LCMAError values are no-ops here so the caller can
-    re-raise unchanged.
-    """
-    if str(exc) != "unknown_tool":
-        return
-
-    tool = getattr(exc, "stage", "") or fallback_tool
-    logger.error(
-        "LCMA deployment error: unknown_tool for %s during profile %r run "
-        "— aborting run. Check that the connected Lithos deployment "
-        "supports the required LCMA tools.",
-        tool,
-        profile,
+    related = await after_write(
+        client=deps.client,
+        title=cascade.title,
+        contributions=cascade.contributions,
+        run_task_id=deps.run_task_id,
+        profile=deps.profile,
+        lcma_edge_score=deps.lcma_edge_score,
+        source_note_id=written_note_id,
     )
-    if on_unknown_tool is not None:
-        on_unknown_tool(profile=profile, detail=f"tool={tool!r}")
+    await resolve_builds_on(
+        client=deps.client,
+        builds_on=cascade.builds_on,
+        source_note_id=written_note_id,
+    )
+    return related
