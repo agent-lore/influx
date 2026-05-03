@@ -221,7 +221,7 @@ async def _run_arxiv_scenario(
 
     with (
         # Tracer patches — all modules see the collecting tracer
-        patch("influx.scheduler.get_tracer", return_value=tracer),
+        patch("influx.run_service.get_tracer", return_value=tracer),
         patch("influx.run.get_tracer", return_value=tracer),
         patch("influx.sources.arxiv.get_tracer", return_value=tracer),
         patch("influx.cascade.get_tracer", return_value=tracer),
@@ -245,10 +245,10 @@ async def _run_arxiv_scenario(
             return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
         ),
         # Scheduler + Run infrastructure (#58 dispatch)
-        patch("influx.scheduler.LithosClient", return_value=mock_client),
+        patch("influx.run.LithosClient", return_value=mock_client),
         patch("influx.run.LithosClient", return_value=mock_client),
         patch(
-            "influx.scheduler.build_negative_examples_block",
+            "influx.run.build_negative_examples_block",
             new_callable=AsyncMock,
             return_value="",
         ),
@@ -257,7 +257,7 @@ async def _run_arxiv_scenario(
             new_callable=AsyncMock,
             return_value="",
         ),
-        patch("influx.scheduler.repair_sweep", new_callable=AsyncMock),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock),
         patch("influx.run.repair_sweep", new_callable=AsyncMock),
         # lcma_after_write runs normally — produces influx.lithos.retrieve span
         # lcma_resolve_builds_on runs normally — "b1" has no arXiv ref, no-ops
@@ -452,7 +452,7 @@ class TestOtelDisabledZeroSpans:
 
         with (
             # All modules see the disabled tracer
-            patch("influx.scheduler.get_tracer", return_value=disabled_tracer),
+            patch("influx.run_service.get_tracer", return_value=disabled_tracer),
             patch("influx.run.get_tracer", return_value=disabled_tracer),
             patch("influx.sources.arxiv.get_tracer", return_value=disabled_tracer),
             patch("influx.lcma.get_tracer", return_value=disabled_tracer),
@@ -478,10 +478,10 @@ class TestOtelDisabledZeroSpans:
                 return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
             ),
             # Scheduler + Run infrastructure (#58 dispatch)
-            patch("influx.scheduler.LithosClient", return_value=mock_client),
+            patch("influx.run.LithosClient", return_value=mock_client),
             patch("influx.run.LithosClient", return_value=mock_client),
             patch(
-                "influx.scheduler.build_negative_examples_block",
+                "influx.run.build_negative_examples_block",
                 new_callable=AsyncMock,
                 return_value="",
             ),
@@ -490,7 +490,7 @@ class TestOtelDisabledZeroSpans:
                 new_callable=AsyncMock,
                 return_value="",
             ),
-            patch("influx.scheduler.repair_sweep", new_callable=AsyncMock),
+            patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch("influx.service.post_run_webhook_hook"),
         ):

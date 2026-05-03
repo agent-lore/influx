@@ -397,7 +397,7 @@ class TestBackfillNoOverlap:
                 return_value=list(_FIXTURE_ARXIV_ITEMS),
             ),
             patch(
-                "influx.scheduler.repair_sweep",
+                "influx.run.repair_sweep",
                 new_callable=AsyncMock,
             ) as mock_sweep,
         ):

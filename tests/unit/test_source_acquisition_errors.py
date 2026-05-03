@@ -140,16 +140,18 @@ async def test_scheduler_drains_context_into_ledger_complete(
     config = _make_minimal_config()
     ledger = RunLedger(tmp_path / "state")
 
-    async def fake_body(*_args: Any, **_kwargs: Any) -> None:
-        # Inside the body — the scheduler has already initialised the
+    from influx.run import RunOutcome
+
+    async def fake_body(*_args: Any, **_kwargs: Any) -> RunOutcome:
+        # Inside the body — RunService has already initialised the
         # contextvar.  Mimic an arxiv NetworkError swallow.
         record_source_acquisition_error(
             source="arxiv", kind="http", detail="HTTP 500 from arXiv API"
         )
-        return None
+        return RunOutcome()
 
     fake = AsyncMock(side_effect=fake_body)
-    with patch("influx.scheduler._run_profile_body", new=fake):
+    with patch("influx.run.Run.execute", new=fake):
         await run_profile(
             "ai-robotics",
             RunKind.SCHEDULED,
@@ -178,9 +180,11 @@ async def test_scheduler_writes_clean_ledger_on_no_errors(tmp_path: Any) -> None
     config = _make_minimal_config()
     ledger = RunLedger(tmp_path / "state")
 
+    from influx.run import RunOutcome
+
     with patch(
-        "influx.scheduler._run_profile_body",
-        new=AsyncMock(return_value=None),
+        "influx.run.Run.execute",
+        new=AsyncMock(return_value=RunOutcome()),
     ):
         await run_profile(
             "ai-robotics",

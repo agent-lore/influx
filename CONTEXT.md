@@ -70,7 +70,7 @@ A Run over an explicit date window that skips the repair sweep, skips already-ca
 The post-write step that calls `lithos_retrieve` for related notes, upserts `related_to` edges above `thresholds.lcma_edge_score`, and resolves Tier 3 `builds_on` entries via `lithos_cache_lookup` to upsert `builds_on` edges. Runs after every successful write. _(proposed as a separate collaborator of the Run module)_
 
 **RunService**:
-The collaborator that owns "build RunPlan → execute Run → dispatch notifications → record outcome" for one request. The scheduler's three entry points (scheduled tick, `POST /runs`, `POST /backfills`) become thin RunPlan builders that hand off to RunService. _(proposed)_
+The collaborator that owns "build RunPlan → execute Run → dispatch notifications → record outcome" for one request. The scheduler's three entry points (scheduled tick, `POST /runs`, `POST /backfills`) are thin RunPlan builders that hand off to RunService. Lives in `src/influx/run_service.py` as `RunService.execute()`.
 
 ### Domain — Lithos integration
 

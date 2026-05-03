@@ -96,9 +96,9 @@ class TestInfluxRunSpan:
         # Patch get_tracer to return our collecting tracer
         # Patch _run_profile_body to avoid real Lithos calls
         with (
-            patch("influx.scheduler.get_tracer", return_value=tracer),
+            patch("influx.run_service.get_tracer", return_value=tracer),
             patch(
-                "influx.scheduler._run_profile_body",
+                "influx.run.Run.execute",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
@@ -129,9 +129,9 @@ class TestInfluxRunSpan:
         config = _make_minimal_config()
 
         with (
-            patch("influx.scheduler.get_tracer", return_value=tracer),
+            patch("influx.run_service.get_tracer", return_value=tracer),
             patch(
-                "influx.scheduler._run_profile_body",
+                "influx.run.Run.execute",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
@@ -154,9 +154,9 @@ class TestInfluxRunSpan:
         config = _make_minimal_config()
 
         with (
-            patch("influx.scheduler.get_tracer", return_value=tracer),
+            patch("influx.run_service.get_tracer", return_value=tracer),
             patch(
-                "influx.scheduler._run_profile_body",
+                "influx.run.Run.execute",
                 new_callable=AsyncMock,
                 return_value=None,
             ),
@@ -360,9 +360,9 @@ class TestOtelDisabledNoSpans:
         assert not disabled_tracer.enabled
 
         with (
-            patch("influx.scheduler.get_tracer", return_value=disabled_tracer),
+            patch("influx.run_service.get_tracer", return_value=disabled_tracer),
             patch(
-                "influx.scheduler._run_profile_body",
+                "influx.run.Run.execute",
                 new_callable=AsyncMock,
                 return_value=None,
             ) as mock_body,
@@ -1138,12 +1138,12 @@ class TestInfluxLithosWriteSpan:
         token = current_run_id.set("test-run-write")
         try:
             with (
-                patch("influx.scheduler.get_tracer", return_value=tracer),
+                patch("influx.run_service.get_tracer", return_value=tracer),
                 patch("influx.run.get_tracer", return_value=tracer),
-                patch("influx.scheduler.LithosClient") as mock_client_cls,
+                patch("influx.run.LithosClient") as mock_client_cls,
                 patch("influx.run.LithosClient") as mock_client_cls_run,
                 patch(
-                    "influx.scheduler.build_negative_examples_block",
+                    "influx.run.build_negative_examples_block",
                     new_callable=AsyncMock,
                     return_value="",
                 ),
@@ -1153,7 +1153,7 @@ class TestInfluxLithosWriteSpan:
                     return_value="",
                 ),
                 patch(
-                    "influx.scheduler.repair_sweep",
+                    "influx.run.repair_sweep",
                     new_callable=AsyncMock,
                 ),
                 patch(
@@ -1161,7 +1161,7 @@ class TestInfluxLithosWriteSpan:
                     new_callable=AsyncMock,
                 ),
                 patch(
-                    "influx.scheduler.lcma_wire",
+                    "influx.run.lcma_wire",
                     new_callable=AsyncMock,
                     return_value=[],
                 ),
@@ -1235,12 +1235,12 @@ class TestInfluxLithosWriteSpan:
             ]
 
         with (
-            patch("influx.scheduler.get_tracer", return_value=disabled_tracer),
+            patch("influx.run_service.get_tracer", return_value=disabled_tracer),
             patch("influx.run.get_tracer", return_value=disabled_tracer),
-            patch("influx.scheduler.LithosClient") as mock_client_cls,
+            patch("influx.run.LithosClient") as mock_client_cls,
             patch("influx.run.LithosClient") as mock_client_cls_run,
             patch(
-                "influx.scheduler.build_negative_examples_block",
+                "influx.run.build_negative_examples_block",
                 new_callable=AsyncMock,
                 return_value="",
             ),
@@ -1249,10 +1249,10 @@ class TestInfluxLithosWriteSpan:
                 new_callable=AsyncMock,
                 return_value="",
             ),
-            patch("influx.scheduler.repair_sweep", new_callable=AsyncMock),
+            patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch(
-                "influx.scheduler.lcma_wire",
+                "influx.run.lcma_wire",
                 new_callable=AsyncMock,
                 return_value=[],
             ),

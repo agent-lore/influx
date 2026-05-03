@@ -173,7 +173,7 @@ class TestBackfillExclusion:
         app = _make_app(config)
 
         with patch(
-            "influx.scheduler.repair_sweep",
+            "influx.run.repair_sweep",
             new_callable=AsyncMock,
         ) as mock_sweep:
             with TestClient(app) as tc:

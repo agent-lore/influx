@@ -184,7 +184,7 @@ class TestCoordinatorSlotIntegration:
         from unittest.mock import patch
 
         with (
-            patch("influx.scheduler.repair_sweep", side_effect=_spy_sweep),
+            patch("influx.run.repair_sweep", side_effect=_spy_sweep),
             patch("influx.run.repair_sweep", side_effect=_spy_sweep),
             TestClient(app) as tc,
         ):
@@ -228,7 +228,7 @@ class TestCoordinatorSlotIntegration:
         from unittest.mock import patch
 
         with (
-            patch("influx.scheduler.repair_sweep", sweep_mock),
+            patch("influx.run.repair_sweep", sweep_mock),
             patch("influx.run.repair_sweep", sweep_mock),
             TestClient(app) as tc,
         ):
@@ -266,7 +266,7 @@ class TestCoordinatorSlotIntegration:
         from unittest.mock import patch
 
         with (
-            patch("influx.scheduler.repair_sweep", sweep_mock),
+            patch("influx.run.repair_sweep", sweep_mock),
             patch("influx.run.repair_sweep", sweep_mock),
             TestClient(app) as tc,
         ):
