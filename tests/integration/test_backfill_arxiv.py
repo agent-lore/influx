@@ -448,12 +448,12 @@ class TestBackfillNoOverlap:
                 )
             )
 
-        # The webhook hook IS called (run_profile always calls it), but
-        # it should be a no-op for backfill runs (kind=BACKFILL).
-        # We verify it was called with kind=BACKFILL.
-        mock_webhook.assert_called_once()
-        call_kwargs = mock_webhook.call_args
-        assert call_kwargs[1]["kind"] == RunKind.BACKFILL
+        # FR-NOT-4: backfill runs skip the webhook POST.  Since #60
+        # the Run module's Finalise stage gates on ``plan.notify``, so
+        # for backfill (``notify=False``) the hook is never called at
+        # all — replacing the legacy "always call, hook no-ops on
+        # BACKFILL" pattern with explicit skipping.
+        mock_webhook.assert_not_called()
 
 
 # ── Test: non-backfill still writes on cache hit (US-005 regression) ──

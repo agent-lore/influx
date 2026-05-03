@@ -635,8 +635,13 @@ class TestSweepWriteErrorMarksReadinessDegraded:
 
         with (
             patch("influx.scheduler.LithosClient", return_value=_NoopClient()),
+            patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
                 "influx.scheduler.build_negative_examples_block",
+                side_effect=_empty_neg_block,
+            ),
+            patch(
+                "influx.run.build_negative_examples_block",
                 side_effect=_empty_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook"),
@@ -1135,4 +1140,110 @@ class TestManualRunDispatchesToRunModule:
         )
         assert legacy_sweep_called is False, (
             "The legacy _run_profile_body path must not run for manual kind"
+        )
+
+
+class TestBackfillRunDispatchesToRunModule:
+    """Backfills (#60) dispatch through ``influx.run.Run.execute()``.
+
+    Uses ``RunPlan(skip_repair=True, skip_cache_hits=True,
+    notify=False)`` so the Run module's stages skip the repair
+    sweep, skip cache-hit items, and skip the post-run webhook.
+    """
+
+    async def test_backfill_routes_through_run_module_with_correct_flags(
+        self, tmp_path: Any
+    ) -> None:
+        """A backfill builds a backfill-shaped RunPlan and skips repair."""
+        from influx.run_ledger import RunLedger
+
+        config = _make_config(profiles=["alpha"])
+        config = config.model_copy(
+            update={
+                "storage": config.storage.model_copy(
+                    update={"state_dir": str(tmp_path)}
+                )
+            }
+        )
+
+        run_sweep_called = False
+
+        async def _run_sweep(*args: Any, **kwargs: Any) -> list[Any]:
+            nonlocal run_sweep_called
+            run_sweep_called = True
+            return []
+
+        webhook_called = False
+
+        def _webhook(*args: Any, **kwargs: Any) -> None:
+            nonlocal webhook_called
+            webhook_called = True
+
+        class _NoopClient:
+            async def close(self) -> None: ...
+
+            async def list_archive_terminal_arxiv_ids(
+                self, *, profile: str
+            ) -> frozenset[str]:
+                return frozenset()
+
+            async def task_create(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(
+                            type="text",
+                            text=_json.dumps({"task_id": "bf-task"}),
+                        ),
+                    ],
+                )
+
+            async def task_complete(self, **kwargs: Any) -> Any:
+                import json as _json
+
+                from mcp import types as _mcp_types
+
+                return _mcp_types.CallToolResult(
+                    content=[
+                        _mcp_types.TextContent(
+                            type="text",
+                            text=_json.dumps({"status": "completed"}),
+                        ),
+                    ],
+                )
+
+        async def _empty_neg_block(*args: Any, **kwargs: Any) -> str:
+            return ""
+
+        ledger = RunLedger(tmp_path)
+        with (
+            patch("influx.run.repair_sweep", side_effect=_run_sweep),
+            patch("influx.run.LithosClient", return_value=_NoopClient()),
+            patch(
+                "influx.run.build_negative_examples_block",
+                side_effect=_empty_neg_block,
+            ),
+            patch("influx.service.post_run_webhook_hook", side_effect=_webhook),
+        ):
+            await run_profile(
+                "alpha",
+                RunKind.BACKFILL,
+                run_range={"days": 7},
+                config=config,
+                item_provider=None,
+                run_ledger=ledger,
+            )
+
+        # FR-REP-2: backfill skips repair sweep entirely.
+        assert run_sweep_called is False, (
+            "Backfill must build a RunPlan with skip_repair=True so "
+            "the repair stage is bypassed."
+        )
+        # FR-NOT-4: backfill skips the post-run webhook.
+        assert webhook_called is False, (
+            "Backfill must build a RunPlan with notify=False so the "
+            "Finalise stage doesn't call post_run_webhook_hook."
         )
