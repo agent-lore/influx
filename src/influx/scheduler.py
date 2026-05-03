@@ -378,33 +378,37 @@ async def _run_profile_body(
     real ledger; when ``None`` the unresolved-collision write is
     skipped (the metric still fires).
 
-    For ``RunKind.SCHEDULED`` (#58) and ``RunKind.MANUAL`` (#59) the
-    body delegates to the :class:`influx.run.Run` module — five named
-    stages, typed StageDiagnostics, ``RunAborted``-driven abort path.
-    The ``RunPlan`` flag values are identical (``skip_repair=False``,
-    ``skip_cache_hits=False``, ``notify=True``); only ``kind`` differs,
-    which is why one branch handles both.  Backfills stay on the
-    legacy inline body until #60 migrates them.
-    """
-    if kind in (RunKind.SCHEDULED, RunKind.MANUAL):
-        from influx.run import Run, RunDeps, RunPlan
+    All ``RunKind`` values now delegate to the :class:`influx.run.Run`
+    module (#58 → #59 → #60) — five named stages, typed
+    StageDiagnostics, ``RunAborted``-driven abort path.  The
+    ``RunPlan`` flag values vary by kind:
 
-        plan = RunPlan(
-            profile=profile,
-            kind=kind,
-            date_window=run_range,
-            skip_repair=False,
-            skip_cache_hits=False,
-            notify=True,
-        )
-        deps = RunDeps(
-            config=config,
-            item_provider=item_provider,
-            probe_loop=probe_loop,
-            ledger=ledger,
-        )
-        outcome = await Run(plan, deps).execute()
-        return outcome.profile_run_result
+    - ``SCHEDULED`` / ``MANUAL`` — full run with repair sweep, cache
+      writes, and post-run webhook.
+    - ``BACKFILL`` — ``skip_repair=True`` (FR-REP-2),
+      ``skip_cache_hits=True`` (FR-BF-2), ``notify=False`` (FR-NOT-4).
+
+    The legacy inline body below is now unreachable; #61 deletes it.
+    """
+    from influx.run import Run, RunDeps, RunPlan
+
+    is_backfill = kind == RunKind.BACKFILL
+    plan = RunPlan(
+        profile=profile,
+        kind=kind,
+        date_window=run_range,
+        skip_repair=is_backfill,
+        skip_cache_hits=is_backfill,
+        notify=not is_backfill,
+    )
+    deps = RunDeps(
+        config=config,
+        item_provider=item_provider,
+        probe_loop=probe_loop,
+        ledger=ledger,
+    )
+    outcome = await Run(plan, deps).execute()
+    return outcome.profile_run_result
 
     provider = item_provider
     profile_cfg = next((p for p in config.profiles if p.name == profile), None)
