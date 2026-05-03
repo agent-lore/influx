@@ -31,15 +31,15 @@ from typing import TYPE_CHECKING, Any
 import feedparser
 
 from influx import metrics
+from influx.cascade import Acquired, Cascade
 from influx.coordinator import RunKind
-from influx.enrich import tier1_enrich, tier3_extract
-from influx.errors import ExtractionError, LCMAError, NetworkError
+from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article
 from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch as _guarded_fetch
 from influx.http_client import guarded_post_json_fetch
 from influx.renderer import render
-from influx.schemas import FilterResponse, Tier1Enrichment, Tier3Extraction
+from influx.schemas import FilterResponse
 from influx.slugs import slugify_feed_name
 from influx.storage import download_archive
 from influx.telemetry import (
@@ -193,6 +193,7 @@ def build_rss_note_item(
 
     archive_root = Path(config.storage.archive_dir)
 
+    # ── Acquire stage (RSS-specific) ──────────────────────────────
     # Download and archive the article HTML (FR-SRC-5 / FR-RES-4).
     tracer = get_tracer()
     with tracer.span(
@@ -218,11 +219,13 @@ def build_rss_note_item(
         )
 
     archive_path = archive_result.rel_posix_path
+    archive_missing = not archive_result.ok
 
-    # ── Article text extraction with summary fallback (FR-ENR-3) ────
-    # Attempt web article extraction; fall back to the feed item's
-    # <summary> when the extracted body is below min_web_chars or
-    # extraction fails entirely (AC-09-J).
+    # Article text extraction with summary fallback (FR-ENR-3): try web
+    # article extraction; fall back to the feed item's ``<summary>``
+    # when the extracted body is below ``min_web_chars`` or extraction
+    # fails entirely (AC-09-J).  Tier 1 always uses the feed summary
+    # as its abstract input; Tier 2/3 use the extracted body if present.
     extracted_text: str | None = None
     summary = item.summary
     try:
@@ -243,6 +246,48 @@ def build_rss_note_item(
             exc,
         )
 
+    source_url = normalise_url(item.url)
+    profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
+
+    acquired = Acquired(
+        item_id=item_id,
+        source_url=source_url,
+        title=item.title,
+        # Tier 1 uses the raw feed summary as its abstract input,
+        # regardless of extraction success (preserves prior behaviour).
+        abstract=item.summary,
+        identity_tags=(f"feed-slug:{feed_slug}",),
+        archive_path=archive_path,
+        archive_missing=archive_missing,
+        extracted_text=extracted_text,
+        # ``summary-fallback`` records that the feed body was the source
+        # of the rendered text, distinguishing it from ``html``-extracted
+        # bodies.  Used by future telemetry / Renderer rules.
+        text_flavour="html" if extracted_text is not None else "summary-fallback",
+    )
+
+    # ── Cascade ───────────────────────────────────────────────────
+    # ``ProfileThresholds`` defaults gate every stage off when no
+    # profile config is found, mirroring the prior RSS behaviour where
+    # an unknown profile produced an unenriched note.
+    from influx.config import ProfileThresholds
+
+    cascade = Cascade(
+        config=config,
+        profile_name=profile_name,
+        profile_summary=profile_cfg.description if profile_cfg else "",
+        thresholds=profile_cfg.thresholds if profile_cfg else ProfileThresholds(),
+        # RSS pre-populates ``Acquired.extracted_text`` at acquire time,
+        # so the cascade does not need a Tier-2 extractor seam.
+        tier2_extractor=None,
+    )
+    sections = cascade.enrich(acquired, score)
+
+    # ── Tag composition ──────────────────────────────────────────
+    # RSS does not stamp a ``text:*`` provenance tag (canonical
+    # convention preserved from PRD 09).  Otherwise the tag-list shape
+    # mirrors arXiv's: provenance + identity tags first, archive
+    # repair flags next, then cascade-driven tags.
     tags: list[str] = [
         f"profile:{profile_name}",
         f"source:{item.source_tag}",
@@ -250,63 +295,31 @@ def build_rss_note_item(
         "ingested-by:influx",
         f"schema:{config.influx.note_schema_version}",
     ]
-
-    if not archive_result.ok:
+    if archive_missing:
         tags.append("influx:archive-missing")
+    if sections.full_text is not None:
+        tags.append("full-text")
+    if archive_missing and "influx:repair-needed" not in tags:
         tags.append("influx:repair-needed")
+    if sections.tier3 is not None:
+        tags.append("influx:deep-extracted")
+    for flag in sections.repair_flags:
+        if flag not in tags:
+            tags.append(flag)
+    for flag in sections.terminal_flags:
+        if flag not in tags:
+            tags.append(flag)
 
     # Note storage path: articles/{source_tag}/{YYYY}/{MM} (FR-NOTE-2)
     path = f"articles/{item.source_tag}/{pub.year}/{pub.month:02d}"
 
-    source_url = normalise_url(item.url)
-
-    profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
-    thresholds = profile_cfg.thresholds if profile_cfg is not None else None
-    repair_needed = "influx:repair-needed" in tags
-
-    tier1_result: Tier1Enrichment | None = None
-    if thresholds is not None and score >= thresholds.relevance:
-        assert profile_cfg is not None
-        try:
-            tier1_result = tier1_enrich(
-                title=item.title,
-                abstract=item.summary,
-                profile_summary=profile_cfg.description,
-                config=config,
-            )
-        except LCMAError:
-            repair_needed = True
-
-    full_text_for_note: str | None = None
-    if (
-        thresholds is not None
-        and score >= thresholds.full_text
-        and extracted_text is not None
-    ):
-        full_text_for_note = extracted_text
-        tags.append("full-text")
-
-    tier3_result: Tier3Extraction | None = None
-    if (
-        thresholds is not None
-        and score >= thresholds.deep_extract
-        and full_text_for_note is not None
-    ):
-        try:
-            tier3_result = tier3_extract(
-                title=item.title,
-                full_text=full_text_for_note,
-                config=config,
-            )
-        except LCMAError:
-            repair_needed = True
-
-    if tier3_result is not None:
-        tags.append("influx:deep-extracted")
-    if repair_needed and "influx:repair-needed" not in tags:
-        tags.append("influx:repair-needed")
-
-    summary_for_note = "" if score and tier1_result is None else summary
+    # Suppress the plain-text summary when Tier 1 was attempted but
+    # failed (AC-07-A / FR-ENR-6).  When Tier 1 was not attempted
+    # (e.g. score below threshold), keep the extracted/feed summary so
+    # ``## Summary`` renders the fallback body.
+    summary_for_note = (
+        "" if sections.tier1_attempted and sections.tier1 is None else summary
+    )
 
     content = render(
         title=item.title,
@@ -318,9 +331,9 @@ def build_rss_note_item(
         profile_name=profile_name,
         score=score,
         reason=reason,
-        tier1_enrichment=tier1_result,
-        full_text=full_text_for_note,
-        tier3_extraction=tier3_result,
+        tier1_enrichment=sections.tier1,
+        full_text=sections.full_text,
+        tier3_extraction=sections.tier3,
     )
 
     return {
@@ -336,8 +349,8 @@ def build_rss_note_item(
         "reason": reason,
         "path": path,
         "abstract_or_summary": summary,
-        "contributions": tier1_result.contributions if tier1_result else None,
-        "builds_on": list(tier3_result.builds_on) if tier3_result else None,
+        "contributions": sections.tier1.contributions if sections.tier1 else None,
+        "builds_on": list(sections.tier3.builds_on) if sections.tier3 else None,
     }
 
 
