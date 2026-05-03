@@ -1146,13 +1146,9 @@ class TestInfluxLithosWriteSpan:
                     new_callable=AsyncMock,
                 ),
                 patch(
-                    "influx.scheduler.lcma_after_write",
+                    "influx.scheduler.lcma_wire",
                     new_callable=AsyncMock,
                     return_value=[],
-                ),
-                patch(
-                    "influx.scheduler.lcma_resolve_builds_on",
-                    new_callable=AsyncMock,
                 ),
                 patch("influx.service.post_run_webhook_hook"),
             ):
@@ -1227,11 +1223,10 @@ class TestInfluxLithosWriteSpan:
             ),
             patch("influx.scheduler.repair_sweep", new_callable=AsyncMock),
             patch(
-                "influx.scheduler.lcma_after_write",
+                "influx.scheduler.lcma_wire",
                 new_callable=AsyncMock,
                 return_value=[],
             ),
-            patch("influx.scheduler.lcma_resolve_builds_on", new_callable=AsyncMock),
             patch("influx.service.post_run_webhook_hook"),
         ):
             mock_client = AsyncMock()
