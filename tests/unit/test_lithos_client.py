@@ -231,3 +231,49 @@ class TestExistingIdParsing:
 
         assert _existing_id_from_detail("") is None
         assert _existing_id_from_detail("no id here") is None
+
+    def test_prefers_retry_id_in_issue32_form(self) -> None:
+        """Issue #32: when both ids are present, return the retry id."""
+        from influx.lithos_client import _existing_id_from_detail
+
+        detail = (
+            "first_existing_id=doc-a; first_slug='Title'; "
+            "retry_existing_id=doc-b; retry_slug='Title [arXiv 1.2]'"
+        )
+        assert _existing_id_from_detail(detail) == "doc-b"
+
+
+class TestUnresolvedDetailFormat:
+    """Issue #32: ``_format_unresolved_detail`` enumerates both squatters."""
+
+    def test_includes_both_ids_and_slugs(self) -> None:
+        from influx.lithos_client import _format_unresolved_detail
+
+        out = _format_unresolved_detail(
+            first_existing_id="doc-a",
+            first_slug="Paper",
+            retry_existing_id="doc-b",
+            retry_slug="Paper [arXiv 1.2]",
+            retry_detail="existing_id=doc-b; Slug 'paper-arxiv-1-2' in use",
+        )
+        assert "first_existing_id=doc-a" in out
+        assert "first_slug='Paper'" in out
+        assert "retry_existing_id=doc-b" in out
+        assert "retry_slug='Paper [arXiv 1.2]'" in out
+        # The retry envelope's human-readable message tail is preserved.
+        assert "Slug 'paper-arxiv-1-2' in use" in out
+        # And not duplicated as a second existing_id.
+        assert out.count("existing_id=doc-b") == 1
+
+    def test_emits_placeholder_when_id_missing(self) -> None:
+        from influx.lithos_client import _format_unresolved_detail
+
+        out = _format_unresolved_detail(
+            first_existing_id=None,
+            first_slug="Paper",
+            retry_existing_id="doc-b",
+            retry_slug="Paper [host]",
+            retry_detail="",
+        )
+        assert "first_existing_id=<missing>" in out
+        assert "retry_existing_id=doc-b" in out

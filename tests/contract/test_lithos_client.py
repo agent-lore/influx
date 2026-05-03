@@ -1284,13 +1284,15 @@ class TestWriteEnvelopeSlugCollision:
             await client.close()
 
         assert result.status == "slug_collision"
-        # The diagnostic from the *retry* response wins (it is the value
-        # actually returned to the scheduler), and it must include both
-        # the colliding doc id and lithos's human-readable message.
+        # Issue #32: the exhausted-path detail must enumerate BOTH the
+        # first squatter (whose id is otherwise lost on retry) AND the
+        # retry squatter, with their respective titles, so an operator
+        # can clean both with one command.
         assert result.detail
-        assert "doc-squatter-456" in result.detail
-        assert "existing_id=" in result.detail
-        assert "already in use" in result.detail
+        assert "first_existing_id=doc-squatter-123" in result.detail
+        assert "retry_existing_id=doc-squatter-456" in result.detail
+        assert "first_slug='Diagnostic Slug'" in result.detail
+        assert "retry_slug='Diagnostic Slug [arXiv 2601.77777]'" in result.detail
 
 
 class TestWriteSlugCollisionRecovery:
@@ -1531,6 +1533,13 @@ class TestWriteSlugCollisionRecovery:
         assert result.status == "slug_collision"
         # No deletes attempted (both squatters were 'distinct').
         assert all(c[0] != "lithos_delete" for c in fake_lithos_server.calls)
+        # Issue #32: when the recovery chain is exhausted, BOTH squatter
+        # ids must surface in the final detail so an operator can clean
+        # both with one command.
+        assert "first_existing_id=doc-a" in result.detail
+        assert "retry_existing_id=doc-b" in result.detail
+        assert "first_slug='OmniRobotHome'" in result.detail
+        assert "retry_slug='OmniRobotHome [arXiv 2604.28197]'" in result.detail
 
 
 # ── Write envelopes — version_conflict (FR-MCP-7, AC-05-E) ────────
