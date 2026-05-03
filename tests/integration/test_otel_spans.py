@@ -223,6 +223,7 @@ async def _run_arxiv_scenario(
         # Tracer patches — all modules see the collecting tracer
         patch("influx.scheduler.get_tracer", return_value=tracer),
         patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+        patch("influx.cascade.get_tracer", return_value=tracer),
         patch("influx.lcma.get_tracer", return_value=tracer),
         # ArXiv mocks
         patch("influx.sources.arxiv.fetch_arxiv", return_value=arxiv_items),
@@ -233,13 +234,13 @@ async def _run_arxiv_scenario(
             ),
         ),
         patch(
-            "influx.sources.arxiv.tier1_enrich",
+            "influx.cascade.tier1_enrich",
             return_value=Tier1Enrichment(
                 contributions=["c1"], method="m", result="r", relevance="rel"
             ),
         ),
         patch(
-            "influx.sources.arxiv.tier3_extract",
+            "influx.cascade.tier3_extract",
             return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
         ),
         # Scheduler infrastructure
@@ -455,7 +456,7 @@ class TestOtelDisabledZeroSpans:
                 ),
             ),
             patch(
-                "influx.sources.arxiv.tier1_enrich",
+                "influx.cascade.tier1_enrich",
                 return_value=Tier1Enrichment(
                     contributions=["c1"],
                     method="m",
@@ -464,7 +465,7 @@ class TestOtelDisabledZeroSpans:
                 ),
             ),
             patch(
-                "influx.sources.arxiv.tier3_extract",
+                "influx.cascade.tier3_extract",
                 return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
             ),
             # Scheduler infrastructure

@@ -408,7 +408,7 @@ class TestRunProfileHonoursScoreGating:
                 return_value=_html_fetch_result(),
             ),
             patch(
-                "influx.sources.arxiv.tier3_extract",
+                "influx.cascade.tier3_extract",
                 return_value=tier3_stub,
             ) as mock_tier3,
         ):
@@ -664,7 +664,7 @@ class TestDefaultFilterScorerEndToEnd:
                 return_value=_filter_fetch_result(_filter_response(_ARXIV_ID, 9)),
             ) as mock_filter_post,
             patch(
-                "influx.sources.arxiv.tier3_extract",
+                "influx.cascade.tier3_extract",
                 return_value=tier3_stub,
             ) as mock_tier3,
         ):
