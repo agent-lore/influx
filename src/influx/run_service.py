@@ -161,13 +161,30 @@ async def ledger_lifecycle(
         )
         run_outcome = "degraded" if source_errors else "success"
         if "ingestion_stall" in degraded_reasons:
-            metrics.ingestion_stalls().add(1, {"profile": profile})
+            metrics.ingestion_stalls().add(
+                1, {"profile": profile, "reason": "ingestion_stall"}
+            )
             if run_outcome == "success":
                 run_outcome = "degraded"
             logger.warning(
                 "run flagged ingestion_stall profile=%s kind=%s run_id=%s "
                 "(this + prior scheduled run both ingested 0 with "
                 "sources_checked > 0)",
+                profile,
+                plan.kind.value,
+                run_id,
+            )
+        if "fetch_stall" in degraded_reasons:
+            metrics.ingestion_stalls().add(
+                1, {"profile": profile, "reason": "fetch_stall"}
+            )
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged fetch_stall profile=%s kind=%s run_id=%s "
+                "(this + prior scheduled run both saw sources_checked == 0 "
+                "despite prior non-zero history — likely too-narrow "
+                "lookback_days or upstream feed change)",
                 profile,
                 plan.kind.value,
                 run_id,

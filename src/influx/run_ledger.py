@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 
 RunEntry = dict[str, Any]
 
+# How many prior runs to consider when computing the stall flags.
+#
+# Twenty is chosen to roughly match a *day* of scheduled runs at the
+# typical hourly cadence, so the historical-ratchet for #50
+# (``fetch_stall``) tolerates a half-day window of zero fetches before
+# stale history disqualifies the profile from ratcheting.  It also
+# matches the historical default of :meth:`recent` which the
+# ``ingestion_stall`` (#36) check used implicitly.
+_STALL_HISTORY_LIMIT = 20
+
 
 @dataclass(frozen=True)
 class RunLedger:
@@ -92,12 +102,22 @@ class RunLedger:
 
         Returns the structured ``degraded_reasons`` list that was
         recorded — one of: ``[]`` (clean run), ``["source_acquisition"]``
-        (issue #20: swallowed source-fetch failures), or
+        (issue #20: swallowed source-fetch failures),
         ``["ingestion_stall"]`` (issue #36: this and the immediately
         prior scheduled run for the same profile both saw
         ``ingested == 0`` despite ``sources_checked > 0`` — typically a
-        slug-collision squatter, all-duplicate writes, etc.).  When
-        both apply the list contains both reasons.
+        slug-collision squatter, all-duplicate writes, etc.), or
+        ``["fetch_stall"]`` (issue #50: this and the immediately prior
+        scheduled run for the same profile both saw
+        ``sources_checked == 0``, AND the profile has historically seen
+        ``sources_checked > 0`` within the recent window — typically a
+        too-narrow ``lookback_days`` or an upstream feed shape change).
+        When several apply the list contains every reason.
+
+        ``ingestion_stall`` and ``fetch_stall`` are mutually exclusive
+        for any single run: ``ingestion_stall`` requires
+        ``sources_checked > 0`` while ``fetch_stall`` requires
+        ``sources_checked == 0``.
 
         Returning the reasons lets the caller (the scheduler) emit
         per-reason metrics without re-deriving the logic.
@@ -107,29 +127,51 @@ class RunLedger:
         if errors:
             reasons.append("source_acquisition")
 
+        # Resolve profile + kind once for both stall checks.  Both flags
+        # only apply to scheduled runs (backfills legitimately ingest 0
+        # when every candidate is a cache hit, and operator-triggered
+        # manual runs may use a deliberately narrow lookback).
+        active = self._read_active()
+        entry = active.get(run_id, {})
+        profile = entry.get("profile")
+        kind = entry.get("kind")
+        is_scheduled = isinstance(profile, str) and kind == "scheduled"
+
         # #36 ingestion-stall detection: only meaningful when the run
-        # actually inspected something.  Backfills are excluded — they
-        # legitimately ingest 0 when every candidate is a cache hit.
+        # actually inspected something.
         if (
-            isinstance(ingested, int)
+            is_scheduled
+            and isinstance(ingested, int)
             and ingested == 0
             and isinstance(sources_checked, int)
             and sources_checked > 0
         ):
-            # Look up the *currently-active* entry to learn this run's
-            # profile + kind, then count consecutive prior scheduled runs
-            # for the same profile that match the stall shape.  We add
-            # 1 for *this* run since it hasn't been written yet.
-            active = self._read_active()
-            entry = active.get(run_id, {})
-            profile = entry.get("profile")
-            kind = entry.get("kind")
-            if isinstance(profile, str) and kind == "scheduled":
-                consecutive = 1 + self._consecutive_zero_ingestion_runs(
-                    profile=profile, exclude_run_id=run_id
-                )
-                if consecutive >= 2:
-                    reasons.append("ingestion_stall")
+            # Count consecutive prior scheduled runs for the same
+            # profile that match the stall shape.  We add 1 for *this*
+            # run since it hasn't been written yet.
+            assert isinstance(profile, str)  # narrowed by is_scheduled
+            consecutive = 1 + self._consecutive_zero_ingestion_runs(
+                profile=profile, exclude_run_id=run_id
+            )
+            if consecutive >= 2:
+                reasons.append("ingestion_stall")
+
+        # #50 fetch-stall detection: complementary to ingestion_stall.
+        # Catches the zero-fetch case (sources_checked == 0) that #36
+        # explicitly filtered out as a "quiet window".  The
+        # historical-ratchet — profile has previously seen
+        # ``sources_checked > 0`` within the recent ledger window —
+        # silences brand-new profiles and profiles that genuinely never
+        # receive items.
+        if is_scheduled and isinstance(sources_checked, int) and sources_checked == 0:
+            assert isinstance(profile, str)  # narrowed by is_scheduled
+            consecutive_zero_fetch = 1 + self._consecutive_zero_fetch_runs(
+                profile=profile, exclude_run_id=run_id
+            )
+            if consecutive_zero_fetch >= 2 and self._has_prior_non_zero_fetch(
+                profile=profile, exclude_run_id=run_id
+            ):
+                reasons.append("fetch_stall")
 
         self._finish(
             run_id=run_id,
@@ -155,7 +197,7 @@ class RunLedger:
         reason (#36).
         """
         count = 0
-        for prior in self.recent(limit=20, profile=profile):
+        for prior in self.recent(limit=_STALL_HISTORY_LIMIT, profile=profile):
             if prior.get("run_id") == exclude_run_id:
                 continue
             if prior.get("kind") != "scheduled":
@@ -175,6 +217,45 @@ class RunLedger:
                 continue
             break
         return count
+
+    def _consecutive_zero_fetch_runs(self, *, profile: str, exclude_run_id: str) -> int:
+        """Count consecutive prior scheduled runs with ``sources_checked == 0``.
+
+        Walks ``recent()`` newest-first.  Stops at the first scheduled
+        run that doesn't match.  Used by :meth:`complete` to compute the
+        ``fetch_stall`` degraded reason (#50).  Symmetric with
+        :meth:`_consecutive_zero_ingestion_runs`.
+        """
+        count = 0
+        for prior in self.recent(limit=_STALL_HISTORY_LIMIT, profile=profile):
+            if prior.get("run_id") == exclude_run_id:
+                continue
+            if prior.get("kind") != "scheduled":
+                continue
+            sources_checked = prior.get("sources_checked")
+            if isinstance(sources_checked, int) and sources_checked == 0:
+                count += 1
+                continue
+            break
+        return count
+
+    def _has_prior_non_zero_fetch(self, *, profile: str, exclude_run_id: str) -> bool:
+        """Return whether *profile* has ever fetched items in recent history.
+
+        Implements the #50 historical-ratchet: ``fetch_stall`` only
+        fires for profiles that have previously seen
+        ``sources_checked > 0`` within the last ``_STALL_HISTORY_LIMIT``
+        runs.  This silences brand-new profiles (no history at all) and
+        profiles that genuinely never receive items — for them, a
+        run of zero fetches is the steady-state, not a regression.
+        """
+        for prior in self.recent(limit=_STALL_HISTORY_LIMIT, profile=profile):
+            if prior.get("run_id") == exclude_run_id:
+                continue
+            sources_checked = prior.get("sources_checked")
+            if isinstance(sources_checked, int) and sources_checked > 0:
+                return True
+        return False
 
     def fail(self, *, run_id: str, error: str) -> None:
         """Mark an active run as failed and append it to history."""

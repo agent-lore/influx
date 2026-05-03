@@ -49,6 +49,13 @@ Three quick signals, all read-only:
     / `duplicate`, the LLM filter rejecting everything, or an
     upstream content shift.  The diagnose row prints the reason
     list so you can triage without parsing the JSON.
+  - `fetch_stall` (issue #50) — this and the prior scheduled run
+    for the same profile both saw `sources_checked == 0` despite
+    historical non-zero fetches in the recent ledger window;
+    typical cause is too-narrow `lookback_days` (nothing reached
+    the inspection loop) or an upstream feed shape change.
+    Mutually exclusive with `ingestion_stall`.  Brand-new profiles
+    are not flagged.
   A `skipped` run (#40) means the Lithos circuit breaker fired:
   ProbeLoop saw 3+ consecutive `degraded` Lithos probes, so the
   scheduler short-circuited to avoid burning LLM tokens against a
