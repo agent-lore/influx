@@ -419,6 +419,69 @@ class InfluxMeter:
         return instrument
 
 
+def _build_logger_provider() -> Any | None:
+    """Construct an OTEL ``LoggerProvider`` based on env + package state.
+
+    Mirrors :func:`_build_tracer` and :func:`_build_meter`: shares the
+    ``INFLUX_OTEL_ENABLED`` toggle, the ``OTEL_EXPORTER_OTLP_ENDPOINT``
+    configuration, and the same resource-attribute set, so traces,
+    metrics, and logs always describe the same service from the
+    collector's point of view.
+
+    Returns ``None`` when OTEL is disabled or the OTEL packages are not
+    importable — callers must treat ``None`` as "do not attach any OTEL
+    log handler" (AC-10-A discipline: the disabled path must not
+    construct any OTEL objects).
+    """
+    if not _otel_enabled():
+        return None
+    if not _otel_packages_available():
+        return None
+
+    try:
+        from opentelemetry.sdk._logs import LoggerProvider
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+        from opentelemetry.sdk.resources import Resource
+    except ImportError:
+        logger.warning("OTEL logs SDK not installed; logs will not be exported")
+        return None
+
+    resource_attrs = _build_resource_attributes()
+    provider = LoggerProvider(resource=Resource.create(resource_attrs))
+
+    if _otlp_endpoint_configured():
+        try:
+            from opentelemetry.exporter.otlp.proto.http._log_exporter import (
+                OTLPLogExporter,
+            )
+        except ImportError:
+            if not _console_fallback_enabled():
+                logger.warning(
+                    "OTEL enabled but OTLP HTTP log exporter is not installed; "
+                    "logs will not be exported"
+                )
+                return provider
+        else:
+            provider.add_log_record_processor(
+                BatchLogRecordProcessor(OTLPLogExporter())
+            )
+            logger.info(
+                "OTEL OTLP log exporter configured endpoint=%s logs_endpoint=%s",
+                os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+                os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", ""),
+            )
+
+    if _console_fallback_enabled() and not _otlp_endpoint_configured():
+        from opentelemetry.sdk._logs.export import ConsoleLogExporter
+
+        provider.add_log_record_processor(BatchLogRecordProcessor(ConsoleLogExporter()))
+        logger.info("OTEL console log exporter configured")
+    elif not _otlp_endpoint_configured():
+        logger.warning("OTEL enabled but no log exporter endpoint is configured")
+
+    return provider
+
+
 def _build_meter() -> InfluxMeter:
     """Construct an ``InfluxMeter`` based on current env + package state.
 

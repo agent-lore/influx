@@ -244,8 +244,35 @@ Resource attributes on every metric: `service.name=influx` plus
 `deployment.environment=<INFLUX_ENVIRONMENT>` (e.g. `staging`). Filter
 by these on the collector if multiple environments share a backend.
 
-OTEL log export is **not** wired in this revision; the runbook still
-relies on `docker logs` (and `influx-diagnose.py`) for log inspection.
+### Reading logs in the OTEL backend
+
+The same `INFLUX_OTEL_ENABLED=true` toggle that wires traces and metrics
+also forwards Influx's structured log records to the OTEL backend
+(issue #28). Each `logger.info / warning / exception` call is exported
+as an OTEL log record alongside the existing stderr JSON stream — so
+`docker logs` and `scripts/influx-diagnose.py` keep working unchanged,
+and the OTEL backend becomes a second, queryable view of the same
+records.
+
+| Question | Query shape (LogQL-like) |
+| -------- | ------------------------ |
+| Why did this run degrade? | Filter by `run_id=<the one from the run_completions metric>` to see every log line emitted under that run. |
+| What article writes were skipped? | Filter for body matching `article write skipped`; group by `status` (e.g. `duplicate`, `slug_collision`). |
+| Which sources are throwing acquisition errors? | Filter for body matching `source acquisition error`; group by `source` and `kind`. |
+| What is the repair sweep doing right now? | Filter for `sweep_stage` attribute presence; group by `sweep_stage`. |
+| Did this exception fire during a specific run? | Severity `ERROR` filtered by `run_id` and `profile`. |
+
+Every OTEL log record carries the same structured fields the JSON
+formatter writes to stderr (`run_id`, `profile`, `source_url`, `status`,
+`detail`, `note_id`, `sweep_stage`, `tags`, `cache_hit`, `exc_type`, …)
+as OTEL log attributes — anything passed to `logger.<level>(...,
+extra={...})` survives the trip to the collector. Resource attributes
+on every record match the metric set: `service.name=influx` plus
+`deployment.environment=<INFLUX_ENVIRONMENT>`.
+
+When OTEL is disabled, no log handler is constructed and no records are
+exported — the disabled path follows the same AC-10-A discipline as
+spans and metrics.
 
 ## 8. Cleaning up slug-collision squatters
 
