@@ -163,26 +163,93 @@ def test_compose_retrieve_query_golden(
 
 
 class TestTruncation:
-    """AC-08-A case 5: composed query truncated to 500 characters.
+    """Composed query bounded to 500 characters AND syntactically balanced.
 
-    Phrase-quoting adds two quote characters per disjunct (#80), so the
-    pre-truncation length is wrapped-length, not raw input length. The
-    truncation contract remains a simple slice of the final composed
-    string with no word re-wrap.
+    Phrase-quoting adds two quote characters per disjunct (#80), and a
+    naive tail-slice can split a phrase mid-string and produce an
+    unmatched opening ``"`` — exactly the parse-failure class the patch
+    set out to eliminate (review on PR #84). Truncation is therefore
+    applied to the *raw* title content before wrapping, and any
+    contribution whose wrapped form would not fit whole is dropped
+    rather than sliced.
     """
 
-    def test_long_title_truncated_to_500(self) -> None:
+    def test_long_title_truncated_to_500_with_balanced_quotes(self) -> None:
         long_title = "x" * 600
         result = compose_retrieve_query(long_title)
         assert len(result) == 500
-        # Wrapped form is `"xxx...xxx"` — leading quote then x's,
-        # truncated mid-phrase at 500.
-        assert result == '"' + "x" * 499
+        # Surviving form is `"xxx...xxx"` — both quotes intact, 498 x's
+        # between them.
+        assert result == '"' + "x" * 498 + '"'
+        assert result.startswith('"')
+        assert result.endswith('"')
+        assert result.count('"') == 2
 
-    def test_long_composed_truncated_to_500(self) -> None:
+    def test_title_at_exact_budget_unchanged(self) -> None:
+        # A 498-char title wraps to exactly 500 — unchanged.
+        title = "y" * 498
+        result = compose_retrieve_query(title)
+        assert len(result) == 500
+        assert result == '"' + "y" * 498 + '"'
+
+    def test_title_one_over_budget_loses_one_char(self) -> None:
+        # A 499-char title wraps to 501 — drop one inner char.
+        title = "z" * 499
+        result = compose_retrieve_query(title)
+        assert len(result) == 500
+        assert result == '"' + "z" * 498 + '"'
+
+    def test_title_truncation_does_not_leave_dangling_backslash(self) -> None:
+        # A title that is all backslashes escapes to twice its length;
+        # truncating the escaped form mid-`\\` would leave a dangling
+        # backslash. The fitter must shave it off.
+        title = "\\" * 300  # escapes to 600 backslashes
+        result = compose_retrieve_query(title)
+        assert len(result) <= 500
+        assert result.startswith('"')
+        assert result.endswith('"')
+        # Inner content is even-length pairs of backslashes only.
+        inner = result[1:-1]
+        assert inner.count("\\") % 2 == 0
+
+    def test_long_composed_drops_contribution_that_will_not_fit(self) -> None:
+        # Title wrapped is 402 chars; budget after title is 500 - 402 - 3 = 95
+        # for the next contribution. A 200-char contribution wraps to 202
+        # chars and must therefore be dropped entirely (not sliced).
         title = "t" * 400
         contrib = "c" * 200
         result = compose_retrieve_query(title, contributions=[contrib])
-        assert len(result) == 500
-        expected_full = f'"{"t" * 400}" | "{"c" * 200}"'
-        assert result == expected_full[:500]
+        assert len(result) <= 500
+        assert result == '"' + "t" * 400 + '"'
+        assert result.startswith('"')
+        assert result.endswith('"')
+        assert result.count('"') == 2
+
+    def test_partial_fit_keeps_fitting_contributions_drops_rest(self) -> None:
+        # Title 200, contrib1 100, contrib2 200 — first contribution
+        # fits (`"<200>"` + ` | ` + `"<100>"` = 202 + 3 + 102 = 307),
+        # second would push to 307 + 3 + 202 = 512 > 500, so contrib2
+        # is dropped, contrib1 is kept whole.
+        title = "t" * 200
+        contrib_short = "a" * 100
+        contrib_long = "b" * 200
+        result = compose_retrieve_query(
+            title, contributions=[contrib_short, contrib_long]
+        )
+        assert len(result) <= 500
+        assert result == f'"{"t" * 200}" | "{"a" * 100}"'
+        # All quotes balanced.
+        assert result.count('"') % 2 == 0
+
+    def test_result_always_has_balanced_quotes(self) -> None:
+        # Stress: many titles of varying sizes around the boundary,
+        # each must produce a balanced query. Backslash counts are
+        # tracked separately via inner-content parity.
+        for n in (1, 100, 250, 497, 498, 499, 500, 501, 600, 1000):
+            result = compose_retrieve_query("x" * n)
+            assert len(result) <= 500
+            assert result.startswith('"')
+            assert result.endswith('"')
+            # Even number of unescaped quotes — for a pure-x title the
+            # only quotes are the two surrounding ones.
+            assert result.count('"') == 2
