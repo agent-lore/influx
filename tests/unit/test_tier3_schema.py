@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from influx.schemas import Tier3Extraction
+from influx.schemas import TIER3_LIST_MAX, Tier3Extraction
 
 
 def _valid(**overrides: list[str]) -> dict[str, list[str]]:
@@ -40,6 +40,11 @@ class TestTier3ExtractionPositive:
         t = Tier3Extraction(**_valid(datasets=[f"d{i}" for i in range(10)]))
         assert len(t.datasets) == 10
 
+    def test_datasets_length_at_cap(self) -> None:
+        """Issue #81: datasets accepts up to TIER3_LIST_MAX items."""
+        t = Tier3Extraction(**_valid(datasets=[f"d{i}" for i in range(TIER3_LIST_MAX)]))
+        assert len(t.datasets) == TIER3_LIST_MAX
+
     def test_builds_on_length_0(self) -> None:
         t = Tier3Extraction(**_valid(builds_on=[]))
         assert len(t.builds_on) == 0
@@ -47,6 +52,25 @@ class TestTier3ExtractionPositive:
     def test_builds_on_length_10(self) -> None:
         t = Tier3Extraction(**_valid(builds_on=[f"b{i}" for i in range(10)]))
         assert len(t.builds_on) == 10
+
+    def test_builds_on_length_at_cap(self) -> None:
+        """Issue #81: builds_on accepts up to TIER3_LIST_MAX items."""
+        t = Tier3Extraction(
+            **_valid(builds_on=[f"b{i}" for i in range(TIER3_LIST_MAX)])
+        )
+        assert len(t.builds_on) == TIER3_LIST_MAX
+
+    @pytest.mark.parametrize("size", [13, 14, 23, 30])
+    def test_observed_failure_sizes_now_parse(self, size: int) -> None:
+        """Issue #81: 13-, 14-, 23-, 30-item datasets/builds_on now parse."""
+        t = Tier3Extraction(
+            **_valid(
+                datasets=[f"d{i}" for i in range(size)],
+                builds_on=[f"b{i}" for i in range(size)],
+            )
+        )
+        assert len(t.datasets) == size
+        assert len(t.builds_on) == size
 
     def test_open_questions_length_0(self) -> None:
         t = Tier3Extraction(**_valid(open_questions=[]))
@@ -100,13 +124,24 @@ class TestTier3ExtractionNegative:
         with pytest.raises(ValidationError):
             Tier3Extraction(**_valid(claims=[f"c{i}" for i in range(11)]))
 
-    def test_datasets_length_11(self) -> None:
+    def test_datasets_length_over_cap(self) -> None:
+        """Issue #81: datasets length TIER3_LIST_MAX + 1 is still rejected."""
         with pytest.raises(ValidationError):
-            Tier3Extraction(**_valid(datasets=[f"d{i}" for i in range(11)]))
+            Tier3Extraction(
+                **_valid(datasets=[f"d{i}" for i in range(TIER3_LIST_MAX + 1)])
+            )
 
-    def test_builds_on_length_11(self) -> None:
+    def test_builds_on_length_over_cap(self) -> None:
+        """Issue #81: builds_on length TIER3_LIST_MAX + 1 is still rejected."""
         with pytest.raises(ValidationError):
-            Tier3Extraction(**_valid(builds_on=[f"b{i}" for i in range(11)]))
+            Tier3Extraction(
+                **_valid(builds_on=[f"b{i}" for i in range(TIER3_LIST_MAX + 1)])
+            )
+
+    def test_observed_39_item_case_still_rejected(self) -> None:
+        """Issue #81: 39-item datasets case from the bug report still fails."""
+        with pytest.raises(ValidationError):
+            Tier3Extraction(**_valid(datasets=[f"d{i}" for i in range(39)]))
 
     def test_open_questions_length_11(self) -> None:
         with pytest.raises(ValidationError):
@@ -173,3 +208,19 @@ class TestTier3ExtractionNegative:
                 open_questions=["q"],
                 potential_connections=["p"],
             )  # type: ignore[call-arg]
+
+
+class TestTier3ListMaxConstant:
+    """Issue #81: TIER3_LIST_MAX is the single source of truth for the cap."""
+
+    def test_constant_value(self) -> None:
+        """The cap is 30 today (raised from 10 per issue #81)."""
+        assert TIER3_LIST_MAX == 30
+
+    def test_schema_max_length_reads_from_constant(self) -> None:
+        """The schema's ``max_length`` for the bumped fields must equal
+        ``TIER3_LIST_MAX`` so a future bump propagates without code drift.
+        """
+        schema = Tier3Extraction.model_json_schema()
+        assert schema["properties"]["datasets"]["maxItems"] == TIER3_LIST_MAX
+        assert schema["properties"]["builds_on"]["maxItems"] == TIER3_LIST_MAX

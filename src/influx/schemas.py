@@ -13,6 +13,14 @@ from pydantic import BaseModel, Field, field_validator
 _TIER3_MAX_CHARS = 500
 _FILTER_MAX_TAGS = 5
 
+# Single source of truth for the upper bound on Tier-3 ``datasets`` and
+# ``builds_on`` list lengths (FR-ENR-5, issue #81).  Bumped from 10 → 30
+# after structured-output models routinely returned 14-39 items, breaking
+# validation.  Both the schema's ``max_length`` and the constant-derived
+# cap reminder appended to the rendered Tier-3 prompt read from this
+# value, so a future bump propagates automatically.
+TIER3_LIST_MAX = 30
+
 
 def _trim_and_truncate(values: list[str]) -> list[str]:
     """Trim whitespace and truncate each element to 500 chars (FR-ENR-5).
@@ -46,15 +54,19 @@ class Tier3Extraction(BaseModel):
 
     Constraints:
     - ``claims`` length must be in ``[1, 10]`` inclusive.
-    - ``datasets``, ``builds_on``, ``open_questions``, ``potential_connections``
-      lengths must be in ``[0, 10]`` inclusive.
+    - ``datasets`` and ``builds_on`` lengths must be in
+      ``[0, TIER3_LIST_MAX]`` inclusive (issue #81 — raised from 10 to
+      accommodate structured-output models routinely returning 14-39
+      items).
+    - ``open_questions`` and ``potential_connections`` lengths must be
+      in ``[0, 10]`` inclusive.
     - All string elements are trimmed and truncated to 500 characters on ingest.
     - Empty/whitespace-only elements fail validation.
     """
 
     claims: list[str] = Field(min_length=1, max_length=10)
-    datasets: list[str] = Field(default_factory=list, max_length=10)
-    builds_on: list[str] = Field(default_factory=list, max_length=10)
+    datasets: list[str] = Field(default_factory=list, max_length=TIER3_LIST_MAX)
+    builds_on: list[str] = Field(default_factory=list, max_length=TIER3_LIST_MAX)
     open_questions: list[str] = Field(default_factory=list, max_length=10)
     potential_connections: list[str] = Field(default_factory=list, max_length=10)
 
