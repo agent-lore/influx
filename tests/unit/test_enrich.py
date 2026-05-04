@@ -26,7 +26,7 @@ from influx.config import AppConfig, load_config
 from influx.enrich import _call_json_model, tier1_enrich, tier3_extract
 from influx.errors import LCMAError
 from influx.http_client import FetchResult
-from influx.schemas import Tier1Enrichment, Tier3Extraction
+from influx.schemas import TIER3_LIST_MAX, Tier1Enrichment, Tier3Extraction
 
 
 def _valid_tier1_response(**overrides: Any) -> dict[str, Any]:
@@ -548,7 +548,32 @@ class TestTier3ExtractPromptRendering:
             )
 
         # Template from conftest: "Extract: {title} {full_text}"
-        assert captured[0] == "Extract: T F"
+        # Issue #81: a constant-derived cap reminder is appended after.
+        assert captured[0].startswith("Extract: T F")
+
+    def test_prompt_includes_list_cap_reminder(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Issue #81: rendered prompt must include the cap value sourced from
+        ``TIER3_LIST_MAX`` so future bumps propagate without code drift.
+        """
+        config = load_config()
+        payload = _valid_tier3_response()
+        captured: list[str] = []
+
+        def fake_call(
+            cfg: Any, slot: str, prompt: str, **kwargs: Any
+        ) -> dict[str, Any]:
+            captured.append(prompt)
+            return payload
+
+        with patch("influx.enrich._call_json_model", side_effect=fake_call):
+            tier3_extract(title="T", full_text="F", config=config)
+
+        rendered = captured[0]
+        assert str(TIER3_LIST_MAX) in rendered
+        assert "datasets" in rendered
+        assert "builds_on" in rendered
 
 
 class TestTier3ExtractModelSlot:

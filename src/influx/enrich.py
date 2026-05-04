@@ -24,9 +24,21 @@ from influx.errors import LCMAError, NetworkError
 from influx.http_client import guarded_post_json_fetch
 from influx.prompts import load_prompt
 from influx.schemas import (
+    TIER3_LIST_MAX,
     Tier1Enrichment,
     Tier3Extraction,
     openai_strict_response_format,
+)
+
+# Constant-derived suffix appended to the rendered Tier-3 prompt so the
+# "at most N" instruction stays in lockstep with the schema cap (issue
+# #81).  Kept in code rather than the user's TOML so existing operator
+# configs continue to validate against ``REQUIRED_VARIABLES`` without
+# requiring a new ``{max_list_items}`` template variable.
+_TIER3_CAP_REMINDER = (
+    f"\n\nReturn at most {TIER3_LIST_MAX} items in datasets and at most "
+    f"{TIER3_LIST_MAX} items in builds_on, prioritised by relevance and "
+    "centrality to the paper's contribution.  Drop the rest."
 )
 
 __all__ = [
@@ -270,9 +282,12 @@ def tier3_extract(
     """
     prompt_cfg = config.prompts.tier3_extract
     prompt_text = load_prompt(text=prompt_cfg.text, path=prompt_cfg.path)
-    rendered = prompt_text.format(
-        title=title,
-        full_text=full_text,
+    rendered = (
+        prompt_text.format(
+            title=title,
+            full_text=full_text,
+        )
+        + _TIER3_CAP_REMINDER
     )
 
     raw = _call_json_model(config, "extract", rendered, schema_class=Tier3Extraction)

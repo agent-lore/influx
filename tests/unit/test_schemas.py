@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from influx.schemas import (
+    TIER3_LIST_MAX,
     FilterResponse,
     FilterResult,
     Tier1Enrichment,
@@ -188,7 +189,10 @@ class TestTier3Extraction:
 
     def test_too_many_datasets(self) -> None:
         with pytest.raises(ValidationError):
-            Tier3Extraction(claims=["c"], datasets=[f"d{i}" for i in range(11)])
+            Tier3Extraction(
+                claims=["c"],
+                datasets=[f"d{i}" for i in range(TIER3_LIST_MAX + 1)],
+            )
 
 
 # ── OpenAI structured-outputs response_format builder ────────────────
