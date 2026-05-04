@@ -10,10 +10,16 @@ Covers the request lifecycle that wraps :class:`influx.run.Run`:
 - ``run_via_service`` builds the right :class:`RunPlan` shape per
   :class:`RunKind` (BACKFILL flips ``skip_repair`` /
   ``skip_cache_hits`` / ``notify``).
+- ``run completed`` log line reflects degraded state (issue #79):
+  the ``degraded=`` field tracks the structured ``degraded_reasons``
+  list so ``ingestion_stall`` / ``fetch_stall`` show up as
+  ``degraded=True`` for operators reading the log stream.
 """
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -31,6 +37,7 @@ from influx.coordinator import RunKind
 from influx.run import RunOutcome, RunPlan
 from influx.run_ledger import RunLedger
 from influx.run_service import RunService, run_via_service
+from influx.telemetry import current_source_acquisition_errors
 
 
 def _make_config(state_dir: str = "/tmp/influx-test") -> AppConfig:
@@ -260,3 +267,187 @@ async def test_run_via_service_returns_none_when_body_returns_none(
         )
 
     assert result is None
+
+
+# ── #79: ``run completed`` log line reflects degraded state ────────
+
+
+def _extract_run_completed_record(
+    caplog: pytest.LogCaptureFixture,
+) -> logging.LogRecord:
+    """Find the single ``run completed`` log record emitted by the lifecycle CM."""
+    matches = [r for r in caplog.records if r.message.startswith("run completed")]
+    assert len(matches) == 1, (
+        f"expected exactly one 'run completed' log line, got {len(matches)}: "
+        f"{[r.message for r in matches]}"
+    )
+    return matches[0]
+
+
+def _seed_zero_ingestion_stall_history(ledger: RunLedger, profile: str) -> None:
+    """Seed one prior scheduled zero-ingestion run.
+
+    The next zero-ingestion run on the same profile then trips
+    ``ingestion_stall``.
+    """
+    ledger.start(
+        run_id="prior-ingestion",
+        profile=profile,
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.complete(
+        run_id="prior-ingestion",
+        sources_checked=5,
+        ingested=0,
+    )
+
+
+def _seed_fetch_stall_history(ledger: RunLedger, profile: str) -> None:
+    """Seed history so the next zero-fetch run trips fetch_stall.
+
+    Requires (a) a prior non-zero fetch (the historical-ratchet) and
+    (b) one prior consecutive zero-fetch scheduled run.
+    """
+    ledger.start(
+        run_id="prior-history",
+        profile=profile,
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.complete(
+        run_id="prior-history",
+        sources_checked=5,
+        ingested=2,
+    )
+    ledger.start(
+        run_id="prior-zero-fetch",
+        profile=profile,
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.complete(
+        run_id="prior-zero-fetch",
+        sources_checked=0,
+        ingested=0,
+    )
+
+
+async def test_run_completed_log_degraded_true_for_source_errors(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """source_acquisition errors → ``degraded=True`` in the log line."""
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    async def body_with_source_errors(self: Any) -> RunOutcome:
+        errors = current_source_acquisition_errors.get() or []
+        errors.append(
+            {"source": "arxiv", "kind": "http", "detail": "HTTP 500 from upstream"}
+        )
+        current_source_acquisition_errors.set(errors)
+        return RunOutcome(sources_checked=3, ingested=2)
+
+    with (
+        caplog.at_level(logging.INFO, logger="influx.run_service"),
+        patch("influx.run.Run.execute", new=body_with_source_errors),
+    ):
+        await service.execute(_scheduled_plan())
+
+    record = _extract_run_completed_record(caplog)
+    assert "degraded=True" in record.message
+
+
+async def test_run_completed_log_degraded_true_for_ingestion_stall(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ingestion_stall reason → ``degraded=True`` in the log line.
+
+    Regression for #79: the old code logged ``bool(source_errors)``,
+    which stayed False for the stall-only path even though
+    ``degraded_reasons`` flagged ``ingestion_stall``.
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    _seed_zero_ingestion_stall_history(ledger, profile="alpha")
+    service = RunService(config=config, ledger=ledger)
+
+    # No source errors; ingested=0 with sources_checked>0 trips
+    # ingestion_stall on the second consecutive zero-ingestion run.
+    body_outcome = RunOutcome(sources_checked=4, ingested=0)
+    with (
+        caplog.at_level(logging.INFO, logger="influx.run_service"),
+        patch(
+            "influx.run.Run.execute",
+            new_callable=AsyncMock,
+            return_value=body_outcome,
+        ),
+    ):
+        await service.execute(_scheduled_plan())
+
+    # Sanity: the ledger really did record the stall reason.
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert "ingestion_stall" in entry["degraded_reasons"]
+
+    record = _extract_run_completed_record(caplog)
+    assert "degraded=True" in record.message
+
+
+async def test_run_completed_log_degraded_true_for_fetch_stall(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """fetch_stall reason → ``degraded=True`` in the log line.
+
+    Regression for #79: source_errors is empty and sources_checked
+    is 0, so the old ``bool(source_errors)`` argument logged
+    ``degraded=False`` even though ``fetch_stall`` was flagged.
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    _seed_fetch_stall_history(ledger, profile="alpha")
+    service = RunService(config=config, ledger=ledger)
+
+    body_outcome = RunOutcome(sources_checked=0, ingested=0)
+    with (
+        caplog.at_level(logging.INFO, logger="influx.run_service"),
+        patch(
+            "influx.run.Run.execute",
+            new_callable=AsyncMock,
+            return_value=body_outcome,
+        ),
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert "fetch_stall" in entry["degraded_reasons"]
+
+    record = _extract_run_completed_record(caplog)
+    assert "degraded=True" in record.message
+
+
+async def test_run_completed_log_degraded_false_for_clean_run(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Clean run (no errors, no stall reasons) → ``degraded=False`` in the log."""
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    body_outcome = RunOutcome(sources_checked=3, ingested=2)
+    with (
+        caplog.at_level(logging.INFO, logger="influx.run_service"),
+        patch(
+            "influx.run.Run.execute",
+            new_callable=AsyncMock,
+            return_value=body_outcome,
+        ),
+    ):
+        await service.execute(_scheduled_plan())
+
+    record = _extract_run_completed_record(caplog)
+    assert "degraded=False" in record.message

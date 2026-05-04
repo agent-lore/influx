@@ -193,16 +193,22 @@ async def ledger_lifecycle(
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
 
         if outcome is not None:
+            # #79: tie ``degraded`` to ``run_outcome`` (the same source of
+            # truth as the ``run_completions`` metric attribute) so any
+            # future stall-reason additions stay in sync without touching
+            # this call site.  ``reasons=...`` is appended for the
+            # ``influx-diagnose failures`` grep path.
             logger.info(
                 "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
-                "sources_checked=%d ingested=%d degraded=%s",
+                "sources_checked=%d ingested=%d degraded=%s reasons=%s",
                 profile,
                 plan.kind.value,
                 run_id,
                 elapsed,
                 outcome.sources_checked,
                 outcome.ingested,
-                bool(source_errors),
+                run_outcome == "degraded",
+                ",".join(degraded_reasons) if degraded_reasons else "",
             )
         else:
             logger.info(
