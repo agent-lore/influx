@@ -31,6 +31,18 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _ARXIV_RE = re.compile(r"arXiv:(\d{4}\.\d{4,5}(?:v\d+)?)")
 
 
+def _phrase_quote(s: str) -> str:
+    """Wrap *s* as a Tantivy phrase query, backslash-escaping ``\\`` and ``"``.
+
+    Phrase quoting neutralises Tantivy reserved characters inside the
+    payload (notably ``:`` from ``Topic: Subtitle`` titles, plus ``(``,
+    ``)``, ``'``), so the parser cannot mistake content for field
+    qualifiers or syntax (#80).
+    """
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def compose_retrieve_query(
     title: str,
     contributions: list[str] | None = None,
@@ -42,9 +54,13 @@ def compose_retrieve_query(
        trim each, and skip any that are empty after trimming. Empty
        elements within those first three are dropped, NOT replaced by
        later non-empty entries (FR-LCMA-2 step 2).
-    3. Join the surviving parts with ``" | "``.
-    4. Collapse internal whitespace runs to a single space.
-    5. Truncate to 500 characters (simple slice, no word re-wrap).
+    3. Collapse internal whitespace runs to a single space within each
+       disjunct.
+    4. Wrap each disjunct as a Tantivy phrase (double-quoted, with
+       ``\\`` and ``"`` escaped) so reserved characters in titles like
+       ``Topic: Subtitle`` cannot be parsed as field qualifiers (#80).
+    5. Join the wrapped parts with ``" | "``.
+    6. Truncate to 500 characters (simple slice, no word re-wrap).
     """
     parts: list[str] = [title]
 
@@ -55,8 +71,8 @@ def compose_retrieve_query(
                 continue
             parts.append(stripped)
 
-    composed = " | ".join(parts)
-    composed = _WHITESPACE_RE.sub(" ", composed)
+    quoted = [_phrase_quote(_WHITESPACE_RE.sub(" ", p).strip()) for p in parts]
+    composed = " | ".join(quoted)
     return composed[:_MAX_QUERY_LEN]
 
 
