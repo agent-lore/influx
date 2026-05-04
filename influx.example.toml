@@ -13,6 +13,14 @@ note_schema_version = 1         # stamped on every Influx-authored note
 cron = "0 6 * * *"              # daily at 06:00
 timezone = "UTC"
 misfire_grace_seconds = 3600    # tolerate missed fires within an hour
+# Stagger the per-tick request pattern away from exact hour boundaries
+# (issue #87) so we don't cluster with every other arXiv consumer at
+# `:00:NN`.  ``initial_jitter_seconds`` adds a uniform random delay in
+# ``[0, N]`` before fan-out begins; ``inter_profile_gap_seconds``
+# serialises profiles within one tick with the configured gap between
+# them.  Both default to 0 (legacy parallel fan-out).
+# initial_jitter_seconds = 30
+# inter_profile_gap_seconds = 1800   # 30 minutes between profiles
 
 [storage]
 archive_dir = "/archive"

@@ -24,6 +24,8 @@ def _make_config(
     cron: str = "0 6 * * *",
     timezone: str = "UTC",
     misfire_grace_seconds: int = 3600,
+    initial_jitter_seconds: int = 0,
+    inter_profile_gap_seconds: int = 0,
 ) -> AppConfig:
     """Build a minimal AppConfig for scheduler tests."""
     profile_names = profiles if profiles is not None else ["alpha", "beta"]
@@ -33,6 +35,8 @@ def _make_config(
             cron=cron,
             timezone=timezone,
             misfire_grace_seconds=misfire_grace_seconds,
+            initial_jitter_seconds=initial_jitter_seconds,
+            inter_profile_gap_seconds=inter_profile_gap_seconds,
         ),
         profiles=profile_list,
         prompts=PromptsConfig(
@@ -197,52 +201,60 @@ class TestTickOverlapDoesNotBlockUnrelatedProfiles:
     """
 
     async def test_tick2_runs_profile_b_while_tick1_alpha_blocks(self) -> None:
+        """Cross-tick non-blocking under #87 sequential semantics.
+
+        Profiles within a single tick now run sequentially in declared
+        config order, so beta from tick1 cannot overtake a stuck alpha
+        in the same tick.  The cross-tick guarantee still holds though:
+        tick2 fires while tick1's alpha is blocked, sees alpha as busy
+        (skip via the coordinator), and proceeds to run beta — proving
+        APScheduler is not the gate, only the coordinator is.
+        """
         config = _make_config(profiles=["alpha", "beta"])
         coord = Coordinator()
         sched = InfluxScheduler(config, coord)
 
         started: list[str] = []
+        alpha_started = asyncio.Event()
         alpha_block = asyncio.Event()
-        beta_done = asyncio.Event()
 
         async def slow_run(
             profile: str, kind: Any, run_range: Any = None, **_: Any
         ) -> None:
             started.append(profile)
             if profile == "alpha":
+                alpha_started.set()
                 # alpha from tick1 stays in flight until released.
                 await alpha_block.wait()
-            else:
-                # beta finishes promptly so tick2 can re-run it.
-                beta_done.set()
 
         with patch("influx.scheduler.run_profile", side_effect=slow_run):
             tick1 = asyncio.create_task(sched._fire_tick())
-            # Wait for tick1's beta to actually finish (so its lock is free)
-            # while tick1's alpha remains stuck.
-            await asyncio.wait_for(beta_done.wait(), timeout=1.0)
+            # Wait for tick1's alpha to actually start and hold the lock.
+            await asyncio.wait_for(alpha_started.wait(), timeout=1.0)
             assert coord.is_busy("alpha") is True
             assert coord.is_busy("beta") is False
+            # Sequential: tick1's beta has NOT started yet — it queues
+            # behind the still-running alpha.
+            assert started == ["alpha"]
 
-            # Tick2 fires while tick1's alpha is still running.
+            # Tick2 fires while tick1's alpha is still running.  Its alpha
+            # is skipped (busy); its beta runs because beta's lock is free.
             tick2 = asyncio.create_task(sched._fire_tick())
-            # Drain pending callbacks so tick2's fan-out can dispatch.
-            for _ in range(10):
-                await asyncio.sleep(0)
+            await asyncio.wait_for(tick2, timeout=1.0)
 
-            # tick2's beta must have run; tick2's alpha must have been
-            # skipped (lock held by tick1).
-            assert started.count("beta") == 2
+            # tick2 ran beta exactly once, skipped alpha entirely.
+            assert started.count("beta") == 1
             assert started.count("alpha") == 1
             assert coord.is_busy("alpha") is True
 
-            # Tick2 has nothing left to do (alpha skipped, beta done).
-            await asyncio.wait_for(tick2, timeout=1.0)
-
-            # Release alpha so tick1 can finish.
+            # Release alpha so tick1 can finish (which then runs tick1's beta).
             alpha_block.set()
             await asyncio.wait_for(tick1, timeout=1.0)
 
+        # By the time both ticks complete: alpha ran once (tick1, tick2 skipped),
+        # beta ran twice (tick2 first while tick1 was blocked, tick1 after).
+        assert started.count("alpha") == 1
+        assert started.count("beta") == 2
         assert coord.is_busy("alpha") is False
         assert coord.is_busy("beta") is False
 
@@ -361,6 +373,221 @@ class TestTickOverlapDoesNotBlockUnrelatedProfiles:
         for cache in produced_caches:
             assert cache.begin_count == 1
             assert cache.end_count == 1
+
+
+# ── Sequential within-tick fan-out + jitter / gap (issue #87) ──────
+
+
+class TestSequentialFanOutWithJitterAndGap:
+    """Issue #87: avoid arXiv hour-boundary 429 clusters.
+
+    Profiles within a single cron tick now run **sequentially in
+    declared config order** with an optional gap between them, after an
+    optional initial jitter at the start of the tick.  Both knobs live
+    under ``[schedule]`` and default to 0 for backwards-compatible
+    behaviour.  The shared ``begin_fire`` / ``end_fire`` window around
+    the whole fan-out is preserved so cross-profile fetch dedup
+    (R-8 / AC-09-D) still holds.
+    """
+
+    async def test_profiles_run_in_declared_config_order(self) -> None:
+        """Sequential, in the order profiles appear in ``[[profiles]]``."""
+        config = _make_config(profiles=["alpha", "beta", "gamma"])
+        coord = Coordinator()
+        sched = InfluxScheduler(config, coord)
+
+        order: list[str] = []
+
+        async def spy(profile: str, kind: Any, run_range: Any = None, **_: Any) -> None:
+            order.append(profile)
+
+        with patch("influx.scheduler.run_profile", side_effect=spy):
+            await sched._fire_tick()
+
+        assert order == ["alpha", "beta", "gamma"]
+
+    async def test_initial_jitter_sleeps_before_first_profile(self) -> None:
+        """``initial_jitter_seconds`` produces one sleep at tick start."""
+        config = _make_config(
+            profiles=["alpha", "beta"],
+            initial_jitter_seconds=30,
+        )
+        coord = Coordinator()
+        sched = InfluxScheduler(config, coord)
+
+        sleep_calls: list[float] = []
+        order: list[str] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            order.append(f"sleep:{seconds}")
+
+        async def spy(profile: str, kind: Any, run_range: Any = None, **_: Any) -> None:
+            order.append(profile)
+
+        with (
+            patch(
+                "influx.scheduler.random.uniform",
+                return_value=17.0,
+            ),
+            patch("influx.scheduler.asyncio.sleep", side_effect=fake_sleep),
+            patch("influx.scheduler.run_profile", side_effect=spy),
+        ):
+            await sched._fire_tick()
+
+        # The jitter sleep is the first thing that happens, before any
+        # profile runs.
+        assert order[0] == "sleep:17.0"
+        assert order[1:] == ["alpha", "beta"]
+        # No inter-profile gap configured → only the jitter sleep fires.
+        assert sleep_calls == [17.0]
+
+    async def test_zero_jitter_skips_sleep(self) -> None:
+        """``initial_jitter_seconds = 0`` does not call sleep."""
+        config = _make_config(
+            profiles=["alpha"],
+            initial_jitter_seconds=0,
+        )
+        coord = Coordinator()
+        sched = InfluxScheduler(config, coord)
+
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        async def spy(profile: str, kind: Any, run_range: Any = None, **_: Any) -> None:
+            pass
+
+        with (
+            patch("influx.scheduler.asyncio.sleep", side_effect=fake_sleep),
+            patch("influx.scheduler.run_profile", side_effect=spy),
+        ):
+            await sched._fire_tick()
+
+        assert sleep_calls == []
+
+    async def test_inter_profile_gap_sleeps_between_profiles(self) -> None:
+        """``inter_profile_gap_seconds`` sleeps between each pair, not before
+        the first profile and not after the last."""
+        config = _make_config(
+            profiles=["alpha", "beta", "gamma"],
+            inter_profile_gap_seconds=42,
+        )
+        coord = Coordinator()
+        sched = InfluxScheduler(config, coord)
+
+        events: list[str] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            events.append(f"sleep:{seconds}")
+
+        async def spy(profile: str, kind: Any, run_range: Any = None, **_: Any) -> None:
+            events.append(profile)
+
+        with (
+            patch("influx.scheduler.asyncio.sleep", side_effect=fake_sleep),
+            patch("influx.scheduler.run_profile", side_effect=spy),
+        ):
+            await sched._fire_tick()
+
+        # Gap fires between profile pairs only — not before alpha,
+        # not after gamma.
+        assert events == [
+            "alpha",
+            "sleep:42",
+            "beta",
+            "sleep:42",
+            "gamma",
+        ]
+
+    async def test_zero_gap_runs_back_to_back(self) -> None:
+        """``inter_profile_gap_seconds = 0`` does not insert sleeps."""
+        config = _make_config(
+            profiles=["alpha", "beta"],
+            inter_profile_gap_seconds=0,
+        )
+        coord = Coordinator()
+        sched = InfluxScheduler(config, coord)
+
+        events: list[str] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            events.append(f"sleep:{seconds}")
+
+        async def spy(profile: str, kind: Any, run_range: Any = None, **_: Any) -> None:
+            events.append(profile)
+
+        with (
+            patch("influx.scheduler.asyncio.sleep", side_effect=fake_sleep),
+            patch("influx.scheduler.run_profile", side_effect=spy),
+        ):
+            await sched._fire_tick()
+
+        assert events == ["alpha", "beta"]
+
+    async def test_profile_failure_does_not_abort_remaining_profiles(
+        self,
+    ) -> None:
+        """One profile raising must not skip subsequent profiles in the tick."""
+        config = _make_config(profiles=["alpha", "beta", "gamma"])
+        coord = Coordinator()
+        sched = InfluxScheduler(config, coord)
+
+        ran: list[str] = []
+
+        async def maybe_fail(
+            profile: str, kind: Any, run_range: Any = None, **_: Any
+        ) -> None:
+            ran.append(profile)
+            if profile == "beta":
+                raise RuntimeError("beta exploded")
+
+        with patch("influx.scheduler.run_profile", side_effect=maybe_fail):
+            await sched._fire_tick()
+
+        assert ran == ["alpha", "beta", "gamma"]
+        # Locks released for every profile despite the middle one raising.
+        for name in ("alpha", "beta", "gamma"):
+            assert coord.is_busy(name) is False
+
+    async def test_fetch_cache_window_brackets_full_sequential_fanout(
+        self,
+    ) -> None:
+        """The single shared ``begin_fire`` / ``end_fire`` window is preserved.
+
+        Sequential within-tick fan-out must still bracket all profiles
+        in one cache scope so cross-profile fetch dedup (R-8, AC-09-D)
+        keeps working.
+        """
+        config = _make_config(
+            profiles=["alpha", "beta"],
+            inter_profile_gap_seconds=0,
+        )
+        coord = Coordinator()
+
+        events: list[str] = []
+
+        class _RecordingCache:
+            def begin_fire(self) -> None:
+                events.append("begin_fire")
+
+            def end_fire(self) -> None:
+                events.append("end_fire")
+
+        sched = InfluxScheduler(
+            config,
+            coord,
+            fetch_cache=_RecordingCache(),
+        )
+
+        async def spy(profile: str, kind: Any, run_range: Any = None, **_: Any) -> None:
+            events.append(profile)
+
+        with patch("influx.scheduler.run_profile", side_effect=spy):
+            await sched._fire_tick()
+
+        assert events == ["begin_fire", "alpha", "beta", "end_fire"]
 
 
 # ── Cross-profile parallelism (AC-M3-1) ────────────────────────────

@@ -79,7 +79,7 @@ Status: Aligned with Implementation
 ### 2.2 Runtime Flow
 
 1. `serve` loads config, validates the local admin bind address, creates the FastAPI app, starts the probe loop, and starts the scheduler.
-2. The scheduler registers one `influx-tick` cron dispatcher job. Each tick creates a fresh source provider/cache pair and starts profile runs as background tasks.
+2. The scheduler registers one `influx-tick` cron dispatcher job. Each tick creates a fresh source provider/cache pair and runs profile runs **sequentially in declared config order** within the tick, optionally separated by `schedule.inter_profile_gap_seconds` and preceded by a uniform random delay of `[0, schedule.initial_jitter_seconds]` (issue #87 — avoids arXiv hour-boundary 429 clustering when multiple profiles share the same cron expression). The single shared `begin_fire` / `end_fire` window is preserved, so cross-profile fetch deduplication (R-8 / AC-09-D) still holds.
 3. Manual `POST /runs` and `POST /backfills` requests acquire per-profile locks and spawn background run tasks.
 4. The HTTP / scheduler entry points build a `RunPlan` and hand off to `RunService.execute()`. RunService checks the probe-time skip gates (`lithos_circuit_open`, `lcma_tools_unavailable`), opens the ledger entry + run-level metrics + tracer span, and delegates the body to `Run.execute()`.
 5. `Run.execute()` walks five named stages — repair (skipped on backfill), feedback (negative examples + filter prompt), acquire (`Source.fetch_candidates` → `Filter.score` → `Source.acquire`), ingest (per item: `cache_lookup` → `Cascade.enrich` → `Renderer.render` → `LithosClient.write_note` → `LcmaWiring.wire`), finalise (assemble outcome + fire notifications when `plan.notify`). The Lithos task lifecycle (`task_create` / `task_complete`) brackets the body via an inner CM.
@@ -119,7 +119,7 @@ Environment overrides are applied for selected runtime values. The complete anno
 
 - `[influx]`: `note_schema_version`, stamped as `schema:<version>` on Influx-authored notes.
 - `[lithos]`: Lithos MCP endpoint and transport. Only `transport = "sse"` is supported.
-- `[schedule]`: cron expression, timezone, misfire grace, and shutdown grace.
+- `[schedule]`: cron expression, timezone, misfire grace, shutdown grace, optional initial-tick jitter (`initial_jitter_seconds`), and optional inter-profile gap (`inter_profile_gap_seconds`).
 - `[storage]`: archive directory, local state directory, retention setting, max download size, and download timeout.
 - `[notifications]`: outbound timeout plus typed `[[notifications.webhooks]]` sinks. `notifications.webhook_url` remains as a legacy single-sink generic-digest fallback.
 - `[security]`: outbound/private-IP and remote-admin bind policy.
@@ -767,3 +767,4 @@ Known warnings in the suite:
 6. Archive retention is configured but no retention-pruning worker is implemented in the current code.
 7. RSS filtering requires a configured `models.filter` slot and provider; failed RSS filter batches are skipped.
 8. Source archives and Lithos notes can diverge when archive download fails; repair tags mark those notes for later recovery.
+9. All profiles share a single global cron expression. Within a tick they run sequentially in declared order, separated by `schedule.inter_profile_gap_seconds`, with an initial random jitter of `[0, schedule.initial_jitter_seconds]`. True per-profile cadence (different cron expressions per profile) is not yet supported; tracked separately under issue #90.
