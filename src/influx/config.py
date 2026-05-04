@@ -74,6 +74,28 @@ class ScheduleConfig(BaseModel):
     timezone: str = "UTC"
     misfire_grace_seconds: int = 3600
     shutdown_grace_seconds: int = 30
+    # Issue #87: avoid arXiv hour-boundary 429 clusters.  ``initial_jitter_seconds``
+    # introduces a uniform random delay in ``[0, N]`` at the start of each
+    # cron tick so the request pattern is not perfectly aligned with the
+    # cron expression (e.g. ``:00:00`` of every hour).
+    # ``inter_profile_gap_seconds`` runs profiles sequentially within a
+    # single tick with the configured gap between them, so two profiles
+    # configured on the same cron expression no longer hit shared upstreams
+    # (arXiv categories, RSS feeds) within the same wall-clock second.
+    # Both default to ``0`` to preserve historical behaviour; operators
+    # opt in via ``[schedule]`` in ``influx.toml``.
+    initial_jitter_seconds: int = 0
+    inter_profile_gap_seconds: int = 0
+
+    @field_validator("initial_jitter_seconds", "inter_profile_gap_seconds")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ConfigError(
+                "schedule.initial_jitter_seconds and "
+                "schedule.inter_profile_gap_seconds must be non-negative"
+            )
+        return v
 
 
 class StorageConfig(BaseModel):

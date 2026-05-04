@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
@@ -308,6 +309,15 @@ class InfluxScheduler:
 
         Per-source fetches within a single tick are deduplicated across
         profiles for that tick's fan-out (R-8, AC-09-D).
+
+        Issue #87: profiles run **sequentially in declared config order**
+        with an optional ``schedule.inter_profile_gap_seconds`` between
+        them, and an optional ``schedule.initial_jitter_seconds`` random
+        delay applied once at the start of the tick.  This avoids
+        arXiv-side rate-limit clustering at exact hour boundaries when
+        multiple profiles share the same cron expression.  The single
+        shared ``begin_fire`` / ``end_fire`` window is preserved so
+        cross-profile fetch deduplication (R-8, AC-09-D) still holds.
         """
         if provider is None and self._item_provider_factory is not None:
             provider, cache = self._item_provider_factory()
@@ -316,16 +326,29 @@ class InfluxScheduler:
         if cache is None:
             cache = self._fetch_cache
 
+        initial_jitter = self._config.schedule.initial_jitter_seconds
+        if initial_jitter > 0:
+            await asyncio.sleep(random.uniform(0, initial_jitter))  # noqa: S311
+
         if cache is not None:
             cache.begin_fire()
         try:
-            await asyncio.gather(
-                *(
-                    self._fire_profile(profile.name, item_provider=provider)
-                    for profile in self._config.profiles
-                ),
-                return_exceptions=True,
-            )
+            gap = self._config.schedule.inter_profile_gap_seconds
+            for index, profile in enumerate(self._config.profiles):
+                if index > 0 and gap > 0:
+                    await asyncio.sleep(gap)
+                try:
+                    await self._fire_profile(profile.name, item_provider=provider)
+                except Exception:  # pragma: no cover — defensive parity
+                    # Mirror the previous ``return_exceptions=True``
+                    # gather behaviour so one profile's failure does not
+                    # abort the rest of the tick.  ``_fire_profile`` already
+                    # swallows ``ProfileBusyError``; this guards against
+                    # ``run_profile`` raising for any other reason.
+                    logger.exception(
+                        "Scheduled fire for %r raised; continuing tick",
+                        profile.name,
+                    )
         finally:
             if cache is not None:
                 cache.end_fire()

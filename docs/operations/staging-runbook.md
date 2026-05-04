@@ -361,7 +361,55 @@ the unsuffixed-slug squatter, which can be removed the same way.
 surfacing both squatters in a single WARNING so they can be cleaned
 in one pass.
 
-## 9. Reference
+## 9. Scheduling stagger (issue #87)
+
+Profiles share a single global `[schedule].cron` expression. Within
+each tick, profiles run **sequentially in declared `[[profiles]]`
+order**. Two `[schedule]` knobs shape that fan-out:
+
+| Setting | Effect |
+| ------- | ------ |
+| `initial_jitter_seconds` | Sleep a uniform random `[0, N]` seconds at tick start, before any profile runs. Defaults to `0`. |
+| `inter_profile_gap_seconds` | Sleep `N` seconds between consecutive profiles in the same tick. Not applied before the first profile or after the last. Defaults to `0`. |
+
+Why this exists: when multiple profiles fire on the hour (e.g. `0 *
+* * *`), they hit shared upstreams (arXiv categories, RSS feeds) at
+exactly `:00:NN` of every hour and cluster with every other on-the-hour
+arXiv consumer — easy 429 territory. `initial_jitter_seconds` walks the
+tick off the boundary; `inter_profile_gap_seconds` separates profile-A
+and profile-B requests within the tick.
+
+Recommended starting values for staging:
+
+```toml
+[schedule]
+cron = "0 * * * *"
+initial_jitter_seconds = 30
+inter_profile_gap_seconds = 1800   # 30 minutes
+```
+
+What this does **not** give you:
+
+- Independent cadence per profile (e.g. profile-A every 6h, profile-B
+  every 12h). All profiles share one cron expression. True per-profile
+  cron is tracked separately under issue #90.
+- Any change to the arXiv retry/backoff policy. Backoff after a 429
+  remains `resilience.arxiv_429_backoff_seconds` × `resilience.max_retries`;
+  staggering reduces *whether* we hit 429 in the first place.
+
+Verification after a config change:
+
+```
+./scripts/influx-diagnose.py recent --limit 10
+./scripts/influx-diagnose.py warnings --since 24h --contains "429"
+```
+
+If both staggered profiles still hit 429 clusters, file a follow-up to
+revisit `resilience.arxiv_429_backoff_seconds` (e.g. exponential
+backoff). Don't tune backoff until you can show staggering didn't fix
+the recurrence.
+
+## 10. Reference
 
 - Run ledger schema: `src/influx/run_ledger.py` (`RunEntry` TypedDict).
 - Admin endpoints: `src/influx/http_api.py` (`/live`, `/ready`,
