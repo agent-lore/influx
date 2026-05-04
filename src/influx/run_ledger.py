@@ -80,6 +80,7 @@ class RunLedger:
             "sources_checked": None,
             "ingested": None,
             "fetched_total": None,
+            "filter_errors_total": None,
             "error": None,
             "degraded": False,
             "degraded_reasons": [],
@@ -99,16 +100,24 @@ class RunLedger:
         sources_checked: int | None,
         ingested: int | None,
         fetched_total: int | None = None,
+        filter_errors_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Mark an active run as completed and append it to history.
 
         Returns the structured ``degraded_reasons`` list that was
-        recorded.  Possible values (mutually exclusive among the three
-        stall reasons on a single run):
+        recorded.  Possible values:
 
         - ``"source_acquisition"`` (issue #20) — at least one
           source-fetch failure was swallowed.
+        - ``"filter_error"`` (issue #85 review) — the LLM filter
+          scorer raised :class:`FilterScorerError` (transport, parse,
+          or provider failure) at least once during this run.  Single-
+          run signal — no consecutive-runs gate, since one filter
+          execution failure is immediately actionable.  Mutually
+          exclusive with ``filter_stall``: when both would apply,
+          ``filter_error`` wins because the scorer-failure diagnosis
+          is more specific.
         - ``"ingestion_stall"`` (issue #36) — this and the immediately
           prior scheduled run both saw ``ingested == 0`` despite
           ``sources_checked > 0``.  Typical cause: every candidate hits
@@ -120,17 +129,24 @@ class RunLedger:
           too-narrow ``lookback_days`` or an upstream feed shape change.
         - ``"filter_stall"`` (issue #85) — this and the immediately
           prior scheduled run both saw ``fetched_total > 0`` but
-          ``sources_checked == 0`` (the LLM filter rejected every
-          candidate), AND the profile has historically seen
-          ``sources_checked > 0``.  Typical cause: profile description
-          drift, filter prompt regression, or
-          ``min_score_in_results`` set too high.
+          ``sources_checked == 0`` (the LLM filter ran cleanly and
+          rejected every candidate), AND the profile has historically
+          seen ``sources_checked > 0``.  Typical cause: profile
+          description drift, filter prompt regression, or
+          ``min_score_in_results`` set too high.  Requires
+          ``filter_errors_total == 0`` so a scorer failure produces
+          ``filter_error`` rather than this.
 
         ``fetch_stall`` and ``filter_stall`` partition the
         ``sources_checked == 0`` space by ``fetched_total``: they are
         mutually exclusive on a single run.  ``ingestion_stall``
         requires ``sources_checked > 0``, so it is mutually exclusive
-        with both.
+        with both.  ``filter_error`` and ``filter_stall`` are mutually
+        exclusive because they describe distinct failure shapes (scorer
+        broken vs scorer-rejected-all); ``filter_error`` is independent
+        of ``ingestion_stall`` and ``fetch_stall`` and may co-occur
+        with either if a partial-failure run still ingested or
+        legitimately fetched nothing from some sources.
 
         Returning the reasons lets the caller (the scheduler) emit
         per-reason metrics without re-deriving the logic.
@@ -139,6 +155,18 @@ class RunLedger:
         reasons: list[str] = []
         if errors:
             reasons.append("source_acquisition")
+
+        # #85 review: filter_error fires immediately on any
+        # FilterScorerError catch, regardless of run kind.  Operators
+        # need to know about scorer execution failures even on manual
+        # / backfill runs (where the stall family doesn't apply).
+        # Mutual exclusion with filter_stall is enforced below by
+        # gating the filter_stall branch on filter_errors_total == 0.
+        has_filter_error = (
+            isinstance(filter_errors_total, int) and filter_errors_total > 0
+        )
+        if has_filter_error:
+            reasons.append("filter_error")
 
         # Resolve profile + kind once for the stall checks.  All three
         # stall flags only apply to scheduled runs (backfills
@@ -182,16 +210,25 @@ class RunLedger:
 
             if isinstance(fetched_total, int) and fetched_total > 0:
                 # #85 filter_stall: items WERE fetched, the filter
-                # rejected them all.  Streak counts prior scheduled
-                # runs that match the same shape (sources_checked == 0
-                # AND fetched_total > 0).
-                consecutive_filter = 1 + self._consecutive_zero_check_with_fetch_runs(
-                    profile=profile, exclude_run_id=run_id
-                )
-                if consecutive_filter >= 2 and self._has_prior_non_zero_fetch(
-                    profile=profile, exclude_run_id=run_id
-                ):
-                    reasons.append("filter_stall")
+                # rejected them all.  Requires filter_errors_total == 0
+                # — a scorer-execution failure has a distinct, more
+                # specific reason (``filter_error``) and shouldn't
+                # double-fire as a filter_stall (#85 review).  Streak
+                # counts prior scheduled runs that match the same
+                # shape (sources_checked == 0 AND fetched_total > 0).
+                if has_filter_error:
+                    pass  # filter_error already appended above
+                else:
+                    consecutive_filter = (
+                        1
+                        + self._consecutive_zero_check_with_fetch_runs(
+                            profile=profile, exclude_run_id=run_id
+                        )
+                    )
+                    if consecutive_filter >= 2 and self._has_prior_non_zero_fetch(
+                        profile=profile, exclude_run_id=run_id
+                    ):
+                        reasons.append("filter_stall")
             else:
                 # #50 fetch_stall: nothing was fetched at all.  Either
                 # ``fetched_total`` was explicitly 0 or the caller
@@ -211,6 +248,7 @@ class RunLedger:
             sources_checked=sources_checked,
             ingested=ingested,
             fetched_total=fetched_total,
+            filter_errors_total=filter_errors_total,
             error=None,
             degraded=bool(reasons),
             source_acquisition_errors=errors,
@@ -526,6 +564,7 @@ class RunLedger:
         ingested: int | None,
         error: str | None,
         fetched_total: int | None = None,
+        filter_errors_total: int | None = None,
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
@@ -556,6 +595,7 @@ class RunLedger:
                     "sources_checked": sources_checked,
                     "ingested": ingested,
                     "fetched_total": fetched_total,
+                    "filter_errors_total": filter_errors_total,
                     "error": error,
                     "degraded": degraded,
                     "degraded_reasons": list(degraded_reasons or []),

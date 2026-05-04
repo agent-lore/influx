@@ -195,10 +195,13 @@ def archive_missing() -> Any:
 def ingestion_stalls() -> Any:
     """Counter of runs flagged with a stall ``degraded_reasons`` value.
 
-    Combines the #36 ``ingestion_stall``, #50 ``fetch_stall`` and #85
-    ``filter_stall`` signals on a single instrument, split by the
-    ``reason`` label so dashboards can alert on each independently.
-    The three reasons are mutually exclusive on a single run.
+    Combines the #36 ``ingestion_stall``, #50 ``fetch_stall``, #85
+    ``filter_stall``, and #85-review ``filter_error`` signals on a
+    single instrument, split by the ``reason`` label so dashboards
+    can alert on each independently.  The three stall reasons
+    (``ingestion_stall``/``fetch_stall``/``filter_stall``) are mutually
+    exclusive on a single run; ``filter_error`` is mutually exclusive
+    with ``filter_stall`` but orthogonal to the rest.
 
     ``reason="ingestion_stall"`` (#36): increments once per scheduled
     run that completes with ``ingested == 0 AND sources_checked > 0``
@@ -218,27 +221,39 @@ def ingestion_stalls() -> Any:
 
     ``reason="filter_stall"`` (#85): increments once per scheduled
     run that completes with ``fetched_total > 0 AND
-    sources_checked == 0`` (sources fetched normally but the LLM
-    filter rejected every candidate) AND the immediately prior
-    scheduled run for the same profile also matched that shape AND
-    the profile has historically seen ``sources_checked > 0`` within
-    the recent ledger window.  Typical cause: profile description
-    drift, filter prompt regression, or a ``min_score_in_results``
-    set too high.
+    sources_checked == 0`` (sources fetched normally and the LLM
+    filter ran cleanly but rejected every candidate) AND the
+    immediately prior scheduled run for the same profile also
+    matched that shape AND the profile has historically seen
+    ``sources_checked > 0`` within the recent ledger window.
+    Typical cause: profile description drift, filter prompt
+    regression, or a ``min_score_in_results`` set too high.
+
+    ``reason="filter_error"`` (#85, post-review): increments once per
+    run (any kind, scheduled or otherwise) where the LLM filter
+    scorer raised :class:`FilterScorerError` at least once —
+    transport, parse, or provider failure.  Single-run signal: no
+    consecutive-runs gate, no historical ratchet, no kind gate.
+    Distinct from ``filter_stall`` (clean scorer rejected all);
+    routes operator attention at provider config / model
+    availability / response schema.
 
     Labels: ``profile``, ``reason``
-    (``"ingestion_stall"`` | ``"fetch_stall"`` | ``"filter_stall"``).
+    (``"ingestion_stall"`` | ``"fetch_stall"`` |
+    ``"filter_stall"`` | ``"filter_error"``).
     """
     return get_meter().counter(
         "influx_ingestion_stall_runs_total",
         description=(
-            "scheduled runs flagged with a stall reason — "
-            "ingestion_stall (two consecutive runs inspected items but "
-            "ingested zero), fetch_stall (two consecutive runs fetched "
-            "zero items despite prior non-zero history), or "
-            "filter_stall (two consecutive runs fetched items but the "
-            "filter rejected every candidate, despite prior non-zero "
-            "history)"
+            "runs flagged with a stall reason — ingestion_stall (two "
+            "consecutive scheduled runs inspected items but ingested "
+            "zero), fetch_stall (two consecutive scheduled runs "
+            "fetched zero items despite prior non-zero history), "
+            "filter_stall (two consecutive scheduled runs fetched "
+            "items but the filter cleanly rejected every candidate, "
+            "despite prior non-zero history), or filter_error (any "
+            "run whose LLM filter scorer raised FilterScorerError "
+            "at least once)"
         ),
     )
 

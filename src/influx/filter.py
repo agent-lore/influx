@@ -47,6 +47,7 @@ from influx.errors import NetworkError
 from influx.http_client import guarded_post_json_fetch
 from influx.schemas import FilterResponse
 from influx.source import Candidate, ScoredCandidate
+from influx.telemetry import record_filter_error
 
 __all__ = [
     "BatchScorer",
@@ -438,6 +439,10 @@ class Filter:
                     source,
                     exc_info=True,
                 )
+                # #85 review: surface the scorer execution failure to
+                # the run ledger so it fires ``filter_error`` rather
+                # than misclassifying as ``filter_stall``.
+                record_filter_error()
                 return []
             all_scores.update(chunk_scores)
 

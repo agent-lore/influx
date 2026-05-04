@@ -50,6 +50,7 @@ from influx.telemetry import (
     current_run_id,
     get_tracer,
     record_fetched_items,
+    record_filter_error,
     record_source_acquisition_error,
 )
 
@@ -1176,6 +1177,12 @@ async def _score_arxiv_candidates(
                 # ingested with a default score.
                 for _ in candidates:
                     metrics.articles_filtered().add(1, drop_attrs)
+                # #85 review: distinguish a scorer execution failure
+                # (transport/parse/provider error) from a clean filter
+                # rejection.  The ledger uses this to fire
+                # ``filter_error`` instead of misclassifying as
+                # ``filter_stall``.
+                record_filter_error()
                 return []
             chunked_scores.update(chunk_scores)
 

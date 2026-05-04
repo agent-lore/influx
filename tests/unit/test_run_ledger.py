@@ -233,6 +233,7 @@ def _start_complete(
     sources_checked: int | None,
     ingested: int | None,
     fetched_total: int | None = None,
+    filter_errors_total: int | None = None,
     source_acquisition_errors: list[dict[str, str]] | None = None,
 ) -> list[str]:
     """Helper: start + complete a run, return the degraded_reasons list.
@@ -241,7 +242,10 @@ def _start_complete(
     supplied, preserving the legacy semantics of existing tests written
     before the #85 split (where ``sources_checked == 0`` implied
     ``fetched_total == 0``).  Tests that exercise the new
-    ``filter_stall`` discrimination supply both values explicitly.
+    ``filter_stall`` / ``filter_error`` discrimination supply both
+    values explicitly.
+
+    ``filter_errors_total`` defaults to ``None`` (no scorer failures).
     """
     if fetched_total is None:
         fetched_total = sources_checked if isinstance(sources_checked, int) else 0
@@ -251,6 +255,7 @@ def _start_complete(
         sources_checked=sources_checked,
         ingested=ingested,
         fetched_total=fetched_total,
+        filter_errors_total=filter_errors_total,
         source_acquisition_errors=source_acquisition_errors,
     )
 
@@ -872,3 +877,204 @@ def test_complete_default_fetched_total_when_omitted(tmp_path: Path) -> None:
     # ``fetched_total`` is recorded on every entry; absent when caller
     # didn't supply one.
     assert entry.get("fetched_total") is None
+
+
+# ── #85 review: filter_error detection (scorer execution failure) ───
+
+
+def test_filter_error_fires_on_single_run_when_filter_errors_total_positive(
+    tmp_path: Path,
+) -> None:
+    """A single FilterScorerError raises ``filter_error`` immediately.
+
+    Single-run signal — no consecutive-runs gate.  An ``ingested > 0``
+    case still fires because the scorer failed at least once even
+    if other batches/feeds succeeded (partial-failure visibility).
+    """
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=5,
+        ingested=3,
+        fetched_total=10,
+        filter_errors_total=1,
+    )
+    assert reasons == ["filter_error"]
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is True
+    assert entry["degraded_reasons"] == ["filter_error"]
+    assert entry["filter_errors_total"] == 1
+
+
+def test_filter_error_takes_precedence_over_filter_stall(tmp_path: Path) -> None:
+    """When both would apply, ``filter_error`` wins (mutual exclusion).
+
+    Reviewer concern from PR for #85: a scorer transport/parse/provider
+    failure leaves ``fetched_total > 0`` and ``sources_checked == 0``,
+    which used to misclassify as ``filter_stall`` and point operators
+    at the profile description / prompt.  After this fix the more-
+    specific ``filter_error`` is emitted instead.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    # Build a history shape that would otherwise satisfy filter_stall:
+    # prior non-zero history + a zero-checked-with-fetch run.
+    _start_complete(
+        ledger,
+        run_id="r-history",
+        profile="p",
+        sources_checked=10,
+        ingested=5,
+        fetched_total=10,
+    )
+    _start_complete(
+        ledger,
+        run_id="r-prior",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+    )
+    # Now the run with a scorer error.  filter_stall conditions are met
+    # (two consecutive sources_checked=0 with fetched_total>0 + history)
+    # but filter_errors_total > 0 must redirect to filter_error.
+    reasons = _start_complete(
+        ledger,
+        run_id="r-now",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        filter_errors_total=2,
+    )
+    assert "filter_error" in reasons
+    assert "filter_stall" not in reasons
+
+
+def test_filter_stall_still_fires_when_filter_errors_total_is_zero(
+    tmp_path: Path,
+) -> None:
+    """Clean filter rejection (no scorer errors) still produces filter_stall.
+
+    Guard against over-correcting: filter_stall is a real signal when
+    the scorer ran successfully but rejected everything.  filter_error
+    must not eclipse it.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(
+        ledger,
+        run_id="r-history",
+        profile="p",
+        sources_checked=10,
+        ingested=5,
+        fetched_total=10,
+    )
+    _start_complete(
+        ledger,
+        run_id="r-prior",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        filter_errors_total=0,
+    )
+    reasons = _start_complete(
+        ledger,
+        run_id="r-now",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        filter_errors_total=0,
+    )
+    assert reasons == ["filter_stall"]
+
+
+def test_filter_error_fires_on_backfill_run(tmp_path: Path) -> None:
+    """Scorer failure is actionable on any run kind, not just scheduled.
+
+    Stalls are gated on ``kind=scheduled`` because they describe trends.
+    A single scorer-execution failure is point-in-time and actionable
+    regardless of run kind, so ``filter_error`` does not gate on kind.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        kind="backfill",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        filter_errors_total=1,
+    )
+    assert reasons == ["filter_error"]
+
+
+def test_filter_error_persists_filter_errors_total_in_ledger_entry(
+    tmp_path: Path,
+) -> None:
+    """The ``filter_errors_total`` field is recorded on every completed run."""
+    ledger = RunLedger(tmp_path / "state")
+    _start_complete(
+        ledger,
+        run_id="r-clean",
+        profile="p",
+        sources_checked=5,
+        ingested=3,
+        fetched_total=5,
+        filter_errors_total=0,
+    )
+    _start_complete(
+        ledger,
+        run_id="r-error",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        filter_errors_total=3,
+    )
+    history = ledger.recent()
+    by_id = {e["run_id"]: e for e in history}
+    assert by_id["r-clean"]["filter_errors_total"] == 0
+    assert by_id["r-error"]["filter_errors_total"] == 3
+
+
+def test_filter_error_can_co_occur_with_source_acquisition(tmp_path: Path) -> None:
+    """A run can carry both ``source_acquisition`` and ``filter_error``.
+
+    They describe distinct, orthogonal failure modes — a swallowed
+    source-fetch error and a separate scorer execution failure can
+    happen on the same run (e.g. one source's fetch failed, another's
+    fetch succeeded but its filter call raised).
+    """
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        filter_errors_total=1,
+        source_acquisition_errors=[
+            {"source": "rss", "kind": "timeout", "detail": "feed X"},
+        ],
+    )
+    assert "source_acquisition" in reasons
+    assert "filter_error" in reasons
+    assert "filter_stall" not in reasons
+
+
+def test_complete_default_filter_errors_total_when_omitted(tmp_path: Path) -> None:
+    """Omitting ``filter_errors_total`` keeps the legacy signature working.
+
+    Mirrors the equivalent test for ``fetched_total``.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    reasons = ledger.complete(run_id="r-1", sources_checked=4, ingested=2)
+    assert reasons == []
+    entry = ledger.recent()[0]
+    assert entry.get("filter_errors_total") is None

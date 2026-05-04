@@ -47,6 +47,7 @@ from influx.telemetry import (
     current_run_id,
     get_tracer,
     record_fetched_items,
+    record_filter_error,
     record_source_acquisition_error,
 )
 from influx.urls import normalise_url, url_hash
@@ -616,6 +617,11 @@ def make_rss_item_provider(
                         feed_entry.name,
                         exc_info=True,
                     )
+                    # #85 review: see arxiv.py for rationale.  Per-feed
+                    # failures each tick the counter so a profile with
+                    # multiple feeds reflects the true partial-failure
+                    # surface.
+                    record_filter_error()
                     continue
                 _log.info(
                     "rss filter completed profile=%s feed=%r items=%d "

@@ -46,6 +46,7 @@ from influx.run import (
 from influx.run_ledger import RunLedger
 from influx.telemetry import (
     current_fetched_total,
+    current_filter_errors,
     current_run_id,
     current_source_acquisition_errors,
     get_tracer,
@@ -104,6 +105,11 @@ async def ledger_lifecycle(
     # filter_stall vs fetch_stall split.
     fetched_total_counter: list[int] = [0]
     fetched_total_token = current_fetched_total.set(fetched_total_counter)
+    # #85 review: per-run count of FilterScorerError catches.  Lets the
+    # ledger fire ``filter_error`` (scorer execution failed) instead of
+    # misclassifying as ``filter_stall`` (scorer ran, rejected all).
+    filter_errors_counter: list[int] = [0]
+    filter_errors_token = current_filter_errors.set(filter_errors_counter)
     metric_attrs = {"profile": profile, "run_type": plan.kind.value}
 
     ledger.start(
@@ -166,11 +172,14 @@ async def ledger_lifecycle(
         # still pass the counter value (typically 0) so the ledger
         # entry carries the field for downstream consumers.
         fetched_total = fetched_total_counter[0]
+        # #85 review: same pattern for filter-execution failures.
+        filter_errors_total = filter_errors_counter[0]
         degraded_reasons = ledger.complete(
             run_id=run_id,
             sources_checked=sources_checked,
             ingested=ingested,
             fetched_total=fetched_total,
+            filter_errors_total=filter_errors_total,
             source_acquisition_errors=source_errors,
         )
         run_outcome = "degraded" if source_errors else "success"
@@ -204,11 +213,11 @@ async def ledger_lifecycle(
                 run_id,
             )
         if "filter_stall" in degraded_reasons:
-            # #85: items WERE fetched (fetched_total > 0) but the LLM
-            # filter rejected every candidate so sources_checked
-            # landed at 0.  Operator triage points at filter-side
-            # causes — distinct from fetch_stall, which points at
-            # fetch-side causes.
+            # #85: items WERE fetched (fetched_total > 0), the filter
+            # ran cleanly, and rejected every candidate so
+            # sources_checked landed at 0.  Operator triage points at
+            # filter-side causes — distinct from fetch_stall (fetch
+            # side) and filter_error (scorer execution failure).
             metrics.ingestion_stalls().add(
                 1, {"profile": profile, "reason": "filter_stall"}
             )
@@ -224,6 +233,30 @@ async def ledger_lifecycle(
                 plan.kind.value,
                 run_id,
                 fetched_total,
+            )
+        if "filter_error" in degraded_reasons:
+            # #85 review: the filter scorer raised FilterScorerError at
+            # least once this run (transport / parse / provider).
+            # Distinct from filter_stall (scorer ran cleanly, rejected
+            # all) — operators should look at provider config, model
+            # availability, and recent prompt schema changes, NOT the
+            # profile description or score threshold.  Single-run
+            # signal: no consecutive-runs gate.
+            metrics.ingestion_stalls().add(
+                1, {"profile": profile, "reason": "filter_error"}
+            )
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged filter_error profile=%s kind=%s run_id=%s "
+                "filter_errors=%d "
+                "(filter scorer raised FilterScorerError — check "
+                "provider config, model availability, response "
+                "schema; not a profile/prompt issue)",
+                profile,
+                plan.kind.value,
+                run_id,
+                filter_errors_total,
             )
         metrics.run_duration().record(elapsed, metric_attrs)
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
@@ -277,6 +310,7 @@ async def ledger_lifecycle(
         current_run_id.reset(run_id_token)
         current_source_acquisition_errors.reset(source_errors_token)
         current_fetched_total.reset(fetched_total_token)
+        current_filter_errors.reset(filter_errors_token)
 
 
 # ── RunService ──────────────────────────────────────────────────────

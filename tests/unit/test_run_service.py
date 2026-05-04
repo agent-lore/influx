@@ -39,6 +39,7 @@ from influx.run_ledger import RunLedger
 from influx.run_service import RunService, run_via_service
 from influx.telemetry import (
     current_fetched_total,
+    current_filter_errors,
     current_source_acquisition_errors,
 )
 
@@ -560,3 +561,85 @@ async def test_run_completed_log_degraded_false_for_clean_run(
 
     record = _extract_run_completed_record(caplog)
     assert "degraded=False" in record.message
+
+
+async def test_filter_error_emits_warning_with_scorer_failure_guidance(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """filter_error (#85 review) fires its WARNING with scorer-failure text.
+
+    A FilterScorerError caught by a source adapter increments the
+    per-run filter_errors counter.  Even when the run shape would also
+    satisfy filter_stall (fetched_total > 0, sources_checked == 0),
+    the operator-facing WARNING must point at scorer execution causes
+    (provider config / model availability / response schema), NOT at
+    profile description / prompt / threshold.
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    _seed_filter_stall_history(ledger, profile="alpha")
+    service = RunService(config=config, ledger=ledger)
+
+    async def body_with_scorer_failure(self: Any) -> RunOutcome:
+        # Source layer fetched items, then the scorer raised.
+        fetched_counter = current_fetched_total.get()
+        assert fetched_counter is not None
+        fetched_counter[0] += 10
+        # Source layer caught FilterScorerError → record it.
+        filter_errors_counter = current_filter_errors.get()
+        assert filter_errors_counter is not None
+        filter_errors_counter[0] += 1
+        # No items survive the failed scorer batch.
+        return RunOutcome(sources_checked=0, ingested=0, fetched_total=10)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="influx.run_service"),
+        patch("influx.run.Run.execute", new=body_with_scorer_failure),
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert "filter_error" in entry["degraded_reasons"]
+    # Mutual exclusion: filter_stall must NOT also fire.
+    assert "filter_stall" not in entry["degraded_reasons"]
+    assert entry["filter_errors_total"] == 1
+
+    warnings = [r for r in caplog.records if "filter_error" in r.message]
+    assert warnings, "expected a filter_error WARNING"
+    msg = warnings[0].message
+    # Scorer-failure guidance — operator should look at provider, not profile.
+    assert "FilterScorerError" in msg
+    assert "provider config" in msg or "provider" in msg.lower()
+    # Must NOT misdirect to filter_stall guidance.
+    assert "min_score_in_results" not in msg
+    assert "profile description" not in msg
+
+
+async def test_filter_error_does_not_collide_with_filter_stall(
+    tmp_path: Path,
+) -> None:
+    """When filter_errors_total > 0 in a filter_stall-shaped run, ONLY
+    ``filter_error`` is emitted (mutual exclusion at the ledger boundary).
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    _seed_filter_stall_history(ledger, profile="alpha")
+    service = RunService(config=config, ledger=ledger)
+
+    async def body(self: Any) -> RunOutcome:
+        fetched_counter = current_fetched_total.get()
+        assert fetched_counter is not None
+        fetched_counter[0] += 7
+        filter_errors_counter = current_filter_errors.get()
+        assert filter_errors_counter is not None
+        filter_errors_counter[0] += 2
+        return RunOutcome(sources_checked=0, ingested=0, fetched_total=7)
+
+    with patch("influx.run.Run.execute", new=body):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert "filter_error" in entry["degraded_reasons"]
+    assert "filter_stall" not in entry["degraded_reasons"]
+    assert "fetch_stall" not in entry["degraded_reasons"]

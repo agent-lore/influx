@@ -32,11 +32,13 @@ __all__ = [
     "SpanWrapper",
     "current_archive_terminal_arxiv_ids",
     "current_fetched_total",
+    "current_filter_errors",
     "current_run_id",
     "current_source_acquisition_errors",
     "get_meter",
     "get_tracer",
     "record_fetched_items",
+    "record_filter_error",
     "record_source_acquisition_error",
 ]
 
@@ -144,6 +146,33 @@ def record_fetched_items(count: int) -> None:
     if counter is None:
         return
     counter[0] += count
+
+
+# Per-run counter of LLM-filter execution failures (FilterScorerError).
+# Set to ``[0]`` at run start by ``run_service.ledger_lifecycle``;
+# source adapters increment via :func:`record_filter_error` from the
+# ``except FilterScorerError`` arm.  Used by the run ledger to
+# discriminate ``filter_error`` (the scorer failed — transport, parse,
+# or provider error) from ``filter_stall`` (the scorer ran and
+# rejected every candidate) — review on PR for #85.
+current_filter_errors: ContextVar[list[int] | None] = ContextVar(
+    "current_filter_errors",
+    default=None,
+)
+
+
+def record_filter_error() -> None:
+    """Increment the current run's ``filter_errors_total`` (#85 review).
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_filter_errors` is unset.  Source adapters call this
+    once per ``FilterScorerError`` (one per failed batch / feed).
+    Multiple errors in the same run accumulate.
+    """
+    counter = current_filter_errors.get()
+    if counter is None:
+        return
+    counter[0] += 1
 
 
 logger = logging.getLogger(__name__)
