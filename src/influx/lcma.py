@@ -31,6 +31,56 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _ARXIV_RE = re.compile(r"arXiv:(\d{4}\.\d{4,5}(?:v\d+)?)")
 
 
+def _escape_phrase_inner(s: str) -> str:
+    """Backslash-escape ``\\`` and ``"`` for inclusion inside a phrase query."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _phrase_quote(s: str) -> str:
+    """Wrap *s* as a Tantivy phrase query, backslash-escaping ``\\`` and ``"``.
+
+    Phrase quoting neutralises Tantivy reserved characters inside the
+    payload (notably ``:`` from ``Topic: Subtitle`` titles, plus ``(``,
+    ``)``, ``'``), so the parser cannot mistake content for field
+    qualifiers or syntax (#80).
+    """
+    return f'"{_escape_phrase_inner(s)}"'
+
+
+def _fit_phrase(content: str, budget: int) -> str:
+    """Return a phrase-quoted form of *content* with total length ``<= budget``.
+
+    Truncates from the tail of the *escaped* form so the result is
+    always syntactically balanced — both surrounding quotes survive,
+    and a trailing odd-count run of backslashes (which would cut a
+    ``\\\\`` or ``\\"`` escape in half) is shaved off.
+
+    Returns ``'""'`` (empty phrase) when *budget* < the escaped length
+    of the content but the budget still leaves room for the two
+    surrounding quotes.
+    """
+    if budget < 2:
+        return ""
+    escaped = _escape_phrase_inner(content)
+    inner_budget = budget - 2
+    if len(escaped) <= inner_budget:
+        return f'"{escaped}"'
+
+    truncated = escaped[:inner_budget]
+    # Avoid leaving a dangling escape: every backslash in the escaped
+    # form is the leading half of either ``\\`` or ``\"``. An odd
+    # trailing run means we truncated mid-escape — drop one to restore
+    # a valid escaped string.
+    trailing = 0
+    i = len(truncated) - 1
+    while i >= 0 and truncated[i] == "\\":
+        trailing += 1
+        i -= 1
+    if trailing % 2 == 1:
+        truncated = truncated[:-1]
+    return f'"{truncated}"'
+
+
 def compose_retrieve_query(
     title: str,
     contributions: list[str] | None = None,
@@ -42,22 +92,38 @@ def compose_retrieve_query(
        trim each, and skip any that are empty after trimming. Empty
        elements within those first three are dropped, NOT replaced by
        later non-empty entries (FR-LCMA-2 step 2).
-    3. Join the surviving parts with ``" | "``.
-    4. Collapse internal whitespace runs to a single space.
-    5. Truncate to 500 characters (simple slice, no word re-wrap).
+    3. Collapse internal whitespace runs to a single space within each
+       disjunct.
+    4. Wrap each disjunct as a Tantivy phrase (double-quoted, with
+       ``\\`` and ``"`` escaped) so reserved characters in titles like
+       ``Topic: Subtitle`` cannot be parsed as field qualifiers (#80).
+    5. Join the wrapped parts with ``" | "``.
+    6. Bound the final string at 500 characters while preserving
+       Tantivy syntactic validity: the title phrase is truncated as a
+       phrase if needed, and any contribution whose wrapped form would
+       overflow the remaining budget is dropped (no mid-phrase slicing
+       — see #80 review).
     """
-    parts: list[str] = [title]
+    parts: list[str] = [_WHITESPACE_RE.sub(" ", title).strip()]
 
     if contributions is not None:
         for c in contributions[:_MAX_CONTRIBUTIONS]:
-            stripped = c.strip()
+            stripped = _WHITESPACE_RE.sub(" ", c).strip()
             if not stripped:
                 continue
             parts.append(stripped)
 
-    composed = " | ".join(parts)
-    composed = _WHITESPACE_RE.sub(" ", composed)
-    return composed[:_MAX_QUERY_LEN]
+    title_phrase = _fit_phrase(parts[0], _MAX_QUERY_LEN)
+    pieces = [title_phrase]
+    used = len(title_phrase)
+    separator = " | "
+    for content in parts[1:]:
+        wrapped = _phrase_quote(content)
+        if used + len(separator) + len(wrapped) > _MAX_QUERY_LEN:
+            break
+        pieces.append(wrapped)
+        used += len(separator) + len(wrapped)
+    return separator.join(pieces)
 
 
 def extract_arxiv_ref(item: str) -> tuple[str, str] | None:
