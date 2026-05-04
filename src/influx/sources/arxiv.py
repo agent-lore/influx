@@ -49,6 +49,7 @@ from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
     current_run_id,
     get_tracer,
+    record_fetched_items,
     record_source_acquisition_error,
 )
 
@@ -848,6 +849,13 @@ class ArxivSource:
             metrics.candidates_fetched().add(
                 len(items), {"profile": profile, "source": "arxiv"}
             )
+            # #85: feed the pre-filter count into the run-level
+            # ``fetched_total`` so the ledger can split fetch_stall
+            # (no items reached the filter) from filter_stall (items
+            # reached the filter, all rejected).  Source-error path
+            # above returned early on NetworkError, so this only fires
+            # when the fetch actually succeeded.
+            record_fetched_items(len(items))
             _log.info(
                 "arxiv fetch completed profile=%s kind=%s items=%d",
                 profile,

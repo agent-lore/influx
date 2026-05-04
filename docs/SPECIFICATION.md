@@ -651,10 +651,11 @@ When the Lithos probe has been ``degraded`` for **3 consecutive cycles** (defaul
 Run-ledger entries carry a structured `degraded_reasons` field listing why a completed run was marked `degraded=True`.  Today the values are:
 
 - `"source_acquisition"` — at least one source-fetch failure was swallowed during the run (issue #20).
-- `"ingestion_stall"` — this and the immediately prior scheduled run for the same profile both saw `ingested == 0` despite `sources_checked > 0` (issue #36).  Typical causes: every candidate hit `slug_collision`/`duplicate`, the LLM filter rejected everything, or upstream sources started returning content the profile no longer accepts.  Backfills are excluded from this check (their ingest pattern is fundamentally different — they legitimately ingest 0 when every candidate is a cache hit).
-- `"fetch_stall"` — this and the immediately prior scheduled run for the same profile both saw `sources_checked == 0`, AND the profile has historically seen `sources_checked > 0` within the recent ledger window (issue #50).  Catches the case `ingestion_stall` filters out: nothing reached the inspection loop at all (e.g. too-narrow `lookback_days`, upstream feed shape change).  The historical ratchet silences brand-new profiles and profiles that genuinely never receive items.  Mutually exclusive with `ingestion_stall` (different `sources_checked` conditions).  Backfills are excluded.
+- `"ingestion_stall"` — this and the immediately prior scheduled run for the same profile both saw `ingested == 0` despite `sources_checked > 0` (issue #36).  Typical causes: every candidate hit `slug_collision`/`duplicate`, all writes were cache-merge with no new content, or upstream sources started returning content the profile no longer accepts.  Backfills are excluded from this check (their ingest pattern is fundamentally different — they legitimately ingest 0 when every candidate is a cache hit).
+- `"fetch_stall"` — this and the immediately prior scheduled run for the same profile both saw `fetched_total == 0` (no source returned any items at all), AND the profile has historically seen `sources_checked > 0` within the recent ledger window (issue #50).  Typical cause: too-narrow `lookback_days` or an upstream feed shape change leaving the fetch path empty.  The historical ratchet silences brand-new profiles and profiles that genuinely never receive items.  Backfills are excluded.
+- `"filter_stall"` — this and the immediately prior scheduled run for the same profile both saw `fetched_total > 0 AND sources_checked == 0` (sources fetched normally but the LLM filter rejected every candidate), AND the profile has historically seen `sources_checked > 0` within the recent ledger window (issue #85).  Typical cause: profile description drift, filter prompt regression, or `min_score_in_results` set too high.  Mutually exclusive with `fetch_stall` (different `fetched_total` conditions) and with `ingestion_stall` (different `sources_checked` conditions).  Backfills are excluded.
 
-Multiple reasons can apply to a single run.  `influx_ingestion_stall_runs_total{profile, reason}` ticks once per stall-flagged run, split by reason so dashboards can alert on each signal independently.
+Multiple reasons can apply to a single run, but the three stall reasons (`ingestion_stall`, `fetch_stall`, `filter_stall`) are mutually exclusive on any single run.  `influx_ingestion_stall_runs_total{profile, reason}` ticks once per stall-flagged run, split by reason so dashboards can alert on each signal independently.
 
 ### 13.2 Telemetry
 
@@ -683,7 +684,7 @@ Metric instruments cover run lifecycle, the source funnel, write outcomes, and f
 | `influx_slug_collision_reclaimed_total` | Counter | _(no labels)_ |
 | `influx_slug_collision_unresolved_total` | Counter | `profile`, `source` |
 | `influx_runs_skipped_total` | Counter | `profile`, `reason` |
-| `influx_ingestion_stall_runs_total` | Counter | `profile`, `reason` (`ingestion_stall` \| `fetch_stall`) |
+| `influx_ingestion_stall_runs_total` | Counter | `profile`, `reason` (`ingestion_stall` \| `fetch_stall` \| `filter_stall`) |
 
 When `OTEL_EXPORTER_OTLP_ENDPOINT` is set the OTLP HTTP exporter is used. With `INFLUX_OTEL_CONSOLE_FALLBACK=true` and no endpoint configured, both spans and metrics are written to stdout for local development.
 

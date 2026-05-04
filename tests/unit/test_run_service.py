@@ -37,7 +37,10 @@ from influx.coordinator import RunKind
 from influx.run import RunOutcome, RunPlan
 from influx.run_ledger import RunLedger
 from influx.run_service import RunService, run_via_service
-from influx.telemetry import current_source_acquisition_errors
+from influx.telemetry import (
+    current_fetched_total,
+    current_source_acquisition_errors,
+)
 
 
 def _make_config(state_dir: str = "/tmp/influx-test") -> AppConfig:
@@ -319,6 +322,7 @@ def _seed_fetch_stall_history(ledger: RunLedger, profile: str) -> None:
         run_id="prior-history",
         sources_checked=5,
         ingested=2,
+        fetched_total=5,
     )
     ledger.start(
         run_id="prior-zero-fetch",
@@ -330,6 +334,41 @@ def _seed_fetch_stall_history(ledger: RunLedger, profile: str) -> None:
         run_id="prior-zero-fetch",
         sources_checked=0,
         ingested=0,
+        fetched_total=0,
+    )
+
+
+def _seed_filter_stall_history(ledger: RunLedger, profile: str) -> None:
+    """Seed history so the next (fetched > 0, sources_checked = 0) run
+    trips filter_stall (#85).
+
+    Requires (a) a prior non-zero ``sources_checked`` run (the
+    historical-ratchet) and (b) one prior consecutive
+    ``sources_checked == 0 AND fetched_total > 0`` scheduled run.
+    """
+    ledger.start(
+        run_id="prior-history",
+        profile=profile,
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.complete(
+        run_id="prior-history",
+        sources_checked=5,
+        ingested=2,
+        fetched_total=5,
+    )
+    ledger.start(
+        run_id="prior-filter-rejected",
+        profile=profile,
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.complete(
+        run_id="prior-filter-rejected",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
     )
 
 
@@ -427,6 +466,76 @@ async def test_run_completed_log_degraded_true_for_fetch_stall(
 
     record = _extract_run_completed_record(caplog)
     assert "degraded=True" in record.message
+
+
+async def test_filter_stall_emits_warning_and_metric_tick(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """filter_stall (#85) fires its WARNING and ticks the stall metric.
+
+    Mirrors the staging-robotics 2026-05-04 12:00:30 shape: sources
+    fetched 61 items (10 arXiv + 51 RSS) but the LLM filter rejected
+    every candidate so ``sources_checked`` landed at 0.  A prior
+    matching run + non-zero history is seeded so the second run trips
+    ``filter_stall`` (not ``fetch_stall``).
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    _seed_filter_stall_history(ledger, profile="alpha")
+    service = RunService(config=config, ledger=ledger)
+
+    async def body_with_fetched_items(self: Any) -> RunOutcome:
+        # Populate the per-run pre-filter counter the way the real
+        # source layer does: from inside the lifecycle CM, after the
+        # contextvar has been set.
+        counter = current_fetched_total.get()
+        assert counter is not None
+        counter[0] += 61  # 10 arxiv + 51 rss → matches the real shape
+        return RunOutcome(sources_checked=0, ingested=0, fetched_total=61)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="influx.run_service"),
+        patch("influx.run.Run.execute", new=body_with_fetched_items),
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert entry["degraded_reasons"] == ["filter_stall"]
+    assert entry["fetched_total"] == 61
+    # Verify the operator-facing WARNING fired with filter-side guidance.
+    warnings = [r for r in caplog.records if "filter_stall" in r.message]
+    assert warnings, "expected a filter_stall WARNING"
+    assert "filter rejected all candidates" in warnings[0].message
+
+
+async def test_filter_stall_does_not_collide_with_fetch_stall(
+    tmp_path: Path,
+) -> None:
+    """A run with ``fetched_total > 0`` and ``sources_checked == 0`` emits
+    ``filter_stall`` only — never ``fetch_stall``.
+
+    Mutual exclusion guard.  Seeded history satisfies both ratchets,
+    but the (fetched, checked) shape selects exactly one reason.
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    _seed_filter_stall_history(ledger, profile="alpha")
+    service = RunService(config=config, ledger=ledger)
+
+    async def body_with_fetched_items(self: Any) -> RunOutcome:
+        counter = current_fetched_total.get()
+        assert counter is not None
+        counter[0] += 7
+        return RunOutcome(sources_checked=0, ingested=0, fetched_total=7)
+
+    with patch("influx.run.Run.execute", new=body_with_fetched_items):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert "filter_stall" in entry["degraded_reasons"]
+    assert "fetch_stall" not in entry["degraded_reasons"]
+    assert "ingestion_stall" not in entry["degraded_reasons"]
 
 
 async def test_run_completed_log_degraded_false_for_clean_run(

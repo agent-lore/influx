@@ -24,10 +24,11 @@ RunEntry = dict[str, Any]
 #
 # Twenty is chosen to roughly match a *day* of scheduled runs at the
 # typical hourly cadence, so the historical-ratchet for #50
-# (``fetch_stall``) tolerates a half-day window of zero fetches before
-# stale history disqualifies the profile from ratcheting.  It also
-# matches the historical default of :meth:`recent` which the
-# ``ingestion_stall`` (#36) check used implicitly.
+# (``fetch_stall``) and #85 (``filter_stall``) tolerates a half-day
+# window of zero-checked runs before stale history disqualifies the
+# profile from ratcheting.  It also matches the historical default of
+# :meth:`recent` which the ``ingestion_stall`` (#36) check used
+# implicitly.
 _STALL_HISTORY_LIMIT = 20
 
 
@@ -78,6 +79,7 @@ class RunLedger:
             "duration_seconds": None,
             "sources_checked": None,
             "ingested": None,
+            "fetched_total": None,
             "error": None,
             "degraded": False,
             "degraded_reasons": [],
@@ -96,28 +98,39 @@ class RunLedger:
         run_id: str,
         sources_checked: int | None,
         ingested: int | None,
+        fetched_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Mark an active run as completed and append it to history.
 
         Returns the structured ``degraded_reasons`` list that was
-        recorded — one of: ``[]`` (clean run), ``["source_acquisition"]``
-        (issue #20: swallowed source-fetch failures),
-        ``["ingestion_stall"]`` (issue #36: this and the immediately
-        prior scheduled run for the same profile both saw
-        ``ingested == 0`` despite ``sources_checked > 0`` — typically a
-        slug-collision squatter, all-duplicate writes, etc.), or
-        ``["fetch_stall"]`` (issue #50: this and the immediately prior
-        scheduled run for the same profile both saw
-        ``sources_checked == 0``, AND the profile has historically seen
-        ``sources_checked > 0`` within the recent window — typically a
-        too-narrow ``lookback_days`` or an upstream feed shape change).
-        When several apply the list contains every reason.
+        recorded.  Possible values (mutually exclusive among the three
+        stall reasons on a single run):
 
-        ``ingestion_stall`` and ``fetch_stall`` are mutually exclusive
-        for any single run: ``ingestion_stall`` requires
-        ``sources_checked > 0`` while ``fetch_stall`` requires
-        ``sources_checked == 0``.
+        - ``"source_acquisition"`` (issue #20) — at least one
+          source-fetch failure was swallowed.
+        - ``"ingestion_stall"`` (issue #36) — this and the immediately
+          prior scheduled run both saw ``ingested == 0`` despite
+          ``sources_checked > 0``.  Typical cause: every candidate hits
+          ``slug_collision``/``duplicate``.
+        - ``"fetch_stall"`` (issue #50) — this and the immediately
+          prior scheduled run both saw ``fetched_total == 0`` (no
+          source returned any items at all), AND the profile has
+          historically seen ``sources_checked > 0``.  Typical cause:
+          too-narrow ``lookback_days`` or an upstream feed shape change.
+        - ``"filter_stall"`` (issue #85) — this and the immediately
+          prior scheduled run both saw ``fetched_total > 0`` but
+          ``sources_checked == 0`` (the LLM filter rejected every
+          candidate), AND the profile has historically seen
+          ``sources_checked > 0``.  Typical cause: profile description
+          drift, filter prompt regression, or
+          ``min_score_in_results`` set too high.
+
+        ``fetch_stall`` and ``filter_stall`` partition the
+        ``sources_checked == 0`` space by ``fetched_total``: they are
+        mutually exclusive on a single run.  ``ingestion_stall``
+        requires ``sources_checked > 0``, so it is mutually exclusive
+        with both.
 
         Returning the reasons lets the caller (the scheduler) emit
         per-reason metrics without re-deriving the logic.
@@ -127,10 +140,11 @@ class RunLedger:
         if errors:
             reasons.append("source_acquisition")
 
-        # Resolve profile + kind once for both stall checks.  Both flags
-        # only apply to scheduled runs (backfills legitimately ingest 0
-        # when every candidate is a cache hit, and operator-triggered
-        # manual runs may use a deliberately narrow lookback).
+        # Resolve profile + kind once for the stall checks.  All three
+        # stall flags only apply to scheduled runs (backfills
+        # legitimately ingest 0 when every candidate is a cache hit,
+        # and operator-triggered manual runs may use a deliberately
+        # narrow lookback).
         active = self._read_active()
         entry = active.get(run_id, {})
         profile = entry.get("profile")
@@ -156,28 +170,47 @@ class RunLedger:
             if consecutive >= 2:
                 reasons.append("ingestion_stall")
 
-        # #50 fetch-stall detection: complementary to ingestion_stall.
-        # Catches the zero-fetch case (sources_checked == 0) that #36
-        # explicitly filtered out as a "quiet window".  The
-        # historical-ratchet — profile has previously seen
-        # ``sources_checked > 0`` within the recent ledger window —
-        # silences brand-new profiles and profiles that genuinely never
-        # receive items.
+        # #50 / #85: zero-sources_checked split.  ``fetch_stall`` keeps
+        # the original semantics — *no items reached the filter* —
+        # while ``filter_stall`` (#85) catches the case where sources
+        # fetched normally but the filter rejected every candidate.
+        # Both share the historical-ratchet ("profile has previously
+        # seen ``sources_checked > 0``") that silences brand-new
+        # profiles and profiles that genuinely never receive items.
         if is_scheduled and isinstance(sources_checked, int) and sources_checked == 0:
             assert isinstance(profile, str)  # narrowed by is_scheduled
-            consecutive_zero_fetch = 1 + self._consecutive_zero_fetch_runs(
-                profile=profile, exclude_run_id=run_id
-            )
-            if consecutive_zero_fetch >= 2 and self._has_prior_non_zero_fetch(
-                profile=profile, exclude_run_id=run_id
-            ):
-                reasons.append("fetch_stall")
+
+            if isinstance(fetched_total, int) and fetched_total > 0:
+                # #85 filter_stall: items WERE fetched, the filter
+                # rejected them all.  Streak counts prior scheduled
+                # runs that match the same shape (sources_checked == 0
+                # AND fetched_total > 0).
+                consecutive_filter = 1 + self._consecutive_zero_check_with_fetch_runs(
+                    profile=profile, exclude_run_id=run_id
+                )
+                if consecutive_filter >= 2 and self._has_prior_non_zero_fetch(
+                    profile=profile, exclude_run_id=run_id
+                ):
+                    reasons.append("filter_stall")
+            else:
+                # #50 fetch_stall: nothing was fetched at all.  Either
+                # ``fetched_total`` was explicitly 0 or the caller
+                # didn't supply one (legacy path) — both fall to
+                # fetch_stall to preserve pre-#85 semantics.
+                consecutive_zero_fetch = 1 + self._consecutive_zero_fetch_runs(
+                    profile=profile, exclude_run_id=run_id
+                )
+                if consecutive_zero_fetch >= 2 and self._has_prior_non_zero_fetch(
+                    profile=profile, exclude_run_id=run_id
+                ):
+                    reasons.append("fetch_stall")
 
         self._finish(
             run_id=run_id,
             status="completed",
             sources_checked=sources_checked,
             ingested=ingested,
+            fetched_total=fetched_total,
             error=None,
             degraded=bool(reasons),
             source_acquisition_errors=errors,
@@ -219,12 +252,42 @@ class RunLedger:
         return count
 
     def _consecutive_zero_fetch_runs(self, *, profile: str, exclude_run_id: str) -> int:
-        """Count consecutive prior scheduled runs with ``sources_checked == 0``.
+        """Count consecutive prior scheduled runs with ``fetched_total == 0``.
 
         Walks ``recent()`` newest-first.  Stops at the first scheduled
         run that doesn't match.  Used by :meth:`complete` to compute the
-        ``fetch_stall`` degraded reason (#50).  Symmetric with
-        :meth:`_consecutive_zero_ingestion_runs`.
+        ``fetch_stall`` degraded reason (#50).
+
+        ``fetched_total`` was added in #85; legacy ledger entries
+        without that field but with ``sources_checked == 0`` are
+        treated as zero-fetch for backward-compatibility (the pre-#85
+        invariant ``fetched_total == 0 ↔ sources_checked == 0`` holds
+        by construction since the LLM-filter rejection was the only
+        new way to land at ``sources_checked == 0`` despite a
+        successful fetch).
+        """
+        count = 0
+        for prior in self.recent(limit=_STALL_HISTORY_LIMIT, profile=profile):
+            if prior.get("run_id") == exclude_run_id:
+                continue
+            if prior.get("kind") != "scheduled":
+                continue
+            if self._is_zero_fetch_entry(prior):
+                count += 1
+                continue
+            break
+        return count
+
+    def _consecutive_zero_check_with_fetch_runs(
+        self, *, profile: str, exclude_run_id: str
+    ) -> int:
+        """Count consecutive prior scheduled runs matching the filter_stall shape.
+
+        Walks ``recent()`` newest-first, counting runs where
+        ``sources_checked == 0 AND fetched_total > 0`` for *profile*
+        of kind ``scheduled``.  Stops at the first run that doesn't
+        match.  Used by :meth:`complete` to compute the
+        ``filter_stall`` degraded reason (#85).
         """
         count = 0
         for prior in self.recent(limit=_STALL_HISTORY_LIMIT, profile=profile):
@@ -233,11 +296,34 @@ class RunLedger:
             if prior.get("kind") != "scheduled":
                 continue
             sources_checked = prior.get("sources_checked")
-            if isinstance(sources_checked, int) and sources_checked == 0:
+            fetched_total = prior.get("fetched_total")
+            if (
+                isinstance(sources_checked, int)
+                and sources_checked == 0
+                and isinstance(fetched_total, int)
+                and fetched_total > 0
+            ):
                 count += 1
                 continue
             break
         return count
+
+    @staticmethod
+    def _is_zero_fetch_entry(entry: RunEntry) -> bool:
+        """Return ``True`` when *entry* matches the fetch-stall shape.
+
+        ``fetched_total == 0`` is the explicit signal added in #85;
+        legacy entries without that field but with
+        ``sources_checked == 0`` are treated as zero-fetch.
+        """
+        sources_checked = entry.get("sources_checked")
+        if not (isinstance(sources_checked, int) and sources_checked == 0):
+            return False
+        fetched_total = entry.get("fetched_total")
+        if isinstance(fetched_total, int):
+            return fetched_total == 0
+        # Legacy entry written before #85 added ``fetched_total``.
+        return True
 
     def _has_prior_non_zero_fetch(self, *, profile: str, exclude_run_id: str) -> bool:
         """Return whether *profile* has ever fetched items in recent history.
@@ -439,6 +525,7 @@ class RunLedger:
         sources_checked: int | None,
         ingested: int | None,
         error: str | None,
+        fetched_total: int | None = None,
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
@@ -468,6 +555,7 @@ class RunLedger:
                     ),
                     "sources_checked": sources_checked,
                     "ingested": ingested,
+                    "fetched_total": fetched_total,
                     "error": error,
                     "degraded": degraded,
                     "degraded_reasons": list(degraded_reasons or []),

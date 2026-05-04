@@ -31,10 +31,12 @@ __all__ = [
     "SourceAcquisitionError",
     "SpanWrapper",
     "current_archive_terminal_arxiv_ids",
+    "current_fetched_total",
     "current_run_id",
     "current_source_acquisition_errors",
     "get_meter",
     "get_tracer",
+    "record_fetched_items",
     "record_source_acquisition_error",
 ]
 
@@ -102,6 +104,46 @@ def record_source_acquisition_error(
             }
         )
     )
+
+
+# Per-run counter of pre-filter fetched candidates.  Set to ``[0]`` at
+# run start by ``run_service.ledger_lifecycle``; source adapters
+# increment via :func:`record_fetched_items` after a successful fetch
+# (BEFORE the LLM filter runs).  The scheduler reads it at run end so
+# the run-ledger entry can split ``fetch_stall`` (no items reached the
+# filter) from ``filter_stall`` (items reached the filter, all
+# rejected) — issue #85.
+#
+# A list-of-ints (rather than a bare int) is used so that incrementing
+# from the source layer mutates a shared mutable container, mirroring
+# the :data:`current_source_acquisition_errors` pattern: callers don't
+# have to worry about ContextVar.set semantics on top of an immutable
+# integer.
+current_fetched_total: ContextVar[list[int] | None] = ContextVar(
+    "current_fetched_total",
+    default=None,
+)
+
+
+def record_fetched_items(count: int) -> None:
+    """Add *count* to the current run's pre-filter ``fetched_total`` (#85).
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_fetched_total` is unset.  Source adapters call this
+    once per fetch batch, AFTER a successful fetch and BEFORE the LLM
+    filter runs, so the count reflects the raw item population the
+    filter saw.
+
+    A source that errors during fetch contributes 0 (don't call this
+    on the error path).  Multiple sources on one profile (arXiv +
+    RSS) accumulate via successive calls.
+    """
+    if count <= 0:
+        return
+    counter = current_fetched_total.get()
+    if counter is None:
+        return
+    counter[0] += count
 
 
 logger = logging.getLogger(__name__)

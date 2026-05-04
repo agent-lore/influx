@@ -195,36 +195,50 @@ def archive_missing() -> Any:
 def ingestion_stalls() -> Any:
     """Counter of runs flagged with a stall ``degraded_reasons`` value.
 
-    Combines the #36 ``ingestion_stall`` and #50 ``fetch_stall``
-    signals on a single instrument, split by the ``reason`` label so
-    dashboards can alert on each independently.
+    Combines the #36 ``ingestion_stall``, #50 ``fetch_stall`` and #85
+    ``filter_stall`` signals on a single instrument, split by the
+    ``reason`` label so dashboards can alert on each independently.
+    The three reasons are mutually exclusive on a single run.
 
     ``reason="ingestion_stall"`` (#36): increments once per scheduled
     run that completes with ``ingested == 0 AND sources_checked > 0``
     AND the immediately prior scheduled run for the same profile
     also matched that shape — TWO consecutive
     inspect-something-but-write-nothing sweeps.  Typical causes: every
-    candidate hits ``slug_collision`` / ``duplicate``, or the LLM
-    filter is rejecting everything.
+    candidate hits ``slug_collision`` / ``duplicate``, all writes are
+    cache-merge with no new content, etc.
 
     ``reason="fetch_stall"`` (#50): increments once per scheduled run
-    that completes with ``sources_checked == 0`` AND the immediately
-    prior scheduled run for the same profile also saw zero
-    sources_checked AND the profile has historically seen
-    ``sources_checked > 0`` within the recent ledger window.  Typical
-    cause: too-narrow ``lookback_days`` or an upstream feed shape
-    change leaving the inspection loop empty.
+    that completes with ``fetched_total == 0`` (no source returned
+    any items at all) AND the immediately prior scheduled run for
+    the same profile also saw the same shape AND the profile has
+    historically seen ``sources_checked > 0`` within the recent
+    ledger window.  Typical cause: too-narrow ``lookback_days`` or
+    an upstream feed shape change leaving the fetch path empty.
+
+    ``reason="filter_stall"`` (#85): increments once per scheduled
+    run that completes with ``fetched_total > 0 AND
+    sources_checked == 0`` (sources fetched normally but the LLM
+    filter rejected every candidate) AND the immediately prior
+    scheduled run for the same profile also matched that shape AND
+    the profile has historically seen ``sources_checked > 0`` within
+    the recent ledger window.  Typical cause: profile description
+    drift, filter prompt regression, or a ``min_score_in_results``
+    set too high.
 
     Labels: ``profile``, ``reason``
-    (``"ingestion_stall"`` | ``"fetch_stall"``).
+    (``"ingestion_stall"`` | ``"fetch_stall"`` | ``"filter_stall"``).
     """
     return get_meter().counter(
         "influx_ingestion_stall_runs_total",
         description=(
             "scheduled runs flagged with a stall reason — "
             "ingestion_stall (two consecutive runs inspected items but "
-            "ingested zero) or fetch_stall (two consecutive runs saw zero "
-            "sources_checked despite prior non-zero history)"
+            "ingested zero), fetch_stall (two consecutive runs fetched "
+            "zero items despite prior non-zero history), or "
+            "filter_stall (two consecutive runs fetched items but the "
+            "filter rejected every candidate, despite prior non-zero "
+            "history)"
         ),
     )
 

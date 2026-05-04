@@ -45,6 +45,7 @@ from influx.run import (
 )
 from influx.run_ledger import RunLedger
 from influx.telemetry import (
+    current_fetched_total,
     current_run_id,
     current_source_acquisition_errors,
     get_tracer,
@@ -97,6 +98,12 @@ async def ledger_lifecycle(
     session = _LedgerSession(run_id=run_id, started_at=started_at)
     run_id_token = current_run_id.set(run_id)
     source_errors_token = current_source_acquisition_errors.set([])
+    # #85: per-run pre-filter fetched-count.  A list-of-ints so source
+    # adapters increment a shared mutable container; reads at run-end
+    # land the value into the run-ledger entry for the
+    # filter_stall vs fetch_stall split.
+    fetched_total_counter: list[int] = [0]
+    fetched_total_token = current_fetched_total.set(fetched_total_counter)
     metric_attrs = {"profile": profile, "run_type": plan.kind.value}
 
     ledger.start(
@@ -153,10 +160,17 @@ async def ledger_lifecycle(
         outcome = session.outcome
         sources_checked = outcome.sources_checked if outcome is not None else None
         ingested = outcome.ingested if outcome is not None else None
+        # #85: pull the pre-filter fetched-count from the contextvar
+        # bucket the source layer accumulated into.  ``outcome`` may be
+        # ``None`` on the early-skip / abort paths; in that case we
+        # still pass the counter value (typically 0) so the ledger
+        # entry carries the field for downstream consumers.
+        fetched_total = fetched_total_counter[0]
         degraded_reasons = ledger.complete(
             run_id=run_id,
             sources_checked=sources_checked,
             ingested=ingested,
+            fetched_total=fetched_total,
             source_acquisition_errors=source_errors,
         )
         run_outcome = "degraded" if source_errors else "success"
@@ -182,12 +196,34 @@ async def ledger_lifecycle(
                 run_outcome = "degraded"
             logger.warning(
                 "run flagged fetch_stall profile=%s kind=%s run_id=%s "
-                "(this + prior scheduled run both saw sources_checked == 0 "
+                "(this + prior scheduled run both saw fetched_total == 0 "
                 "despite prior non-zero history — likely too-narrow "
                 "lookback_days or upstream feed change)",
                 profile,
                 plan.kind.value,
                 run_id,
+            )
+        if "filter_stall" in degraded_reasons:
+            # #85: items WERE fetched (fetched_total > 0) but the LLM
+            # filter rejected every candidate so sources_checked
+            # landed at 0.  Operator triage points at filter-side
+            # causes — distinct from fetch_stall, which points at
+            # fetch-side causes.
+            metrics.ingestion_stalls().add(
+                1, {"profile": profile, "reason": "filter_stall"}
+            )
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged filter_stall profile=%s kind=%s run_id=%s "
+                "fetched_total=%d "
+                "(this + prior scheduled run both fetched items but the "
+                "filter rejected all candidates — check profile "
+                "description, filter prompt, or min_score_in_results)",
+                profile,
+                plan.kind.value,
+                run_id,
+                fetched_total,
             )
         metrics.run_duration().record(elapsed, metric_attrs)
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
@@ -240,6 +276,7 @@ async def ledger_lifecycle(
         metrics.active_runs().add(-1, {"profile": profile})
         current_run_id.reset(run_id_token)
         current_source_acquisition_errors.reset(source_errors_token)
+        current_fetched_total.reset(fetched_total_token)
 
 
 # ── RunService ──────────────────────────────────────────────────────
