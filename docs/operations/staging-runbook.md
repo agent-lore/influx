@@ -46,16 +46,41 @@ Three quick signals, all read-only:
   - `ingestion_stall` (issue #36) — this and the prior scheduled
     run for the same profile both inspected items but ingested
     zero; typical cause is every candidate hitting `slug_collision`
-    / `duplicate`, the LLM filter rejecting everything, or an
-    upstream content shift.  The diagnose row prints the reason
-    list so you can triage without parsing the JSON.
+    / `duplicate`, all writes being cache-merge with no new content,
+    or an upstream content shift.  The diagnose row prints the
+    reason list so you can triage without parsing the JSON.
   - `fetch_stall` (issue #50) — this and the prior scheduled run
-    for the same profile both saw `sources_checked == 0` despite
-    historical non-zero fetches in the recent ledger window;
-    typical cause is too-narrow `lookback_days` (nothing reached
-    the inspection loop) or an upstream feed shape change.
-    Mutually exclusive with `ingestion_stall`.  Brand-new profiles
-    are not flagged.
+    for the same profile both saw `fetched_total == 0` (no source
+    returned any items at all) despite historical non-zero fetches
+    in the recent ledger window; typical cause is too-narrow
+    `lookback_days` (nothing reached the fetch path) or an
+    upstream feed shape change.  Brand-new profiles are not
+    flagged.
+  - `filter_stall` (issue #85) — this and the prior scheduled run
+    for the same profile both saw `fetched_total > 0` but
+    `sources_checked == 0` (sources fetched normally and the filter
+    ran cleanly but rejected every candidate) despite historical
+    non-zero inspections in the recent ledger window; typical cause
+    is profile description drift, filter prompt regression, or
+    `min_score_in_results` set too high.  Distinct from
+    `fetch_stall`: routes operator attention to the filter, not the
+    fetch path.  Distinct from `filter_error`: the scorer ran cleanly
+    here.  Brand-new profiles are not flagged.
+  - `filter_error` (issue #85, post-review) — the LLM filter scorer
+    raised `FilterScorerError` at least once during this run
+    (transport, parse, or provider error).  Single-run signal — no
+    consecutive-runs gate, no `kind=scheduled` gate.  Operator triage:
+    check `[providers]` configuration, model availability for the
+    `[models.filter]` slot, and any recent prompt/response schema
+    changes.  Do **not** investigate profile description, filter
+    prompt, or `min_score_in_results` — those are the `filter_stall`
+    signals; this one is purely about filter execution.  Mutually
+    exclusive with `filter_stall`.
+
+  The three stall reasons (`ingestion_stall`, `fetch_stall`,
+  `filter_stall`) are mutually exclusive on any single run.
+  `filter_error` is mutually exclusive with `filter_stall` (same
+  shape, different cause) but orthogonal to the rest.
   A `skipped` run (#40) means the Lithos circuit breaker fired:
   ProbeLoop saw 3+ consecutive `degraded` Lithos probes, so the
   scheduler short-circuited to avoid burning LLM tokens against a

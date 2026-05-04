@@ -46,6 +46,8 @@ from influx.storage import download_archive
 from influx.telemetry import (
     current_run_id,
     get_tracer,
+    record_fetched_items,
+    record_filter_error,
     record_source_acquisition_error,
 )
 from influx.urls import normalise_url, url_hash
@@ -484,6 +486,12 @@ class RssSource:
             metrics.candidates_fetched().add(
                 len(items), {"profile": profile_cfg.name, "source": "rss"}
             )
+            # #85: per-feed pre-filter count.  Multiple feeds on one
+            # profile accumulate.  Sum-of-feeds is the correct
+            # ``fetched_total`` for filter_stall discrimination — what
+            # matters is whether ANY items reached the filter, not
+            # which feed they came from.
+            record_fetched_items(len(items))
             for item in items:
                 candidates.append(
                     Candidate(
@@ -587,6 +595,9 @@ def make_rss_item_provider(
                 metrics.candidates_fetched().add(
                     len(items), {"profile": profile, "source": "rss"}
                 )
+                # #85: per-feed pre-filter count for the run-level
+                # ``fetched_total`` (filter_stall vs fetch_stall split).
+                record_fetched_items(len(items))
                 _log.info(
                     "rss feed fetch completed profile=%s feed=%r items=%d",
                     profile,
@@ -606,6 +617,11 @@ def make_rss_item_provider(
                         feed_entry.name,
                         exc_info=True,
                     )
+                    # #85 review: see arxiv.py for rationale.  Per-feed
+                    # failures each tick the counter so a profile with
+                    # multiple feeds reflects the true partial-failure
+                    # surface.
+                    record_filter_error()
                     continue
                 _log.info(
                     "rss filter completed profile=%s feed=%r items=%d "

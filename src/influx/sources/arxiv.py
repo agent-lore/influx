@@ -49,6 +49,8 @@ from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
     current_run_id,
     get_tracer,
+    record_fetched_items,
+    record_filter_error,
     record_source_acquisition_error,
 )
 
@@ -848,6 +850,13 @@ class ArxivSource:
             metrics.candidates_fetched().add(
                 len(items), {"profile": profile, "source": "arxiv"}
             )
+            # #85: feed the pre-filter count into the run-level
+            # ``fetched_total`` so the ledger can split fetch_stall
+            # (no items reached the filter) from filter_stall (items
+            # reached the filter, all rejected).  Source-error path
+            # above returned early on NetworkError, so this only fires
+            # when the fetch actually succeeded.
+            record_fetched_items(len(items))
             _log.info(
                 "arxiv fetch completed profile=%s kind=%s items=%d",
                 profile,
@@ -1168,6 +1177,12 @@ async def _score_arxiv_candidates(
                 # ingested with a default score.
                 for _ in candidates:
                     metrics.articles_filtered().add(1, drop_attrs)
+                # #85 review: distinguish a scorer execution failure
+                # (transport/parse/provider error) from a clean filter
+                # rejection.  The ledger uses this to fire
+                # ``filter_error`` instead of misclassifying as
+                # ``filter_stall``.
+                record_filter_error()
                 return []
             chunked_scores.update(chunk_scores)
 

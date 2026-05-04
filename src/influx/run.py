@@ -53,6 +53,7 @@ from influx.repair import sweep as repair_sweep
 from influx.run_ledger import RunLedger
 from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
+    current_fetched_total,
     current_run_id,
     current_source_acquisition_errors,
     get_tracer,
@@ -117,10 +118,17 @@ class RunOutcome:
     + ``skip_reason`` let the caller distinguish the
     circuit-breaker / LCMA-tools-unavailable paths from real-work
     outcomes.
+
+    ``fetched_total`` (#85) is the pre-filter count summed across
+    every source on the profile.  It splits the
+    ``sources_checked == 0`` space into ``fetch_stall`` (no items
+    reached the filter) and ``filter_stall`` (items reached the
+    filter, all rejected).
     """
 
     sources_checked: int = 0
     ingested: int = 0
+    fetched_total: int = 0
     error: str | None = None
     degraded: bool = False
     degraded_reasons: tuple[str, ...] = ()
@@ -613,9 +621,18 @@ async def _run_finalise_stage(
             run_id=current_run_id.get() or None,
         )
 
+    # #85: snapshot the per-run pre-filter fetched count from the
+    # contextvar bucket the source layer has been incrementing into.
+    # When run outside a request lifecycle (unit tests that bypass
+    # ``ledger_lifecycle``), the bucket may be ``None`` — default to
+    # zero rather than crashing.
+    fetched_counter = current_fetched_total.get()
+    fetched_total = fetched_counter[0] if fetched_counter is not None else 0
+
     outcome = RunOutcome(
         sources_checked=sources_checked,
         ingested=len(ingested_items),
+        fetched_total=fetched_total,
         profile_run_result=profile_run_result,
         source_acquisition_errors=tuple(current_source_acquisition_errors.get() or []),
     )
