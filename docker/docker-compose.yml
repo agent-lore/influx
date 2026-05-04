@@ -13,7 +13,7 @@ services:
       - ${INFLUX_ARCHIVE_PATH:-./archive}:/archive
       - ${INFLUX_STATE_PATH:-./state}:/state
     ports:
-      - "${INFLUX_ADMIN_HOST_PORT:-8080}:8080"
+      - "${INFLUX_ADMIN_HOST_PORT:-8080}:${INFLUX_ADMIN_PORT:-8080}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
