@@ -137,11 +137,11 @@ class TestCreateApp:
         assert "/runs" in paths
         assert "/backfills" in paths
 
-    async def test_lcma_tool_probe_reuses_lithos_client(
+    async def test_lcma_tool_probe_uses_ephemeral_lithos_client(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Issue #93: repeated tool probes reuse one client and close at shutdown."""
+        """Each tool probe gets its own short-lived client."""
         instances: list[Any] = []
 
         class FakeLithosClient:
@@ -169,18 +169,21 @@ class TestCreateApp:
         await tool_lister()
         await tool_lister()
 
-        assert len(instances) == 1
-        assert instances[0].list_calls == 2
-        assert instances[0].close_calls == 0
+        assert len(instances) == 2
+        assert instances[0].list_calls == 1
+        assert instances[1].list_calls == 1
+        assert instances[0].close_calls == 1
+        assert instances[1].close_calls == 1
 
         await app.state.close_lithos_probe_client()
         assert instances[0].close_calls == 1
+        assert instances[1].close_calls == 1
 
-    async def test_lcma_tool_probe_resets_client_after_failure(
+    async def test_lcma_tool_probe_closes_client_after_failure(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A failing tool probe closes the client so the next cycle reconnects."""
+        """A failing tool probe still closes its ephemeral client."""
         instances: list[Any] = []
 
         class FakeLithosClient:
@@ -213,7 +216,7 @@ class TestCreateApp:
 
         assert len(instances) == 2
         assert instances[0].close_calls == 1
-        assert instances[1].close_calls == 0
+        assert instances[1].close_calls == 1
 
 
 # ── InfluxService lifecycle ──────────────────────────────────────────
