@@ -281,8 +281,15 @@ class InfluxService:
         )
         tracer = get_tracer(force_rebuild=True)
         logger.info("OTEL telemetry %s", "enabled" if tracer.enabled else "disabled")
-        await self.probe_loop.start()
-        self.scheduler.start()
+        probe_started = False
+        try:
+            await self.probe_loop.start()
+            probe_started = True
+            self.scheduler.start()
+        except Exception:
+            if probe_started:
+                await self.probe_loop.stop()
+            raise
         self._started = True
         logger.info("Influx service started")
 
