@@ -517,15 +517,28 @@ async def _run_ingest_stage(
                 write_result.note_id,
                 str(cache_hit).lower(),
             )
-            related_in_lithos = await lcma_wire(
-                written_note_id=write_result.note_id,
-                cascade=CascadeOutput(
-                    title=title,
-                    contributions=item.get("contributions"),
-                    builds_on=item.get("builds_on"),
-                ),
-                deps=lcma_deps,
-            )
+            try:
+                related_in_lithos = await lcma_wire(
+                    written_note_id=write_result.note_id,
+                    source_url=source_url,
+                    cascade=CascadeOutput(
+                        title=title,
+                        contributions=item.get("contributions"),
+                        builds_on=item.get("builds_on"),
+                    ),
+                    deps=lcma_deps,
+                )
+            except Exception:
+                logger.warning(
+                    "LCMA wiring failed unexpectedly outside best-effort guard "
+                    "profile=%s source_url=%s title=%r note_id=%s",
+                    profile,
+                    source_url,
+                    title,
+                    write_result.note_id,
+                    exc_info=True,
+                )
+                related_in_lithos = []
             ingested.append(
                 HighlightItem(
                     id=item.get("id", f"note-{len(ingested) + 1}"),

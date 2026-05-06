@@ -386,6 +386,95 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
     wire.assert_awaited_once()
 
 
+async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
+    """A post-write LCMA failure does not prevent later items from ingesting."""
+    config = _make_config()
+    plan = _scheduled_plan()
+
+    items = [
+        {
+            "title": "First Paper",
+            "source_url": "https://arxiv.org/abs/2401.00001",
+            "content": "# Summary\n\nbody",
+            "tags": ["profile:alpha", "source:arxiv"],
+            "confidence": 0.9,
+            "score": 9,
+            "path": "papers/arxiv/2024/01",
+            "abstract_or_summary": "abs",
+        },
+        {
+            "title": "Second Paper",
+            "source_url": "https://arxiv.org/abs/2401.00002",
+            "content": "# Summary\n\nbody",
+            "tags": ["profile:alpha", "source:arxiv"],
+            "confidence": 0.9,
+            "score": 9,
+            "path": "papers/arxiv/2024/01",
+            "abstract_or_summary": "abs",
+        },
+    ]
+
+    async def provider(
+        profile: str, kind: RunKind, run_range: Any, filter_prompt: str
+    ) -> list[dict[str, Any]]:
+        return items
+
+    from mcp import types as mcp_types
+
+    deps = RunDeps(config=config, item_provider=provider, probe_loop=None)
+
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
+    mock_client.task_create = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"task_id": "task-1"})
+                )
+            ]
+        )
+    )
+    mock_client.task_complete = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"status": "completed"})
+                )
+            ]
+        )
+    )
+    mock_client.cache_lookup_for_item = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
+        )
+    )
+    write_result_1 = MagicMock()
+    write_result_1.status = "created"
+    write_result_1.note_id = "note-1"
+    write_result_2 = MagicMock()
+    write_result_2.status = "created"
+    write_result_2.note_id = "note-2"
+    mock_client.write_note = AsyncMock(side_effect=[write_result_1, write_result_2])
+
+    with (
+        patch("influx.run.LithosClient", return_value=mock_client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.run.lcma_wire",
+            new_callable=AsyncMock,
+            side_effect=[RuntimeError("retrieve failed"), []],
+        ) as wire,
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        outcome = await Run(plan, deps).execute()
+
+    assert outcome.sources_checked == 2
+    assert outcome.ingested == 2
+    assert wire.await_count == 2
+
+
 def test_run_aborted_carries_diagnostics_for_apply() -> None:
     """``RunAborted.diagnostics`` is the channel for abort-path health actions."""
     diagnostics = StageDiagnostics(
