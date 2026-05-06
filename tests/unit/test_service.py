@@ -11,6 +11,7 @@ import pytest
 
 from influx.config import (
     AppConfig,
+    LithosConfig,
     ProfileConfig,
     PromptEntryConfig,
     PromptsConfig,
@@ -135,6 +136,84 @@ class TestCreateApp:
         assert "/status" in paths
         assert "/runs" in paths
         assert "/backfills" in paths
+
+    async def test_lcma_tool_probe_reuses_lithos_client(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Issue #93: repeated tool probes reuse one client and close at shutdown."""
+        instances: list[Any] = []
+
+        class FakeLithosClient:
+            def __init__(self, *, url: str, transport: str) -> None:
+                self.url = url
+                self.transport = transport
+                self.list_calls = 0
+                self.close_calls = 0
+                instances.append(self)
+
+            async def list_tools(self) -> list[str]:
+                self.list_calls += 1
+                return ["lithos_retrieve"]
+
+            async def close(self) -> None:
+                self.close_calls += 1
+
+        monkeypatch.setattr("influx.service.LithosClient", FakeLithosClient)
+
+        config = _make_config()
+        app = create_app(config)
+        tool_lister = app.state.probe_loop._tool_lister
+        assert tool_lister is not None
+
+        await tool_lister()
+        await tool_lister()
+
+        assert len(instances) == 1
+        assert instances[0].list_calls == 2
+        assert instances[0].close_calls == 0
+
+        await app.state.close_lithos_probe_client()
+        assert instances[0].close_calls == 1
+
+    async def test_lcma_tool_probe_resets_client_after_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing tool probe closes the client so the next cycle reconnects."""
+        instances: list[Any] = []
+
+        class FakeLithosClient:
+            def __init__(self, *, url: str, transport: str) -> None:
+                self.url = url
+                self.transport = transport
+                self.close_calls = 0
+                instances.append(self)
+
+            async def list_tools(self) -> list[str]:
+                if len(instances) == 1:
+                    raise RuntimeError("stale SSE session")
+                return ["lithos_retrieve"]
+
+            async def close(self) -> None:
+                self.close_calls += 1
+
+        monkeypatch.setattr("influx.service.LithosClient", FakeLithosClient)
+
+        config = _make_config().model_copy(
+            update={"lithos": LithosConfig(url="http://localhost:8766/sse")}
+        )
+        app = create_app(config)
+        tool_lister = app.state.probe_loop._tool_lister
+        assert tool_lister is not None
+
+        with pytest.raises(RuntimeError, match="stale SSE session"):
+            await tool_lister()
+        await tool_lister()
+
+        assert len(instances) == 2
+        assert instances[0].close_calls == 1
+        assert instances[1].close_calls == 0
 
 
 # ── InfluxService lifecycle ──────────────────────────────────────────
