@@ -43,8 +43,9 @@ ProbeStatus = Literal["ok", "degraded"]
 
 
 # The five LCMA tools every Influx-compatible Lithos deployment must
-# expose.  Probed at startup + every probe interval; missing tools flip
-# the ``lcma_unknown_tool_failure`` latch so ``Run.execute()`` (and
+# expose. Validated at startup and after Lithos recovers from an
+# unhealthy period; missing tools flip the
+# ``lcma_unknown_tool_failure`` latch so ``Run.execute()`` (and
 # today's ``run_profile``) can skip the run with
 # ``reason="lcma_tools_unavailable"`` — replacing the legacy per-call
 # ``LCMAError("unknown_tool")`` latch (issue #69).
@@ -60,8 +61,8 @@ REQUIRED_LCMA_TOOLS: frozenset[str] = frozenset(
 
 
 # Async callable returning the tool names the connected Lithos exposes.
-# Wired in production from :meth:`influx.lithos_client.LithosClient.list_tools`.
-# Unit tests inject a stub so the probe behaviour can be exercised
+# Wired in production from an ephemeral ``LithosClient.list_tools`` call.
+# Unit tests inject a stub so the validation behaviour can be exercised
 # without standing up a real MCP transport.
 ToolLister = Callable[[], Awaitable[list[str]]]
 
@@ -315,14 +316,16 @@ class ProbeLoop:
         # is invoked by a successful sweep.
         self._repair_write_failure = False
         self._repair_write_failure_detail = ""
-        # LCMA tools-availability latch (issue #69).  Driven each cycle
-        # by ``_probe_lcma_tools`` — non-sticky.  Replaces the legacy
-        # mid-run ``LCMAError("unknown_tool")`` latch.
+        # LCMA tools-availability latch (issue #69). Revalidated at
+        # startup and whenever Lithos transitions from unhealthy back
+        # to healthy. Replaces the legacy mid-run
+        # ``LCMAError("unknown_tool")`` latch.
         self._lcma_unknown_tool_failure = False
         self._lcma_unknown_tool_failure_detail = ""
         # Async tool-lister wired by the service factory; ``None`` skips
-        # the LCMA-tools probe (e.g. CLI / tests with no MCP transport).
+        # LCMA validation (e.g. CLI / tests with no MCP transport).
         self._tool_lister = tool_lister
+        self._lcma_validation_needed = True
         # Consecutive count of degraded Lithos probes (#40 circuit breaker).
         # Reset to 0 on the first ``ok`` probe; ``lithos_circuit_open``
         # returns True once it crosses the configured threshold so the
@@ -368,11 +371,11 @@ class ProbeLoop:
         )
 
     async def run_once_async(self) -> None:
-        """Execute a full probe cycle including the async LCMA-tools probe.
+        """Execute a full probe cycle plus conditional LCMA validation.
 
-        Drives the LCMA tool-availability latch directly from the
-        probe result — non-sticky.  When ``tool_lister`` is ``None``
-        the LCMA latch state is left at its previous value (typically
+        LCMA tool validation runs at startup and after Lithos recovers
+        from an unhealthy period. When ``tool_lister`` is ``None`` the
+        LCMA latch state is left at its previous value (typically
         cleared) so a probe-less deployment never spuriously reports
         ``lcma_tools_unavailable``.
         """
@@ -382,7 +385,11 @@ class ProbeLoop:
         # failures, so a totally-down Lithos shows up as a degraded
         # probe before the LCMA-tools probe reports its own failure.
         self.run_once()
-        if self._tool_lister is not None:
+        if (
+            self._tool_lister is not None
+            and self._state.lithos.status == "ok"
+            and self._lcma_validation_needed
+        ):
             lcma_result = await _probe_lcma_tools(self._tool_lister)
             if lcma_result.status == "degraded":
                 self._lcma_unknown_tool_failure = True
@@ -390,6 +397,7 @@ class ProbeLoop:
             else:
                 self._lcma_unknown_tool_failure = False
                 self._lcma_unknown_tool_failure_detail = ""
+            self._lcma_validation_needed = False
             self._state = ProbeState(
                 lithos=self._state.lithos,
                 llm_credentials=self._state.llm_credentials,
@@ -401,6 +409,8 @@ class ProbeLoop:
                     self._lcma_unknown_tool_failure_detail
                 ),
             )
+        elif self._state.lithos.status != "ok":
+            self._lcma_validation_needed = True
 
     def lcma_tools_unavailable(self) -> bool:
         """Return ``True`` when the latest probe found the LCMA surface missing.
