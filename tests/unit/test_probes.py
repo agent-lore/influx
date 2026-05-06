@@ -608,11 +608,21 @@ class TestLithosCircuitBreaker:
 
 
 class TestLcmaToolsProbe:
-    """Probe-time LCMA tool-availability check (issue #69).
+    """Startup/reconnect LCMA tool-availability validation (issue #69).
 
     Replaces the legacy mid-run ``LCMAError("unknown_tool")`` latch
-    with a probe-driven, non-sticky latch flipped from ``tools/list``.
+    with a validation-driven latch flipped from ``tools/list``.
     """
+
+    @staticmethod
+    def _patch_healthy_lithos_probe(mp: pytest.MonkeyPatch) -> None:
+        from influx import probes as probes_mod
+
+        def fake_probe_lithos(url: str) -> ProbeResult:
+            del url
+            return ProbeResult(status="ok", detail="ok", timestamp=1.0)
+
+        mp.setattr(probes_mod, "_probe_lithos", fake_probe_lithos)
 
     @pytest.mark.asyncio
     async def test_all_required_tools_present_clears_latch(self) -> None:
@@ -622,9 +632,11 @@ class TestLcmaToolsProbe:
         async def lister() -> list[str]:
             return list(REQUIRED_LCMA_TOOLS) + ["lithos_write", "lithos_ping"]
 
-        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
-        loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
-        await loop.run_once_async()
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_healthy_lithos_probe(mp)
+            cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+            loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
+            await loop.run_once_async()
 
         assert loop.lcma_tools_unavailable() is False
         assert loop.state.lcma_unknown_tool_failure is False
@@ -643,9 +655,11 @@ class TestLcmaToolsProbe:
                 # ``lithos_retrieve`` deliberately missing
             ]
 
-        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
-        loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
-        await loop.run_once_async()
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_healthy_lithos_probe(mp)
+            cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+            loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
+            await loop.run_once_async()
 
         assert loop.lcma_tools_unavailable() is True
         assert loop.state.lcma_unknown_tool_failure is True
@@ -658,9 +672,11 @@ class TestLcmaToolsProbe:
         async def failing_lister() -> list[str]:
             raise RuntimeError("MCP connection refused")
 
-        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
-        loop = ProbeLoop(cfg, interval=30.0, tool_lister=failing_lister)
-        await loop.run_once_async()
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_healthy_lithos_probe(mp)
+            cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+            loop = ProbeLoop(cfg, interval=30.0, tool_lister=failing_lister)
+            await loop.run_once_async()
 
         assert loop.lcma_tools_unavailable() is True
         assert "tools/list failed" in loop.state.lcma_unknown_tool_failure_detail
@@ -676,11 +692,35 @@ class TestLcmaToolsProbe:
         assert loop.state.lcma_unknown_tool_failure is False
 
     @pytest.mark.asyncio
-    async def test_latch_recovers_when_tools_become_available(self) -> None:
-        """Non-sticky behaviour: missing → present across cycles re-clears."""
+    async def test_validation_does_not_repeat_while_lithos_stays_healthy(self) -> None:
+        """Healthy steady state does not keep polling ``tools/list`` every cycle."""
         from influx.probes import REQUIRED_LCMA_TOOLS
 
-        cycle_state = {"missing_retrieve": True}
+        call_count = 0
+
+        async def lister() -> list[str]:
+            nonlocal call_count
+            call_count += 1
+            return list(REQUIRED_LCMA_TOOLS)
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_healthy_lithos_probe(mp)
+            cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+            loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
+            await loop.run_once_async()
+            await loop.run_once_async()
+
+        assert call_count == 1
+        assert loop.lcma_tools_unavailable() is False
+
+    @pytest.mark.asyncio
+    async def test_latch_recovers_when_lithos_recovers_and_tools_become_available(
+        self,
+    ) -> None:
+        """Lithos unhealthy -> healthy triggers a fresh LCMA validation."""
+        from influx.probes import REQUIRED_LCMA_TOOLS
+
+        cycle_state = {"healthy": True, "missing_retrieve": True}
 
         async def lister() -> list[str]:
             base = list(REQUIRED_LCMA_TOOLS)
@@ -688,13 +728,58 @@ class TestLcmaToolsProbe:
                 return [t for t in base if t != "lithos_retrieve"]
             return base
 
-        cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
-        loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
-        await loop.run_once_async()
-        assert loop.lcma_tools_unavailable() is True
+        with pytest.MonkeyPatch.context() as mp:
+            from influx import probes as probes_mod
 
-        # Deployment fixed mid-flight; next probe cycle clears the latch.
-        cycle_state["missing_retrieve"] = False
-        await loop.run_once_async()
+            def fake_probe_lithos(url: str) -> ProbeResult:
+                del url
+                status = "ok" if cycle_state["healthy"] else "degraded"
+                detail = "ok" if cycle_state["healthy"] else "down"
+                return ProbeResult(status=status, detail=detail, timestamp=1.0)
+
+            mp.setattr(probes_mod, "_probe_lithos", fake_probe_lithos)
+            cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+            loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
+
+            await loop.run_once_async()
+            assert loop.lcma_tools_unavailable() is True
+
+            # Steady healthy state does not revalidate.
+            cycle_state["missing_retrieve"] = False
+            await loop.run_once_async()
+            assert loop.lcma_tools_unavailable() is True
+
+            # Lithos outage marks the validation stale.
+            cycle_state["healthy"] = False
+            await loop.run_once_async()
+            assert loop.lcma_tools_unavailable() is True
+
+            # On recovery, validation runs again and clears the latch.
+            cycle_state["healthy"] = True
+            await loop.run_once_async()
+
         assert loop.lcma_tools_unavailable() is False
         assert loop.state.lcma_unknown_tool_failure is False
+
+    @pytest.mark.asyncio
+    async def test_startup_transport_error_is_not_retried_each_healthy_cycle(
+        self,
+    ) -> None:
+        """A startup validation failure stays latched until Lithos reconnects."""
+        attempts = 0
+
+        async def lister() -> list[str]:
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("MCP connection refused")
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_healthy_lithos_probe(mp)
+            cfg = _make_config(lithos_url="http://127.0.0.1:1/sse")
+            loop = ProbeLoop(cfg, interval=30.0, tool_lister=lister)
+            await loop.run_once_async()
+            await loop.run_once_async()
+
+        assert attempts == 1
+        assert loop.lcma_tools_unavailable() is True
+        assert "tools/list failed" in loop.state.lcma_unknown_tool_failure_detail
