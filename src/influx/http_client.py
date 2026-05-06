@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urljoin, urlparse
 
@@ -57,6 +57,7 @@ class FetchResult:
     status_code: int
     content_type: str
     final_url: str
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 # ── Scheme validation ────────────────────────────────────────────────
@@ -232,6 +233,7 @@ def guarded_fetch(
                     body = b"".join(chunks)
                     status_code = response.status_code
                     content_type = response.headers.get("content-type", "")
+                    response_headers = dict(response.headers)
                     final_url = str(response.url)
                     break
             else:
@@ -266,6 +268,7 @@ def guarded_fetch(
         status_code=status_code,
         content_type=content_type,
         final_url=final_url,
+        headers=response_headers,
     )
 
 
@@ -384,6 +387,7 @@ def guarded_post_json_fetch(
                 status_code=response.status_code,
                 content_type=response.headers.get("content-type", ""),
                 final_url=str(response.url),
+                headers=dict(response.headers),
             )
     except NetworkError:
         raise
