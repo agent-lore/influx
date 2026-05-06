@@ -255,6 +255,26 @@ class TestInfluxService:
         await svc.start()  # should be a no-op
         await svc.stop()
 
+    async def test_start_rolls_back_probe_loop_when_scheduler_start_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A scheduler startup failure must not leave the probe loop running."""
+        config = _make_config()
+        svc = InfluxService(config)
+
+        def failing_scheduler_start() -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(svc.scheduler, "start", failing_scheduler_start)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await svc.start()
+
+        assert svc.probe_loop._task is None
+        assert svc.probe_loop.state.overall_status != "starting"
+        assert svc._started is False
+
     async def test_stop_without_start_is_safe(self) -> None:
         """Calling stop() before start() does not crash."""
         config = _make_config()
