@@ -142,17 +142,31 @@ def create_app(
     # ``schedule.shutdown_grace_seconds`` (US-008).
     active_tasks: set[asyncio.Task[Any]] = set()
 
-    # Tool-lister opens a transient MCP session per probe cycle and
-    # asks Lithos which tools it exposes (issue #69).  Probing each
-    # cycle keeps the latch non-sticky — the next cycle re-evaluates
-    # so a deployment that adds the missing tools recovers
-    # automatically without an Influx restart.
+    # Tool-lister reuses one lazy LithosClient for the service lifetime.
+    # Each probe still re-evaluates the LCMA tool surface, so missing-tool
+    # deployments recover without restart, but steady-state probes no
+    # longer re-register the agent or flap the SSE connection every cycle.
+    lithos_probe_client: LithosClient | None = None
+
     async def _list_lithos_tools() -> list[str]:
-        client = LithosClient(url=config.lithos.url, transport=config.lithos.transport)
+        nonlocal lithos_probe_client
+        if lithos_probe_client is None:
+            lithos_probe_client = LithosClient(
+                url=config.lithos.url,
+                transport=config.lithos.transport,
+            )
         try:
-            return await client.list_tools()
-        finally:
-            await client.close()
+            return await lithos_probe_client.list_tools()
+        except Exception:
+            await lithos_probe_client.close()
+            lithos_probe_client = None
+            raise
+
+    async def _close_lithos_probe_client() -> None:
+        nonlocal lithos_probe_client
+        if lithos_probe_client is not None:
+            await lithos_probe_client.close()
+            lithos_probe_client = None
 
     probe_loop = ProbeLoop(
         config,
@@ -216,6 +230,7 @@ def create_app(
     app.state.item_provider = item_provider
     app.state.fetch_cache = fetch_cache
     app.state.run_ledger = run_ledger
+    app.state.close_lithos_probe_client = _close_lithos_probe_client
 
     return app
 
@@ -321,6 +336,7 @@ class InfluxService:
         self.scheduler.stop(wait=False)
 
         await self.probe_loop.stop()
+        await self._app.state.close_lithos_probe_client()
         self._started = False
         logger.info("Influx service stopped")
 

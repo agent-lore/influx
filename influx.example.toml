@@ -293,6 +293,9 @@ strip_tags = ["script", "iframe", "object", "embed"]
 # ---------------------------------------------------------------------------
 
 [resilience]
+# Recommended for staging/prod arXiv traffic: max_retries = 5 and
+# arxiv_429_backoff_seconds = 30. Retry-After headers override the flat
+# 429 backoff when arXiv provides them.
 max_retries = 3
 backoff_base_seconds = 1
 arxiv_request_min_interval_seconds = 3

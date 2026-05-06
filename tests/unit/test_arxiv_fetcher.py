@@ -34,12 +34,14 @@ def _make_fetch_result(
     status_code: int = 200,
     content_type: str = "application/atom+xml",
     final_url: str = "https://export.arxiv.org/api/query",
+    headers: dict[str, str] | None = None,
 ) -> FetchResult:
     return FetchResult(
         body=body,
         status_code=status_code,
         content_type=content_type,
         final_url=final_url,
+        headers=headers or {},
     )
 
 
@@ -577,6 +579,123 @@ class TestFetchRetry:
         assert len(items) == 2
         # Must be the fixed 429 backoff, NOT base * 2**0 = 1s.
         mock_sleep.assert_called_once_with(12)
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_429_numeric_retry_after_honoured(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        body = _load_fixture("recent_two.atom")
+        mock_fetch.side_effect = [
+            _make_fetch_result(
+                b"Too many requests",
+                status_code=429,
+                headers={"Retry-After": "42"},
+            ),
+            _make_fetch_result(body),
+        ]
+
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=10,
+            arxiv_request_min_interval_seconds=3,
+            max_retries=3,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=30)
+        now = datetime(2026, 4, 24, 0, 0, 0, tzinfo=UTC)
+        items = fetch_arxiv(arxiv_config=cfg, resilience=resilience, now=now)
+
+        assert len(items) == 2
+        mock_sleep.assert_called_once_with(42)
+
+    @patch("influx.sources.arxiv.time.time", return_value=1_778_068_800.0)
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_429_http_date_retry_after_honoured(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+        mock_time: MagicMock,
+    ) -> None:
+        del mock_time
+        body = _load_fixture("recent_two.atom")
+        mock_fetch.side_effect = [
+            _make_fetch_result(
+                b"Too many requests",
+                status_code=429,
+                headers={"Retry-After": "Wed, 06 May 2026 12:01:30 GMT"},
+            ),
+            _make_fetch_result(body),
+        ]
+
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=10,
+            arxiv_request_min_interval_seconds=3,
+            max_retries=3,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=30)
+        now = datetime(2026, 4, 24, 0, 0, 0, tzinfo=UTC)
+        items = fetch_arxiv(arxiv_config=cfg, resilience=resilience, now=now)
+
+        assert len(items) == 2
+        mock_sleep.assert_called_once_with(90)
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_429_malformed_retry_after_uses_default_backoff(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        body = _load_fixture("recent_two.atom")
+        mock_fetch.side_effect = [
+            _make_fetch_result(
+                b"Too many requests",
+                status_code=429,
+                headers={"Retry-After": "not a date"},
+            ),
+            _make_fetch_result(body),
+        ]
+
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=12,
+            max_retries=3,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=30)
+        now = datetime(2026, 4, 24, 0, 0, 0, tzinfo=UTC)
+        items = fetch_arxiv(arxiv_config=cfg, resilience=resilience, now=now)
+
+        assert len(items) == 2
+        mock_sleep.assert_called_once_with(12)
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_429_retry_after_is_clamped(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        body = _load_fixture("recent_two.atom")
+        mock_fetch.side_effect = [
+            _make_fetch_result(
+                b"Too many requests",
+                status_code=429,
+                headers={"Retry-After": "999"},
+            ),
+            _make_fetch_result(body),
+        ]
+
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=10,
+            max_retries=3,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=30)
+        now = datetime(2026, 4, 24, 0, 0, 0, tzinfo=UTC)
+        items = fetch_arxiv(arxiv_config=cfg, resilience=resilience, now=now)
+
+        assert len(items) == 2
+        mock_sleep.assert_called_once_with(300)
 
     @patch("influx.sources.arxiv.guarded_fetch")
     def test_successful_non_xml_content_type_raises(

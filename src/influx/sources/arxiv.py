@@ -6,8 +6,8 @@ client-side date filtering against ``profile.sources.arxiv.lookback_days``
 (FR-SRC-1, FR-SRC-2).
 
 Retry behaviour:
-- HTTP 429 → sleep ``resilience.arxiv_429_backoff_seconds`` then retry
-  (FR-RES-2)
+- HTTP 429 → honour ``Retry-After`` when present, otherwise sleep
+  ``resilience.arxiv_429_backoff_seconds`` then retry (FR-RES-2)
 - Other transient failures → exponential backoff from
   ``resilience.backoff_base_seconds`` (FR-RES-1)
 
@@ -24,6 +24,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -90,6 +91,7 @@ _XML_CONTENT_TYPES: frozenset[str] = frozenset(
         "application/rss+xml",
     }
 )
+_RETRY_AFTER_MAX_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +340,47 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _header_value(headers: dict[str, str], name: str) -> str | None:
+    """Return an HTTP header value using case-insensitive lookup."""
+    name_lower = name.lower()
+    for key, value in headers.items():
+        if key.lower() == name_lower:
+            return value
+    return None
+
+
+def _parse_retry_after_seconds(value: str) -> float | None:
+    """Parse RFC 7231 ``Retry-After`` as seconds or HTTP-date."""
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        seconds = retry_at.timestamp() - time.time()
+    if seconds < 0:
+        return 0.0
+    return min(seconds, _RETRY_AFTER_MAX_SECONDS)
+
+
+def _arxiv_429_delay(
+    result_headers: dict[str, str],
+    resilience: ResilienceConfig,
+) -> float:
+    retry_after = _header_value(result_headers, "Retry-After")
+    if retry_after is not None:
+        parsed = _parse_retry_after_seconds(retry_after)
+        if parsed is not None:
+            return max(float(resilience.arxiv_request_min_interval_seconds), parsed)
+    return float(resilience.arxiv_429_backoff_seconds)
+
+
 def fetch_arxiv(
     *,
     arxiv_config: ArxivSourceConfig,
@@ -440,7 +483,6 @@ def _fetch_with_retry(
 
     max_retries = resilience.max_retries
     backoff_base = resilience.backoff_base_seconds
-    backoff_429 = resilience.arxiv_429_backoff_seconds
 
     last_error: Exception | None = None
 
@@ -477,13 +519,14 @@ def _fetch_with_retry(
                 kind="rate_limit",
             )
             if attempt < max_retries:
+                delay = _arxiv_429_delay(result.headers, resilience)
                 _log.warning(
-                    "arXiv 429 on attempt %d/%d, backing off %ds (FR-RES-2)",
+                    "arXiv 429 on attempt %d/%d, backing off %.1fs (FR-RES-2)",
                     attempt + 1,
                     max_retries + 1,
-                    backoff_429,
+                    delay,
                 )
-                _sleep(backoff_429)
+                _sleep(delay)
                 continue
             raise last_error
 

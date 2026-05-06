@@ -375,28 +375,6 @@ async def _score_rss_items(
     if provider is None:
         raise FilterScorerError(f"filter provider {slot.provider!r} not configured")
 
-    candidates = [
-        {"id": _rss_filter_id(item), "title": item.title, "abstract": item.summary}
-        for item in items
-    ]
-    body: dict[str, Any] = {
-        "model": slot.model,
-        "temperature": slot.temperature,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    f"{filter_prompt}\n\n## CANDIDATES\n"
-                    f"{json.dumps(candidates, ensure_ascii=False)}"
-                ),
-            }
-        ],
-    }
-    if slot.max_tokens is not None:
-        body["max_tokens"] = slot.max_tokens
-    if slot.json_mode:
-        body["response_format"] = {"type": "json_object"}
-
     headers: dict[str, str] = {**provider.extra_headers}
     if provider.api_key_env:
         api_key = os.environ.get(provider.api_key_env, "")
@@ -405,30 +383,69 @@ async def _score_rss_items(
 
     url = f"{provider.base_url.rstrip('/')}/chat/completions"
     attempts = slot.max_retries + 1
-    last_error: Exception | None = None
-    for _attempt in range(attempts):
-        try:
-            response = guarded_post_json_fetch(
-                url,
-                body,
-                headers=headers,
-                allow_private_ips=config.security.allow_private_ips,
-                max_response_bytes=config.storage.max_download_bytes,
-                timeout_seconds=slot.request_timeout,
-            )
-            if response.status_code >= 400:
-                last_error = FilterScorerError(f"HTTP {response.status_code}")
+
+    all_scores: dict[str, Any] = {}
+    batch_size = max(int(config.filter.batch_size), 1)
+    for chunk_start in range(0, len(items), batch_size):
+        chunk = items[chunk_start : chunk_start + batch_size]
+        candidates = [
+            {"id": _rss_filter_id(item), "title": item.title, "abstract": item.summary}
+            for item in chunk
+        ]
+        body: dict[str, Any] = {
+            "model": slot.model,
+            "temperature": slot.temperature,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        f"{filter_prompt}\n\n## CANDIDATES\n"
+                        f"{json.dumps(candidates, ensure_ascii=False)}"
+                    ),
+                }
+            ],
+        }
+        if slot.max_tokens is not None:
+            body["max_tokens"] = slot.max_tokens
+        if slot.json_mode:
+            body["response_format"] = {"type": "json_object"}
+
+        last_error: Exception | None = None
+        for _attempt in range(attempts):
+            try:
+                response = guarded_post_json_fetch(
+                    url,
+                    body,
+                    headers=headers,
+                    allow_private_ips=config.security.allow_private_ips,
+                    max_response_bytes=config.storage.max_download_bytes,
+                    timeout_seconds=slot.request_timeout,
+                )
+                if response.status_code >= 400:
+                    last_error = FilterScorerError(f"HTTP {response.status_code}")
+                    continue
+                envelope = json.loads(response.body.decode("utf-8"))
+                content = envelope["choices"][0]["message"]["content"]
+                parsed = FilterResponse.model_validate(json.loads(content))
+                all_scores.update({result.id: result for result in parsed.results})
+                break
+            except Exception as exc:
+                last_error = exc
                 continue
-            envelope = json.loads(response.body.decode("utf-8"))
-            content = envelope["choices"][0]["message"]["content"]
-            parsed = FilterResponse.model_validate(json.loads(content))
-            return {result.id: result for result in parsed.results}
-        except Exception as exc:
-            last_error = exc
-            continue
-    raise FilterScorerError(f"RSS filter failed after {attempts} attempts") from (
-        last_error
-    )
+        else:
+            exc_info = None
+            if last_error is not None:
+                exc_info = (type(last_error), last_error, last_error.__traceback__)
+            _log.warning(
+                "RSS filter failed for profile %r items %d-%d; skipping chunk",
+                profile,
+                chunk_start,
+                chunk_start + len(chunk) - 1,
+                exc_info=exc_info,
+            )
+            record_filter_error()
+
+    return all_scores
 
 
 def _rss_filter_id(item: RssFeedItem) -> str:
