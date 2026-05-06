@@ -356,6 +356,37 @@ class TestProbeLoopLifecycle:
         loop = ProbeLoop(cfg, interval=30.0)
         await loop.stop()  # no-op, should not raise
 
+    async def test_background_loop_continues_after_unexpected_exception(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A single escaped probe-cycle exception does not kill the loop."""
+        import asyncio as asyncio_mod
+
+        calls = 0
+        cfg = _make_config()
+        loop = ProbeLoop(cfg, interval=30.0)
+
+        async def fake_sleep(_seconds: float) -> None:
+            return None
+
+        async def fake_run_once_async() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("boom")
+            raise asyncio_mod.CancelledError()
+
+        monkeypatch.setattr("influx.probes.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr(loop, "run_once_async", fake_run_once_async)
+
+        with pytest.raises(asyncio_mod.CancelledError):
+            await loop._loop()
+
+        assert calls == 2
+        assert "Probe cycle failed" in caplog.text
+
 
 # ── Degraded state driven by both probes ─────────────────────────────
 

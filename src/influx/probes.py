@@ -494,4 +494,7 @@ class ProbeLoop:
         """Internal loop — runs a full probe cycle at fixed intervals."""
         while True:
             await asyncio.sleep(self._interval)
-            await self.run_once_async()
+            try:
+                await self.run_once_async()
+            except Exception:
+                logger.exception("Probe cycle failed; continuing background probe loop")
