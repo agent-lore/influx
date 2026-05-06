@@ -30,7 +30,6 @@ from influx.config import (
     SecurityConfig,
 )
 from influx.coordinator import RunKind
-from influx.errors import LCMAError
 from influx.probes import ProbeLoop
 from influx.scheduler import run_profile
 from tests.contract.test_lithos_client import FakeLithosServer
@@ -543,18 +542,18 @@ class TestBuildsOnResolver:
         assert len(builds_on_edges) == 0
 
 
-# ── US-007: Abort on LCMAError("unknown_tool") ──────────────────
+# ── US-007: Best-effort containment for post-write LCMA failures ───
 
 
 class TestUnknownToolAbort:
-    """LCMAError("unknown_tool") aborts run, degrades readiness."""
+    """Post-write LCMA failures do not abort a run after the note is written."""
 
-    def test_retrieve_unknown_tool_aborts_run(
+    def test_retrieve_unknown_tool_is_contained(
         self,
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
     ) -> None:
-        """Retrieve unknown_tool mid-run: aborts, no edges, notes remain."""
+        """Retrieve unknown_tool mid-run: note stays written and run completes."""
         config = _make_config(fake_lithos_url)
 
         # Make lithos_retrieve raise (simulates unknown_tool on Lithos).
@@ -571,15 +570,15 @@ class TestUnknownToolAbort:
             }
         ]
 
-        with pytest.raises(LCMAError, match="unknown_tool"):
-            asyncio.run(
-                run_profile(
-                    "ai-robotics",
-                    RunKind.MANUAL,
-                    config=config,
-                    item_provider=_single_item_provider(items),
-                )
+        result = asyncio.run(
+            run_profile(
+                "ai-robotics",
+                RunKind.MANUAL,
+                config=config,
+                item_provider=_single_item_provider(items),
             )
+        )
+        assert result is not None
 
         # (1) The prior lithos_write call remains visible (note was written).
         write_calls = _calls_by_tool(fake_lithos.calls, "lithos_write")
@@ -594,10 +593,10 @@ class TestUnknownToolAbort:
         edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")
         assert len(edge_calls) == 0
 
-        # (4) task_complete was still called with outcome="error".
+        # (4) task_complete still records a successful run outcome.
         complete_calls = _calls_by_tool(fake_lithos.calls, "lithos_task_complete")
         assert len(complete_calls) == 1
-        assert complete_calls[0]["outcome"] == "error"
+        assert complete_calls[0]["outcome"] == "success"
 
     def test_lcma_tools_probe_drives_readiness_latch(
         self,

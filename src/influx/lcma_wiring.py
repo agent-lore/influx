@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from influx.lcma import after_write, resolve_builds_on
+from influx.telemetry import current_run_id
 
 if TYPE_CHECKING:
     from influx.lithos_client import LithosClient
@@ -78,6 +79,7 @@ class LcmaWiringDeps:
 async def wire(
     *,
     written_note_id: str,
+    source_url: str,
     cascade: CascadeOutput,
     deps: LcmaWiringDeps,
 ) -> list[dict[str, Any]]:
@@ -110,18 +112,44 @@ async def wire(
         (issue #69) drives the latch and the next probe cycle
         re-evaluates.
     """
-    related = await after_write(
-        client=deps.client,
-        title=cascade.title,
-        contributions=cascade.contributions,
-        run_task_id=deps.run_task_id,
-        profile=deps.profile,
-        lcma_edge_score=deps.lcma_edge_score,
-        source_note_id=written_note_id,
-    )
-    await resolve_builds_on(
-        client=deps.client,
-        builds_on=cascade.builds_on,
-        source_note_id=written_note_id,
-    )
+    related: list[dict[str, Any]] = []
+    try:
+        related = await after_write(
+            client=deps.client,
+            title=cascade.title,
+            contributions=cascade.contributions,
+            run_task_id=deps.run_task_id,
+            profile=deps.profile,
+            lcma_edge_score=deps.lcma_edge_score,
+            source_note_id=written_note_id,
+            source_url=source_url,
+        )
+    except Exception:
+        logger.warning(
+            "LCMA related_to wiring failed profile=%s run_id=%s "
+            "source_url=%s note_id=%s",
+            deps.profile,
+            current_run_id.get() or "",
+            source_url,
+            written_note_id,
+            exc_info=True,
+        )
+    try:
+        await resolve_builds_on(
+            client=deps.client,
+            builds_on=cascade.builds_on,
+            source_note_id=written_note_id,
+            profile=deps.profile,
+            written_source_url=source_url,
+        )
+    except Exception:
+        logger.warning(
+            "LCMA builds_on wiring failed profile=%s run_id=%s "
+            "source_url=%s note_id=%s",
+            deps.profile,
+            current_run_id.get() or "",
+            source_url,
+            written_note_id,
+            exc_info=True,
+        )
     return related
