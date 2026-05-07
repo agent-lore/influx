@@ -553,7 +553,7 @@ async def test_run_execute_persists_unresolved_slug_collision_without_injected_l
         outcome = await Run(plan, deps).execute()
 
     assert outcome.ingested == 0
-    backlog = RunLedger(config.storage.state_dir).unresolved_slug_collisions()
+    backlog = RunLedger(Path(config.storage.state_dir)).unresolved_slug_collisions()
     assert len(backlog) == 1
     assert backlog[0]["title"] == "Colliding Paper"
     assert backlog[0]["source"] == "rss"
