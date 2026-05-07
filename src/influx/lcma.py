@@ -165,6 +165,7 @@ async def after_write(
     profile: str,
     lcma_edge_score: float,
     source_note_id: str = "",
+    source_url: str = "",
 ) -> list[dict[str, Any]]:
     """Retrieve related Lithos memory and upsert ``related_to`` edges.
 
@@ -172,9 +173,9 @@ async def after_write(
     FR-LCMA-3, AC-M2-5, AC-M2-6).
 
     *source_note_id* is the id of the note that was just written; it is
-    passed verbatim as ``source_note_id`` to each ``edge_upsert`` so a
-    real graph edge can be created (per finding 1).  Each retrieve
-    result contributes its own ``note_id`` as ``target_note_id``.
+    passed verbatim as ``from_id`` to each ``edge_upsert`` so a real
+    graph edge can be created. Each retrieve result contributes its own
+    ``note_id`` as ``to_id``.
 
     Returns a list of ``{"title": str, "score": float}`` dicts for
     high-scoring results so the webhook digest can populate
@@ -199,6 +200,16 @@ async def after_write(
 
     body = json.loads(result.content[0].text)  # type: ignore[union-attr]
     results: list[dict[str, Any]] = body.get("results", [])
+    logger.info(
+        "LCMA retrieve completed profile=%s run_id=%s source_url=%s "
+        "note_id=%s tool=%s results=%d",
+        profile,
+        current_run_id.get() or "",
+        source_url,
+        source_note_id,
+        "lithos_retrieve",
+        len(results),
+    )
 
     related: list[dict[str, Any]] = []
     for r in results:
@@ -209,16 +220,42 @@ async def after_write(
         receipt_id = r.get("receipt_id", "")
         target_note_id = r.get("note_id", "")
         await client.edge_upsert(
+            from_id=source_note_id,
+            to_id=target_note_id,
             type="related_to",
+            weight=score,
+            namespace="influx",
+            provenance_actor="influx-lcma-retrieve",
+            provenance_type="lcma_retrieve",
             evidence={
                 "kind": "lithos_retrieve",
                 "score": score,
                 "receipt_id": receipt_id,
             },
-            source_note_id=source_note_id,
-            target_note_id=target_note_id,
+        )
+        logger.info(
+            "LCMA related_to edge upserted profile=%s run_id=%s "
+            "source_url=%s note_id=%s tool=%s target_note_id=%s score=%.3f",
+            profile,
+            current_run_id.get() or "",
+            source_url,
+            source_note_id,
+            "lithos_edge_upsert",
+            target_note_id,
+            score,
         )
         related.append({"title": r.get("title", ""), "score": score})
+
+    if not related:
+        logger.info(
+            "LCMA retrieve produced no related matches above threshold "
+            "profile=%s run_id=%s source_url=%s note_id=%s threshold=%.3f",
+            profile,
+            current_run_id.get() or "",
+            source_url,
+            source_note_id,
+            lcma_edge_score,
+        )
 
     return related
 
@@ -231,6 +268,8 @@ async def resolve_builds_on(
     client: LithosClient,
     builds_on: list[str] | None = None,
     source_note_id: str = "",
+    profile: str = "",
+    written_source_url: str = "",
 ) -> None:
     """Resolve Tier 3 ``builds_on`` items via ``lithos_cache_lookup``.
 
@@ -241,8 +280,8 @@ async def resolve_builds_on(
     matching cache entry are silently skipped (AC-M2-8).
 
     *source_note_id* is the id of the note that was just written; the
-    cache-lookup hit supplies the prior note's id as
-    ``target_note_id``.  Both are forwarded to ``edge_upsert`` so a real
+    cache-lookup hit supplies the prior note's id as ``to_id``. Both are
+    forwarded to ``edge_upsert`` so a real
     graph edge can be created (per finding 1).
     """
     if not builds_on:
@@ -263,15 +302,51 @@ async def resolve_builds_on(
 
         body = json.loads(result.content[0].text)  # type: ignore[union-attr]
         if not body.get("hit"):
+            logger.info(
+                "LCMA builds_on lookup miss profile=%s run_id=%s "
+                "source_url=%s note_id=%s tool=%s target_source_url=%s",
+                profile,
+                current_run_id.get() or "",
+                written_source_url,
+                source_note_id,
+                "lithos_cache_lookup",
+                source_url,
+            )
             continue
 
         # Exact source_url match required — no fuzzy matching (AC-M2-8).
         if body.get("source_url") != source_url:
+            logger.info(
+                "LCMA builds_on lookup source_url mismatch profile=%s run_id=%s "
+                "source_url=%s note_id=%s tool=%s expected_source_url=%s "
+                "actual_source_url=%s",
+                profile,
+                current_run_id.get() or "",
+                written_source_url,
+                source_note_id,
+                "lithos_cache_lookup",
+                source_url,
+                body.get("source_url", ""),
+            )
             continue
 
         await client.edge_upsert(
+            from_id=source_note_id,
+            to_id=body.get("note_id", ""),
             type="builds_on",
+            weight=1.0,
+            namespace="influx",
+            provenance_actor="influx-tier3-builds-on",
+            provenance_type="tier3_extraction",
             evidence={"kind": "tier3_builds_on_extraction"},
-            source_note_id=source_note_id,
-            target_note_id=body.get("note_id", ""),
+        )
+        logger.info(
+            "LCMA builds_on edge upserted profile=%s run_id=%s "
+            "source_url=%s note_id=%s tool=%s target_note_id=%s",
+            profile,
+            current_run_id.get() or "",
+            written_source_url,
+            source_note_id,
+            "lithos_edge_upsert",
+            body.get("note_id", ""),
         )

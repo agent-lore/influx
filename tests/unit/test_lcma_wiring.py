@@ -90,6 +90,7 @@ class TestRelatedToEdgeScoreThreshold:
 
         related = await wire(
             written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
             cascade=CascadeOutput(title="A Paper", contributions=["c1"]),
             deps=deps,
         )
@@ -98,8 +99,10 @@ class TestRelatedToEdgeScoreThreshold:
         client.edge_upsert.assert_awaited_once()
         call = client.edge_upsert.await_args
         assert call.kwargs["type"] == "related_to"
-        assert call.kwargs["source_note_id"] == "note-new"
-        assert call.kwargs["target_note_id"] == "note-prior"
+        assert call.kwargs["from_id"] == "note-new"
+        assert call.kwargs["to_id"] == "note-prior"
+        assert call.kwargs["weight"] == 0.9
+        assert call.kwargs["namespace"] == "influx"
         assert call.kwargs["evidence"]["score"] == 0.9
 
     @pytest.mark.asyncio
@@ -115,6 +118,7 @@ class TestRelatedToEdgeScoreThreshold:
 
         related = await wire(
             written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
             cascade=CascadeOutput(title="A Paper"),
             deps=deps,
         )
@@ -136,6 +140,7 @@ class TestRelatedToEdgeScoreThreshold:
 
         related = await wire(
             written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
             cascade=CascadeOutput(title="A Paper"),
             deps=deps,
         )
@@ -163,6 +168,7 @@ class TestBuildsOnResolution:
 
         await wire(
             written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
             cascade=CascadeOutput(
                 title="A Paper",
                 builds_on=["FooNet (arXiv:2412.12345)"],
@@ -178,8 +184,10 @@ class TestBuildsOnResolution:
             if call.kwargs.get("type") == "builds_on"
         ]
         assert len(upserts) == 1
-        assert upserts[0]["source_note_id"] == "note-new"
-        assert upserts[0]["target_note_id"] == "note-prior"
+        assert upserts[0]["from_id"] == "note-new"
+        assert upserts[0]["to_id"] == "note-prior"
+        assert upserts[0]["weight"] == 1.0
+        assert upserts[0]["namespace"] == "influx"
 
     @pytest.mark.asyncio
     async def test_no_arxiv_id_skips_lookup(self) -> None:
@@ -188,6 +196,7 @@ class TestBuildsOnResolution:
 
         await wire(
             written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
             cascade=CascadeOutput(
                 title="A Paper",
                 builds_on=["A handwave reference with no id"],
@@ -204,6 +213,7 @@ class TestBuildsOnResolution:
 
         await wire(
             written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
             cascade=CascadeOutput(
                 title="A Paper",
                 builds_on=["FooNet (arXiv:2412.12345)"],
@@ -220,8 +230,12 @@ class TestBuildsOnResolution:
         assert builds_on_upserts == []
 
     @pytest.mark.asyncio
-    async def test_source_url_mismatch_skips_edge(self) -> None:
+    async def test_source_url_mismatch_skips_edge(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         """AC-M2-8: cache hit with a different source_url is treated as miss."""
+        caplog.set_level("INFO")
         client = _make_client(
             cache_lookup_payload={
                 "hit": True,
@@ -233,6 +247,7 @@ class TestBuildsOnResolution:
 
         await wire(
             written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
             cascade=CascadeOutput(
                 title="A Paper",
                 builds_on=["FooNet (arXiv:2412.12345)"],
@@ -246,6 +261,7 @@ class TestBuildsOnResolution:
             if call.kwargs.get("type") == "builds_on"
         ]
         assert builds_on_upserts == []
+        assert "LCMA builds_on lookup source_url mismatch" in caplog.text
 
     @pytest.mark.asyncio
     async def test_empty_builds_on_is_noop(self) -> None:
@@ -254,6 +270,7 @@ class TestBuildsOnResolution:
 
         await wire(
             written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
             cascade=CascadeOutput(title="A Paper", builds_on=None),
             deps=deps,
         )
@@ -265,39 +282,48 @@ class TestBuildsOnResolution:
 
 
 class TestLcmaErrorPropagation:
-    """``LCMAError`` propagates verbatim — no per-call latching here.
+    """LCMA wiring is best-effort at the item boundary.
 
-    The probe loop drives the ``lcma_unknown_tool_failure`` latch via
-    ``tools/list`` (issue #69); ``wire`` is purely a tools-call seam
-    now.
+    The probe loop still drives the ``lcma_unknown_tool_failure`` latch
+    via ``tools/list`` (issue #69), but post-write LCMA execution no
+    longer aborts the rest of the run after the note has already been
+    written.
     """
 
     @pytest.mark.asyncio
-    async def test_unknown_tool_on_retrieve_propagates(self) -> None:
+    async def test_unknown_tool_on_retrieve_is_contained(self) -> None:
         client = _make_client()
         client.retrieve = AsyncMock(
             side_effect=LCMAError("unknown_tool", stage="lithos_retrieve")
         )
         deps = _make_deps(client)
 
-        with pytest.raises(LCMAError, match="unknown_tool"):
-            await wire(
-                written_note_id="note-new",
-                cascade=CascadeOutput(title="A Paper"),
-                deps=deps,
-            )
+        related = await wire(
+            written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
+            cascade=CascadeOutput(title="A Paper"),
+            deps=deps,
+        )
+
+        assert related == []
 
     @pytest.mark.asyncio
-    async def test_other_lcma_error_propagates(self) -> None:
+    async def test_other_lcma_error_is_contained_and_builds_on_still_runs(self) -> None:
         client = _make_client()
         client.retrieve = AsyncMock(
             side_effect=LCMAError("transport refused", stage="http")
         )
         deps = _make_deps(client)
 
-        with pytest.raises(LCMAError):
-            await wire(
-                written_note_id="note-new",
-                cascade=CascadeOutput(title="A Paper"),
-                deps=deps,
-            )
+        related = await wire(
+            written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
+            cascade=CascadeOutput(
+                title="A Paper",
+                builds_on=["FooNet (arXiv:2412.12345)"],
+            ),
+            deps=deps,
+        )
+
+        assert related == []
+        client.cache_lookup.assert_awaited_once()

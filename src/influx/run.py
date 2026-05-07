@@ -36,6 +36,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from influx import metrics
@@ -304,7 +305,19 @@ async def lithos_task_lifecycle(
                 exc_info=True,
             )
             if not body_failed:
-                raise
+                try:
+                    await client.reconnect()
+                    await client.task_complete(
+                        task_id=run_task_id,
+                        agent="influx",
+                        outcome="success",
+                    )
+                except Exception:
+                    logger.warning(
+                        "lithos_task_complete retry failed for profile %r",
+                        profile,
+                        exc_info=True,
+                    )
 
 
 # ── Stages ──────────────────────────────────────────────────────────
@@ -517,15 +530,28 @@ async def _run_ingest_stage(
                 write_result.note_id,
                 str(cache_hit).lower(),
             )
-            related_in_lithos = await lcma_wire(
-                written_note_id=write_result.note_id,
-                cascade=CascadeOutput(
-                    title=title,
-                    contributions=item.get("contributions"),
-                    builds_on=item.get("builds_on"),
-                ),
-                deps=lcma_deps,
-            )
+            try:
+                related_in_lithos = await lcma_wire(
+                    written_note_id=write_result.note_id,
+                    source_url=source_url,
+                    cascade=CascadeOutput(
+                        title=title,
+                        contributions=item.get("contributions"),
+                        builds_on=item.get("builds_on"),
+                    ),
+                    deps=lcma_deps,
+                )
+            except Exception:
+                logger.warning(
+                    "LCMA wiring failed unexpectedly outside best-effort guard "
+                    "profile=%s source_url=%s title=%r note_id=%s",
+                    profile,
+                    source_url,
+                    title,
+                    write_result.note_id,
+                    exc_info=True,
+                )
+                related_in_lithos = []
             ingested.append(
                 HighlightItem(
                     id=item.get("id", f"note-{len(ingested) + 1}"),
@@ -750,12 +776,15 @@ class Run:
                     _apply_health_actions(d3.health_actions, probe_loop)
 
                     # Stage 4 — Ingest
+                    run_ledger = deps.ledger or RunLedger(
+                        Path(config.storage.state_dir)
+                    )
                     ingest, d4 = await _run_ingest_stage(
                         plan,
                         items=acquire.items,
                         client=client,
                         lcma_deps=lcma_deps,
-                        ledger=deps.ledger,
+                        ledger=run_ledger,
                     )
                     diagnostics = _merge_diagnostics(diagnostics, d4)
                     _apply_health_actions(d4.health_actions, probe_loop)

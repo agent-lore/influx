@@ -18,6 +18,7 @@ patches existing scheduler tests use.  This is the contract the
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -43,6 +44,7 @@ from influx.run import (
     _merge_diagnostics,
     _run_repair_stage,
 )
+from influx.run_ledger import RunLedger
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -100,6 +102,9 @@ class _NoopClient:
                 )
             ]
         )
+
+    async def reconnect(self) -> None:
+        self.calls.append(("reconnect", {}))
 
 
 # ── StageDiagnostics merge ─────────────────────────────────────────
@@ -220,6 +225,82 @@ async def test_run_execute_happy_path_returns_outcome() -> None:
     tools = [c[0] for c in client.calls]
     assert tools == ["task_create", "task_complete"]
     assert client.calls[1][1]["outcome"] == "success"
+
+
+async def test_run_execute_retries_task_complete_after_reconnect() -> None:
+    """Successful runs retry final task completion once after reconnect."""
+    config = _make_config()
+    plan = _scheduled_plan()
+    deps = RunDeps(config=config, item_provider=_empty_provider, probe_loop=None)
+    client = _NoopClient()
+
+    completion_attempts = 0
+
+    async def flaky_task_complete(**kwargs: Any) -> Any:
+        nonlocal completion_attempts
+        completion_attempts += 1
+        client.calls.append(("task_complete", kwargs))
+        if completion_attempts == 1:
+            raise RuntimeError("sse dropped")
+        from mcp import types as mcp_types
+
+        return mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"status": "completed"})
+                )
+            ]
+        )
+
+    client.task_complete = flaky_task_complete
+
+    with (
+        patch("influx.run.LithosClient", return_value=client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        outcome = await Run(plan, deps).execute()
+
+    assert outcome.ingested == 0
+    assert [call[0] for call in client.calls] == [
+        "task_create",
+        "task_complete",
+        "reconnect",
+        "task_complete",
+    ]
+
+
+async def test_run_execute_suppresses_terminal_task_complete_failure_after_retry() -> (
+    None
+):
+    """Successful ingest remains successful when both completion attempts fail."""
+    config = _make_config()
+    plan = _scheduled_plan()
+    deps = RunDeps(config=config, item_provider=_empty_provider, probe_loop=None)
+    client = _NoopClient()
+
+    async def failing_task_complete(**kwargs: Any) -> Any:
+        client.calls.append(("task_complete", kwargs))
+        raise RuntimeError("sse dropped")
+
+    client.task_complete = failing_task_complete
+
+    with (
+        patch("influx.run.LithosClient", return_value=client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        outcome = await Run(plan, deps).execute()
+
+    assert outcome.ingested == 0
+    assert [call[0] for call in client.calls] == [
+        "task_create",
+        "task_complete",
+        "reconnect",
+        "task_complete",
+    ]
 
 
 async def test_run_execute_propagates_sweep_write_error_with_health_action() -> None:
@@ -384,6 +465,177 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
     assert outcome.ingested == 1
     mock_client.write_note.assert_awaited_once()
     wire.assert_awaited_once()
+
+
+async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
+    """A post-write LCMA failure does not prevent later items from ingesting."""
+    config = _make_config()
+    plan = _scheduled_plan()
+
+    items = [
+        {
+            "title": "First Paper",
+            "source_url": "https://arxiv.org/abs/2401.00001",
+            "content": "# Summary\n\nbody",
+            "tags": ["profile:alpha", "source:arxiv"],
+            "confidence": 0.9,
+            "score": 9,
+            "path": "papers/arxiv/2024/01",
+            "abstract_or_summary": "abs",
+        },
+        {
+            "title": "Second Paper",
+            "source_url": "https://arxiv.org/abs/2401.00002",
+            "content": "# Summary\n\nbody",
+            "tags": ["profile:alpha", "source:arxiv"],
+            "confidence": 0.9,
+            "score": 9,
+            "path": "papers/arxiv/2024/01",
+            "abstract_or_summary": "abs",
+        },
+    ]
+
+    async def provider(
+        profile: str, kind: RunKind, run_range: Any, filter_prompt: str
+    ) -> list[dict[str, Any]]:
+        return items
+
+    from mcp import types as mcp_types
+
+    deps = RunDeps(config=config, item_provider=provider, probe_loop=None)
+
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
+    mock_client.task_create = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"task_id": "task-1"})
+                )
+            ]
+        )
+    )
+    mock_client.task_complete = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"status": "completed"})
+                )
+            ]
+        )
+    )
+    mock_client.cache_lookup_for_item = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
+        )
+    )
+    write_result_1 = MagicMock()
+    write_result_1.status = "created"
+    write_result_1.note_id = "note-1"
+    write_result_2 = MagicMock()
+    write_result_2.status = "created"
+    write_result_2.note_id = "note-2"
+    mock_client.write_note = AsyncMock(side_effect=[write_result_1, write_result_2])
+
+    with (
+        patch("influx.run.LithosClient", return_value=mock_client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.run.lcma_wire",
+            new_callable=AsyncMock,
+            side_effect=[RuntimeError("retrieve failed"), []],
+        ) as wire,
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        outcome = await Run(plan, deps).execute()
+
+    assert outcome.sources_checked == 2
+    assert outcome.ingested == 2
+    assert wire.await_count == 2
+
+
+async def test_run_execute_persists_unresolved_slug_collision_without_injected_ledger(
+    tmp_path: Path,
+) -> None:
+    """Slug-collision backlog still persists when ``RunDeps.ledger`` is ``None``."""
+    from mcp import types as mcp_types
+
+    config = _make_config().model_copy(
+        update={
+            "storage": _make_config().storage.model_copy(
+                update={"state_dir": tmp_path / "state"}
+            )
+        }
+    )
+    plan = _scheduled_plan()
+
+    items = [
+        {
+            "title": "Colliding Paper",
+            "source_url": "https://example.com/paper",
+            "content": "# Summary\n\nbody",
+            "tags": ["profile:alpha", "source:rss"],
+            "confidence": 0.9,
+            "score": 9,
+            "path": "papers/rss/2026/05",
+            "abstract_or_summary": "abs",
+        }
+    ]
+
+    async def provider(
+        profile: str, kind: RunKind, run_range: Any, filter_prompt: str
+    ) -> list[dict[str, Any]]:
+        return items
+
+    deps = RunDeps(config=config, item_provider=provider, probe_loop=None, ledger=None)
+
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
+    mock_client.task_create = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"task_id": "task-1"})
+                )
+            ]
+        )
+    )
+    mock_client.task_complete = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"status": "completed"})
+                )
+            ]
+        )
+    )
+    mock_client.cache_lookup_for_item = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
+        )
+    )
+    write_result = MagicMock()
+    write_result.status = "slug_collision"
+    write_result.note_id = ""
+    write_result.detail = "first_existing_id=doc-a; retry_existing_id=doc-b"
+    mock_client.write_note = AsyncMock(return_value=write_result)
+
+    with (
+        patch("influx.run.LithosClient", return_value=mock_client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        outcome = await Run(plan, deps).execute()
+
+    assert outcome.ingested == 0
+    backlog = RunLedger(Path(config.storage.state_dir)).unresolved_slug_collisions()
+    assert len(backlog) == 1
+    assert backlog[0]["title"] == "Colliding Paper"
+    assert backlog[0]["source"] == "rss"
 
 
 def test_run_aborted_carries_diagnostics_for_apply() -> None:

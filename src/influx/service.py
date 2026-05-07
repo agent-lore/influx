@@ -142,31 +142,25 @@ def create_app(
     # ``schedule.shutdown_grace_seconds`` (US-008).
     active_tasks: set[asyncio.Task[Any]] = set()
 
-    # Tool-lister reuses one lazy LithosClient for the service lifetime.
-    # Each probe still re-evaluates the LCMA tool surface, so missing-tool
-    # deployments recover without restart, but steady-state probes no
-    # longer re-register the agent or flap the SSE connection every cycle.
-    lithos_probe_client: LithosClient | None = None
-
     async def _list_lithos_tools() -> list[str]:
-        nonlocal lithos_probe_client
-        if lithos_probe_client is None:
-            lithos_probe_client = LithosClient(
-                url=config.lithos.url,
-                transport=config.lithos.transport,
-            )
+        # Keep the LCMA validation path side-effect-free with respect to
+        # service lifetime: open a short-lived SSE session only for the
+        # validation call, then close it immediately so Lithos restarts
+        # cannot strand a background probe client.
+        client = LithosClient(
+            url=config.lithos.url,
+            transport=config.lithos.transport,
+        )
         try:
-            return await lithos_probe_client.list_tools()
+            return await client.list_tools()
         except Exception:
-            await lithos_probe_client.close()
-            lithos_probe_client = None
             raise
+        finally:
+            await client.close()
 
     async def _close_lithos_probe_client() -> None:
-        nonlocal lithos_probe_client
-        if lithos_probe_client is not None:
-            await lithos_probe_client.close()
-            lithos_probe_client = None
+        # The probe lister now uses an ephemeral client per validation.
+        return
 
     probe_loop = ProbeLoop(
         config,
@@ -287,8 +281,15 @@ class InfluxService:
         )
         tracer = get_tracer(force_rebuild=True)
         logger.info("OTEL telemetry %s", "enabled" if tracer.enabled else "disabled")
-        await self.probe_loop.start()
-        self.scheduler.start()
+        probe_started = False
+        try:
+            await self.probe_loop.start()
+            probe_started = True
+            self.scheduler.start()
+        except Exception:
+            if probe_started:
+                await self.probe_loop.stop()
+            raise
         self._started = True
         logger.info("Influx service started")
 

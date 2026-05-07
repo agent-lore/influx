@@ -30,7 +30,6 @@ from influx.config import (
     SecurityConfig,
 )
 from influx.coordinator import RunKind
-from influx.errors import LCMAError
 from influx.probes import ProbeLoop
 from influx.scheduler import run_profile
 from tests.contract.test_lithos_client import FakeLithosServer
@@ -339,11 +338,13 @@ class TestAfterWriteEdgeWiring:
         assert evidence["score"] == 0.85
         assert evidence["receipt_id"] == "rcpt-001"
 
-        # Verify graph endpoints are wired (finding 1):
-        # source_note_id from the just-written note,
-        # target_note_id from the retrieve result.
-        assert edge_calls[0]["source_note_id"] == "note-source-001"
-        assert edge_calls[0]["target_note_id"] == "note-related-001"
+        # Verify graph endpoints and provenance are wired end-to-end.
+        assert edge_calls[0]["from_id"] == "note-source-001"
+        assert edge_calls[0]["to_id"] == "note-related-001"
+        assert edge_calls[0]["weight"] == 0.85
+        assert edge_calls[0]["namespace"] == "influx"
+        assert edge_calls[0]["provenance_actor"] == "influx-lcma-retrieve"
+        assert edge_calls[0]["provenance_type"] == "lcma_retrieve"
 
         # Verify the result carries related_in_lithos for webhook digest.
         assert result is not None
@@ -489,9 +490,13 @@ class TestBuildsOnResolver:
         builds_on_edges = [c for c in edge_calls if c["type"] == "builds_on"]
         assert len(builds_on_edges) == 1
         assert builds_on_edges[0]["evidence"] == {"kind": "tier3_builds_on_extraction"}
-        # Graph endpoints are wired end-to-end (finding 1).
-        assert builds_on_edges[0]["source_note_id"] == "note-builds-source"
-        assert builds_on_edges[0]["target_note_id"] == "note-foonet"
+        # Graph endpoints and provenance are wired end-to-end.
+        assert builds_on_edges[0]["from_id"] == "note-builds-source"
+        assert builds_on_edges[0]["to_id"] == "note-foonet"
+        assert builds_on_edges[0]["weight"] == 1.0
+        assert builds_on_edges[0]["namespace"] == "influx"
+        assert builds_on_edges[0]["provenance_actor"] == "influx-tier3-builds-on"
+        assert builds_on_edges[0]["provenance_type"] == "tier3_extraction"
 
     def test_cache_miss_produces_no_builds_on_edge(
         self,
@@ -543,18 +548,18 @@ class TestBuildsOnResolver:
         assert len(builds_on_edges) == 0
 
 
-# ── US-007: Abort on LCMAError("unknown_tool") ──────────────────
+# ── US-007: Best-effort containment for post-write LCMA failures ───
 
 
 class TestUnknownToolAbort:
-    """LCMAError("unknown_tool") aborts run, degrades readiness."""
+    """Post-write LCMA failures do not abort a run after the note is written."""
 
-    def test_retrieve_unknown_tool_aborts_run(
+    def test_retrieve_unknown_tool_is_contained(
         self,
         fake_lithos: FakeLithosServer,
         fake_lithos_url: str,
     ) -> None:
-        """Retrieve unknown_tool mid-run: aborts, no edges, notes remain."""
+        """Retrieve unknown_tool mid-run: note stays written and run completes."""
         config = _make_config(fake_lithos_url)
 
         # Make lithos_retrieve raise (simulates unknown_tool on Lithos).
@@ -571,15 +576,15 @@ class TestUnknownToolAbort:
             }
         ]
 
-        with pytest.raises(LCMAError, match="unknown_tool"):
-            asyncio.run(
-                run_profile(
-                    "ai-robotics",
-                    RunKind.MANUAL,
-                    config=config,
-                    item_provider=_single_item_provider(items),
-                )
+        result = asyncio.run(
+            run_profile(
+                "ai-robotics",
+                RunKind.MANUAL,
+                config=config,
+                item_provider=_single_item_provider(items),
             )
+        )
+        assert result is not None
 
         # (1) The prior lithos_write call remains visible (note was written).
         write_calls = _calls_by_tool(fake_lithos.calls, "lithos_write")
@@ -594,10 +599,10 @@ class TestUnknownToolAbort:
         edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")
         assert len(edge_calls) == 0
 
-        # (4) task_complete was still called with outcome="error".
+        # (4) task_complete still records a successful run outcome.
         complete_calls = _calls_by_tool(fake_lithos.calls, "lithos_task_complete")
         assert len(complete_calls) == 1
-        assert complete_calls[0]["outcome"] == "error"
+        assert complete_calls[0]["outcome"] == "success"
 
     def test_lcma_tools_probe_drives_readiness_latch(
         self,
