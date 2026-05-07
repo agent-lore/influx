@@ -18,6 +18,7 @@ patches existing scheduler tests use.  This is the contract the
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,6 +34,7 @@ from influx.config import (
 )
 from influx.coordinator import RunKind
 from influx.repair import SweepWriteError
+from influx.run_ledger import RunLedger
 from influx.run import (
     HealthAction,
     Run,
@@ -473,6 +475,88 @@ async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
     assert outcome.sources_checked == 2
     assert outcome.ingested == 2
     assert wire.await_count == 2
+
+
+async def test_run_execute_persists_unresolved_slug_collision_without_injected_ledger(
+    tmp_path: Path,
+) -> None:
+    """Slug-collision backlog still persists when ``RunDeps.ledger`` is ``None``."""
+    from mcp import types as mcp_types
+
+    config = _make_config().model_copy(
+        update={
+            "storage": _make_config().storage.model_copy(
+                update={"state_dir": tmp_path / "state"}
+            )
+        }
+    )
+    plan = _scheduled_plan()
+
+    items = [
+        {
+            "title": "Colliding Paper",
+            "source_url": "https://example.com/paper",
+            "content": "# Summary\n\nbody",
+            "tags": ["profile:alpha", "source:rss"],
+            "confidence": 0.9,
+            "score": 9,
+            "path": "papers/rss/2026/05",
+            "abstract_or_summary": "abs",
+        }
+    ]
+
+    async def provider(
+        profile: str, kind: RunKind, run_range: Any, filter_prompt: str
+    ) -> list[dict[str, Any]]:
+        return items
+
+    deps = RunDeps(config=config, item_provider=provider, probe_loop=None, ledger=None)
+
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
+    mock_client.task_create = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"task_id": "task-1"})
+                )
+            ]
+        )
+    )
+    mock_client.task_complete = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"status": "completed"})
+                )
+            ]
+        )
+    )
+    mock_client.cache_lookup_for_item = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
+        )
+    )
+    write_result = MagicMock()
+    write_result.status = "slug_collision"
+    write_result.note_id = ""
+    write_result.detail = "first_existing_id=doc-a; retry_existing_id=doc-b"
+    mock_client.write_note = AsyncMock(return_value=write_result)
+
+    with (
+        patch("influx.run.LithosClient", return_value=mock_client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        outcome = await Run(plan, deps).execute()
+
+    assert outcome.ingested == 0
+    backlog = RunLedger(config.storage.state_dir).unresolved_slug_collisions()
+    assert len(backlog) == 1
+    assert backlog[0]["title"] == "Colliding Paper"
+    assert backlog[0]["source"] == "rss"
 
 
 def test_run_aborted_carries_diagnostics_for_apply() -> None:
