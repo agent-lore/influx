@@ -36,6 +36,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from influx import metrics
@@ -763,12 +764,15 @@ class Run:
                     _apply_health_actions(d3.health_actions, probe_loop)
 
                     # Stage 4 — Ingest
+                    run_ledger = deps.ledger or RunLedger(
+                        Path(config.storage.state_dir)
+                    )
                     ingest, d4 = await _run_ingest_stage(
                         plan,
                         items=acquire.items,
                         client=client,
                         lcma_deps=lcma_deps,
-                        ledger=deps.ledger,
+                        ledger=run_ledger,
                     )
                     diagnostics = _merge_diagnostics(diagnostics, d4)
                     _apply_health_actions(d4.health_actions, probe_loop)
