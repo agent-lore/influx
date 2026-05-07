@@ -103,6 +103,9 @@ class _NoopClient:
             ]
         )
 
+    async def reconnect(self) -> None:
+        self.calls.append(("reconnect", {}))
+
 
 # ── StageDiagnostics merge ─────────────────────────────────────────
 
@@ -222,6 +225,82 @@ async def test_run_execute_happy_path_returns_outcome() -> None:
     tools = [c[0] for c in client.calls]
     assert tools == ["task_create", "task_complete"]
     assert client.calls[1][1]["outcome"] == "success"
+
+
+async def test_run_execute_retries_task_complete_after_reconnect() -> None:
+    """Successful runs retry final task completion once after reconnect."""
+    config = _make_config()
+    plan = _scheduled_plan()
+    deps = RunDeps(config=config, item_provider=_empty_provider, probe_loop=None)
+    client = _NoopClient()
+
+    completion_attempts = 0
+
+    async def flaky_task_complete(**kwargs: Any) -> Any:
+        nonlocal completion_attempts
+        completion_attempts += 1
+        client.calls.append(("task_complete", kwargs))
+        if completion_attempts == 1:
+            raise RuntimeError("sse dropped")
+        from mcp import types as mcp_types
+
+        return mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"status": "completed"})
+                )
+            ]
+        )
+
+    client.task_complete = flaky_task_complete
+
+    with (
+        patch("influx.run.LithosClient", return_value=client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        outcome = await Run(plan, deps).execute()
+
+    assert outcome.ingested == 0
+    assert [call[0] for call in client.calls] == [
+        "task_create",
+        "task_complete",
+        "reconnect",
+        "task_complete",
+    ]
+
+
+async def test_run_execute_suppresses_terminal_task_complete_failure_after_retry() -> (
+    None
+):
+    """Successful ingest remains successful when both completion attempts fail."""
+    config = _make_config()
+    plan = _scheduled_plan()
+    deps = RunDeps(config=config, item_provider=_empty_provider, probe_loop=None)
+    client = _NoopClient()
+
+    async def failing_task_complete(**kwargs: Any) -> Any:
+        client.calls.append(("task_complete", kwargs))
+        raise RuntimeError("sse dropped")
+
+    client.task_complete = failing_task_complete
+
+    with (
+        patch("influx.run.LithosClient", return_value=client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        outcome = await Run(plan, deps).execute()
+
+    assert outcome.ingested == 0
+    assert [call[0] for call in client.calls] == [
+        "task_create",
+        "task_complete",
+        "reconnect",
+        "task_complete",
+    ]
 
 
 async def test_run_execute_propagates_sweep_write_error_with_health_action() -> None:

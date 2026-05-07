@@ -305,7 +305,19 @@ async def lithos_task_lifecycle(
                 exc_info=True,
             )
             if not body_failed:
-                raise
+                try:
+                    await client.reconnect()
+                    await client.task_complete(
+                        task_id=run_task_id,
+                        agent="influx",
+                        outcome="success",
+                    )
+                except Exception:
+                    logger.warning(
+                        "lithos_task_complete retry failed for profile %r",
+                        profile,
+                        exc_info=True,
+                    )
 
 
 # ── Stages ──────────────────────────────────────────────────────────
