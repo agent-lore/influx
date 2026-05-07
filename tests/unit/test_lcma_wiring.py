@@ -99,8 +99,10 @@ class TestRelatedToEdgeScoreThreshold:
         client.edge_upsert.assert_awaited_once()
         call = client.edge_upsert.await_args
         assert call.kwargs["type"] == "related_to"
-        assert call.kwargs["source_note_id"] == "note-new"
-        assert call.kwargs["target_note_id"] == "note-prior"
+        assert call.kwargs["from_id"] == "note-new"
+        assert call.kwargs["to_id"] == "note-prior"
+        assert call.kwargs["weight"] == 0.9
+        assert call.kwargs["namespace"] == "influx"
         assert call.kwargs["evidence"]["score"] == 0.9
 
     @pytest.mark.asyncio
@@ -182,8 +184,10 @@ class TestBuildsOnResolution:
             if call.kwargs.get("type") == "builds_on"
         ]
         assert len(upserts) == 1
-        assert upserts[0]["source_note_id"] == "note-new"
-        assert upserts[0]["target_note_id"] == "note-prior"
+        assert upserts[0]["from_id"] == "note-new"
+        assert upserts[0]["to_id"] == "note-prior"
+        assert upserts[0]["weight"] == 1.0
+        assert upserts[0]["namespace"] == "influx"
 
     @pytest.mark.asyncio
     async def test_no_arxiv_id_skips_lookup(self) -> None:
