@@ -173,9 +173,9 @@ async def after_write(
     FR-LCMA-3, AC-M2-5, AC-M2-6).
 
     *source_note_id* is the id of the note that was just written; it is
-    passed verbatim as ``source_note_id`` to each ``edge_upsert`` so a
-    real graph edge can be created (per finding 1).  Each retrieve
-    result contributes its own ``note_id`` as ``target_note_id``.
+    passed verbatim as ``from_id`` to each ``edge_upsert`` so a real
+    graph edge can be created. Each retrieve result contributes its own
+    ``note_id`` as ``to_id``.
 
     Returns a list of ``{"title": str, "score": float}`` dicts for
     high-scoring results so the webhook digest can populate
@@ -220,14 +220,18 @@ async def after_write(
         receipt_id = r.get("receipt_id", "")
         target_note_id = r.get("note_id", "")
         await client.edge_upsert(
+            from_id=source_note_id,
+            to_id=target_note_id,
             type="related_to",
+            weight=score,
+            namespace="influx",
+            provenance_actor="influx-lcma-retrieve",
+            provenance_type="lcma_retrieve",
             evidence={
                 "kind": "lithos_retrieve",
                 "score": score,
                 "receipt_id": receipt_id,
             },
-            source_note_id=source_note_id,
-            target_note_id=target_note_id,
         )
         logger.info(
             "LCMA related_to edge upserted profile=%s run_id=%s "
@@ -276,8 +280,8 @@ async def resolve_builds_on(
     matching cache entry are silently skipped (AC-M2-8).
 
     *source_note_id* is the id of the note that was just written; the
-    cache-lookup hit supplies the prior note's id as
-    ``target_note_id``.  Both are forwarded to ``edge_upsert`` so a real
+    cache-lookup hit supplies the prior note's id as ``to_id``. Both are
+    forwarded to ``edge_upsert`` so a real
     graph edge can be created (per finding 1).
     """
     if not builds_on:
@@ -327,10 +331,14 @@ async def resolve_builds_on(
             continue
 
         await client.edge_upsert(
+            from_id=source_note_id,
+            to_id=body.get("note_id", ""),
             type="builds_on",
+            weight=1.0,
+            namespace="influx",
+            provenance_actor="influx-tier3-builds-on",
+            provenance_type="tier3_extraction",
             evidence={"kind": "tier3_builds_on_extraction"},
-            source_note_id=source_note_id,
-            target_note_id=body.get("note_id", ""),
         )
         logger.info(
             "LCMA builds_on edge upserted profile=%s run_id=%s "
