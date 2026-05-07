@@ -269,8 +269,9 @@ async def test_run_execute_retries_task_complete_after_reconnect() -> None:
     ]
 
 
-async def test_run_execute_suppresses_terminal_task_complete_failure_after_retry(
-) -> None:
+async def test_run_execute_suppresses_terminal_task_complete_failure_after_retry() -> (
+    None
+):
     """Successful ingest remains successful when both completion attempts fail."""
     config = _make_config()
     plan = _scheduled_plan()
