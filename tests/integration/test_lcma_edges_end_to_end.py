@@ -338,11 +338,13 @@ class TestAfterWriteEdgeWiring:
         assert evidence["score"] == 0.85
         assert evidence["receipt_id"] == "rcpt-001"
 
-        # Verify graph endpoints are wired (finding 1):
-        # source_note_id from the just-written note,
-        # target_note_id from the retrieve result.
-        assert edge_calls[0]["source_note_id"] == "note-source-001"
-        assert edge_calls[0]["target_note_id"] == "note-related-001"
+        # Verify graph endpoints and provenance are wired end-to-end.
+        assert edge_calls[0]["from_id"] == "note-source-001"
+        assert edge_calls[0]["to_id"] == "note-related-001"
+        assert edge_calls[0]["weight"] == 0.85
+        assert edge_calls[0]["namespace"] == "influx"
+        assert edge_calls[0]["provenance_actor"] == "influx-lcma-retrieve"
+        assert edge_calls[0]["provenance_type"] == "lcma_retrieve"
 
         # Verify the result carries related_in_lithos for webhook digest.
         assert result is not None
@@ -488,9 +490,13 @@ class TestBuildsOnResolver:
         builds_on_edges = [c for c in edge_calls if c["type"] == "builds_on"]
         assert len(builds_on_edges) == 1
         assert builds_on_edges[0]["evidence"] == {"kind": "tier3_builds_on_extraction"}
-        # Graph endpoints are wired end-to-end (finding 1).
-        assert builds_on_edges[0]["source_note_id"] == "note-builds-source"
-        assert builds_on_edges[0]["target_note_id"] == "note-foonet"
+        # Graph endpoints and provenance are wired end-to-end.
+        assert builds_on_edges[0]["from_id"] == "note-builds-source"
+        assert builds_on_edges[0]["to_id"] == "note-foonet"
+        assert builds_on_edges[0]["weight"] == 1.0
+        assert builds_on_edges[0]["namespace"] == "influx"
+        assert builds_on_edges[0]["provenance_actor"] == "influx-tier3-builds-on"
+        assert builds_on_edges[0]["provenance_type"] == "tier3_extraction"
 
     def test_cache_miss_produces_no_builds_on_edge(
         self,

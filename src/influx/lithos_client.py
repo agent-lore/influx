@@ -1237,20 +1237,32 @@ class LithosClient:
     async def edge_upsert(
         self,
         *,
+        from_id: str,
+        to_id: str,
         type: str,
-        evidence: dict[str, Any],
-        source_note_id: str = "",
-        target_note_id: str = "",
+        weight: float,
+        namespace: str = "influx",
+        provenance_actor: str | None = None,
+        provenance_type: str | None = None,
+        evidence: dict[str, Any] | list[Any] | None = None,
+        conflict_state: str | None = None,
     ) -> mcp_types.CallToolResult:
         """Call ``lithos_edge_upsert`` (FR-LCMA-3)."""
         args: dict[str, Any] = {
+            "from_id": from_id,
+            "to_id": to_id,
             "type": type,
-            "evidence": evidence,
+            "weight": weight,
+            "namespace": namespace,
         }
-        if source_note_id:
-            args["source_note_id"] = source_note_id
-        if target_note_id:
-            args["target_note_id"] = target_note_id
+        if provenance_actor is not None:
+            args["provenance_actor"] = provenance_actor
+        if provenance_type is not None:
+            args["provenance_type"] = provenance_type
+        if evidence is not None:
+            args["evidence"] = evidence
+        if conflict_state is not None:
+            args["conflict_state"] = conflict_state
         return await self._call_lcma_tool("lithos_edge_upsert", args)
 
     async def task_create(

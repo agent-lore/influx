@@ -217,19 +217,29 @@ class FakeLithosServer:
 
         @self._mcp.tool(name="lithos_edge_upsert")
         async def lithos_edge_upsert(
+            from_id: str = "",
+            to_id: str = "",
             type: str = "",
-            source_note_id: str = "",
-            target_note_id: str = "",
+            weight: float = 0.0,
+            namespace: str = "",
+            provenance_actor: str | None = None,
+            provenance_type: str | None = None,
             evidence: dict[str, Any] | None = None,
+            conflict_state: str | None = None,
         ) -> str:
             calls.append(
                 (
                     "lithos_edge_upsert",
                     {
+                        "from_id": from_id,
+                        "to_id": to_id,
                         "type": type,
-                        "source_note_id": source_note_id,
-                        "target_note_id": target_note_id,
+                        "weight": weight,
+                        "namespace": namespace,
+                        "provenance_actor": provenance_actor,
+                        "provenance_type": provenance_type,
                         "evidence": evidence,
+                        "conflict_state": conflict_state,
                     },
                 )
             )
