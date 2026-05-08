@@ -212,6 +212,20 @@ async def after_write(
     for r in results:
         score = float(r.get("score", 0.0))
         if score < lcma_edge_score:
+            logger.debug(
+                "LCMA related_to result below threshold profile=%s run_id=%s "
+                "source_url=%s note_id=%s tool=%s target_note_id=%s "
+                "target_title=%r score=%.3f threshold=%.3f",
+                profile,
+                current_run_id.get() or "",
+                source_url,
+                source_note_id,
+                "lithos_retrieve",
+                r.get("note_id", ""),
+                r.get("title", ""),
+                score,
+                lcma_edge_score,
+            )
             continue
 
         receipt_id = r.get("receipt_id", "")
@@ -287,6 +301,15 @@ async def resolve_builds_on(
     for item in builds_on:
         ref = extract_arxiv_ref(item)
         if ref is None:
+            logger.info(
+                "LCMA builds_on item missing arxiv_id profile=%s run_id=%s "
+                "source_url=%s note_id=%s item=%r",
+                profile,
+                current_run_id.get() or "",
+                written_source_url,
+                source_note_id,
+                item,
+            )
             continue
 
         prior_title, arxiv_id = ref
@@ -299,13 +322,16 @@ async def resolve_builds_on(
         if not body.get("hit"):
             logger.info(
                 "LCMA builds_on lookup miss profile=%s run_id=%s "
-                "source_url=%s note_id=%s tool=%s target_source_url=%s",
+                "source_url=%s note_id=%s tool=%s target_source_url=%s "
+                "prior_title=%r arxiv_id=%s",
                 profile,
                 current_run_id.get() or "",
                 written_source_url,
                 source_note_id,
                 "lithos_cache_lookup",
                 source_url,
+                prior_title,
+                arxiv_id,
             )
             continue
 
@@ -314,7 +340,7 @@ async def resolve_builds_on(
             logger.info(
                 "LCMA builds_on lookup source_url mismatch profile=%s run_id=%s "
                 "source_url=%s note_id=%s tool=%s expected_source_url=%s "
-                "actual_source_url=%s",
+                "actual_source_url=%s prior_title=%r arxiv_id=%s",
                 profile,
                 current_run_id.get() or "",
                 written_source_url,
@@ -322,6 +348,8 @@ async def resolve_builds_on(
                 "lithos_cache_lookup",
                 source_url,
                 body.get("source_url", ""),
+                prior_title,
+                arxiv_id,
             )
             continue
 
