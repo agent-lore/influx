@@ -204,6 +204,30 @@ def _find_tag(tags: list[str], prefix: str) -> str | None:
     return None
 
 
+def _note_tags(note: dict[str, object]) -> list[str]:
+    """Read and cast the note's tag list defensively (Lithos returns ``Any``)."""
+    raw = note.get("tags", [])
+    return list(raw) if isinstance(raw, list) else []
+
+
+def _require_arxiv_source(note: dict[str, object], *, stage_label: str) -> None:
+    """Raise ``ExtractionError(stage="unsupported_source")`` for non-arxiv notes.
+
+    The current sweep-side hooks only know how to retry archive download
+    and text extraction for arxiv notes; other sources surface this
+    sentinel which the sweep classifies as transient (and which
+    :func:`influx.repair._terminate_unsupported_text_source` flips to
+    terminal so the note exits the sweep instead of looping).
+    """
+    source = _find_tag(_note_tags(note), _SOURCE_TAG_PREFIX) or ""
+    if source != "arxiv":
+        raise ExtractionError(
+            f"{stage_label}: source {source!r} not supported",
+            stage="unsupported_source",
+            detail=f"note id={note.get('id', '?')}",
+        )
+
+
 def _parse_year_month_from_note_path(note_path: str) -> tuple[int, int] | None:
     """Pull ``(year, month)`` from a Lithos note path like ``papers/arxiv/2026/04``."""
     m = _NOTE_PATH_RE.search(note_path)
@@ -240,9 +264,7 @@ def _resolve_arxiv_download_args(
     missing fields needed to retry — the sweep treats this as transient
     so an operator hand-fix lands the next pass.
     """
-    raw_tags = note.get("tags", [])
-    tags: list[str] = list(raw_tags) if isinstance(raw_tags, list) else []
-    arxiv_id = _find_tag(tags, _ARXIV_ID_TAG_PREFIX)
+    arxiv_id = _find_tag(_note_tags(note), _ARXIV_ID_TAG_PREFIX)
     if not arxiv_id:
         raise ExtractionError(
             "Cannot retry archive download: no arxiv-id tag on note",
@@ -295,15 +317,7 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
     """
 
     def hook(note: dict[str, object]) -> str:
-        raw_tags = note.get("tags", [])
-        tags: list[str] = list(raw_tags) if isinstance(raw_tags, list) else []
-        source = _find_tag(tags, _SOURCE_TAG_PREFIX) or ""
-        if source != "arxiv":
-            raise ExtractionError(
-                f"archive_download retry: source {source!r} not supported",
-                stage="unsupported_source",
-                detail=f"note id={note.get('id', '?')}",
-            )
+        _require_arxiv_source(note, stage_label="archive_download retry")
 
         kwargs = _resolve_arxiv_download_args(note, config)
         result = download_archive(**kwargs)  # type: ignore[arg-type]
@@ -345,17 +359,9 @@ def _make_text_extraction_hook(config: AppConfig) -> TextExtractionHook:
     """
 
     def hook(note: dict[str, object]) -> str:
-        raw_tags = note.get("tags", [])
-        tags: list[str] = list(raw_tags) if isinstance(raw_tags, list) else []
-        source = _find_tag(tags, _SOURCE_TAG_PREFIX) or ""
-        if source != "arxiv":
-            raise ExtractionError(
-                f"text_extraction retry: source {source!r} not supported",
-                stage="unsupported_source",
-                detail=f"note id={note.get('id', '?')}",
-            )
+        _require_arxiv_source(note, stage_label="text_extraction retry")
 
-        arxiv_id = _find_tag(tags, _ARXIV_ID_TAG_PREFIX)
+        arxiv_id = _find_tag(_note_tags(note), _ARXIV_ID_TAG_PREFIX)
         if not arxiv_id:
             raise ExtractionError(
                 "Cannot retry text extraction: no arxiv-id tag on note",
@@ -430,8 +436,7 @@ def _make_tier2_enrich_hook(config: AppConfig) -> Tier2EnrichHook:
 
     def hook(note: dict[str, object]) -> None:
         content: str = str(note.get("content", ""))
-        raw_tags = note.get("tags", [])
-        tags: list[str] = list(raw_tags) if isinstance(raw_tags, list) else []
+        tags: list[str] = _note_tags(note)
 
         # Find archive path from note content.
         try:
@@ -478,8 +483,7 @@ def _make_tier3_extract_hook(config: AppConfig) -> Tier3ExtractHook:
 
     def hook(note: dict[str, object]) -> None:
         content: str = str(note.get("content", ""))
-        raw_tags = note.get("tags", [])
-        tags: list[str] = list(raw_tags) if isinstance(raw_tags, list) else []
+        tags: list[str] = _note_tags(note)
 
         # Extract full text from note content.
         full_text = _extract_full_text_body(content)
