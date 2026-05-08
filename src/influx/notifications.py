@@ -453,7 +453,11 @@ def _deliver_json_payload(
                 extra={
                     **extra,
                     "status_code": result.status_code,
-                    "response_body": _decode_response_snippet(result.body),
+                    "response_body": _decode_response_snippet(
+                        result.body,
+                        truncated=result.truncated,
+                    ),
+                    "response_body_truncated": result.truncated,
                 },
             )
         else:
@@ -469,14 +473,22 @@ def _deliver_json_payload(
         )
 
 
-def _decode_response_snippet(body: bytes) -> str:
+_TRUNCATION_MARKER = "…[truncated]"
+
+
+def _decode_response_snippet(body: bytes, *, truncated: bool) -> str:
     """Decode a bounded webhook response body for safe inclusion in logs.
 
     The HTTP layer already caps the captured body length, so this only
     needs to coerce arbitrary bytes into a printable string without
-    raising on partial UTF-8 sequences.
+    raising on partial UTF-8 sequences.  When the captured snippet is a
+    fragment of a longer upstream response, append a marker so an
+    operator reading the log cannot mistake it for the full body.
     """
-    return body.decode("utf-8", errors="replace")
+    text = body.decode("utf-8", errors="replace")
+    if truncated:
+        return f"{text}{_TRUNCATION_MARKER}"
+    return text
 
 
 def _build_auth_headers(

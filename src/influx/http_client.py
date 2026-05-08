@@ -72,11 +72,15 @@ class PostJsonResult:
 
     ``body`` is truncated to at most :data:`_MAX_POST_RESPONSE_BODY_BYTES`
     so callers can include it in failure logs without risking unbounded
-    payloads.
+    payloads.  ``truncated`` is ``True`` when the upstream response was
+    longer than the cap and the captured snippet is therefore a fragment;
+    callers should surface a marker in user-facing logs so operators do
+    not mistake the snippet for the full body.
     """
 
     status_code: int
     body: bytes
+    truncated: bool = False
 
 
 # ── Scheme validation ────────────────────────────────────────────────
@@ -334,16 +338,24 @@ def guarded_post_json(
         ):
             chunks: list[bytes] = []
             received = 0
+            truncated = False
             for chunk in response.iter_bytes():
-                if received >= _MAX_POST_RESPONSE_BODY_BYTES:
-                    break
                 remaining = _MAX_POST_RESPONSE_BODY_BYTES - received
-                slice_ = chunk[:remaining]
-                chunks.append(slice_)
-                received += len(slice_)
+                if remaining <= 0:
+                    # Upstream still has bytes beyond the cap.
+                    truncated = True
+                    break
+                if len(chunk) > remaining:
+                    chunks.append(chunk[:remaining])
+                    received += remaining
+                    truncated = True
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
             return PostJsonResult(
                 status_code=response.status_code,
                 body=b"".join(chunks),
+                truncated=truncated,
             )
     except httpx.TimeoutException as exc:
         raise NetworkError(

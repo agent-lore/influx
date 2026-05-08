@@ -536,6 +536,7 @@ class TestGuardedPostJsonBodyCapture:
         assert isinstance(result, PostJsonResult)
         assert result.status_code == 400
         assert b'"bad request"' in result.body
+        assert result.truncated is False
 
     @respx.mock
     def test_returns_status_and_body_for_2xx(self) -> None:
@@ -550,9 +551,10 @@ class TestGuardedPostJsonBodyCapture:
         )
         assert result.status_code == 200
         assert result.body == b'{"ok":true}'
+        assert result.truncated is False
 
     @respx.mock
-    def test_response_body_is_capped(self) -> None:
+    def test_response_body_is_capped_and_marked_truncated(self) -> None:
         url = "http://public.example.com/webhook"
         respx.post(url).mock(
             return_value=httpx.Response(500, text="x" * 16384),
@@ -565,3 +567,19 @@ class TestGuardedPostJsonBodyCapture:
         assert result.status_code == 500
         assert len(result.body) == 4096
         assert result.body == b"x" * 4096
+        assert result.truncated is True
+
+    @respx.mock
+    def test_response_body_at_exact_cap_is_not_marked_truncated(self) -> None:
+        """A response that fits exactly inside the cap is not marked truncated."""
+        url = "http://public.example.com/webhook"
+        respx.post(url).mock(
+            return_value=httpx.Response(500, text="y" * 4096),
+        )
+        result = guarded_post_json(
+            url,
+            {"foo": "bar"},
+            allow_private_ips=True,
+        )
+        assert len(result.body) == 4096
+        assert result.truncated is False

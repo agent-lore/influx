@@ -613,13 +613,16 @@ class TestNotificationDeliveryBehavior:
         assert isinstance(body_snippet, str)
         assert "missing context" in body_snippet
         assert "context field is required" in body_snippet
+        # A body that fits within the cap is NOT marked truncated.
+        assert getattr(record, "response_body_truncated", None) is False
+        assert "[truncated]" not in body_snippet
 
-    def test_non_2xx_response_body_is_capped(
+    def test_non_2xx_response_body_is_capped_and_marked_truncated(
         self,
         error_body_webhook_url: str,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Oversized webhook error bodies are truncated to a bounded snippet (#108)."""
+        """Oversized webhook error bodies are truncated and flagged (#108)."""
         # Override the fixture's defaults for this test.
         _ErrorBodyHandler.response_status = 500
         _ErrorBodyHandler.response_body = b"x" * 16384
@@ -650,7 +653,9 @@ class TestNotificationDeliveryBehavior:
             if "unexpected HTTP status" in record.message
         ]
         assert unexpected_records
-        body_snippet = getattr(unexpected_records[0], "response_body", "")
-        # Cap is 4096 bytes; ASCII-decoded length matches.
-        assert len(body_snippet) <= 4096
-        assert len(body_snippet) > 0
+        record = unexpected_records[0]
+        body_snippet = getattr(record, "response_body", "")
+        assert getattr(record, "response_body_truncated", None) is True
+        # 4096 captured ASCII bytes plus the truncation marker.
+        assert "[truncated]" in body_snippet
+        assert body_snippet.startswith("x" * 4096)
