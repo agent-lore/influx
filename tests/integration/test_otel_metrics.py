@@ -268,13 +268,15 @@ class TestRunLifecycleAndFunnelMetrics:
             {"profile": "ai-robotics", "run_type": "scheduled"},
         )
         assert "influx_run_completions_total" in points
-        # Outcome is "success" (no source_acquisition_errors in the fake run).
+        # Archive persistence fails in this isolated test environment, so the
+        # accepted item is tagged ``influx:archive-missing`` and the run
+        # completes as degraded via archive_acquisition.
         assert _has_label_set(
             points["influx_run_completions_total"],
             {
                 "profile": "ai-robotics",
                 "run_type": "scheduled",
-                "outcome": "success",
+                "outcome": "degraded",
             },
         )
         assert "influx_run_duration_seconds" in points

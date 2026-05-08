@@ -166,6 +166,13 @@ async def ledger_lifecycle(
         outcome = session.outcome
         sources_checked = outcome.sources_checked if outcome is not None else None
         ingested = outcome.ingested if outcome is not None else None
+        archive_failures_total = 0
+        if outcome is not None and outcome.profile_run_result is not None:
+            archive_failures_total = sum(
+                1
+                for item in outcome.profile_run_result.items
+                if "influx:archive-missing" in item.tags
+            )
         # #85: pull the pre-filter fetched-count from the contextvar
         # bucket the source layer accumulated into.  ``outcome`` may be
         # ``None`` on the early-skip / abort paths; in that case we
@@ -180,6 +187,7 @@ async def ledger_lifecycle(
             ingested=ingested,
             fetched_total=fetched_total,
             filter_errors_total=filter_errors_total,
+            archive_failures_total=archive_failures_total,
             source_acquisition_errors=source_errors,
         )
         run_outcome = "degraded" if source_errors else "success"
@@ -257,6 +265,19 @@ async def ledger_lifecycle(
                 plan.kind.value,
                 run_id,
                 filter_errors_total,
+            )
+        if "archive_acquisition" in degraded_reasons:
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged archive_acquisition profile=%s kind=%s run_id=%s "
+                "archive_failures=%d "
+                "(accepted items were ingested with influx:archive-missing "
+                "after archive download failed)",
+                profile,
+                plan.kind.value,
+                run_id,
+                archive_failures_total,
             )
         metrics.run_duration().record(elapsed, metric_attrs)
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
