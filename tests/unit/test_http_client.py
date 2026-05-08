@@ -19,7 +19,9 @@ import respx
 from influx.errors import NetworkError
 from influx.http_client import (
     FetchResult,
+    PostJsonResult,
     guarded_fetch,
+    guarded_post_json,
 )
 
 # ── Scheme allow-list ────────────────────────────────────────────────
@@ -504,3 +506,62 @@ class TestRedirectRevalidation:
         result = guarded_fetch(pub, allow_private_ips=True)
         assert result.status_code == 200
         assert result.body == b"ok"
+
+
+# ── guarded_post_json body capture (#108) ────────────────────────────
+
+
+class TestGuardedPostJsonBodyCapture:
+    """``guarded_post_json`` returns the status plus a bounded body snippet.
+
+    Issue #108: webhook diagnostics need the response body, not just the
+    status code, to explain 4xx and 5xx rejections.  The body is capped
+    at 4096 bytes to keep logs bounded.
+    """
+
+    @respx.mock
+    def test_returns_status_and_body_for_non_2xx(self) -> None:
+        url = "http://public.example.com/webhook"
+        respx.post(url).mock(
+            return_value=httpx.Response(
+                400,
+                text='{"error":"bad request"}',
+            ),
+        )
+        result = guarded_post_json(
+            url,
+            {"foo": "bar"},
+            allow_private_ips=True,
+        )
+        assert isinstance(result, PostJsonResult)
+        assert result.status_code == 400
+        assert b'"bad request"' in result.body
+
+    @respx.mock
+    def test_returns_status_and_body_for_2xx(self) -> None:
+        url = "http://public.example.com/webhook"
+        respx.post(url).mock(
+            return_value=httpx.Response(200, text='{"ok":true}'),
+        )
+        result = guarded_post_json(
+            url,
+            {"foo": "bar"},
+            allow_private_ips=True,
+        )
+        assert result.status_code == 200
+        assert result.body == b'{"ok":true}'
+
+    @respx.mock
+    def test_response_body_is_capped(self) -> None:
+        url = "http://public.example.com/webhook"
+        respx.post(url).mock(
+            return_value=httpx.Response(500, text="x" * 16384),
+        )
+        result = guarded_post_json(
+            url,
+            {"foo": "bar"},
+            allow_private_ips=True,
+        )
+        assert result.status_code == 500
+        assert len(result.body) == 4096
+        assert result.body == b"x" * 4096

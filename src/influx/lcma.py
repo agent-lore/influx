@@ -299,13 +299,16 @@ async def resolve_builds_on(
         if not body.get("hit"):
             logger.info(
                 "LCMA builds_on lookup miss profile=%s run_id=%s "
-                "source_url=%s note_id=%s tool=%s target_source_url=%s",
+                "source_url=%s note_id=%s tool=%s target_source_url=%s "
+                "prior_title=%r arxiv_id=%s",
                 profile,
                 current_run_id.get() or "",
                 written_source_url,
                 source_note_id,
                 "lithos_cache_lookup",
                 source_url,
+                prior_title,
+                arxiv_id,
             )
             continue
 
@@ -314,7 +317,7 @@ async def resolve_builds_on(
             logger.info(
                 "LCMA builds_on lookup source_url mismatch profile=%s run_id=%s "
                 "source_url=%s note_id=%s tool=%s expected_source_url=%s "
-                "actual_source_url=%s",
+                "actual_source_url=%s prior_title=%r arxiv_id=%s",
                 profile,
                 current_run_id.get() or "",
                 written_source_url,
@@ -322,6 +325,8 @@ async def resolve_builds_on(
                 "lithos_cache_lookup",
                 source_url,
                 body.get("source_url", ""),
+                prior_title,
+                arxiv_id,
             )
             continue
 

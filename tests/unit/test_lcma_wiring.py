@@ -218,6 +218,72 @@ class TestBuildsOnResolution:
         assert builds_on_upserts == []
 
     @pytest.mark.asyncio
+    async def test_cache_miss_logs_item_identity_context(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No-hit log carries item identity for diagnosis (#108)."""
+        caplog.set_level("INFO")
+        client = _make_client(cache_lookup_payload={"hit": False})
+        deps = _make_deps(client)
+
+        await wire(
+            written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
+            cascade=CascadeOutput(
+                title="A Paper",
+                builds_on=["FooNet (arXiv:2412.12345)"],
+            ),
+            deps=deps,
+        )
+
+        miss_records = [
+            record
+            for record in caplog.records
+            if "LCMA builds_on lookup miss" in record.message
+        ]
+        assert miss_records, "expected a no-hit log line"
+        message = miss_records[0].getMessage()
+        assert "FooNet" in message
+        assert "2412.12345" in message
+
+    @pytest.mark.asyncio
+    async def test_source_url_mismatch_logs_item_identity_context(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """source_url mismatch log carries item identity for diagnosis (#108)."""
+        caplog.set_level("INFO")
+        client = _make_client(
+            cache_lookup_payload={
+                "hit": True,
+                "source_url": "https://arxiv.org/abs/9999.99999",
+                "note_id": "note-other",
+            }
+        )
+        deps = _make_deps(client)
+
+        await wire(
+            written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
+            cascade=CascadeOutput(
+                title="A Paper",
+                builds_on=["FooNet (arXiv:2412.12345)"],
+            ),
+            deps=deps,
+        )
+
+        mismatch_records = [
+            record
+            for record in caplog.records
+            if "LCMA builds_on lookup source_url mismatch" in record.message
+        ]
+        assert mismatch_records, "expected a source_url mismatch log line"
+        message = mismatch_records[0].getMessage()
+        assert "FooNet" in message
+        assert "2412.12345" in message
+
+    @pytest.mark.asyncio
     async def test_source_url_mismatch_skips_edge(
         self,
         caplog: pytest.LogCaptureFixture,

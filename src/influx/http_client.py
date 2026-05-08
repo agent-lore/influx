@@ -24,6 +24,7 @@ from influx.errors import NetworkError
 __all__ = [
     "ContentTypeFamily",
     "FetchResult",
+    "PostJsonResult",
     "guarded_fetch",
     "guarded_post_json",
     "guarded_post_json_fetch",
@@ -32,6 +33,11 @@ __all__ = [
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 _MAX_REDIRECTS = 20
+
+# Cap captured response bodies for non-streaming POST callers.  Webhook
+# error bodies are typically small JSON or HTML envelopes; the cap exists
+# only to keep memory and log lines bounded when an endpoint misbehaves.
+_MAX_POST_RESPONSE_BODY_BYTES = 4096
 
 ContentTypeFamily = Literal["html", "pdf", "xml"]
 
@@ -58,6 +64,19 @@ class FetchResult:
     content_type: str
     final_url: str
     headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class PostJsonResult:
+    """Status code plus a bounded snippet of the response body.
+
+    ``body`` is truncated to at most :data:`_MAX_POST_RESPONSE_BODY_BYTES`
+    so callers can include it in failure logs without risking unbounded
+    payloads.
+    """
+
+    status_code: int
+    body: bytes
 
 
 # ── Scheme validation ────────────────────────────────────────────────
@@ -279,13 +298,16 @@ def guarded_post_json(
     headers: dict[str, str] | None = None,
     allow_private_ips: bool = False,
     timeout_seconds: int | None = None,
-) -> int:
+) -> PostJsonResult:
     """POST *payload* as JSON to *url* with scheme and SSRF guards.
 
-    Returns the HTTP status code.  Raises
-    :class:`~influx.errors.NetworkError` on guard violations, timeouts,
-    or connection failures.  No retry logic — callers handle retries if
-    needed (FR-NOT-1).
+    Returns a :class:`PostJsonResult` carrying the HTTP status code and a
+    bounded snippet of the response body — capped at
+    :data:`_MAX_POST_RESPONSE_BODY_BYTES` so callers (notably webhook
+    diagnostics) can log a useful excerpt without risking unbounded
+    payloads.  Raises :class:`~influx.errors.NetworkError` on guard
+    violations, timeouts, or connection failures.  No retry logic —
+    callers handle retries if needed (FR-NOT-1).
 
     ``timeout_seconds`` defaults to ``None``; when omitted it is resolved
     from the pydantic :class:`~influx.config.NotificationsConfig` field
@@ -306,9 +328,23 @@ def guarded_post_json(
     )
 
     try:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, json=payload, headers=headers)
-            return response.status_code
+        with (
+            httpx.Client(timeout=timeout) as client,
+            client.stream("POST", url, json=payload, headers=headers) as response,
+        ):
+            chunks: list[bytes] = []
+            received = 0
+            for chunk in response.iter_bytes():
+                if received >= _MAX_POST_RESPONSE_BODY_BYTES:
+                    break
+                remaining = _MAX_POST_RESPONSE_BODY_BYTES - received
+                slice_ = chunk[:remaining]
+                chunks.append(slice_)
+                received += len(slice_)
+            return PostJsonResult(
+                status_code=response.status_code,
+                body=b"".join(chunks),
+            )
     except httpx.TimeoutException as exc:
         raise NetworkError(
             f"Request timed out: {exc}",

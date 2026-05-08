@@ -44,6 +44,7 @@ from influx.config import (
     SecurityConfig,
 )
 from influx.coordinator import Coordinator, RunKind
+from influx.http_client import PostJsonResult
 from influx.scheduler import run_profile
 from influx.sources import FetchCache, make_item_provider
 from influx.sources.arxiv import (
@@ -886,7 +887,7 @@ class TestBackfillEndpointEndToEnd:
             # source module rather than ``influx.notifications``.
             patch(
                 "influx.http_client.guarded_post_json",
-                return_value=200,
+                return_value=PostJsonResult(status_code=200, body=b""),
             ) as mock_webhook_post,
             TestClient(app) as client,
         ):

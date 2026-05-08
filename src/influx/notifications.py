@@ -440,22 +440,26 @@ def _deliver_json_payload(
 
     logger.info("notification webhook dispatch started", extra=extra)
     try:
-        status = guarded_post_json(
+        result = guarded_post_json(
             webhook.url,
             payload,
             headers=headers,
             allow_private_ips=allow_private_ips,
             timeout_seconds=timeout_seconds,
         )
-        if status < 200 or status >= 300:
+        if result.status_code < 200 or result.status_code >= 300:
             logger.warning(
                 "notification webhook returned unexpected HTTP status",
-                extra={**extra, "status_code": status},
+                extra={
+                    **extra,
+                    "status_code": result.status_code,
+                    "response_body": _decode_response_snippet(result.body),
+                },
             )
         else:
             logger.info(
                 "notification webhook delivered",
-                extra={**extra, "status_code": status},
+                extra={**extra, "status_code": result.status_code},
             )
     except Exception:
         logger.warning(
@@ -463,6 +467,16 @@ def _deliver_json_payload(
             extra=extra,
             exc_info=True,
         )
+
+
+def _decode_response_snippet(body: bytes) -> str:
+    """Decode a bounded webhook response body for safe inclusion in logs.
+
+    The HTTP layer already caps the captured body length, so this only
+    needs to coerce arbitrary bytes into a printable string without
+    raising on partial UTF-8 sequences.
+    """
+    return body.decode("utf-8", errors="replace")
 
 
 def _build_auth_headers(
