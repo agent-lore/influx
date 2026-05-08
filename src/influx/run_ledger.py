@@ -81,6 +81,7 @@ class RunLedger:
             "ingested": None,
             "fetched_total": None,
             "filter_errors_total": None,
+            "archive_failures_total": None,
             "error": None,
             "degraded": False,
             "degraded_reasons": [],
@@ -101,6 +102,7 @@ class RunLedger:
         ingested: int | None,
         fetched_total: int | None = None,
         filter_errors_total: int | None = None,
+        archive_failures_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Mark an active run as completed and append it to history.
@@ -118,6 +120,10 @@ class RunLedger:
           exclusive with ``filter_stall``: when both would apply,
           ``filter_error`` wins because the scorer-failure diagnosis
           is more specific.
+        - ``"archive_acquisition"`` — at least one accepted item was
+          ingested with ``influx:archive-missing`` after archive
+          acquisition failed, so note quality degraded even though the
+          run continued.
         - ``"ingestion_stall"`` (issue #36) — this and the immediately
           prior scheduled run both saw ``ingested == 0`` despite
           ``sources_checked > 0``.  Typical cause: every candidate hits
@@ -167,6 +173,8 @@ class RunLedger:
         )
         if has_filter_error:
             reasons.append("filter_error")
+        if isinstance(archive_failures_total, int) and archive_failures_total > 0:
+            reasons.append("archive_acquisition")
 
         # Resolve profile + kind once for the stall checks.  All three
         # stall flags only apply to scheduled runs (backfills
@@ -249,6 +257,7 @@ class RunLedger:
             ingested=ingested,
             fetched_total=fetched_total,
             filter_errors_total=filter_errors_total,
+            archive_failures_total=archive_failures_total,
             error=None,
             degraded=bool(reasons),
             source_acquisition_errors=errors,
@@ -565,6 +574,7 @@ class RunLedger:
         error: str | None,
         fetched_total: int | None = None,
         filter_errors_total: int | None = None,
+        archive_failures_total: int | None = None,
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
@@ -596,6 +606,7 @@ class RunLedger:
                     "ingested": ingested,
                     "fetched_total": fetched_total,
                     "filter_errors_total": filter_errors_total,
+                    "archive_failures_total": archive_failures_total,
                     "error": error,
                     "degraded": degraded,
                     "degraded_reasons": list(degraded_reasons or []),

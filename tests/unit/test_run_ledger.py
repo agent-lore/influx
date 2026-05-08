@@ -234,6 +234,7 @@ def _start_complete(
     ingested: int | None,
     fetched_total: int | None = None,
     filter_errors_total: int | None = None,
+    archive_failures_total: int | None = None,
     source_acquisition_errors: list[dict[str, str]] | None = None,
 ) -> list[str]:
     """Helper: start + complete a run, return the degraded_reasons list.
@@ -256,6 +257,7 @@ def _start_complete(
         ingested=ingested,
         fetched_total=fetched_total,
         filter_errors_total=filter_errors_total,
+        archive_failures_total=archive_failures_total,
         source_acquisition_errors=source_acquisition_errors,
     )
 
@@ -293,6 +295,24 @@ def test_complete_returns_source_acquisition_reason(tmp_path: Path) -> None:
     entry = ledger.recent()[0]
     assert entry["degraded"] is True
     assert entry["degraded_reasons"] == ["source_acquisition"]
+
+
+def test_complete_returns_archive_acquisition_reason(tmp_path: Path) -> None:
+    """Accepted archive failures mark the run degraded for note-quality loss."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=5,
+        ingested=2,
+        archive_failures_total=2,
+    )
+    assert reasons == ["archive_acquisition"]
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is True
+    assert entry["degraded_reasons"] == ["archive_acquisition"]
+    assert entry["archive_failures_total"] == 2
 
 
 def test_single_zero_ingestion_run_is_not_yet_a_stall(tmp_path: Path) -> None:

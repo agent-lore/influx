@@ -563,6 +563,56 @@ async def test_run_completed_log_degraded_false_for_clean_run(
     assert "degraded=False" in record.message
 
 
+async def test_archive_acquisition_degrades_run_and_logs_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Accepted archive failures surface as a degraded run-level signal."""
+    from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    body_outcome = RunOutcome(
+        sources_checked=2,
+        ingested=1,
+        profile_run_result=ProfileRunResult(
+            run_date="2026-05-08",
+            profile="alpha",
+            stats=RunStats(sources_checked=2, ingested=1),
+            items=[
+                HighlightItem(
+                    id="note-1",
+                    title="Archived Poorly",
+                    score=8,
+                    tags=["profile:alpha", "influx:archive-missing"],
+                    reason="archive fetch accepted without attachment",
+                    url="https://example.com/archive-429",
+                    related_in_lithos=[],
+                )
+            ],
+        ),
+    )
+    with (
+        caplog.at_level(logging.WARNING, logger="influx.run_service"),
+        patch(
+            "influx.run.Run.execute",
+            new_callable=AsyncMock,
+            return_value=body_outcome,
+        ),
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert entry["degraded_reasons"] == ["archive_acquisition"]
+    assert entry["archive_failures_total"] == 1
+
+    warning = next(r for r in caplog.records if "archive_acquisition" in r.message)
+    assert "archive_failures=1" in warning.message
+    assert "influx:archive-missing" in warning.message
+
+
 async def test_filter_error_emits_warning_with_scorer_failure_guidance(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
