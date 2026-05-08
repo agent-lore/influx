@@ -48,7 +48,7 @@ def _make_client(rejected_titles: list[str] | None = None) -> Any:
     mock_content.text = result_text
     list_result = MagicMock()
     list_result.content = [mock_content]
-    client.list_notes = AsyncMock(return_value=list_result)
+    client.list_notes_body = AsyncMock(return_value=json.loads(result_text))
     return client
 
 

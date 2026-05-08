@@ -6,7 +6,6 @@ and the post-write retrieve + edge wiring used by the LCMA flow.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any
@@ -190,15 +189,13 @@ async def after_write(
             "influx.run_id": current_run_id.get() or "",
         },
     ):
-        result = await client.retrieve(
+        body = await client.retrieve_body(
             query=query,
             limit=5,
             agent_id="influx",
             task_id=run_task_id,
             tags=[f"profile:{profile}"],
         )
-
-    body = json.loads(result.content[0].text)  # type: ignore[union-attr]
     results: list[dict[str, Any]] = body.get("results", [])
     logger.info(
         "LCMA retrieve completed profile=%s run_id=%s source_url=%s "
@@ -295,12 +292,10 @@ async def resolve_builds_on(
         prior_title, arxiv_id = ref
         source_url = f"https://arxiv.org/abs/{arxiv_id}"
 
-        result = await client.cache_lookup(
+        body = await client.cache_lookup_body(
             query=prior_title,
             source_url=source_url,
         )
-
-        body = json.loads(result.content[0].text)  # type: ignore[union-attr]
         if not body.get("hit"):
             logger.info(
                 "LCMA builds_on lookup miss profile=%s run_id=%s "

@@ -23,16 +23,6 @@ from influx.repair import ContentTooLargeSkipped, SweepHooks, SweepWriteError, s
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
-def _make_list_result(items: list[dict[str, Any]]) -> MagicMock:
-    """Build a fake ``CallToolResult`` for ``list_notes``."""
-    text_content = MagicMock()
-    text_content.text = json.dumps({"items": items})
-    result = MagicMock()
-    result.content = [text_content]
-    result.isError = False
-    return result
-
-
 def _make_write_result(status: str = "updated") -> MagicMock:
     """Build a fake ``CallToolResult`` for ``lithos_write``."""
     text_content = MagicMock()
@@ -58,7 +48,7 @@ def _make_client(
 ) -> AsyncMock:
     """Build a mock LithosClient with ``list_notes`` / ``read_note`` / ``call_tool``."""
     client = AsyncMock()
-    client.list_notes = AsyncMock(return_value=_make_list_result(list_items or []))
+    client.list_notes_body = AsyncMock(return_value={"items": list_items or []})
     if read_responses:
         client.read_note = AsyncMock(side_effect=read_responses)
     else:
@@ -81,7 +71,7 @@ class TestSweepListCall:
 
         await sweep("ai-robotics", client=client, config=config, hooks=SweepHooks())
 
-        client.list_notes.assert_awaited_once_with(
+        client.list_notes_body.assert_awaited_once_with(
             tags=["influx:repair-needed", "profile:ai-robotics"],
             limit=50,
             order_by="updated_at",
@@ -94,7 +84,7 @@ class TestSweepListCall:
 
         await sweep("web-tech", client=client, config=config, hooks=SweepHooks())
 
-        call_kwargs = client.list_notes.call_args.kwargs
+        call_kwargs = client.list_notes_body.call_args.kwargs
         assert call_kwargs["limit"] == 100
 
     async def test_profile_name_interpolated_into_tag(self) -> None:
@@ -103,7 +93,7 @@ class TestSweepListCall:
 
         await sweep("ml-research", client=client, config=config, hooks=SweepHooks())
 
-        call_kwargs = client.list_notes.call_args.kwargs
+        call_kwargs = client.list_notes_body.call_args.kwargs
         assert call_kwargs["tags"] == [
             "influx:repair-needed",
             "profile:ml-research",
@@ -403,7 +393,7 @@ class TestSweepVersionConflict:
         }
         config = _make_config()
         client = AsyncMock()
-        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.list_notes_body = AsyncMock(return_value={"items": items})
         # read_note: first call is the initial re-read, second is the
         # FR-MCP-7 re-read after version_conflict.
         client.read_note = AsyncMock(side_effect=[note, refreshed])
@@ -449,7 +439,7 @@ class TestSweepVersionConflict:
         }
         config = _make_config()
         client = AsyncMock()
-        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.list_notes_body = AsyncMock(return_value={"items": items})
         client.read_note = AsyncMock(side_effect=[note, refreshed])
         # Both writes return version_conflict.
         client.call_tool = AsyncMock(
@@ -485,7 +475,7 @@ class TestSweepVersionConflict:
         }
         config = _make_config()
         client = AsyncMock()
-        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.list_notes_body = AsyncMock(return_value={"items": items})
         client.read_note = AsyncMock(side_effect=[note1, refreshed1])
         client.call_tool = AsyncMock(
             side_effect=[
@@ -517,7 +507,7 @@ class TestSweepTransportFailure:
         }
         config = _make_config()
         client = AsyncMock()
-        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.list_notes_body = AsyncMock(return_value={"items": items})
         client.read_note = AsyncMock(return_value=note)
         client.call_tool = AsyncMock(side_effect=LithosError("connection lost"))
 
@@ -536,7 +526,7 @@ class TestSweepTransportFailure:
         }
         config = _make_config()
         client = AsyncMock()
-        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.list_notes_body = AsyncMock(return_value={"items": items})
         client.read_note = AsyncMock(return_value=note1)
         client.call_tool = AsyncMock(side_effect=LithosError("connection lost"))
 
@@ -576,7 +566,7 @@ class TestSweepContentTooLargeSkipped:
         }
         config = _make_config()
         client = AsyncMock()
-        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.list_notes_body = AsyncMock(return_value={"items": items})
         client.read_note = AsyncMock(side_effect=[note1, note2])
         # n1 chronic-oversize: 3 content_too_large (orig + Tier-2-dropped
         # + Tier-1-only) → ContentTooLargeSkipped.  Then n2 → updated.
@@ -621,7 +611,7 @@ class TestSweepContentTooLargeSkipped:
         }
         config = _make_config()
         client = AsyncMock()
-        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.list_notes_body = AsyncMock(return_value={"items": items})
         client.read_note = AsyncMock(return_value=note)
         client.call_tool = AsyncMock(
             return_value=_make_write_result("content_too_large"),
@@ -667,7 +657,7 @@ class TestSweepContentTooLargeSkipped:
         ]
         config = _make_config()
         client = AsyncMock()
-        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.list_notes_body = AsyncMock(return_value={"items": items})
         client.read_note = AsyncMock(side_effect=notes)
         # n1 → oversize×3 (chronic), n2 + n3 → success.
         client.call_tool = AsyncMock(
@@ -713,7 +703,7 @@ class TestSweepContentTooLargeSkipped:
         ]
         config = _make_config()
         client = AsyncMock()
-        client.list_notes = AsyncMock(return_value=_make_list_result(items))
+        client.list_notes_body = AsyncMock(return_value={"items": items})
         client.read_note = AsyncMock(side_effect=notes)
         # Each note gets 3 content_too_large attempts → chronic skip.
         client.call_tool = AsyncMock(

@@ -1261,21 +1261,12 @@ async def sweep(
         effective_hooks = make_default_sweep_hooks(config).to_sweep_hooks()
 
     limit = config.repair.max_items_per_run
-    list_result = await client.list_notes(
+    body = await client.list_notes_body(
         tags=["influx:repair-needed", f"profile:{profile}"],
         limit=limit,
         order_by="updated_at",
         order="asc",
     )
-
-    text = list_result.content[0].text  # type: ignore[union-attr]
-    if getattr(list_result, "isError", False) is True:
-        raise LithosError(
-            "lithos_list failed during repair sweep",
-            operation="repair_sweep",
-            detail=text,
-        )
-    body = json.loads(text)
     items: list[dict[str, Any]] = body.get("items", [])
     items.sort(
         key=lambda item: str(item.get("updated_at") or item.get("updated") or "")

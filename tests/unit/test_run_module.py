@@ -91,6 +91,10 @@ class _NoopClient:
             ]
         )
 
+    async def task_create_body(self, **kwargs: Any) -> dict[str, Any]:
+        await self.task_create(**kwargs)
+        return {"task_id": "task-1"}
+
     async def task_complete(self, **kwargs: Any) -> Any:
         from mcp import types as mcp_types
 
@@ -424,15 +428,7 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
     mock_client = MagicMock()
     mock_client.close = AsyncMock()
     mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
-    mock_client.task_create = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[
-                mcp_types.TextContent(
-                    type="text", text=json.dumps({"task_id": "task-1"})
-                )
-            ]
-        )
-    )
+    mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
     mock_client.task_complete = AsyncMock(
         return_value=mcp_types.CallToolResult(
             content=[
@@ -442,11 +438,7 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
             ]
         )
     )
-    mock_client.cache_lookup_for_item = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
-        )
-    )
+    mock_client.cache_lookup_for_item_body = AsyncMock(return_value={"hit": False})
     write_result = MagicMock()
     write_result.status = "created"
     write_result.note_id = "note-new"
@@ -507,15 +499,7 @@ async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
     mock_client = MagicMock()
     mock_client.close = AsyncMock()
     mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
-    mock_client.task_create = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[
-                mcp_types.TextContent(
-                    type="text", text=json.dumps({"task_id": "task-1"})
-                )
-            ]
-        )
-    )
+    mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
     mock_client.task_complete = AsyncMock(
         return_value=mcp_types.CallToolResult(
             content=[
@@ -525,11 +509,7 @@ async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
             ]
         )
     )
-    mock_client.cache_lookup_for_item = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
-        )
-    )
+    mock_client.cache_lookup_for_item_body = AsyncMock(return_value={"hit": False})
     write_result_1 = MagicMock()
     write_result_1.status = "created"
     write_result_1.note_id = "note-1"
@@ -594,15 +574,7 @@ async def test_run_execute_persists_unresolved_slug_collision_without_injected_l
     mock_client = MagicMock()
     mock_client.close = AsyncMock()
     mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
-    mock_client.task_create = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[
-                mcp_types.TextContent(
-                    type="text", text=json.dumps({"task_id": "task-1"})
-                )
-            ]
-        )
-    )
+    mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
     mock_client.task_complete = AsyncMock(
         return_value=mcp_types.CallToolResult(
             content=[
@@ -612,11 +584,7 @@ async def test_run_execute_persists_unresolved_slug_collision_without_injected_l
             ]
         )
     )
-    mock_client.cache_lookup_for_item = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
-        )
-    )
+    mock_client.cache_lookup_for_item_body = AsyncMock(return_value={"hit": False})
     write_result = MagicMock()
     write_result.status = "slug_collision"
     write_result.note_id = ""
