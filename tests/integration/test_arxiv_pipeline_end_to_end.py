@@ -740,6 +740,78 @@ class TestDefaultFilterScorerEndToEnd:
         write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         assert write_calls == []
 
+    def test_default_scorer_429_backs_off_and_recovers(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """A 429 from the filter model honours Retry-After and succeeds on retry."""
+        config = _make_config_with_filter(fake_lithos_url).model_copy(
+            update={
+                "models": {
+                    "filter": ModelSlotConfig(
+                        provider="openai",
+                        model="gpt-test",
+                        max_retries=1,
+                        json_mode=True,
+                    ),
+                },
+            }
+        )
+        app = create_app(config)
+        assert app.state.item_provider is not None
+
+        filter_calls = {"count": 0}
+        sleeps: list[float] = []
+
+        def fake_filter_post(*args: object, **kwargs: object) -> FetchResult:
+            del args, kwargs
+            filter_calls["count"] += 1
+            if filter_calls["count"] == 1:
+                return FetchResult(
+                    body=b'{"error":{"message":"rate limited"}}',
+                    status_code=429,
+                    content_type="application/json",
+                    final_url="https://api.openai.invalid/v1/chat/completions",
+                    headers={"Retry-After": "11"},
+                )
+            return _filter_fetch_result(_filter_response(_ARXIV_ID, 7))
+
+        with (
+            patch(
+                "influx.sources.arxiv.guarded_fetch",
+                return_value=_atom_fetch_result(),
+            ),
+            patch(
+                "influx.extraction.html.guarded_fetch",
+            ) as mock_html,
+            patch(
+                "influx.filter.guarded_post_json_fetch",
+                side_effect=fake_filter_post,
+            ),
+            patch(
+                "influx.filter._sleep",
+                side_effect=lambda seconds: sleeps.append(seconds),
+            ),
+        ):
+            import asyncio
+
+            asyncio.run(
+                run_profile(
+                    "ai-robotics",
+                    RunKind.MANUAL,
+                    config=config,
+                    item_provider=app.state.item_provider,
+                )
+            )
+
+            assert filter_calls["count"] == 2
+            assert sleeps == [11.0]
+            assert mock_html.call_count == 0
+
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1
+
     def test_default_scorer_missing_provider_skips_batch(
         self,
         fake_lithos: FakeLithosServer,
