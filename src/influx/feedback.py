@@ -7,7 +7,6 @@ consumed by the filter prompt (§6.3).
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -33,12 +32,10 @@ async def fetch_rejection_titles(
 
     Returns a list of title strings (possibly empty).
     """
-    result = await client.list_notes(
+    body: dict[str, Any] = await client.list_notes_body(
         tags=[f"influx:rejected:{profile}"],
         limit=limit,
     )
-    text = result.content[0].text  # type: ignore[union-attr]
-    body: dict[str, Any] = json.loads(text)
     items: list[dict[str, Any]] = body.get("items", [])
 
     titles: list[str] = []

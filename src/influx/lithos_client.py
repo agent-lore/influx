@@ -571,6 +571,68 @@ class LithosClient:
             {"query": query, "source_url": source_url},
         )
 
+    def _result_text(
+        self,
+        result: mcp_types.CallToolResult,
+        *,
+        operation: str,
+    ) -> str:
+        """Extract the first text payload from a tool result."""
+        try:
+            text = result.content[0].text  # type: ignore[union-attr]
+        except (AttributeError, IndexError) as exc:
+            raise LithosError(
+                "malformed_tool_response",
+                operation=operation,
+                detail="missing text content",
+            ) from exc
+        if not isinstance(text, str):
+            raise LithosError(
+                "malformed_tool_response",
+                operation=operation,
+                detail="non-string text content",
+            )
+        return text
+
+    def _result_json_dict(
+        self,
+        result: mcp_types.CallToolResult,
+        *,
+        operation: str,
+    ) -> dict[str, Any]:
+        """Decode a tool result into a JSON object with consistent errors."""
+        text = self._result_text(result, operation=operation)
+        if getattr(result, "isError", False) is True:
+            raise LithosError(
+                f"{operation} failed",
+                operation=operation,
+                detail=text,
+            )
+        try:
+            body = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise LithosError(
+                "malformed_tool_response",
+                operation=operation,
+                detail="invalid JSON payload",
+            ) from exc
+        if not isinstance(body, dict):
+            raise LithosError(
+                "malformed_tool_response",
+                operation=operation,
+                detail="JSON payload was not an object",
+            )
+        return body
+
+    async def cache_lookup_body(
+        self, *, query: str | None, source_url: str | None
+    ) -> dict[str, Any]:
+        """Run ``cache_lookup`` and decode the JSON body."""
+        return self._result_json_dict(
+            await self.cache_lookup(query=query, source_url=source_url),
+            operation="cache_lookup",
+        )
+
     async def cache_lookup_for_item(
         self,
         *,
@@ -595,11 +657,27 @@ class LithosClient:
         query = compose_dedup_query(title, abstract_or_summary)
         return await self.cache_lookup(query=query, source_url=source_url)
 
+    async def cache_lookup_for_item_body(
+        self,
+        *,
+        title: str,
+        source_url: str | None,
+        abstract_or_summary: str | None = None,
+    ) -> dict[str, Any]:
+        """Run ``cache_lookup_for_item`` and decode the JSON body."""
+        return self._result_json_dict(
+            await self.cache_lookup_for_item(
+                title=title,
+                source_url=source_url,
+                abstract_or_summary=abstract_or_summary,
+            ),
+            operation="cache_lookup",
+        )
+
     async def read_note(self, *, note_id: str) -> dict[str, Any]:
         """Read a note by ID (used for version_conflict re-reads)."""
         result = await self.call_tool("lithos_read", {"id": note_id})
-        text = result.content[0].text  # type: ignore[union-attr]
-        return json.loads(text)
+        return self._result_json_dict(result, operation="read_note")
 
     async def write_note(
         self,
@@ -1108,6 +1186,25 @@ class LithosClient:
             args["limit"] = limit
         return await self.call_tool("lithos_list", args)
 
+    async def list_notes_body(
+        self,
+        *,
+        tags: list[str],
+        limit: int | None = None,
+        order_by: str | None = None,
+        order: str | None = None,
+    ) -> dict[str, Any]:
+        """Run ``list_notes`` and decode the JSON body."""
+        return self._result_json_dict(
+            await self.list_notes(
+                tags=tags,
+                limit=limit,
+                order_by=order_by,
+                order=order,
+            ),
+            operation="list_notes",
+        )
+
     async def list_archive_terminal_arxiv_ids(
         self,
         *,
@@ -1124,33 +1221,13 @@ class LithosClient:
         run continues at worst as today.
         """
         try:
-            result = await self.list_notes(
+            body = await self.list_notes_body(
                 tags=["influx:archive-terminal", f"profile:{profile}"],
             )
         except (LithosError, McpError):
             logger.warning(
                 "list_archive_terminal_arxiv_ids: lithos_list failed for "
                 "profile %r; assuming empty terminal set",
-                profile,
-                exc_info=True,
-            )
-            return frozenset()
-
-        if getattr(result, "isError", False) is True:
-            logger.warning(
-                "list_archive_terminal_arxiv_ids: lithos_list returned "
-                "isError=True for profile %r; assuming empty terminal set",
-                profile,
-            )
-            return frozenset()
-
-        try:
-            text = result.content[0].text  # type: ignore[union-attr]
-            body = json.loads(text)
-        except (AttributeError, IndexError, json.JSONDecodeError, KeyError):
-            logger.warning(
-                "list_archive_terminal_arxiv_ids: malformed lithos_list "
-                "response for profile %r; assuming empty terminal set",
                 profile,
                 exc_info=True,
             )
@@ -1234,6 +1311,27 @@ class LithosClient:
             },
         )
 
+    async def retrieve_body(
+        self,
+        *,
+        query: str,
+        limit: int,
+        agent_id: str,
+        task_id: str,
+        tags: list[str],
+    ) -> dict[str, Any]:
+        """Run ``retrieve`` and decode the JSON body."""
+        return self._result_json_dict(
+            await self.retrieve(
+                query=query,
+                limit=limit,
+                agent_id=agent_id,
+                task_id=task_id,
+                tags=tags,
+            ),
+            operation="retrieve",
+        )
+
     async def edge_upsert(
         self,
         *,
@@ -1278,6 +1376,19 @@ class LithosClient:
             {"title": title, "agent": agent, "tags": tags},
         )
 
+    async def task_create_body(
+        self,
+        *,
+        title: str,
+        agent: str,
+        tags: list[str],
+    ) -> dict[str, Any]:
+        """Run ``task_create`` and decode the JSON body."""
+        return self._result_json_dict(
+            await self.task_create(title=title, agent=agent, tags=tags),
+            operation="task_create",
+        )
+
     async def task_complete(
         self,
         *,
@@ -1290,6 +1401,19 @@ class LithosClient:
         if outcome is not None:
             args["outcome"] = outcome
         return await self._call_lcma_tool("lithos_task_complete", args)
+
+    async def task_complete_body(
+        self,
+        *,
+        task_id: str,
+        agent: str,
+        outcome: str | None = None,
+    ) -> dict[str, Any]:
+        """Run ``task_complete`` and decode the JSON body."""
+        return self._result_json_dict(
+            await self.task_complete(task_id=task_id, agent=agent, outcome=outcome),
+            operation="task_complete",
+        )
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None

@@ -30,7 +30,6 @@ from both success and abort paths uniformly.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
@@ -275,13 +274,10 @@ async def lithos_task_lifecycle(
     task_tag = "influx:backfill" if plan.kind == RunKind.BACKFILL else "influx:run"
     run_date = datetime.now(UTC).date().isoformat()
     task_title = f"Influx run {profile} {run_date}"
-    task_result = await client.task_create(
+    task_body = await client.task_create_body(
         title=task_title,
         agent="influx",
         tags=[task_tag, f"profile:{profile}"],
-    )
-    task_body = json.loads(
-        task_result.content[0].text  # type: ignore[union-attr]
     )
     run_task_id = str(task_body["task_id"])
 
@@ -472,13 +468,10 @@ async def _run_ingest_stage(
             item.get("path", ""),
             item.get("tags", []),
         )
-        cache_result = await client.cache_lookup_for_item(
+        cache_body = await client.cache_lookup_for_item_body(
             title=title,
             source_url=source_url,
             abstract_or_summary=item.get("abstract_or_summary"),
-        )
-        cache_body = json.loads(
-            cache_result.content[0].text  # type: ignore[union-attr]
         )
         cache_hit = bool(cache_body.get("hit"))
         if cache_hit:

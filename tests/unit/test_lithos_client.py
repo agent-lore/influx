@@ -8,11 +8,12 @@ live in ``tests/contract/test_lcma_calls.py`` (PRD 08).
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from influx.errors import ConfigError
+from influx.errors import ConfigError, LithosError
 from influx.lithos_client import LithosClient
 
 
@@ -76,6 +77,38 @@ class TestListNotes:
             "lithos_list",
             {"tags": ["influx:repair-needed", "profile:staging-ai"], "limit": 25},
         )
+
+
+def _tool_result(payload: object, *, is_error: bool = False) -> MagicMock:
+    text_content = MagicMock()
+    text_content.text = payload if isinstance(payload, str) else json.dumps(payload)
+    result = MagicMock()
+    result.content = [text_content]
+    result.isError = is_error
+    return result
+
+
+class TestDecodedBodies:
+    """Centralized decode helpers raise consistent LithosError shapes."""
+
+    async def test_list_notes_body_decodes_json_object(self) -> None:
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.list_notes = AsyncMock(  # type: ignore[method-assign]
+            return_value=_tool_result({"items": [{"id": "note-1"}]})
+        )
+
+        body = await client.list_notes_body(tags=["foo"], limit=10)
+
+        assert body == {"items": [{"id": "note-1"}]}
+
+    async def test_list_notes_body_rejects_invalid_json(self) -> None:
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.list_notes = AsyncMock(  # type: ignore[method-assign]
+            return_value=_tool_result("{not-json")
+        )
+
+        with pytest.raises(LithosError, match="malformed_tool_response"):
+            await client.list_notes_body(tags=["foo"], limit=10)
 
 
 class TestClassifySquatter:

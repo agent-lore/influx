@@ -17,23 +17,13 @@ Lower-level retrieve / cache-lookup primitives are exercised in
 
 from __future__ import annotations
 
-import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from influx.errors import LCMAError
 from influx.lcma_wiring import CascadeOutput, LcmaWiringDeps, wire
-
-
-def _mcp_text_result(payload: dict[str, Any]) -> MagicMock:
-    """Build a fake MCP-style result whose ``content[0].text`` is JSON."""
-    text_content = MagicMock()
-    text_content.text = json.dumps(payload)
-    result = MagicMock()
-    result.content = [text_content]
-    return result
 
 
 def _make_client(
@@ -43,11 +33,9 @@ def _make_client(
 ) -> AsyncMock:
     """Build an AsyncMock LithosClient with the listed call returns."""
     client = AsyncMock()
-    client.retrieve = AsyncMock(
-        return_value=_mcp_text_result(retrieve_payload or {"results": []})
-    )
-    client.cache_lookup = AsyncMock(
-        return_value=_mcp_text_result(cache_lookup_payload or {"hit": False})
+    client.retrieve_body = AsyncMock(return_value=retrieve_payload or {"results": []})
+    client.cache_lookup_body = AsyncMock(
+        return_value=cache_lookup_payload or {"hit": False}
     )
     client.edge_upsert = AsyncMock()
     return client
@@ -176,7 +164,7 @@ class TestBuildsOnResolution:
             deps=deps,
         )
 
-        client.cache_lookup.assert_awaited_once()
+        client.cache_lookup_body.assert_awaited_once()
         # Find the builds_on edge among the upsert calls.
         upserts = [
             call.kwargs
@@ -204,7 +192,7 @@ class TestBuildsOnResolution:
             deps=deps,
         )
 
-        client.cache_lookup.assert_not_awaited()
+        client.cache_lookup_body.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_cache_miss_skips_edge(self) -> None:
@@ -221,7 +209,7 @@ class TestBuildsOnResolution:
             deps=deps,
         )
 
-        client.cache_lookup.assert_awaited_once()
+        client.cache_lookup_body.assert_awaited_once()
         builds_on_upserts = [
             call.kwargs
             for call in client.edge_upsert.await_args_list
@@ -293,7 +281,7 @@ class TestLcmaErrorPropagation:
     @pytest.mark.asyncio
     async def test_unknown_tool_on_retrieve_is_contained(self) -> None:
         client = _make_client()
-        client.retrieve = AsyncMock(
+        client.retrieve_body = AsyncMock(
             side_effect=LCMAError("unknown_tool", stage="lithos_retrieve")
         )
         deps = _make_deps(client)
@@ -310,7 +298,7 @@ class TestLcmaErrorPropagation:
     @pytest.mark.asyncio
     async def test_other_lcma_error_is_contained_and_builds_on_still_runs(self) -> None:
         client = _make_client()
-        client.retrieve = AsyncMock(
+        client.retrieve_body = AsyncMock(
             side_effect=LCMAError("transport refused", stage="http")
         )
         deps = _make_deps(client)
@@ -326,4 +314,4 @@ class TestLcmaErrorPropagation:
         )
 
         assert related == []
-        client.cache_lookup.assert_awaited_once()
+        client.cache_lookup_body.assert_awaited_once()

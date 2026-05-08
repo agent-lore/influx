@@ -100,19 +100,13 @@ def _full_config() -> Any:
 
 def _mock_lithos_client() -> AsyncMock:
     client = AsyncMock()
-    client.task_create.return_value = MagicMock(
-        content=[MagicMock(text='{"task_id": "task-1"}')],
-    )
-    client.cache_lookup_for_item.return_value = MagicMock(
-        content=[MagicMock(text='{"hit": false}')],
-    )
+    client.task_create_body.return_value = {"task_id": "task-1"}
+    client.cache_lookup_for_item_body.return_value = {"hit": False}
     write_result = MagicMock()
     write_result.status = "created"
     write_result.note_id = "note-123"
     client.write_note.return_value = write_result
-    client.retrieve.return_value = MagicMock(
-        content=[MagicMock(text='{"results": []}')],
-    )
+    client.retrieve_body.return_value = {"results": []}
     client.close = AsyncMock()
     client.task_complete = AsyncMock()
     return client
