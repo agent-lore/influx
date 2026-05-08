@@ -1038,6 +1038,21 @@ async def _process_sweep_note(
                 note["tags"] = list(current_tags)
         except (ExtractionError, LCMAError, LithosError) as exc:
             _restore_note(note, snapshot)
+            if (
+                isinstance(exc, ExtractionError)
+                and getattr(exc, "stage", "") == "unsupported_source"
+            ):
+                restored_tags = list(note.get("tags", []))
+                if not any(tag.startswith("text:") for tag in restored_tags):
+                    restored_tags.append("text:abstract-only")
+                if "influx:text-terminal" not in restored_tags:
+                    restored_tags.append("influx:text-terminal")
+                if "influx:archive-missing" not in restored_tags:
+                    restored_tags = [
+                        tag for tag in restored_tags if tag != "influx:repair-needed"
+                    ]
+                current_tags = restored_tags
+                note["tags"] = list(current_tags)
             _log_stage_failure(
                 "text_extraction",
                 note=note,
