@@ -1036,9 +1036,7 @@ def _run_archive_retry(
         return current_tags, downloaded_path, True
     except (ExtractionError, LithosError) as exc:
         failure_stage = (
-            getattr(exc, "stage", "")
-            or getattr(exc, "kind", "")
-            or "archive_failed"
+            getattr(exc, "stage", "") or getattr(exc, "kind", "") or "archive_failed"
         )
         new_tags = _apply_counted_failure(
             note=note,
@@ -1073,9 +1071,7 @@ def _terminate_unsupported_text_source(note: dict[str, Any]) -> list[str]:
     if "influx:text-terminal" not in restored_tags:
         restored_tags.append("influx:text-terminal")
     if "influx:archive-missing" not in restored_tags:
-        restored_tags = [
-            tag for tag in restored_tags if tag != "influx:repair-needed"
-        ]
+        restored_tags = [tag for tag in restored_tags if tag != "influx:repair-needed"]
     note["tags"] = list(restored_tags)
     return restored_tags
 
