@@ -23,6 +23,7 @@ from typing import Literal
 
 import pytest
 
+from influx import filter as filter_module
 from influx.config import (
     AppConfig,
     FilterTuningConfig,
@@ -38,7 +39,6 @@ from influx.config import (
     SecurityConfig,
     StorageConfig,
 )
-from influx import filter as filter_module
 from influx.slugs import slugify_feed_name
 from influx.sources import rss as rss_module
 from influx.sources.rss import RssFeedItem, build_rss_note_item, parse_feed

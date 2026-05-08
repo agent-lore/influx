@@ -38,7 +38,6 @@ from influx.extraction.article import extract_article
 from influx.filter import FilterScorerError, _call_filter_model_with_retry
 from influx.http_client import guarded_fetch as _guarded_fetch
 from influx.renderer import render
-from influx.schemas import FilterResponse
 from influx.slugs import slugify_feed_name
 from influx.source import Candidate, ScoredCandidate
 from influx.storage import download_archive

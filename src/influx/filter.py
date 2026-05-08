@@ -122,7 +122,11 @@ def _parse_retry_after_seconds(value: str) -> float | None:
     return min(seconds, _RETRY_AFTER_MAX_SECONDS)
 
 
-def _filter_429_delay(headers: dict[str, str], config: AppConfig, attempt: int) -> float:
+def _filter_429_delay(
+    headers: dict[str, str],
+    config: AppConfig,
+    attempt: int,
+) -> float:
     """Return the backoff delay for a filter-model 429 response."""
     retry_after = _header_value(headers, "Retry-After")
     if retry_after is not None:
@@ -159,7 +163,8 @@ def _call_filter_model_with_retry(
                 break
             delay = float(config.resilience.backoff_base_seconds * (2**attempt))
             _log.warning(
-                "filter HTTP error for profile %r on attempt %d/%d: %s; retrying in %.1fs",
+                "filter HTTP error for profile %r on attempt %d/%d: %s; "
+                "retrying in %.1fs",
                 profile,
                 attempt + 1,
                 attempts,
@@ -175,7 +180,8 @@ def _call_filter_model_with_retry(
                 break
             delay = _filter_429_delay(result.headers, config, attempt)
             _log.warning(
-                "filter slot HTTP 429 for profile %r on attempt %d/%d; backing off %.1fs",
+                "filter slot HTTP 429 for profile %r on attempt %d/%d; "
+                "backing off %.1fs",
                 profile,
                 attempt + 1,
                 attempts,
@@ -190,7 +196,8 @@ def _call_filter_model_with_retry(
                 break
             delay = float(config.resilience.backoff_base_seconds * (2**attempt))
             _log.warning(
-                "filter slot HTTP %d for profile %r on attempt %d/%d; retrying in %.1fs",
+                "filter slot HTTP %d for profile %r on attempt %d/%d; "
+                "retrying in %.1fs",
                 result.status_code,
                 profile,
                 attempt + 1,
