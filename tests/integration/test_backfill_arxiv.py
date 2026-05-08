@@ -44,7 +44,6 @@ from influx.config import (
     SecurityConfig,
 )
 from influx.coordinator import Coordinator, RunKind
-from influx.http_client import PostJsonResult
 from influx.scheduler import run_profile
 from influx.sources import FetchCache, make_item_provider
 from influx.sources.arxiv import (
@@ -882,12 +881,13 @@ class TestBackfillEndpointEndToEnd:
                 return_value=list(_FIXTURE_ARXIV_ITEMS),
             ),
             patch("influx.sources.arxiv._sleep"),
-            # ``send_digest`` lazily imports ``guarded_post_json`` from
-            # ``influx.http_client``, so the patch must target the
-            # source module rather than ``influx.notifications``.
+            # The webhook dispatcher uses ``_dispatch_webhook_post`` from
+            # ``influx.notifications``; patching it here keeps the
+            # backfill path off the network entirely while still
+            # exercising the dispatch decision (which must NOT fire
+            # for kind=BACKFILL).
             patch(
-                "influx.http_client.guarded_post_json",
-                return_value=PostJsonResult(status_code=200, body=b""),
+                "influx.notifications._dispatch_webhook_post",
             ) as mock_webhook_post,
             TestClient(app) as client,
         ):
@@ -912,7 +912,7 @@ class TestBackfillEndpointEndToEnd:
 
         # ── AC-09-G: no webhook HTTP call ─────────────────────────────
         # ``send_digest`` short-circuits for ``kind=BACKFILL`` so the
-        # real ``guarded_post_json`` sender must never be invoked.
+        # real webhook dispatcher must never be invoked.
         mock_webhook_post.assert_not_called()
 
         # ── AC-09-H: no repair-sweep ``lithos_list`` call ─────────────

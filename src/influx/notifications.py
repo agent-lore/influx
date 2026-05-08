@@ -410,6 +410,81 @@ def _deliver_payload(
     )
 
 
+# Webhook responses are opaque to Influx — operators only ever read the
+# body to diagnose 4xx/5xx rejections, so we cap the captured snippet
+# instead of buffering an arbitrarily large body in memory or shipping
+# unbounded text into the log line.
+_MAX_WEBHOOK_RESPONSE_BODY_BYTES = 4096
+_TRUNCATION_MARKER = "…[truncated]"
+
+
+@dataclass(frozen=True, slots=True)
+class _WebhookDispatchResult:
+    """Status and a bounded snippet of a webhook response body.
+
+    Private to this module: webhook diagnostics are the only place where
+    a truncated response body is the right shape.  General API callers
+    should use ``guarded_post_json_fetch`` for full-body POSTs.
+    """
+
+    status_code: int
+    body: bytes
+    truncated: bool
+
+
+def _dispatch_webhook_post(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str],
+    allow_private_ips: bool,
+    timeout_seconds: int,
+) -> _WebhookDispatchResult:
+    """POST a webhook payload and capture a bounded response-body snippet.
+
+    Reuses the SSRF/scheme/timeout guards from :mod:`influx.http_client`
+    via :func:`guarded_outbound_post`.  Reads at most
+    :data:`_MAX_WEBHOOK_RESPONSE_BODY_BYTES` from the response stream
+    and sets ``truncated=True`` when the upstream had more data so the
+    log layer can surface a marker.
+    """
+    from influx.http_client import guarded_outbound_post
+
+    with (
+        guarded_outbound_post(
+            url,
+            allow_private_ips=allow_private_ips,
+            timeout_seconds=timeout_seconds,
+        ) as client,
+        client.stream(
+            "POST",
+            url,
+            json=payload,
+            headers=headers,
+        ) as response,
+    ):
+        chunks: list[bytes] = []
+        received = 0
+        truncated = False
+        for chunk in response.iter_bytes():
+            remaining = _MAX_WEBHOOK_RESPONSE_BODY_BYTES - received
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(chunk) > remaining:
+                chunks.append(chunk[:remaining])
+                received += remaining
+                truncated = True
+                break
+            chunks.append(chunk)
+            received += len(chunk)
+        return _WebhookDispatchResult(
+            status_code=response.status_code,
+            body=b"".join(chunks),
+            truncated=truncated,
+        )
+
+
 def _deliver_json_payload(
     webhook: NotificationWebhookConfig,
     payload: dict[str, Any],
@@ -421,8 +496,6 @@ def _deliver_json_payload(
     run_id: str | None,
     item_id: str | None,
 ) -> None:
-    from influx.http_client import guarded_post_json
-
     extra = {
         "webhook_name": webhook.name,
         "webhook_type": webhook.type,
@@ -440,7 +513,7 @@ def _deliver_json_payload(
 
     logger.info("notification webhook dispatch started", extra=extra)
     try:
-        result = guarded_post_json(
+        result = _dispatch_webhook_post(
             webhook.url,
             payload,
             headers=headers,
@@ -473,14 +546,11 @@ def _deliver_json_payload(
         )
 
 
-_TRUNCATION_MARKER = "…[truncated]"
-
-
 def _decode_response_snippet(body: bytes, *, truncated: bool) -> str:
     """Decode a bounded webhook response body for safe inclusion in logs.
 
-    The HTTP layer already caps the captured body length, so this only
-    needs to coerce arbitrary bytes into a printable string without
+    The dispatch layer already caps the captured body length, so this
+    only needs to coerce arbitrary bytes into a printable string without
     raising on partial UTF-8 sequences.  When the captured snippet is a
     fragment of a longer upstream response, append a marker so an
     operator reading the log cannot mistake it for the full body.

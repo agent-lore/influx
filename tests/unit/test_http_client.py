@@ -19,8 +19,8 @@ import respx
 from influx.errors import NetworkError
 from influx.http_client import (
     FetchResult,
-    PostJsonResult,
     guarded_fetch,
+    guarded_outbound_post,
     guarded_post_json,
 )
 
@@ -508,78 +508,75 @@ class TestRedirectRevalidation:
         assert result.body == b"ok"
 
 
-# ── guarded_post_json body capture (#108) ────────────────────────────
+# ── guarded_post_json (status-only fire-and-forget POST) ─────────────
 
 
-class TestGuardedPostJsonBodyCapture:
-    """``guarded_post_json`` returns the status plus a bounded body snippet.
-
-    Issue #108: webhook diagnostics need the response body, not just the
-    status code, to explain 4xx and 5xx rejections.  The body is capped
-    at 4096 bytes to keep logs bounded.
-    """
+class TestGuardedPostJson:
+    """``guarded_post_json`` returns the HTTP status and discards the body."""
 
     @respx.mock
-    def test_returns_status_and_body_for_non_2xx(self) -> None:
-        url = "http://public.example.com/webhook"
-        respx.post(url).mock(
-            return_value=httpx.Response(
-                400,
-                text='{"error":"bad request"}',
-            ),
-        )
-        result = guarded_post_json(
-            url,
-            {"foo": "bar"},
-            allow_private_ips=True,
-        )
-        assert isinstance(result, PostJsonResult)
-        assert result.status_code == 400
-        assert b'"bad request"' in result.body
-        assert result.truncated is False
-
-    @respx.mock
-    def test_returns_status_and_body_for_2xx(self) -> None:
+    def test_returns_status_for_2xx(self) -> None:
         url = "http://public.example.com/webhook"
         respx.post(url).mock(
             return_value=httpx.Response(200, text='{"ok":true}'),
         )
-        result = guarded_post_json(
+        status = guarded_post_json(
             url,
             {"foo": "bar"},
             allow_private_ips=True,
         )
-        assert result.status_code == 200
-        assert result.body == b'{"ok":true}'
-        assert result.truncated is False
+        assert status == 200
 
     @respx.mock
-    def test_response_body_is_capped_and_marked_truncated(self) -> None:
+    def test_returns_status_for_non_2xx(self) -> None:
         url = "http://public.example.com/webhook"
         respx.post(url).mock(
-            return_value=httpx.Response(500, text="x" * 16384),
+            return_value=httpx.Response(400, text='{"error":"bad"}'),
         )
-        result = guarded_post_json(
+        status = guarded_post_json(
             url,
             {"foo": "bar"},
             allow_private_ips=True,
         )
-        assert result.status_code == 500
-        assert len(result.body) == 4096
-        assert result.body == b"x" * 4096
-        assert result.truncated is True
+        assert status == 400
+
+
+# ── guarded_outbound_post (shared guard context) ─────────────────────
+
+
+class TestGuardedOutboundPost:
+    """``guarded_outbound_post`` exposes guarded httpx clients for callers.
+
+    Webhook diagnostics need bounded-body POST semantics, but the
+    SSRF/scheme/timeout guard stack is shared with the fire-and-forget
+    POST path — this context manager is the seam.
+    """
 
     @respx.mock
-    def test_response_body_at_exact_cap_is_not_marked_truncated(self) -> None:
-        """A response that fits exactly inside the cap is not marked truncated."""
+    def test_yields_usable_client(self) -> None:
         url = "http://public.example.com/webhook"
-        respx.post(url).mock(
-            return_value=httpx.Response(500, text="y" * 4096),
-        )
-        result = guarded_post_json(
-            url,
-            {"foo": "bar"},
-            allow_private_ips=True,
-        )
-        assert len(result.body) == 4096
-        assert result.truncated is False
+        respx.post(url).mock(return_value=httpx.Response(200, text="ok"))
+        with guarded_outbound_post(url, allow_private_ips=True) as client:
+            response = client.post(url, json={"x": 1})
+        assert response.status_code == 200
+
+    def test_validates_scheme_before_yielding(self) -> None:
+        with (
+            pytest.raises(NetworkError) as exc_info,
+            guarded_outbound_post("ftp://example.com") as _,
+        ):
+            pass
+        assert exc_info.value.kind == "scheme"
+
+    def test_translates_httpx_timeout_to_network_error(self) -> None:
+        url = "http://public.example.com/webhook"
+
+        @respx.mock
+        def _run() -> None:
+            respx.post(url).mock(side_effect=httpx.ConnectTimeout("slow"))
+            with guarded_outbound_post(url, allow_private_ips=True) as client:
+                client.post(url, json={"x": 1})
+
+        with pytest.raises(NetworkError) as exc_info:
+            _run()
+        assert exc_info.value.kind == "timeout"

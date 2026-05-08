@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urljoin, urlparse
@@ -24,8 +26,8 @@ from influx.errors import NetworkError
 __all__ = [
     "ContentTypeFamily",
     "FetchResult",
-    "PostJsonResult",
     "guarded_fetch",
+    "guarded_outbound_post",
     "guarded_post_json",
     "guarded_post_json_fetch",
 ]
@@ -33,11 +35,6 @@ __all__ = [
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 _MAX_REDIRECTS = 20
-
-# Cap captured response bodies for non-streaming POST callers.  Webhook
-# error bodies are typically small JSON or HTML envelopes; the cap exists
-# only to keep memory and log lines bounded when an endpoint misbehaves.
-_MAX_POST_RESPONSE_BODY_BYTES = 4096
 
 ContentTypeFamily = Literal["html", "pdf", "xml"]
 
@@ -64,23 +61,6 @@ class FetchResult:
     content_type: str
     final_url: str
     headers: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class PostJsonResult:
-    """Status code plus a bounded snippet of the response body.
-
-    ``body`` is truncated to at most :data:`_MAX_POST_RESPONSE_BODY_BYTES`
-    so callers can include it in failure logs without risking unbounded
-    payloads.  ``truncated`` is ``True`` when the upstream response was
-    longer than the cap and the captured snippet is therefore a fragment;
-    callers should surface a marker in user-facing logs so operators do
-    not mistake the snippet for the full body.
-    """
-
-    status_code: int
-    body: bytes
-    truncated: bool = False
 
 
 # ── Scheme validation ────────────────────────────────────────────────
@@ -295,28 +275,26 @@ def guarded_fetch(
     )
 
 
-def guarded_post_json(
+@contextmanager
+def guarded_outbound_post(
     url: str,
-    payload: dict[str, object],
     *,
-    headers: dict[str, str] | None = None,
     allow_private_ips: bool = False,
     timeout_seconds: int | None = None,
-) -> PostJsonResult:
-    """POST *payload* as JSON to *url* with scheme and SSRF guards.
+) -> Iterator[httpx.Client]:
+    """Yield a guarded :class:`httpx.Client` for outbound POSTs.
 
-    Returns a :class:`PostJsonResult` carrying the HTTP status code and a
-    bounded snippet of the response body — capped at
-    :data:`_MAX_POST_RESPONSE_BODY_BYTES` so callers (notably webhook
-    diagnostics) can log a useful excerpt without risking unbounded
-    payloads.  Raises :class:`~influx.errors.NetworkError` on guard
-    violations, timeouts, or connection failures.  No retry logic —
-    callers handle retries if needed (FR-NOT-1).
+    Validates the URL against the scheme allow-list and SSRF
+    classifier, builds a connect+read+write+pool timeout from
+    ``timeout_seconds`` (falling back to the
+    :class:`~influx.config.NotificationsConfig` field default), and
+    translates :class:`httpx.TimeoutException` /
+    :class:`httpx.HTTPError` raised inside the ``with`` block into
+    :class:`~influx.errors.NetworkError`.
 
-    ``timeout_seconds`` defaults to ``None``; when omitted it is resolved
-    from the pydantic :class:`~influx.config.NotificationsConfig` field
-    default so the only place this tunable lives is config-parsing code
-    (AC-X-1).  Webhook callers pass the loaded config value explicitly.
+    Used by callers that need POST semantics beyond a fire-and-forget
+    status — e.g. the webhook dispatcher capturing a bounded body
+    snippet for diagnostics — without re-implementing the guard stack.
     """
     _validate_scheme(url)
     _ssrf_check(url, allow_private_ips=allow_private_ips)
@@ -332,31 +310,8 @@ def guarded_post_json(
     )
 
     try:
-        with (
-            httpx.Client(timeout=timeout) as client,
-            client.stream("POST", url, json=payload, headers=headers) as response,
-        ):
-            chunks: list[bytes] = []
-            received = 0
-            truncated = False
-            for chunk in response.iter_bytes():
-                remaining = _MAX_POST_RESPONSE_BODY_BYTES - received
-                if remaining <= 0:
-                    # Upstream still has bytes beyond the cap.
-                    truncated = True
-                    break
-                if len(chunk) > remaining:
-                    chunks.append(chunk[:remaining])
-                    received += remaining
-                    truncated = True
-                    break
-                chunks.append(chunk)
-                received += len(chunk)
-            return PostJsonResult(
-                status_code=response.status_code,
-                body=b"".join(chunks),
-                truncated=truncated,
-            )
+        with httpx.Client(timeout=timeout) as client:
+            yield client
     except httpx.TimeoutException as exc:
         raise NetworkError(
             f"Request timed out: {exc}",
@@ -371,6 +326,40 @@ def guarded_post_json(
             kind="network",
             reason=str(exc),
         ) from exc
+
+
+def guarded_post_json(
+    url: str,
+    payload: dict[str, object],
+    *,
+    headers: dict[str, str] | None = None,
+    allow_private_ips: bool = False,
+    timeout_seconds: int | None = None,
+) -> int:
+    """POST *payload* as JSON to *url* with scheme and SSRF guards.
+
+    Returns the HTTP status code.  Fire-and-forget: the response body
+    is read and discarded by ``httpx``.  Callers that need to inspect
+    the body should use :func:`guarded_post_json_fetch` (full body) or
+    drive :func:`guarded_outbound_post` directly with their own
+    streaming/cap policy.
+
+    Raises :class:`~influx.errors.NetworkError` on guard violations,
+    timeouts, or connection failures.  No retry logic — callers handle
+    retries if needed (FR-NOT-1).
+
+    ``timeout_seconds`` defaults to ``None``; when omitted it is resolved
+    from the pydantic :class:`~influx.config.NotificationsConfig` field
+    default so the only place this tunable lives is config-parsing code
+    (AC-X-1).  Webhook callers pass the loaded config value explicitly.
+    """
+    with guarded_outbound_post(
+        url,
+        allow_private_ips=allow_private_ips,
+        timeout_seconds=timeout_seconds,
+    ) as client:
+        response = client.post(url, json=payload, headers=headers)
+        return response.status_code
 
 
 def guarded_post_json_fetch(
