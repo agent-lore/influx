@@ -1,9 +1,10 @@
 # Citation Graph Extension Plan
 
-Version: 0.1.0
-Date: 2026-05-05
-Status: Draft — pre-implementation
-Scope: Influx + Lithos LCMA
+Version: 1.0.0
+Date: 2026-05-07
+Status: Approved for Phase 1+2 — design locked
+Scope: Influx (Phase 1 + Phase 2).  Phases 3–5 (Lithos LCMA scouts) are
+deferred to follow-up epics and tracked as forward references only.
 
 ---
 
@@ -14,7 +15,11 @@ Influx today writes per-paper notes and a small set of relationships
 `builds_on` resolver in §10.5 of the Influx specification is the only
 mechanism connecting notes via citation lineage, and it depends on
 Tier 3 emitting `arXiv:<id>` strings — partial recall, no DOI fallback,
-and silent on anything outside arXiv.
+and silent on anything outside arXiv.  Live `edges.db` evidence
+confirms this is currently zero-yield in production: in a 48 h staging
+window, every persisted edge was written by Lithos's own
+`EnrichWorker` consolidation path (`provenance_type='consolidation'`);
+no edge has been authored by Influx's `lithos_edge_upsert` call site.
 
 Semantic Scholar's Academic Graph API (S2AG) exposes ground-truth
 references, citations, citation contexts and intents, paper-level
@@ -33,22 +38,23 @@ The work splits cleanly along the existing Influx-vs-Lithos contract:
   published.
 
 This plan is written so the two halves can be split into independent
-project epics once we decide to implement.
+project epics.  v1 is **Phase 1 + Phase 2 (Influx-side only)** — the
+Lithos scout work in §6 is deferred and lives here only as a forward
+reference for the consumers of the frontmatter Phase 1+2 produces.
 
 ## 2. Goals
 
 1. Replace the LLM-extracted `arXiv:<id>` resolver with ground-truth
    S2AG references.  Higher precision, higher recall, DOI-aware.
 2. Emit typed citation edges (`cites`, `extends`, `applies_method_of`,
-   `cites_background`) into Lithos at note-write time.
+   `compares_with`, `cites_background`) into Lithos at note-write time
+   for arXiv-source notes.
 3. Land lightweight S2AG-derived enrichment (TLDR fallback,
-   `s2FieldsOfStudy` tags, `s2_paper_id` on every note) so Lithos has
-   enough state on each note to drive its own scouts later.
-4. Build LCMA scouts in Lithos for forward-citation discovery,
-   citation-edge backfill, metadata refresh, and concept-tag
-   governance.
-5. Treat S2AG outage as `degraded`, never fatal.  Influx without S2AG
-   must still ingest cleanly; LCMA scouts must skip cleanly.
+   `s2FieldsOfStudy` tags, `s2_paper_id` on every arXiv-source note)
+   so Lithos has enough state on each note to drive its own scouts
+   later.
+4. Treat S2AG outage as `degraded`, never fatal.  Influx without S2AG
+   must still ingest cleanly.
 
 ## 3. Non-Goals
 
@@ -56,50 +62,55 @@ project epics once we decide to implement.
    writes its seed edges + frontmatter, Lithos owns reconciliation.
 2. **No new note types.**  Citation references for papers Lithos
    doesn't yet know are dropped at Influx-write time, not stored as
-   stub notes.  The Lithos backfill scout materialises edges later
-   when the target appears.
-3. **No OpenAlex integration in v1.**  `s2FieldsOfStudy` is sufficient
-   for an initial concept-tag pass; OpenAlex is a follow-up.
-4. **No SPECTER2 vector storage.**  Worth considering once the simpler
-   wins land, but out of scope for this plan.
-5. **Influx remains a single-process service.**  Scouts live in Lithos;
-   nothing here changes Influx's process model.
+   stub notes.  The (deferred) Lithos backfill scout materialises
+   edges later when the target appears.
+3. **RSS-source candidates are not S2AG-enriched in v1.**  The s2ag
+   stage is gated to arXiv-source candidates only.  RSS items
+   (regardless of whether their URL happens to be an arXiv abs URL)
+   skip the stage cleanly: no counter, no terminal tag, no degraded
+   reason.  Future RSS coverage is a follow-up.
+4. **TLDR fallback substitutes for Tier 1 only in v1.**  The Tier-3
+   body-context substitution proposed in v0.1 is deferred — Tier 3
+   produces a structured payload, not free prose, so the substitution
+   semantics need separate design.
+5. **No OpenAlex integration in v1.**  `s2FieldsOfStudy` is sufficient
+   for an initial concept-tag pass.
+6. **No SPECTER2 vector storage.**  Out of scope.
+7. **Influx remains a single-process service.**  Scouts live in Lithos.
+8. **Phases 3–5 are out of v1 scope.**  Citation backfill, forward-
+   citation tracking, metadata refresh, concept-tag governance,
+   influence reranking, and slug-collision adjudication are tracked
+   as separate epics.
 
 ## 4. The Split
 
-### 4.1 Belongs to Influx
+### 4.1 Belongs to Influx (v1)
 
 | Activity | Reason |
 |---|---|
-| Fetching S2AG records for a paper being ingested *right now* | Same shape as Tier 1 / 2 / 3 — paper-in-hand enrichment. |
-| Writing typed citation edges between notes Influx is creating | Influx already calls `lithos_edge_upsert` for `builds_on` (§10.5). |
-| TLDR fallback when Tier 1 / Tier 3 fails | Per-item enrichment, runs inside `Cascade.enrich`. |
+| Fetching S2AG records for an arXiv paper being ingested *right now* | Same shape as Tier 1 / 2 / 3 — paper-in-hand enrichment. |
+| Writing typed citation edges between arXiv-source notes Influx is creating | Influx already calls `lithos_edge_upsert` for `builds_on` (§10.5). |
+| TLDR fallback when Tier 1 fails | Per-item enrichment, runs inside `Cascade.enrich`. |
 | `s2FieldsOfStudy` tag emission at write time | Tag application is part of the canonical note write. |
-| Reacting to scout-emitted ingest requests via admin API | Influx already owns the relevance filter, ingest pipeline, and webhook fan-out. |
-| Recording `s2_paper_id` and `s2_citations_seen` in note frontmatter | Influx is the single writer of Influx-authored notes. |
+| Recording `s2_paper_id`, `s2_doi`, `s2_citations_seen`, `s2_fields_of_study` in note frontmatter | Influx is the single writer of Influx-authored notes. |
 
-### 4.2 Belongs to Lithos LCMA
+### 4.2 Belongs to Lithos LCMA (Phase 3+, deferred)
 
-| Activity | Reason |
-|---|---|
-| Forward-citation sweeps over the existing corpus | Corpus-wide read; no per-profile / per-tick scope. |
-| Backfilling edges when a previously-shadowed citation becomes a real note | Operates on graph state, not on candidates. |
-| Influence-driven re-ranking of existing notes | Reads corpus, writes annotations — pure curation. |
-| Concept-tag vocabulary control + near-duplicate consolidation | Vocabulary lives with the corpus; Influx is a writer, not a curator. |
-| Metadata refresh (preprint → published, venue assignment) | "Is the world's view of this paper still in sync with ours?" is a graph-maintenance question. |
-| Slug-collision adjudication via S2AG paperId | Reads Lithos squatter state; not in Influx's per-tick scope. |
+See §6 for forward references only.
 
 ### 4.3 Boundary handoff
 
-Influx writes the following on every note it authors after S2AG
-enrichment lands:
+Influx writes the following on every arXiv-source note it authors
+after S2AG enrichment lands (RSS-source notes are unchanged from
+today's behaviour):
 
 ```yaml
 ---
 note_type: summary
 namespace: influx
 source_url: https://arxiv.org/abs/2402.12345
-s2_paper_id: "abc123def456..."
+s2_paper_id: "abc123def456abcdef0123456789abcdef012345"
+s2_doi: "10.1234/example.2024.1234"
 s2_citations_seen: 47
 s2_fields_of_study:
   - "Computer Science"
@@ -108,7 +119,9 @@ tags:
   - profile:ai-agents
   - source:arxiv
   - arxiv-id:2402.12345
-  - field:cs.LG
+  - s2-paper-id:abc123def456abcdef0123456789abcdef012345
+  - field:computer-science
+  - field:mathematics
   - concept:reinforcement-learning
   - ingested-by:influx
   - schema:1
@@ -117,11 +130,11 @@ confidence: 0.78
 ```
 
 Plus typed edges via `lithos_edge_upsert` for any reference whose
-target is already a note in Lithos (cache lookup hit).
+target is already a note in Lithos (resolved via the cache-lookup
+chain in §5.3).
 
 That is the entire Influx → Lithos interface for citation data.  Every
-LCMA scout reads from this state; no scout calls into Influx except to
-*request* an ingest via the new admin endpoint (§5.6).
+(deferred) LCMA scout reads from this state.
 
 ## 5. Influx Work Units
 
@@ -133,132 +146,216 @@ the implementation PRs.
 **New module:** `src/influx/s2ag.py`
 
 - `S2agClient` — async HTTP client wrapping the guarded HTTP path,
-  honouring `[s2ag].request_timeout` and the resilience retry settings.
+  honouring `[s2ag].request_timeout` and the resilience retry settings
+  (`max_retries`, `s2ag_429_backoff_seconds`).
 - Endpoints used:
   - `GET /graph/v1/paper/{paperId}` — single-paper lookup
-  - `POST /graph/v1/paper/batch` — batched lookup (up to 500 IDs/POST)
+  - `POST /graph/v1/paper/batch` — batched lookup
+    (up to `[s2ag].batch_size` IDs/POST, default 500)
   - `GET /graph/v1/paper/{paperId}/references` — references with
-    intents and externalIds
-  - `GET /graph/v1/paper/{paperId}/citations` — citations (used by
-    Lithos scouts, but the client lives in Influx for reuse)
-- Accepts `paperIdType=ARXIV` so we can pass `arXiv:<id>` directly
-  without resolving via DOI first.
+    `intents` and `externalIds`
+- Accepts `paperIdType=ARXIV` so we can pass the unversioned arXiv ID
+  directly (Influx already strips version suffixes at parse time —
+  `arxiv.py:266`).
 - API key loaded from `s2ag.api_key_env` if set; without one, falls
   back to the unauthenticated 1 RPS shared bucket.
-- New `ProbeLoop` probe: HEAD on `/graph/v1/paper/search?query=test&limit=1`
-  every 60s, mirroring the Lithos probe semantics.
-- Latches `s2ag_unavailable` on the probe loop after N consecutive
-  failures, surfaced as a `degraded_reasons` entry in the run ledger.
+- Per-tick `FetchCache` integration — re-uses the existing
+  `FetchCache.get_or_fetch` semantics
+  (`src/influx/sources/__init__.py:84`); concurrent calls for the same
+  `paperId` collapse onto a shared `asyncio.Future`.
+- New `ProbeLoop` probe: `GET /graph/v1/paper/search?query=test&limit=1`
+  every 60 s (GET, not HEAD — REST APIs do not always support HEAD).
+  Latches `s2ag_unavailable` after **3 consecutive failures**; clears
+  on the first success.
 
 ### 5.2 `s2ag_enrich` cascade stage
 
 **Edited:** `src/influx/cascade.py`
 
-- New stage between Tier 1 and Tier 2.  Runs only on items that passed
-  the relevance filter (§7.1) — never on rejects, so the S2AG budget
-  is bounded by ingest-eligible candidates per tick.
-- Inputs: `arxiv-id` (or DOI) from the candidate dict.
-- Outputs added to the candidate's enrichment payload:
-  - `s2_paper_id`, `s2_external_ids`
+- New stage **between Tier 2 (full-text) and Tier 1 (relevance
+  enrichment)** in the cascade execution order.  Mirrors the existing
+  `tier2_extractor` injection pattern: `s2ag_enricher: S2agEnricher | None`.
+- Gate: `score >= thresholds.relevance` (same gate as Tier 1).
+- **Applicability**: arXiv-source candidates only.  RSS-source
+  candidates always pass `arxiv_id=None`; the cascade short-circuits
+  the s2ag stage with no counter, no tag, no degraded reason.
+- Inputs: `arxiv_id` from the candidate dict.
+- Outputs added to the candidate's enrichment payload (in-memory only —
+  see §5.7 for the subset that is persisted to frontmatter):
+  - `s2_paper_id`, `s2_doi`, `s2_external_ids`
   - `s2_tldr` (string, may be empty)
   - `s2_fields_of_study` (list)
   - `s2_reference_count`, `s2_citation_count`,
     `s2_influential_citation_count`
   - `s2_references` (list of `{paperId, externalIds, intents,
-    contexts}`)
-- Failure classification reuses the spec §11.1 partition:
-  - Transient (HTTP, transport, timeout) — counter not advanced.
-  - Counted (parse, validate, missing-paper) — advances
-    `s2ag_attempts` in the note's `## Repair` block.
-- `influx:s2ag-terminal` set after `REPAIR_COUNTED_CAP` (currently 3)
-  counted failures.  Re-arm by removing the tag, mirroring
-  `influx:tier3-terminal`.
+    contexts, year, influentialCitationCount}`) — **not persisted**
+    to frontmatter; lives on the cascade output for the post-write
+    edge fan-out and is re-fetched from S2AG on repair.
+- `EnrichedSections` grows two fields: `s2ag: S2agEnrichment | None`
+  and `s2ag_attempted: bool` (mirrors `tier1_attempted`).
+- Failure classification (mirrors §11.1 of the spec):
+  - **Transient** (HTTP 5xx, transport, timeout, 429-respected) —
+    counter not advanced; repair sweep retries indefinitely.
+  - **Counted** (HTTP 4xx other than 429, parse, validation) —
+    advances `s2ag_attempts`.
+  - **Paper-not-in-S2-corpus** (404 or empty body for a known good
+    `arxiv_id`) — counted-once, **immediately latches**
+    `influx:s2ag-terminal` and tags `summary:s2ag-miss`.  Distinct from
+    generic counted failures because retrying changes nothing.
+- `influx:s2ag-terminal` after `REPAIR_COUNTED_CAP` (3) counted
+  failures, OR after the single counted-once for paper-not-in-S2.
+  Re-arm by removing the tag, mirroring `influx:tier3-terminal`.
 
 ### 5.3 Reference → typed edge emission
 
-**Edited:** `src/influx/lcma_wiring.py`
+**Edited:** `src/influx/lcma_wiring.py`, `src/influx/lcma.py`
 
-- After `lithos_write` succeeds, iterate over `s2_references`:
-  1. For each reference, attempt `lithos_cache_lookup` by `source_url`
-     (built from `externalIds.DOI` or `externalIds.ArXiv`).
-  2. If hit: `lithos_edge_upsert` with edge type derived from intents:
-     | S2AG intent | Edge type |
-     |---|---|
-     | `extension` | `extends` |
-     | `methodology` | `applies_method_of` |
-     | `result` | `compares_with` |
-     | `background` | `cites_background` |
-     | (none / multiple) | `cites` |
-  3. If miss: drop the edge.  The Lithos backfill scout (§6.1) will
-     materialise it later when the target becomes a note.
-- Cap edges per source note: top 50 references by
-  `s2_influential_citation_count` (with ties broken by recency).  Avoids
-  a single mega-survey paper saturating the graph.
-- Replaces the existing `arXiv:<id>` resolver in §10.5 entirely.  Tier 3's
-  `builds_on` field stays in the note for human readability but is no
-  longer load-bearing for edge creation.
+After `lithos_write` succeeds for an arXiv-source note that has a
+non-empty `s2_references` payload:
 
-### 5.4 TLDR Tier 0 fallback
+1. **Cap and order**: take the top **50** references sorted by
+   `(influentialCitationCount DESC, year DESC, paperId ASC)` *before*
+   any cache lookup.  Three-key tuple is deterministic even when
+   the leading two keys tie.
+2. For each reference, run the resolution chain:
+   1. `lithos_cache_lookup(tags=["s2-paper-id:<target_hex>"])` — exact
+      match on S2 canonical ID (works for S2AG-era notes).
+   2. If miss and `externalIds.ArXiv` present:
+      `lithos_cache_lookup(source_url="https://arxiv.org/abs/<arxiv_id>")` —
+      fallback for legacy pre-Phase-1 notes.
+   3. If still miss: silently drop.  No counter, no warning, no tag.
+      The (deferred) Phase 3 backfill scout materialises later.
+3. On hit, call `lithos_edge_upsert` with:
 
-**Edited:** `src/influx/enrich.py`, `src/influx/renderer.py`
+| Field | Value |
+|---|---|
+| `from_id` | source note id |
+| `to_id` | resolved target note id |
+| `type` | derived from S2AG `intents` (table below) |
+| `weight` | `1.0` (constant in v1; reserve for a future scout-computed influence score) |
+| `namespace` | `"influx"` |
+| `provenance_actor` | `"influx-s2ag"` |
+| `provenance_type` | `"s2ag_reference"` |
+| `evidence` | `{"s2_paper_id": <target_hex>, "intents": [...], "contexts": [<≤1 short snippet>], "source_paper_id": <source_hex>}` |
+| `conflict_state` | `None` |
 
-- When Tier 1 enrichment fails (transient OR counted) AND `s2_tldr` is
-  non-empty, render the `## Summary` section from the TLDR with a
-  trailing "(summary auto-generated by Semantic Scholar)" attribution
-  line.
-- When Tier 3 fails terminally (`tier3-terminal`) AND the note has only
-  abstract-only content, the same TLDR can stand in for the body
-  context — keeps notes from sitting in `text:abstract-only` purgatory
-  with no Summary at all.
-- Adds tag `summary:s2ag-tldr` when this fallback applies, so operators
-  can spot it.
+Edge type derivation:
+
+| S2AG intent | Edge `type` |
+|---|---|
+| `extension` | `extends` |
+| `methodology` | `applies_method_of` |
+| `result` | `compares_with` |
+| `background` | `cites_background` |
+| (none / multiple) | `cites` |
+
+**Best-effort fan-out**, never fails the parent write.  Per-reference:
+wrap each `cache_lookup` + `edge_upsert` pair in try/except; log a
+warning, increment `influx_s2ag_edge_upsert_failed_total`, continue to
+the next reference.  When ≥1 reference fails: bump `s2ag_attempts` once
+(not per-edge), set `s2ag_last_stage="edges"`, tag
+`influx:repair-needed`.  Repair sweep re-runs the whole fan-out;
+idempotent edge upsert means already-emitted edges no-op.
+
+This step **replaces** the existing `arXiv:<id>` resolver in §10.5.
+Tier 3's `builds_on` field remains in the note for human readability
+but is no longer load-bearing for edge creation.
+
+> **Prerequisite:** `agent-lore/influx#99` must land first.  The
+> existing `LithosClient.edge_upsert` wrapper sends only
+> `source_note_id` / `target_note_id` / `evidence`; the Lithos MCP
+> tool requires `from_id` / `to_id` / `weight` / `namespace`.  The
+> citation-graph fan-out cannot function until #99 is merged.  See §11.
+
+### 5.4 TLDR fallback (Tier 1 only in v1)
+
+**Edited:** `src/influx/renderer.py`
+
+Renderer becomes a small finite-state machine over Tier 1 status and
+S2AG TLDR availability:
+
+| Tier 1 | `s2_tldr` | Output | Tags |
+|---|---|---|---|
+| OK | * | Tier 1 prose | (no s2ag-tldr) |
+| Failed | non-empty | TLDR + trailing parenthetical attribution `_(summary auto-generated by Semantic Scholar)_` | `summary:s2ag-tldr` |
+| Failed | empty | (no `## Summary` section) | `summary:tier1-failed-no-tldr` |
+| Skipped (`score < relevance`) | * | (no `## Summary` section) | (no S2AG tags) |
+
+When a subsequent re-write succeeds at Tier 1, the renderer always
+prefers Tier 1; the `summary:s2ag-tldr` /
+`summary:tier1-failed-no-tldr` tags are removed in the same write.
+
+The Tier-3 body-context fallback proposed in v0.1 is **deferred** —
+see §3.
 
 ### 5.5 Concept tagging from `s2FieldsOfStudy`
 
 **Edited:** `src/influx/notes.py`
 
-- Emit up to 3 `field:<value>` tags from `s2_fields_of_study`, lowercased
-  and slug-normalised (`Computer Science` → `field:computer-science`).
-- Cap at top-3 to bound cardinality.
+- Take the **first 3** entries of `s2_fields_of_study` as returned by
+  S2AG (trust S2AG's internal ranking — it is stable per call).
+- Slug-normalise: `"Computer Science"` → `"computer-science"`.
+- Emit as `field:<slug>` tags.
+- **No top-level filtering.**  Filtering broad fields like
+  `Computer Science` globally is brittle (a CS paper genuinely about
+  Linguistics may have Linguistics as the discriminator; a
+  `Mathematics` paper may genuinely lead with Mathematics).  Cap-3
+  already gives two slots beyond a dominant top-level field.
 - Concept-tag governance (deduplication, vocabulary control) is a
-  Lithos scout responsibility (§6.4); Influx emits raw tags.
+  Phase 5 Lithos scout responsibility, out of v1 scope.
 
-### 5.6 Citation-alert ingest endpoint
+### 5.6 Citation-alert ingest endpoint — DEFERRED to Phase 4
 
-**New:** `POST /citation-alerts` in `src/influx/http_api.py`
+Out of v1 scope.  Listed in v0.1 §5.6; left as a forward reference for
+when forward-citation tracking lands.
 
-- Body: `{paper_id: <s2_paper_id>, profile: <name>, reason: <string>}`
-- Used by the Lithos forward-citation scout (§6.2) when it discovers a
-  paper that cites a tracked Influx note.
-- Influx resolves the S2AG paper to an arXiv ID or DOI, runs the same
-  per-profile relevance filter, and ingests if it passes.
-- Auth: same loopback / `allow_remote_admin` policy as the rest of the
-  admin API.  In multi-host setups this needs a shared token —
-  defer to a later iteration.
-- Returns `202` with `request_id` like the existing `/runs` endpoint.
-
-### 5.7 Note frontmatter additions
-
-Three new fields on Influx-authored notes:
+### 5.7 Note frontmatter additions (arXiv-source notes only)
 
 | Field | Type | Purpose |
 |---|---|---|
-| `s2_paper_id` | string | Stable handle for all subsequent S2AG queries; lets Lithos scouts batch without re-resolving IDs. |
-| `s2_citations_seen` | int | Last-known citation count, recorded on each ingest / refresh.  Forward-citation scout uses the delta to detect new citations cheaply. |
-| `s2_fields_of_study` | list[string] | Raw field names; tags are derived but the list is preserved for governance scouts to canonicalise. |
+| `s2_paper_id` | string (40-char hex; empty when enrichment skipped/failed) | Stable handle for S2AG queries; lets future scouts batch without re-resolving IDs. |
+| `s2_doi` | string (empty when not present) | DOI from `externalIds.DOI`; sibling lookup key for the (deferred) Phase 3 scout. |
+| `s2_citations_seen` | int | Last-known citation count; deltaable by Phase 3+ scouts. |
+| `s2_fields_of_study` | list[string] | Raw category names; tags are derived but the list is preserved for Phase 5 governance. |
 
-`s2_influential_citation_count` is intentionally **not** stored on the
-note itself — it changes too often and is a corpus-side concern.  The
-Lithos influence reranker scout (§6.5) maintains it as graph metadata.
+Plus tag emission: when `s2_paper_id` is non-empty, also emit
+`s2-paper-id:<hex>` as a tag.  Mirrors the existing `arxiv-id:<id>`
+pattern; lets `lithos_cache_lookup` queries find notes by S2 canonical
+ID directly (used by §5.3 step 1).
+
+`s2_influential_citation_count` is intentionally **not** persisted to
+the note — it changes too often and is a corpus-side concern owned by
+the (deferred) Phase 5 influence reranker scout.
 
 ### 5.8 Repair sweep `s2ag` stage
 
-**Edited:** `src/influx/repair.py`, `src/influx/repair_counters.py`
+**Edited:** `src/influx/repair.py`, `src/influx/repair_counters.py`,
+`src/influx/repair_hooks.py`
 
-- Mirrors Tier 2 / Tier 3 stages.  Adds `s2ag_attempts`,
-  `s2ag_last_stage`, `s2ag_last_error` to the `## Repair` block.
-- Sweep retries S2AG enrichment for notes tagged `influx:repair-needed`
-  whose `s2ag_attempts < REPAIR_COUNTED_CAP`.
+- New stage in the repair sweep, ordered **last** (after
+  `tier3_extract`).  S2AG enrichment is independent of every other
+  repair stage's output and is the slowest stage (network-bound);
+  putting it last reports earlier-stage failures first and minimises
+  wasted work when an earlier stage fails.
+- New fields in `RepairCounters`: `s2ag_attempts`, `s2ag_last_stage`,
+  `s2ag_last_error`.  `CountedStage` Literal grows `"s2ag"`.  Adds
+  `bump_s2ag(stage=, error=)` and an `attempts_for("s2ag")` mapping.
+  Render/parse logic in `repair_counters.py` extended for the three
+  new fields.
+- The `Stages` decision struct grows `s2ag_retry: bool`, set when:
+  - `not influx:s2ag-terminal` AND
+  - `s2ag_attempts < REPAIR_COUNTED_CAP` AND
+  - (`frontmatter.s2_paper_id == ""` OR `s2ag_last_stage == "edges"`).
+- Behaviour:
+  1. If `s2_paper_id == ""`: re-run `/paper/batch` enrichment.  On
+     success update frontmatter / tags.  On counted failure:
+     `bump_s2ag(stage="enrich", ...)`.  On transient: leave for next
+     sweep.
+  2. Whether or not we ran step 1, if `s2_paper_id` is now non-empty
+     AND not terminal: re-fetch references via
+     `/paper/{paperId}/references` and re-run the §5.3 fan-out.  On
+     any per-edge failure: `bump_s2ag(stage="edges", ...)`.  Idempotent
+     edge upsert means already-emitted edges no-op.
 - Successful retry clears `influx:repair-needed` only when no other
   stage is also failing.
 
@@ -270,35 +367,46 @@ Lithos influence reranker scout (§6.5) maintains it as graph metadata.
 [s2ag]
 enabled = true
 base_url = "https://api.semanticscholar.org"
-api_key_env = "S2AG_API_KEY"     # optional
+api_key_env = "S2AG_API_KEY"     # optional; falls back to anon 1 RPS
 request_timeout = 30
 batch_size = 500                 # max IDs per /paper/batch POST
 
 [resilience]
 # existing fields unchanged
-s2ag_429_backoff_seconds = 30    # mirror arxiv_429_backoff_seconds
+s2ag_429_backoff_seconds = 30    # mirrors arxiv_429_backoff_seconds
 
 [[profiles]]
 # existing fields unchanged
 [profiles.s2ag]
-enrich_references = true                  # default true when [s2ag].enabled
-track_forward_citations = false           # opt-in per profile
-tracked_score_threshold = 8               # only notes ≥ this score are tracked
+enrich_references = true         # default true when [s2ag].enabled
 ```
 
 `[profiles.s2ag]` is omitted ⇒ defaults applied.
 
+`track_forward_citations` and `tracked_score_threshold` from v0.1 are
+**dropped** (Phase 4 keys, not needed in v1).
+
 ### 5.10 Metrics + observability
 
-New OTEL instruments:
+OTEL instruments (v1 surface):
 
 | Instrument | Type | Labels |
 |---|---|---|
 | `influx_s2ag_calls_total` | Counter | `endpoint`, `status` |
-| `influx_s2ag_dedup_recovery_total` | Counter | _(no labels)_ |
 | `influx_s2ag_edges_emitted_total` | Counter | `profile`, `edge_type` |
 | `influx_s2ag_tldr_fallback_total` | Counter | `profile`, `tier` |
 | `influx_s2ag_enrichment_duration_seconds` | Histogram | `profile` |
+| `influx_s2ag_cache_lookup_total` | Counter | `result=tag_hit\|url_hit\|miss` |
+| `influx_s2ag_skip_total` | Counter | `reason=non_arxiv_source\|not_in_s2_corpus` |
+| `influx_s2ag_edge_upsert_failed_total` | Counter | `profile`, `reason` |
+
+(`influx_s2ag_dedup_recovery_total` from v0.1 is **dropped** — it was
+for the Phase 5 §6.6 slug-collision adjudicator.)
+
+These give operators the chain:
+`skip_total` (why no calls) → `calls_total{status}` (per-call success) →
+`cache_lookup_total{result}` (why no edges) →
+`edges_emitted_total` / `edge_upsert_failed_total` (final delta).
 
 New `degraded_reasons` value: `s2ag_unavailable`.  Single-run signal,
 no consecutive-runs gate (mirrors `filter_error`'s shape).
@@ -307,117 +415,32 @@ New ledger fields (additive): `s2ag_calls`, `s2ag_edges_written`.
 
 ### 5.11 Per-tick S2AG cache
 
-**New:** `src/influx/sources/s2ag_cache.py` (or fold into existing
-`FetchCache`).
+The existing `FetchCache` (`src/influx/sources/__init__.py`) already
+provides the in-flight collapsing semantics S2AG needs:
+`get_or_fetch` shares an `asyncio.Future` across concurrent callers
+for the same key.  No new cache module — reuse `FetchCache` keyed by
+`("s2ag", paperId)`.  Lifecycle bracketed by the existing
+`_fire_tick` `begin_fire` / `end_fire` window.
 
-- Mirrors the existing arXiv per-tick fetch dedup: when two profiles
-  ingest the same paper in one tick, S2AG is queried once.
-- Lifecycle bracketed by the existing `_fire_tick` `begin_fire` /
-  `end_fire` window — no new cache scope to reason about.
+## 6. Lithos LCMA Work Units (deferred to follow-up epics)
 
-## 6. Lithos LCMA Work Units (Scouts)
+The scouts described in v0.1 §6 are out of v1 scope.  Listed here as
+forward references for the consumers of Phase 1+2's frontmatter:
 
-Each scout is a periodic LCMA worker.  All scouts read note frontmatter
-written by Influx (§5.7); none calls back into Influx except via the
-`POST /citation-alerts` endpoint (§5.6).
+| v0.1 § | Scout | Phase |
+|---|---|---|
+| 6.1 | Citation backfill scout | 3 |
+| 6.2 | Forward citation scout | 4 |
+| 6.3 | Metadata refresh scout | 3 |
+| 6.4 | Concept-tag governance scout | 5 |
+| 6.5 | Influence reranker scout | 5 |
+| 6.6 | Slug-collision adjudicator | 5 |
 
-### 6.1 Citation backfill scout
-
-**Trigger:** New note write event in Lithos (or periodic sweep, batch
-per N minutes).
-
-**Work:**
-1. For the new note, look up `s2_paper_id` in Lithos's reference index
-   (an internal index of "papers we have edges pointing AT but don't
-   yet have a note for").
-2. For every existing note that referenced this paper as a shadow
-   target, materialise the previously-dropped citation edge with the
-   appropriate type.
-3. Update the reference index.
-
-**Why a scout, not Influx:** Influx never knows which future notes will
-fill in its dropped references.  This is a corpus-mutation event that
-can fire long after the source note was written.
-
-### 6.2 Forward citation scout
-
-**Trigger:** Cron, e.g. daily at off-peak hours.
-
-**Work:**
-1. Read all notes with `s2_citations_seen` set (the "tracked" set —
-   bounded by per-profile `tracked_score_threshold` at Influx-write
-   time).
-2. Batch S2AG `/paper/batch` to fetch current `citationCount` per note.
-3. For notes with new citations (delta > 0), call
-   `/paper/{paperId}/citations` and inspect the new entries.
-4. For each new citing paper:
-   - If it's already a Lithos note: emit the appropriate typed edge.
-   - If not: hit `POST /citation-alerts` on Influx with the paperId,
-     the profile that flagged the cited paper, and a reason string.
-     Influx decides whether to ingest (relevance filter still applies).
-5. Update `s2_citations_seen` on the cited note.
-
-**Why a scout, not Influx:** Forward-citation tracking is a read-heavy
-corpus traversal that needs to span profiles and span time.  Influx's
-per-tick / per-profile model is the wrong shape.
-
-### 6.3 Metadata refresh scout
-
-**Trigger:** Cron, weekly.
-
-**Work:**
-1. Batch-query S2AG for notes' `s2_paper_id`s; check `journal`,
-   `publicationVenue`, `publicationDate`, `externalIds`.
-2. Update note frontmatter when something changed (preprint → journal
-   acceptance, DOI assignment, etc.).
-3. Add tags like `venue:NeurIPS-2024`, `published:true`.
-4. Idempotent — running twice is a no-op when nothing has changed.
-
-### 6.4 Concept-tag governance scout
-
-**Trigger:** Cron, weekly.
-
-**Work:**
-1. Read raw `concept:*` and `field:*` tags emitted by Influx across the
-   corpus.
-2. Identify near-duplicates (`graph-neural-networks` vs `gnns` vs
-   `graph-neural-nets`).
-3. Map onto a controlled vocabulary (seeded from OpenAlex's stable
-   concept set, OR from in-corpus tag frequency above a floor).
-4. Rewrite tags on affected notes.
-
-**Why a scout, not Influx:** The vocabulary is a corpus-level concept
-that emerges from multiple Influx writes over time.  Influx writes raw
-tags; Lithos canonicalises them.
-
-### 6.5 Influence reranker scout
-
-**Trigger:** Cron, weekly.
-
-**Work:**
-1. Batch S2AG for all tracked notes' `influentialCitationCount`.
-2. Maintain a Lithos-side annotation (`s2_influential_citations_latest`,
-   `s2_influence_updated_at`).
-3. Optionally drives "rising star" or "becoming foundational"
-   notifications via Lithos's own notification path — orthogonal to
-   Influx's notification machinery.
-
-### 6.6 Slug-collision adjudicator
-
-**Trigger:** On every `slug_collision` event in Lithos's write path
-(or batch-replay against the existing
-`unresolved-slug-collisions.jsonl`).
-
-**Work:**
-1. Both squatter and incoming paper resolve their `s2_paper_id` via
-   S2AG.
-2. If both resolve to the same `paperId`: it's a true duplicate
-   (e.g. arXiv preprint vs DOI'd journal version).  Merge tags and
-   Profile Relevance, treat as `duplicate`.
-3. If different: fall through to the existing AC-05-D suffix retry.
-
-Augments — does not replace — the §10.4 chain.  Catches the
-arXiv→journal republication case the URL-dedup misses today.
+Phase 1+2 lays down the frontmatter (`s2_paper_id`, `s2_doi`,
+`s2_citations_seen`, `s2_fields_of_study`), tags
+(`s2-paper-id:<hex>`, `field:<slug>`), and edges these scouts read.
+They can be designed once Phase 1+2 has been live long enough to
+characterise real-world S2AG payloads in the corpus.
 
 ## 7. Cross-Cutting Concerns
 
@@ -427,141 +450,85 @@ S2AG: 1 RPS authenticated, 1 RPS shared unauthenticated.
 
 | Workload | Rough volume | Mitigation |
 |---|---|---|
-| Influx per-tick enrichment | 6 profiles × ~10 candidates × 4 ticks/day = ~240 papers/day | `/paper/batch` (up to 500 IDs/POST) → ~5 calls/day |
-| Influx per-tick references | ~240 papers × 1 call each | Could be batched via per-paper expansion in `/paper/batch` |
-| Lithos forward-citation scout | ~500 tracked notes, daily | `/paper/batch` for citation counts → 1 call; per-paper `/citations` only on delta > 0 |
-| Lithos metadata refresh | ~corpus size, weekly | `/paper/batch` |
+| Influx per-tick enrichment (arXiv-only) | ~6 profiles × ~10 candidates × 4 ticks/day = ~240 papers/day | `/paper/batch` (up to 500 IDs/POST) → ~5 calls/day |
+| Influx per-tick references | ~240 papers × 1 call each | `/paper/{paperId}/references` per paper |
+| Probe loop | 1 call/60 s = 1440/day | Search with `limit=1` |
 
-Total daily S2AG budget under realistic operation: well under 100
-authenticated calls/day.  Negligible.
+Total daily v1 S2AG budget: well under 2,000 calls/day.  Fits inside
+the anonymous 1 RPS bucket with substantial headroom.
 
 ### 7.2 Per-tick cache
 
-Influx wraps S2AG calls in a per-tick cache that mirrors the existing
-arXiv `FetchCache` (#9.3 / R-8 / AC-09-D).  Two profiles ingesting the
-same paper in one tick → one S2AG call.
+See §5.11.
 
 ### 7.3 Degraded path
 
 S2AG outage is **never fatal**.  Behaviour:
 
-- Influx ingest continues without S2AG enrichment.  Notes are written
-  with no `s2_*` frontmatter and no S2AG-derived edges.
-- Run ledger flags `degraded_reasons += ["s2ag_unavailable"]`.
-- Lithos scouts skip cleanly when their probe says S2AG is down;
-  `s2ag_unavailable` shows up in scout-side metrics but no scout fails.
-- When S2AG recovers, the Influx repair sweep picks up the un-enriched
-  notes (`influx:repair-needed`) on next run; Lithos scouts catch up
-  on the next periodic tick.
+- Influx ingest continues without S2AG enrichment.  arXiv-source notes
+  are written with no `s2_*` frontmatter, no `s2-paper-id` tag, no
+  S2AG-derived edges.
+- Run ledger flags `degraded_reasons += ["s2ag_unavailable"]` when
+  the probe is latched (3 consecutive failures).
+- When S2AG recovers, the Influx repair sweep picks up un-enriched
+  arXiv-source notes (`influx:repair-needed`) on the next sweep pass.
 
 ### 7.4 Edge cardinality guards
 
-- Per source note: cap at top 50 references by
-  `s2_influential_citation_count` (Influx-side, §5.3).
-- Per target note: no cap.  But the Lithos backfill scout should warn
-  when an inbound edge count crosses 1000 — that's a corpus signal
-  worth surfacing, not a problem to silently truncate.
+- **Per source note:** cap at top 50 references by
+  `(influentialCitationCount DESC, year DESC, paperId ASC)` (§5.3).
+  Cap is applied *before* cache lookup.
+- **Per target note:** no cap in v1.  The (deferred) Phase 3 backfill
+  scout will surface high-fan-in targets when it lands.
 
 ### 7.5 Idempotency contract
 
-Every operation in this plan must be safe to re-run:
-
-- Influx S2AG enrichment runs on each ingest *and* on each repair pass.
-  Re-running on an already-enriched note is a no-op (frontmatter
-  comparison short-circuits before the API call).
-- Lithos scouts read note state, decide what's missing, write deltas.
-  No scout maintains its own external state — the corpus is the
-  source of truth.
+- Re-running `s2ag_enrich` on a note with non-empty `s2_paper_id` (and
+  not terminal) short-circuits before any API call.
+- Reference fan-out is always re-run on repair when `s2_paper_id` is
+  set (idempotent `lithos_edge_upsert` means already-emitted edges
+  no-op cleanly).
+- No external state — frontmatter is the source of truth.
 
 ## 8. Rollout Plan
 
-Phased rollout to land highest-leverage / lowest-risk pieces first.
-Each phase is independently shippable and independently revertible.
+Phase 1+2 ship as a single Influx-only epic.  The phase boundary in
+v0.1 (Phase 1 = frontmatter only, Phase 2 = edges) is dissolved
+because the same module set, configuration surface, S2AG client,
+per-tick cache, and repair stage support both — splitting them
+doubles integration tax for no real revertibility win.
 
-### Phase 1 — Influx-side enrichment, no edges (Influx only)
+Reverse-out:
+- Gated by `[s2ag].enabled`.
+- Disabling the flag returns the system to its pre-extension behaviour
+  with no data loss — frontmatter remains but is unused; edges remain
+  but aren't extended.
 
-- §5.1 S2AG client + probe
-- §5.2 `s2ag_enrich` cascade stage (writes frontmatter only, no edges
-  yet)
-- §5.7 Note frontmatter additions
-- §5.9 Config schema additions
-- §5.10 Metrics
-- §5.11 Per-tick S2AG cache
-- §5.4 TLDR Tier 0 fallback
-- §5.5 `s2FieldsOfStudy` tags
-
-**Outcome:** Every Influx-authored note carries `s2_paper_id`,
-`s2_citations_seen`, `s2_fields_of_study`.  No graph changes yet —
-gives the Lithos work somewhere to read from.
-
-### Phase 2 — Citation edges (Influx only)
-
-- §5.3 Reference → typed edge emission
-- §5.8 Repair sweep `s2ag` stage
-
-**Outcome:** Replaces the LLM-extracted `builds_on` resolver with
-ground-truth typed edges.  Lithos's existing graph traversal benefits
-immediately.
-
-### Phase 3 — Lithos backfill + metadata scouts (Lithos only)
-
-- §6.1 Citation backfill scout
-- §6.3 Metadata refresh scout
-
-**Outcome:** Edges that Influx couldn't resolve at write time get
-filled in retroactively.  Notes stay current as preprints get
-published.
-
-### Phase 4 — Forward citation tracking (Influx + Lithos)
-
-- §5.6 Citation-alert ingest endpoint
-- §6.2 Forward citation scout
-
-**Outcome:** Net-new product capability.  "Last week, three new papers
-cited your favourite 2024 paper on agent memory.  Two of them passed
-your relevance filter."
-
-### Phase 5 — Curation scouts (Lithos only)
-
-- §6.4 Concept-tag governance
-- §6.5 Influence reranker
-- §6.6 Slug-collision adjudicator
-
-**Outcome:** Corpus quality improves over time without operator
-intervention.
-
-### Reverse-out
-
-Each phase is gated by `[s2ag].enabled` (Phase 1–2) or scout-level
-`enabled` flags (Phase 3+).  Disabling the flag returns the system to
-its pre-extension behaviour with no data loss — frontmatter remains
-but is unused; edges remain but aren't extended.
+Phases 3–5 (Lithos scouts) are tracked as separate epics and depend
+on Phase 1+2 having been live long enough to characterise the data.
 
 ## 9. Open Questions
 
-1. **Edge directionality in Lithos.**  Does `lithos_edge_upsert`
-   support symmetric inverses, or do we need both `cites` and
-   `cited_by` edges?  Affects scout traversal cost.
-2. **Forward-citation ingest authorisation.**  The scout-driven ingest
-   path bypasses the regular cron tick.  Should it count against
-   `feedback.recalibrate_after_runs`?  Should it write a distinct
-   `RunKind.CITATION_ALERT` to the run ledger so it shows up in
-   diagnose tooling?
-3. **Scout scheduling.**  Where do LCMA scouts live operationally?
-   Same process as Lithos's MCP server, or a separate worker tier?
-   Affects deployment shape and `/ready` semantics.
-4. **API key rotation.**  S2AG offers higher rate limits with an API
-   key.  Is the existing env-var mechanism (`api_key_env`) sufficient,
-   or do we need a key-management story given this becomes a critical
-   path?
-5. **Concept-vocabulary seed.**  Bootstrap from OpenAlex (one-time
-   import) or grow organically from in-corpus tag frequency?
-   Determines whether Phase 5's tag-governance scout has a vocabulary
-   on day one.
-6. **Edge-type closure.**  The `cites` / `extends` / `applies_method_of`
-   / `compares_with` / `cites_background` set is opinionated.  Should
-   we keep S2AG's raw `intents` as an edge attribute too, in case we
-   want to refine the bucketing later?
+(Updated 2026-05-07 after design grilling; see commit history for
+the v0.1 list.)
+
+1. **Edge directionality in Lithos** — *answered:* `lithos/lcma/edges.py:44-45`
+   indexes both `from_id` and `to_id`; reverse traversal is already
+   cheap.  Don't write `cited_by` inverses.
+2. **Forward-citation ingest authorisation** — *deferred to Phase 4*,
+   out of v1 scope.
+3. **Scout scheduling** — *deferred to Phase 3+*, out of v1 scope.
+4. **API key rotation** — *v1 answer:* env-var (`s2ag.api_key_env`)
+   is sufficient.  Rotation is an operator concern; restart picks up
+   the new value.  Revisit when the (deferred) forward-citation scout
+   makes S2AG critical-path.
+5. **Concept-vocabulary seed** — *deferred to Phase 5*, out of v1
+   scope.
+6. **Edge-type closure** — *answered:* Lithos doesn't validate edge
+   `type` strings (`lithos/server.py:1860`); the 5-type closure is an
+   Influx-side convention, not a Lithos contract.  Raw S2AG `intents`
+   are preserved in `evidence` so future re-bucketing is reversible
+   without re-fetching from S2AG.
 
 ## 10. References
 
@@ -571,8 +538,29 @@ but is unused; edges remain but aren't extended.
   pattern reused for `s2ag_attempts`.
 - Influx specification §13.1 (`degraded_reasons`) — where
   `s2ag_unavailable` plugs in.
-- Influx issue #87 — scheduler stagger work; this plan does NOT add
+- Influx issue #87 — scheduler stagger work; this plan does not add
   any cross-tick scheduling pressure beyond what's already accounted
   for there.
+- Influx issue #99 — `LithosClient.edge_upsert` wrapper bug; see §11.
 - Semantic Scholar Academic Graph API
-  ([api.semanticscholar.org/api-docs/graph](https://api.semanticscholar.org/api-docs/graph)).
+  (https://api.semanticscholar.org/api-docs/graph).
+
+## 11. Prerequisite
+
+**`agent-lore/influx#99`** — `LithosClient.edge_upsert` wrapper
+signature does not match the Lithos MCP tool.
+
+The existing wrapper sends `source_note_id` / `target_note_id` /
+`evidence` only; the Lithos MCP tool requires `from_id` / `to_id` /
+`weight` / `namespace` and accepts `provenance_*` / `conflict_state`.
+Live `edges.db` confirms zero `LithosClient.edge_upsert`-authored
+edges in 48 h staging — the only persisted edges are written by
+Lithos's own `EnrichWorker` (`provenance_type='consolidation'`).
+The wrapper is a latent bug today because both call sites
+(`after_write`, `resolve_builds_on`) are upstream-gated and rarely
+fire; the §5.3 reference fan-out will exercise it on every arXiv
+ingest and would fail without the fix.
+
+#99 must merge before the §5.3 edge-emission work lands.  The
+non-edge work (S2AG client, frontmatter, tags, TLDR fallback,
+metrics) does **not** depend on #99 and can land in parallel.
