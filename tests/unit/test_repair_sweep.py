@@ -1349,3 +1349,62 @@ class TestSweepTextExtractionRetry:
         rewritten = self._last_write_args(client)
         assert not any(t.startswith("text:") for t in rewritten["tags"])
         assert "influx:repair-needed" in rewritten["tags"]
+
+    async def test_unsupported_source_becomes_terminal_and_leaves_sweep(self) -> None:
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_textless("n1")
+
+        def hook(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                "text_extraction retry: source '' not supported",
+                stage="unsupported_source",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(text_extraction=hook),
+        )
+
+        rewritten = self._last_write_args(client)
+        assert "text:abstract-only" in rewritten["tags"]
+        assert "influx:text-terminal" in rewritten["tags"]
+        assert "influx:repair-needed" not in rewritten["tags"]
+
+    async def test_unsupported_source_keeps_repair_needed_when_archive_missing(
+        self,
+    ) -> None:
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_textless("n1")
+        note["tags"] = list(note["tags"]) + ["influx:archive-missing"]
+        note["content"] = str(note["content"]).replace(
+            "path: arxiv/2026/04/x.pdf\n\n",
+            "",
+        )
+
+        def hook(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                "text_extraction retry: source '' not supported",
+                stage="unsupported_source",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(text_extraction=hook),
+        )
+
+        rewritten = self._last_write_args(client)
+        assert "text:abstract-only" in rewritten["tags"]
+        assert "influx:text-terminal" in rewritten["tags"]
+        assert "influx:repair-needed" in rewritten["tags"]
