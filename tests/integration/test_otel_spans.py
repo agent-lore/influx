@@ -159,6 +159,8 @@ def _mock_lithos_client() -> AsyncMock:
     client = AsyncMock()
     client.task_create_body.return_value = {"task_id": "task-1"}
     client.cache_lookup_for_item_body.return_value = {"hit": False}
+    client.list_notes_body.return_value = {"items": []}
+    client.read_note.return_value = {}
     write_result = MagicMock()
     write_result.status = "created"
     write_result.note_id = "note-123"
@@ -240,18 +242,11 @@ async def _run_arxiv_scenario(
         ),
         # Scheduler + Run infrastructure (#58 dispatch)
         patch("influx.run.LithosClient", return_value=mock_client),
-        patch("influx.run.LithosClient", return_value=mock_client),
         patch(
             "influx.run.build_negative_examples_block",
             new_callable=AsyncMock,
             return_value="",
         ),
-        patch(
-            "influx.run.build_negative_examples_block",
-            new_callable=AsyncMock,
-            return_value="",
-        ),
-        patch("influx.run.repair_sweep", new_callable=AsyncMock),
         patch("influx.run.repair_sweep", new_callable=AsyncMock),
         # lcma_after_write runs normally — produces influx.lithos.retrieve span
         # lcma_resolve_builds_on runs normally — "b1" has no arXiv ref, no-ops
@@ -473,18 +468,11 @@ class TestOtelDisabledZeroSpans:
             ),
             # Scheduler + Run infrastructure (#58 dispatch)
             patch("influx.run.LithosClient", return_value=mock_client),
-            patch("influx.run.LithosClient", return_value=mock_client),
             patch(
                 "influx.run.build_negative_examples_block",
                 new_callable=AsyncMock,
                 return_value="",
             ),
-            patch(
-                "influx.run.build_negative_examples_block",
-                new_callable=AsyncMock,
-                return_value="",
-            ),
-            patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch("influx.service.post_run_webhook_hook"),
         ):

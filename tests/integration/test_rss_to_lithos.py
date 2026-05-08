@@ -23,6 +23,7 @@ from typing import Literal
 
 import pytest
 
+from influx import filter as filter_module
 from influx.config import (
     AppConfig,
     FilterTuningConfig,
@@ -239,7 +240,7 @@ async def test_score_rss_items_chunks_by_filter_batch_size(
         return _filter_response_for(candidate_ids)
 
     monkeypatch.setattr(
-        rss_module,
+        filter_module,
         "guarded_post_json_fetch",
         fake_post_json_fetch,
     )
@@ -282,7 +283,7 @@ async def test_score_rss_items_skips_failed_chunk_but_keeps_other_scores(
         return _filter_response_for(candidate_ids)
 
     monkeypatch.setattr(
-        rss_module,
+        filter_module,
         "guarded_post_json_fetch",
         fake_post_json_fetch,
     )
@@ -305,6 +306,63 @@ async def test_score_rss_items_skips_failed_chunk_but_keeps_other_scores(
         url_hash("https://example.com/post-4"),
     }
     assert len(recorded_errors) == 1
+
+
+async def test_score_rss_items_honours_retry_after_on_429(
+    archive_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_filter_config(archive_dir=archive_dir, batch_size=2).model_copy(
+        update={
+            "models": {
+                "filter": ModelSlotConfig(
+                    provider="test",
+                    model="test-filter",
+                    max_retries=1,
+                    json_mode=True,
+                ),
+            },
+        }
+    )
+    items = [
+        _make_item(url="https://example.com/post-0", title="Post 0"),
+        _make_item(url="https://example.com/post-1", title="Post 1"),
+    ]
+    calls = {"count": 0}
+    sleeps: list[float] = []
+
+    def fake_post_json_fetch(
+        url: str,
+        body: dict[str, object],
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        candidate_ids = _candidate_ids_from_filter_body(body)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return SimpleNamespace(
+                status_code=429,
+                body=b'{"error":{"message":"rate limited"}}',
+                headers={"Retry-After": "7"},
+            )
+        return _filter_response_for(candidate_ids)
+
+    monkeypatch.setattr(
+        filter_module,
+        "guarded_post_json_fetch",
+        fake_post_json_fetch,
+    )
+    monkeypatch.setattr(filter_module, "_sleep", lambda seconds: sleeps.append(seconds))
+
+    scores = await rss_module._score_rss_items(
+        items=items,
+        profile="test-profile",
+        filter_prompt="score these",
+        config=config,
+    )
+
+    assert calls["count"] == 2
+    assert sleeps == [7.0]
+    assert set(scores) == {_rss_filter_id_for(item) for item in items}
 
 
 def _rss_filter_id_for(item: RssFeedItem) -> str:

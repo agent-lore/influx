@@ -35,11 +35,9 @@ from influx.cascade import Acquired, Cascade
 from influx.coordinator import RunKind
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article
-from influx.filter import FilterScorerError
+from influx.filter import FilterScorerError, _call_filter_model_with_retry
 from influx.http_client import guarded_fetch as _guarded_fetch
-from influx.http_client import guarded_post_json_fetch
 from influx.renderer import render
-from influx.schemas import FilterResponse
 from influx.slugs import slugify_feed_name
 from influx.source import Candidate, ScoredCandidate
 from influx.storage import download_archive
@@ -413,21 +411,15 @@ async def _score_rss_items(
         last_error: Exception | None = None
         for _attempt in range(attempts):
             try:
-                response = guarded_post_json_fetch(
-                    url,
-                    body,
+                response = _call_filter_model_with_retry(
+                    config=config,
+                    profile=profile,
+                    url=url,
+                    body=body,
                     headers=headers,
-                    allow_private_ips=config.security.allow_private_ips,
-                    max_response_bytes=config.storage.max_download_bytes,
-                    timeout_seconds=slot.request_timeout,
+                    attempts=attempts,
                 )
-                if response.status_code >= 400:
-                    last_error = FilterScorerError(f"HTTP {response.status_code}")
-                    continue
-                envelope = json.loads(response.body.decode("utf-8"))
-                content = envelope["choices"][0]["message"]["content"]
-                parsed = FilterResponse.model_validate(json.loads(content))
-                all_scores.update({result.id: result for result in parsed.results})
+                all_scores.update({result.id: result for result in response.results})
                 break
             except Exception as exc:
                 last_error = exc
