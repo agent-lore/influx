@@ -80,7 +80,7 @@ Optional fields:
 |-------|------|-------------|
 | `title` | string | Hint for the candidate's `title` slot. Used as fallback if HTML extraction can't recover one. |
 | `summary` | string | Pre-fetched summary or excerpt. Used as the candidate's `abstract` for the Filter prompt, saving an extract round-trip when reliable. |
-| `source_tag` | string | Sets the resulting note's `source:*` tag. Defaults to `"inbox"`. |
+| `source_tag` | string | Sets the resulting note's `source:*` tag. Defaults to `"inbox"`. In v1 this does **not** control archive layout; it is validated as a conservative slug (`^[a-z0-9][a-z0-9-]{0,31}$`) and is used for note tagging only. |
 
 Explicitly absent from the contract:
 - No `profile` hint field. Multi-profile fan-out is the model.
@@ -146,7 +146,7 @@ Each inbox tick performs:
 
 1. **List pending InboxTasks**: `LithosClient.task_list(tags=[task_tag], status="open", limit=max_items_per_tick)`.
 2. **Claim each**: `LithosClient.task_claim(task_id=…, agent=agent_id, aspect="ingest")`. Failed claims (already claimed by another influx instance) are silently skipped.
-3. **Per-item processing** (§5.3) — for each claimed task, fan out to per-(item, Profile) Runs.
+3. **Per-item processing** (§5.3) — for each claimed task, fan out to per-(item, Profile) inbox dispatches.
 4. **Per-tick metrics tick** — emit `inbox_items_processed` per-item, no batch-level ledger record.
 
 The InboxTick is NOT a `Run`. It does not call `RunLedger.start()` for itself, does not appear in `/runs/recent`, does not produce a `ProfileRunResult`. It is purely an orchestrator above the Run layer.
@@ -158,12 +158,21 @@ For one claimed InboxTask:
 1. **Cache lookup**: `LithosClient.cache_lookup(query=<title or url>, source_url=<normalised_url>)` — both arguments required (§4.2). If hit → §6.
 2. **Acquire (once per item)**: download URL via existing `download_archive` machinery, extract HTML or PDF text via existing extraction cascade based on response content-type. Bytes are reused across all per-Profile filter calls below.
 3. **Filter fan-out**: in parallel for each enabled Profile, call `models.filter` with that Profile's description, prompt, and negative examples. Submitter-provided `title`/`summary` populate the candidate's title/abstract slots when extraction yields nothing better.
-4. **Per-Profile Run dispatch**: for each Profile that scored above its `relevance` threshold, dispatch a real single-Profile `Run` with `RunKind.INBOX` and a synthetic single-item provider feeding only this candidate (already filtered + acquired, so the Run skips `Source.fetch_candidates` and `Filter.score`, jumps to `Source.acquire`-equivalent → Cascade → Renderer → write → LCMA). The first such Run for this URL creates the canonical note; subsequent Runs (for additional scoring Profiles on the same URL) hit `slug_collision` → duplicate-squatter → merge via `_merge_profile_relevance_in_content`.
+4. **Per-Profile inbox dispatch**: for each Profile that scored above its `relevance` threshold, dispatch a real single-Profile execution unit with `RunKind.INBOX` and a synthetic single-item provider feeding only this candidate.
+
+   **Important seam clarification:** v1 does **not** reuse `Run.execute()` literally from its current stage-1/2/3 entrypoint. The current Run owns `Acquire = Source.fetch_candidates → Filter.score → Source.acquire` and `Ingest = cache_lookup → Cascade → Renderer → write → LCMA`. Inbox has already done URL-level acquire and per-Profile filtering before it reaches this step, so it needs an explicit internal seam that starts from an already-filtered, already-acquired single item.
+
+   Concretely, implementation must introduce one of these equivalent forms and pick one explicitly:
+
+   - a new Run/RunService entrypoint for a pre-acquired single item, or
+   - a lower-level shared execution helper reused by both the existing Run and inbox dispatch.
+
+   The first such inbox dispatch for this URL creates the canonical note; subsequent dispatches (for additional scoring Profiles on the same URL) hit `slug_collision` → duplicate-squatter → merge via `_merge_profile_relevance_in_content`.
 5. **Outcome aggregation**: collect per-Profile Run outcomes (ingested / failed / score), build the inbox_result payload (§7), call `LithosClient.task_update(task_id, agent_id, metadata={"inbox_result": …})` and `LithosClient.task_complete(task_id, agent_id, outcome=…, cited_nodes=…)`.
 
-### 5.4 Per-Profile Run shape under inbox
+### 5.4 Per-Profile execution shape under inbox
 
-Inbox-dispatched Runs are real existing per-Profile Runs and produce real `RunLedger` entries with `kind="inbox"` and `profile=<the_profile>`. This means:
+Inbox-dispatched executions are real per-Profile operational units and produce real `RunLedger` entries with `kind="inbox"` and `profile=<the_profile>`. This means:
 
 - One InboxTask scoring in 3 Profiles produces 3 ledger entries, one per Profile.
 - `/runs/recent` shows them as 3 separate per-Profile entries with `kind="inbox"`.
@@ -172,6 +181,8 @@ Inbox-dispatched Runs are real existing per-Profile Runs and produce real `RunLe
 - `RunOutcome` per Profile is the existing `ProfileRunResult` shape — no changes.
 
 The "tick boundary" exists only in metrics + `/status` and in timestamp clustering in `/runs/recent`. There is no per-tick ledger record.
+
+The document intentionally says "execution" rather than assuming the current `Run.execute()` can be called unchanged. The implementation may reuse RunService/Run internals, but the inbox path must start from the pre-acquired single-item seam described in §5.3, not from the ordinary fetch/filter entrypoint.
 
 ### 5.5 Failure isolation
 
@@ -298,14 +309,16 @@ For each per-(item, Profile) ingestion the InboxTick wants to dispatch:
 
 The earlier draft proposed a blocking-wait-and-renew model. That required new Coordinator primitives (blocking acquire with timeout, owner metadata, cancellation) that don't exist. v1 sidesteps the entire problem by not blocking — the cache-hit replay in §6 picks up the work on a future tick.
 
-Worst-case latency for an inbox item targeting a busy Profile:
+Worst-case latency / semantics for an inbox item targeting a busy Profile:
 
 - The item completes this tick with the non-busy Profiles satisfied.
 - The submitter sees a partial outcome (§7.1: `ingested into 1/2 profiles; web-tech profile_busy`).
-- If the submitter doesn't resubmit, the busy Profile never picks up this item — that's the cost of try-acquire.
+- If the submitter doesn't resubmit and the task is already completed, the busy Profile never picks up this item — that is an explicit v1 product tradeoff, not an implementation accident.
 - If the submitter resubmits later (or another tick re-claims a never-completed task), the next tick's cache-hit path scores the previously-busy Profile against the existing note and merges if it clears threshold.
 
 To avoid surprising submitters, the outcome string in the partial-skip case explicitly lists the skipped Profiles so resubmission is an informed choice.
+
+This tradeoff is accepted for v1 because it avoids inventing new Coordinator waiting primitives, task-lease renewal loops, and fairness rules in the same feature. If production use shows that "submitter must resubmit to satisfy a busy Profile" is unacceptable UX, a later version can add blocking wait + renew semantics as a deliberate follow-up feature.
 
 ### 10.3 No `lithos_task_renew` in v1
 
@@ -344,15 +357,21 @@ The `lithos_task_*` tools are core MCP surface and are present whenever lithos i
 
 ### 13.1 Archive layout
 
-URL-submitted items use the existing per-source archive layout. The submitter's `source_tag` (default `"inbox"`) drives both the note's `source:*` tag AND the archive subtree, identical to how RSS items behave today:
+URL-submitted items use a fixed inbox-controlled archive layout:
 
 ```
-archive_root/<source_tag>/YYYY/MM/<url_hash>.html
+archive_root/inbox/YYYY/MM/<url_hash>.html
 ```
 
-Default `source_tag="inbox"` puts inbox items under `archive_root/inbox/YYYY/MM/`. Submitters who want their items under a custom subtree (e.g. `archive_root/daily-report/...`) can set `source_tag="daily-report"`.
+The submitter's `source_tag` (default `"inbox"`) affects only the resulting note's `source:<tag>` metadata. It does **not** select an archive subtree in v1.
 
-There is no path-injection trust problem in v1 because there is no submitter-supplied filesystem path — only the `source_tag` enum value, which is sanity-checked at task pickup time the same way `RssSourceEntry.source_tag` is today.
+Rationale:
+
+- archive layout is operational state owned by Influx, not submitters
+- keeping the subtree fixed avoids mixing user-provided metadata with on-disk path selection
+- it removes the need to answer whether inbox `source_tag` is as trusted as config-authored RSS `source_tag`
+
+Validation rule for `source_tag` in v1: accept only conservative slug values matching `^[a-z0-9][a-z0-9-]{0,31}$`; otherwise complete the task terminally with `outcome="error: invalid_source_tag"`.
 
 ### 13.2 Note tags
 
