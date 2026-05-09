@@ -423,7 +423,71 @@ agent_id = "influx-inbox"
 
 ---
 
-## 15. Open implementation questions
+## 15. Human submission helper script
+
+Agents create InboxTasks directly via Lithos MCP. Humans don't. A helper script under `scripts/` provides a convenient CLI wrapper.
+
+### 15.1 Entrypoint
+
+`scripts/influx-inbox-submit.py` — same conventions as the existing `scripts/influx-diagnose.py` and `scripts/influx-report.py` (Python `__main__`, module docstring, argparse, env loaded from `docker/.env.<env>`).
+
+### 15.2 Behaviour
+
+The script takes a single positional argument that is either a URL or a local file path, decides which `kind` it is, performs any required local-side setup, and creates the Lithos task in the correct shape.
+
+```
+influx-inbox-submit https://example.com/article
+influx-inbox-submit ./papers/transformers.pdf
+influx-inbox-submit /home/dns/Downloads/paper.pdf --title "Attention Is All You Need"
+```
+
+Argument resolution:
+
+- If the argument matches `^https?://` → `kind="url"`, no local work needed.
+- Otherwise, treat as a local path → `kind="pdf"`. Resolve to absolute, verify the file exists and is a PDF (`.pdf` extension or magic-byte check).
+
+For `kind="pdf"`:
+
+1. Read `[inbox] pdf_root` from the resolved Influx config (same loader path the service uses).
+2. If the source path is NOT already inside `pdf_root`, copy it into `pdf_root` with a deterministic filename — `<sha256-prefix>-<original-basename>` works (collision-safe, retains the human-readable name for operator inspection).
+3. The `local_path` sent in the task metadata is the path inside `pdf_root` — never the user's original path.
+4. The user's source file is left in place; the script only copies, never moves or deletes.
+
+For `kind="url"`: no local work; the URL goes directly into `metadata.url`.
+
+### 15.3 Optional flags
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--title <text>` | absent | Hint for the candidate's title slot |
+| `--summary <text>` | absent | Pre-fetched summary for the Filter prompt |
+| `--summary-file <path>` | absent | Read summary from a file (alternative to `--summary` for long text) |
+| `--source-tag <tag>` | `inbox` | Sets the resulting note's `source:*` tag |
+| `--submitted-by <id>` | `manual:<username>` | Submitter agent identifier; defaults to a `manual:` prefix plus the OS username |
+| `--env <name>` | `staging` | Selects `docker/.env.<name>` for config resolution |
+| `--dry-run` | false | Print the task body that would be sent without creating it |
+
+### 15.4 Output
+
+On success, prints the created task ID and a one-line summary:
+
+```
+Created task task_abc123 (kind=pdf, copied to /inbox-pdfs/9f3a-paper.pdf)
+Track outcome: lithos task show task_abc123
+```
+
+The trailing line points the human at the Lithos CLI (or equivalent) for checking back on the outcome — keeps the script focused on submission and avoids re-implementing task-status display.
+
+### 15.5 Posture
+
+- Read-only against the Influx service surface — no HTTP calls to Influx itself.
+- Write-only against Lithos — single `lithos_task_create` MCP call, plus a single local file copy when handling a PDF outside `pdf_root`.
+- No `lithos_task_update` / `_complete` calls; that lifecycle belongs to Influx.
+- Exits non-zero on validation failure (file missing, non-PDF extension, URL malformed) BEFORE making any MCP call or file copy.
+
+---
+
+## 16. Open implementation questions
 
 These are deliberately deferred — they are implementation choices, not foundational design decisions:
 
@@ -436,7 +500,7 @@ These are deliberately deferred — they are implementation choices, not foundat
 
 ---
 
-## 16. Out of scope for v1
+## 17. Out of scope for v1
 
 - Push-based discovery via Lithos's `TASK_CREATED` SSE events. Polling is sufficient for the 5-minute cadence target. SSE subscription is a v2 latency optimisation if needed.
 - A `kind="text"` or `kind="html_blob"` for inline content submission. The schema is forward-compatible (open enum); add when a real submitter needs it.
