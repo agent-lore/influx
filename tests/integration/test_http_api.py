@@ -699,14 +699,8 @@ async def _drain_active_tasks(app: FastAPI) -> None:
         await asyncio.gather(*pending, return_exceptions=True)
 
 
-def _records_with_status(
-    caplog: pytest.LogCaptureFixture, status: str
-) -> list[Any]:
-    return [
-        r
-        for r in caplog.records
-        if getattr(r, "status", None) == status
-    ]
+def _records_with_status(caplog: pytest.LogCaptureFixture, status: str) -> list[Any]:
+    return [r for r in caplog.records if getattr(r, "status", None) == status]
 
 
 class TestRunObservability:
@@ -732,9 +726,7 @@ class TestRunObservability:
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
             ) as client:
-                resp = await client.post(
-                    "/runs", json={"profile": "ai-robotics"}
-                )
+                resp = await client.post("/runs", json={"profile": "ai-robotics"})
             await _drain_active_tasks(app_with_state)
 
         assert resp.status_code == 202
@@ -772,9 +764,7 @@ class TestRunObservability:
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
             ) as client:
-                resp = await client.post(
-                    "/runs", json={"profile": "ai-robotics"}
-                )
+                resp = await client.post("/runs", json={"profile": "ai-robotics"})
             await _drain_active_tasks(app_with_state)
 
         assert resp.status_code == 202
