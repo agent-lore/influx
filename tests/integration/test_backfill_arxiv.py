@@ -270,8 +270,12 @@ class TestBackfillCacheLookupSkip:
         # Queue Lithos: feedback
         fake_lithos.list_responses.append(json.dumps({"items": []}))
 
-        # First item: cache miss (will be written)
-        # Second item: cache hit (should be skipped)
+        # First item: primary miss + source_url fallback miss (#128) →
+        # genuine cache miss → will be written.
+        # Second item: primary hit → no fallback runs → skipped on backfill.
+        fake_lithos.cache_lookup_responses.append(
+            json.dumps({"hit": False, "stale_exists": False})
+        )
         fake_lithos.cache_lookup_responses.append(
             json.dumps({"hit": False, "stale_exists": False})
         )
@@ -299,9 +303,10 @@ class TestBackfillCacheLookupSkip:
         assert len(write_calls) == 1
         assert write_calls[0][1]["title"] == "Backfill Paper Alpha"
 
-        # Verify: TWO cache_lookup calls (both items checked).
+        # Verify: THREE cache_lookup calls — item 1 does primary + source_url
+        # fallback (#128) on a miss, item 2 does only primary on a hit.
         cache_calls = [c for c in fake_lithos.calls if c[0] == "lithos_cache_lookup"]
-        assert len(cache_calls) == 2
+        assert len(cache_calls) == 3
 
     def test_all_cache_hits_produce_zero_writes(
         self,

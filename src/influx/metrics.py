@@ -38,6 +38,7 @@ __all__ = [
     "articles_filtered",
     "articles_inspected",
     "cache_hits",
+    "cache_hits_via_url_fallback",
     "candidates_fetched",
     "lithos_writes",
     "llm_validation_failures",
@@ -163,6 +164,28 @@ def cache_hits() -> Any:
     return get_meter().counter(
         "influx_cache_hits_total",
         description="Lithos cache hits during the scheduler write loop.",
+    )
+
+
+def cache_hits_via_url_fallback() -> Any:
+    """Counter of pre-write dedup cache hits resolved by source-URL fallback (#128).
+
+    Increments when the primary ``compose_dedup_query``-based cache
+    lookup misses but a follow-up exact-``source_url`` lookup hits —
+    i.e. a note for the same URL is already in Lithos but its title
+    or first-sentence abstract drifted enough for the text query to
+    miss.  Sustained non-zero in steady state indicates either Lithos
+    server-side dedup needs strengthening or upstream feeds are
+    rewriting titles/summaries between runs.
+
+    Labels: ``profile``, ``source``.
+    """
+    return get_meter().counter(
+        "influx_cache_hits_via_url_fallback_total",
+        description=(
+            "pre-write dedup cache hits that required a source_url "
+            "fallback lookup after the primary title-based query missed"
+        ),
     )
 
 

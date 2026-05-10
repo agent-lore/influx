@@ -474,19 +474,46 @@ async def _run_ingest_stage(
             abstract_or_summary=item.get("abstract_or_summary"),
         )
         cache_hit = bool(cache_body.get("hit"))
+        cache_hit_reason: str | None = "primary" if cache_hit else None
+
+        # #128: defensive source_url-only fallback when the primary
+        # title+abstract dedup misses.  Catches notes whose source_url
+        # is already in Lithos but whose title/first-sentence abstract
+        # drifted between runs (translation, punctuation, profile-
+        # specific summary edits) — those used to fall through to
+        # ``write_note`` and be rejected as ``duplicate`` at write time.
+        if not cache_hit and source_url:
+            fallback_body = await client.cache_lookup_by_url_body(source_url=source_url)
+            if bool(fallback_body.get("hit")):
+                cache_hit = True
+                cache_hit_reason = "source_url_fallback"
+                metrics.cache_hits_via_url_fallback().add(
+                    1, {"profile": profile, "source": item_source}
+                )
+
         if cache_hit:
             metrics.cache_hits().add(1, {"profile": profile, "source": item_source})
             logger.info(
-                "article cache hit profile=%s source_url=%s title=%r kind=%s action=%s",
+                "article cache hit profile=%s source_url=%s title=%r "
+                "kind=%s action=%s reason=%s",
                 profile,
                 source_url,
                 title,
                 plan.kind.value,
                 "skip" if plan.skip_cache_hits else "merge-profile",
+                cache_hit_reason,
             )
             if plan.skip_cache_hits:
                 continue
             # Multi-profile merge — fall through to write path.
+        else:
+            logger.info(
+                "article cache miss profile=%s source_url=%s title=%r kind=%s",
+                profile,
+                source_url,
+                title,
+                plan.kind.value,
+            )
 
         with tracer.span(
             "influx.lithos.write",
@@ -515,13 +542,15 @@ async def _run_ingest_stage(
         if write_result.status in ("created", "updated"):
             logger.info(
                 "article write completed profile=%s source_url=%s "
-                "title=%r status=%s note_id=%s cache_hit=%s",
+                "title=%r status=%s note_id=%s cache_hit=%s "
+                "cache_hit_reason=%s",
                 profile,
                 source_url,
                 title,
                 write_result.status,
                 write_result.note_id,
                 str(cache_hit).lower(),
+                cache_hit_reason or "none",
             )
             try:
                 related_in_lithos = await lcma_wire(
@@ -559,7 +588,7 @@ async def _run_ingest_stage(
         elif not cache_hit:
             logger.warning(
                 "article write skipped profile=%s source_url=%s title=%r "
-                "status=%s detail=%r cache_hit=false",
+                "status=%s detail=%r cache_hit=false cache_hit_reason=none",
                 profile,
                 source_url,
                 title,
@@ -574,6 +603,7 @@ async def _run_ingest_stage(
                     "run_id": current_run_id.get() or "",
                     "tags": list(item.get("tags", [])),
                     "cache_hit": False,
+                    "cache_hit_reason": "none",
                 },
             )
             if write_result.status == "slug_collision":

@@ -102,6 +102,7 @@ def _mock_lithos_client() -> AsyncMock:
     client = AsyncMock()
     client.task_create_body.return_value = {"task_id": "task-1"}
     client.cache_lookup_for_item_body.return_value = {"hit": False}
+    client.cache_lookup_by_url_body.return_value = {"hit": False}
     client.list_notes_body.return_value = {"items": []}
     client.read_note.return_value = {}
     write_result = MagicMock()
