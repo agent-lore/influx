@@ -87,6 +87,12 @@ class RunLedger:
             "degraded": False,
             "degraded_reasons": [],
             "source_acquisition_errors": [],
+            # #129: per-source counter of *recovered* retries (i.e.
+            # retries that did not produce a swallowed error).  Shape:
+            # ``{"arxiv": {"rate_limit": 2, "timeout": 1}}``.  Empty
+            # dict at start; populated from the per-run contextvar at
+            # ``complete`` time.
+            "source_retry_counts": {},
         }
         try:
             active = self._read_active()
@@ -106,6 +112,7 @@ class RunLedger:
         invalid_url_rejections_total: int | None = None,
         archive_failures_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
+        source_retry_counts: dict[str, dict[str, int]] | None = None,
     ) -> list[str]:
         """Mark an active run as completed and append it to history.
 
@@ -305,6 +312,7 @@ class RunLedger:
             degraded=bool(reasons),
             source_acquisition_errors=errors,
             degraded_reasons=reasons,
+            source_retry_counts=source_retry_counts,
         )
         return reasons
 
@@ -561,6 +569,12 @@ class RunLedger:
                         "source_acquisition_errors": list(
                             entry.get("source_acquisition_errors") or []
                         ),
+                        "source_retry_counts": {
+                            source: dict(by_kind)
+                            for source, by_kind in (
+                                entry.get("source_retry_counts") or {}
+                            ).items()
+                        },
                     }
                 )
                 self._append(entry)
@@ -622,6 +636,7 @@ class RunLedger:
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
+        source_retry_counts: dict[str, dict[str, int]] | None = None,
     ) -> None:
         try:
             active = self._read_active()
@@ -656,6 +671,13 @@ class RunLedger:
                     "degraded": degraded,
                     "degraded_reasons": list(degraded_reasons or []),
                     "source_acquisition_errors": list(source_acquisition_errors or []),
+                    # #129: deep-copy the per-source retry-count dict so
+                    # later mutations of the contextvar bucket do not
+                    # leak into the persisted ledger entry.
+                    "source_retry_counts": {
+                        source: dict(by_kind)
+                        for source, by_kind in (source_retry_counts or {}).items()
+                    },
                 }
             )
             self._append(entry)

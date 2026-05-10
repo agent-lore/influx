@@ -17,10 +17,25 @@ from influx.sources.arxiv import (
     _extract_arxiv_id,
     _filter_by_lookback,
     _parse_atom,
+    _reset_fetch_pacing_for_tests,
     build_query_url,
     fetch_arxiv,
     resolve_backfill_range,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_arxiv_pacing() -> None:
+    """Clear the module-level cross-fetch pacing state between tests.
+
+    ``_fetch_with_retry`` now applies ``arxiv_request_min_interval_seconds``
+    against a process-wide last-fetch timestamp (issue #129).  Without
+    this fixture, the second test in a pytest run would pick up the
+    timestamp the first test left behind and trigger an unexpected
+    ``_sleep`` call that breaks ``mock_sleep.assert_called_once_with``.
+    """
+    _reset_fetch_pacing_for_tests()
+
 
 _FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "arxiv"
 
@@ -379,7 +394,8 @@ class TestFetchRetry:
         mock_fetch: MagicMock,
         mock_sleep: MagicMock,
     ) -> None:
-        """429 on all attempts raises NetworkError."""
+        """429 on every attempt of the 429 retry budget raises NetworkError."""
+        del mock_sleep
         mock_fetch.side_effect = [
             _make_fetch_result(b"", status_code=429),
             _make_fetch_result(b"", status_code=429),
@@ -387,7 +403,10 @@ class TestFetchRetry:
             _make_fetch_result(b"", status_code=429),
         ]
 
-        resilience = ResilienceConfig(max_retries=3)
+        # Issue #129: the 429 retry budget defaults to 5; pin both
+        # budgets to 3 so the existing 4-element side_effect still
+        # exercises "exhaust all 429 retries" exactly.
+        resilience = ResilienceConfig(max_retries=3, arxiv_429_max_retries=3)
         cfg = ArxivSourceConfig(categories=["cs.AI"])
         with pytest.raises(NetworkError, match="429"):
             fetch_arxiv(
@@ -676,6 +695,12 @@ class TestFetchRetry:
         mock_fetch: MagicMock,
         mock_sleep: MagicMock,
     ) -> None:
+        """Issue #129: ``Retry-After`` cannot exceed
+        ``arxiv_429_backoff_max_seconds``.  ``Retry-After`` is first
+        clamped to the parser's RFC ceiling (300s) and then to the
+        config's progressive-backoff cap so a misbehaving upstream
+        cannot extend a single retry beyond a known wall-clock bound.
+        """
         body = _load_fixture("recent_two.atom")
         mock_fetch.side_effect = [
             _make_fetch_result(
@@ -688,6 +713,7 @@ class TestFetchRetry:
 
         resilience = ResilienceConfig(
             arxiv_429_backoff_seconds=10,
+            arxiv_429_backoff_max_seconds=120,
             max_retries=3,
         )
         cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=30)
@@ -695,7 +721,7 @@ class TestFetchRetry:
         items = fetch_arxiv(arxiv_config=cfg, resilience=resilience, now=now)
 
         assert len(items) == 2
-        mock_sleep.assert_called_once_with(300)
+        mock_sleep.assert_called_once_with(120)
 
     @patch("influx.sources.arxiv.guarded_fetch")
     def test_successful_non_xml_content_type_raises(
@@ -735,3 +761,173 @@ class TestFetchRetry:
         kwargs = mock_fetch.call_args.kwargs
         assert kwargs.get("max_download_bytes") == 4321
         assert kwargs.get("timeout_seconds") == 42
+
+
+class TestArxivHardening:
+    """Issue #129 — production-cadence hardening tests.
+
+    Cover progressive 429 backoff, the separate 429 retry budget,
+    cross-fetch pacing, and the run-ledger retry-count linkage.
+    """
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_429_backoff_doubles_per_attempt_until_cap(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """Progressive 429 backoff: each successive 429 in one fetch
+        waits twice the previous delay, capped at
+        ``arxiv_429_backoff_max_seconds``.
+        """
+        body = _load_fixture("recent_two.atom")
+        mock_fetch.side_effect = [
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(body),
+        ]
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=10,
+            arxiv_429_backoff_max_seconds=60,
+            arxiv_429_max_retries=5,
+            max_retries=5,
+            arxiv_request_min_interval_seconds=0,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=30)
+        now = datetime(2026, 4, 24, 0, 0, 0, tzinfo=UTC)
+        fetch_arxiv(arxiv_config=cfg, resilience=resilience, now=now)
+        # Attempts 0..3 each pre-retry sleep: 10, 20, 40, 60 (capped).
+        assert mock_sleep.call_args_list == [
+            call(10.0),
+            call(20.0),
+            call(40.0),
+            call(60.0),
+        ]
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_429_uses_separate_retry_budget(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """``arxiv_429_max_retries`` exceeds ``max_retries`` and 429s
+        keep retrying past the network/5xx budget — the more generous
+        soft-failure budget is what gets the run home.
+        """
+        del mock_sleep
+        body = _load_fixture("recent_two.atom")
+        mock_fetch.side_effect = [
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(body),
+        ]
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=1,
+            arxiv_429_backoff_max_seconds=10,
+            max_retries=2,  # would only allow 3 attempts total for 5xx
+            arxiv_429_max_retries=5,  # but 429s keep going
+            arxiv_request_min_interval_seconds=0,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=30)
+        now = datetime(2026, 4, 24, 0, 0, 0, tzinfo=UTC)
+        items = fetch_arxiv(arxiv_config=cfg, resilience=resilience, now=now)
+        assert len(items) == 2
+        assert mock_fetch.call_count == 5
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_network_path_still_uses_max_retries(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """Issue #129 hardening must not loosen the network/5xx budget.
+        ``max_retries=2`` means 3 attempts total before raising even
+        when ``arxiv_429_max_retries`` is far higher.
+        """
+        del mock_sleep
+        mock_fetch.side_effect = NetworkError("boom", url="http://x", kind="network")
+        resilience = ResilienceConfig(
+            max_retries=2,
+            arxiv_429_max_retries=10,
+            arxiv_request_min_interval_seconds=0,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"])
+        with pytest.raises(NetworkError, match="boom"):
+            fetch_arxiv(arxiv_config=cfg, resilience=resilience)
+        assert mock_fetch.call_count == 3
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_cross_fetch_pacing_applies_min_interval(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """Two consecutive fetches in the same process pace themselves.
+
+        The first fetch records the timestamp without sleeping; the
+        second sees the recent timestamp and sleeps the remaining
+        interval.  The per-day backfill loop already paced itself with
+        the same interval, but the scheduled-tick path did not — this
+        is the new behaviour that absorbs back-to-back profile fetches
+        in the same tick (issue #129).
+        """
+        body = _load_fixture("empty_feed.atom")
+        mock_fetch.return_value = _make_fetch_result(body)
+        resilience = ResilienceConfig(
+            arxiv_request_min_interval_seconds=3,
+            max_retries=0,
+            arxiv_429_max_retries=0,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"])
+        fetch_arxiv(arxiv_config=cfg, resilience=resilience)
+        # First call records the timestamp; no pacing sleep yet.
+        assert mock_sleep.call_count == 0
+        fetch_arxiv(arxiv_config=cfg, resilience=resilience)
+        # Second call, still within 3s wall-clock of the first, must
+        # have slept to bring the gap up to ~3 seconds.  Allow a
+        # generous lower bound to avoid flakiness on slow CI.
+        assert mock_sleep.call_count == 1
+        slept = mock_sleep.call_args_list[0].args[0]
+        assert 0 < slept <= 3
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_record_source_retry_called_per_retry_decision(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """Each retry — 429 or network — calls ``record_source_retry``
+        with the correct kind so the run-ledger entry can surface
+        recovered-retry counts (#129).
+        """
+        del mock_sleep
+        body = _load_fixture("empty_feed.atom")
+        mock_fetch.side_effect = [
+            NetworkError("t/o", url="http://x", kind="timeout"),
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(body),
+        ]
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=1,
+            arxiv_429_backoff_max_seconds=2,
+            backoff_base_seconds=1,
+            max_retries=3,
+            arxiv_429_max_retries=3,
+            arxiv_request_min_interval_seconds=0,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"])
+        with patch("influx.sources.arxiv.record_source_retry") as mock_record:
+            fetch_arxiv(arxiv_config=cfg, resilience=resilience)
+        kinds = [c.kwargs["kind"] for c in mock_record.call_args_list]
+        sources = [c.kwargs["source"] for c in mock_record.call_args_list]
+        assert kinds == ["timeout", "rate_limit"]
+        assert sources == ["arxiv", "arxiv"]

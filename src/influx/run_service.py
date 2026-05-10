@@ -50,6 +50,7 @@ from influx.telemetry import (
     current_invalid_url_rejections,
     current_run_id,
     current_source_acquisition_errors,
+    current_source_retry_counts,
     get_tracer,
 )
 
@@ -120,6 +121,14 @@ async def ledger_lifecycle(
     invalid_url_rejections_token = current_invalid_url_rejections.set(
         invalid_url_rejections_counter
     )
+    # #129: per-run counter of recovered source-fetch retries (i.e.
+    # retries followed by another attempt, distinct from the swallowed
+    # final errors recorded via :func:`record_source_acquisition_error`).
+    # A shared mutable dict so source adapters can ``setdefault`` /
+    # increment without ContextVar.set semantics — same pattern as
+    # ``current_source_acquisition_errors``.
+    source_retry_counts: dict[str, dict[str, int]] = {}
+    source_retry_counts_token = current_source_retry_counts.set(source_retry_counts)
     metric_attrs = {"profile": profile, "run_type": plan.kind.value}
 
     ledger.start(
@@ -202,6 +211,11 @@ async def ledger_lifecycle(
             invalid_url_rejections_total=invalid_url_rejections_total,
             archive_failures_total=archive_failures_total,
             source_acquisition_errors=source_errors,
+            # #129: surface recovered retry counts so the ledger entry
+            # carries "we hit arXiv 429 twice but recovered" alongside
+            # the swallowed-error list, letting an operator distinguish
+            # transient retry success from a burned retry budget.
+            source_retry_counts=source_retry_counts,
         )
         run_outcome = "degraded" if source_errors else "success"
         if "ingestion_stall" in degraded_reasons:
@@ -368,6 +382,7 @@ async def ledger_lifecycle(
         current_fetched_total.reset(fetched_total_token)
         current_filter_errors.reset(filter_errors_token)
         current_invalid_url_rejections.reset(invalid_url_rejections_token)
+        current_source_retry_counts.reset(source_retry_counts_token)
 
 
 # ── RunService ──────────────────────────────────────────────────────

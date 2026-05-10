@@ -140,6 +140,66 @@ def test_complete_with_source_errors_marks_run_degraded(tmp_path: Path) -> None:
     assert entry["source_acquisition_errors"] == errors
 
 
+# ── Issue #129: surface recovered source-fetch retries ──────────────
+
+
+def test_complete_without_retry_counts_persists_empty_dict(
+    tmp_path: Path,
+) -> None:
+    """A clean run with no retry-count input lands ``source_retry_counts={}``
+    so downstream consumers always see the field, never KeyError.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="ai-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.complete(run_id="run-1", sources_checked=3, ingested=2)
+    entry = ledger.recent()[0]
+    assert entry["source_retry_counts"] == {}
+
+
+def test_complete_records_source_retry_counts(tmp_path: Path) -> None:
+    """``source_retry_counts`` survives the ledger round-trip and is
+    deep-copied so post-complete mutations of the caller's dict do not
+    leak into persisted entries (issue #129).
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="ai-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    counts = {"arxiv": {"rate_limit": 2, "timeout": 1}}
+    ledger.complete(
+        run_id="run-1",
+        sources_checked=8,
+        ingested=3,
+        source_retry_counts=counts,
+    )
+    entry = ledger.recent()[0]
+    assert entry["source_retry_counts"] == {
+        "arxiv": {"rate_limit": 2, "timeout": 1},
+    }
+    # Run that recovered transient retries is **not** degraded — only
+    # *swallowed* errors land in the degraded set, retries that
+    # succeeded are pure diagnostics.
+    assert entry["degraded"] is False
+    assert entry["degraded_reasons"] == []
+
+    # Mutating the original dict after ``complete`` must not change
+    # what the ledger persisted (deep-copy invariant).
+    counts["arxiv"]["rate_limit"] = 99
+    counts["rss"] = {"timeout": 7}
+    re_read = ledger.recent()[0]
+    assert re_read["source_retry_counts"] == {
+        "arxiv": {"rate_limit": 2, "timeout": 1},
+    }
+
+
 def test_failed_run_has_degraded_false(tmp_path: Path) -> None:
     """``fail`` always lands ``degraded=false`` so the field's semantics
     stay narrow: it means *partial source-fetch failure on an otherwise

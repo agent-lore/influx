@@ -393,9 +393,6 @@ What this does **not** give you:
 - Independent cadence per profile (e.g. profile-A every 6h, profile-B
   every 12h). All profiles share one cron expression. True per-profile
   cron is tracked separately under issue #90.
-- Any change to the arXiv retry/backoff policy. Backoff after a 429
-  remains `resilience.arxiv_429_backoff_seconds` × `resilience.max_retries`;
-  staggering reduces *whether* we hit 429 in the first place.
 
 Verification after a config change:
 
@@ -404,10 +401,46 @@ Verification after a config change:
 ./scripts/influx-diagnose.py warnings --since 24h --contains "429"
 ```
 
-If both staggered profiles still hit 429 clusters, file a follow-up to
-revisit `resilience.arxiv_429_backoff_seconds` (e.g. exponential
-backoff). Don't tune backoff until you can show staggering didn't fix
-the recurrence.
+### arXiv retry / backoff hardening (#129)
+
+The arXiv fetch path absorbs transient 429 and timeout conditions before
+the run degrades, in addition to the staggering above:
+
+- **Progressive 429 backoff.** Each successive 429 in a single fetch
+  waits twice the previous delay (default `30, 60, 120, ...`), capped
+  at `resilience.arxiv_429_backoff_max_seconds`. `Retry-After` headers
+  override the computed delay but are clamped to the same cap.
+- **Separate 429 retry budget.** 429 retries use
+  `resilience.arxiv_429_max_retries` (default `5`), distinct from the
+  `resilience.max_retries` budget that covers network / 5xx failures.
+- **Cross-fetch pacing.** All arXiv fetches in the same process wait
+  `resilience.arxiv_request_min_interval_seconds` since the previous
+  fetch — so two profiles hitting arXiv in the same scheduled tick are
+  paced even when `inter_profile_gap_seconds = 0`.
+- **Recovered-retry diagnostics.** Every retry decision is recorded on
+  the run-ledger entry as `source_retry_counts`. Operators can confirm
+  hardening worked by looking for runs that show `source_retries`
+  *without* the `degraded` flag — those are runs where the hardening
+  absorbed a transient failure.
+
+Acceptable residual degradation: a run can still finish `degraded` with
+`source_acquisition` if arXiv is unreachable for longer than the
+configured budget allows. With the defaults that is roughly
+`(arxiv_429_max_retries + 1) * arxiv_429_backoff_max_seconds` ≈
+`12 minutes` of sustained 429 pressure on a single fetch. Such runs are
+expected production behaviour, not bugs.
+
+Verification:
+
+```
+./scripts/influx-diagnose.py recent --limit 20
+# Look for `source_retries: source=arxiv rate_limit=N` lines on
+# non-degraded runs — those are recovered transient 429s.
+```
+
+If degradation still recurs after staggering and the new defaults, the
+next levers are operator-side: raise `arxiv_429_max_retries`, raise
+`arxiv_429_backoff_max_seconds`, or widen `inter_profile_gap_seconds`.
 
 ## 10. Reference
 

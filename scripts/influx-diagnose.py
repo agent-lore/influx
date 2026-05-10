@@ -159,6 +159,18 @@ def _print_run_row(run: dict[str, Any]) -> None:
                 f"      source_error: source={src_err.get('source')} "
                 f"kind={src_err.get('kind')} detail={src_err.get('detail')}"
             )
+    # #129: surface recovered-retry counts so an operator can see "we
+    # hit arXiv 429 twice but recovered" alongside any swallowed final
+    # errors.  Empty / missing dicts are skipped silently.
+    retry_counts = run.get("source_retry_counts") or {}
+    if isinstance(retry_counts, dict) and retry_counts:
+        for source, by_kind in sorted(retry_counts.items()):
+            if not isinstance(by_kind, dict) or not by_kind:
+                continue
+            kinds = " ".join(
+                f"{kind}={count}" for kind, count in sorted(by_kind.items())
+            )
+            print(f"      source_retries: source={source} {kinds}")
 
 
 # ── docker logs ─────────────────────────────────────────────────────

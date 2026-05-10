@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
@@ -54,6 +55,7 @@ from influx.telemetry import (
     record_fetched_items,
     record_filter_error,
     record_source_acquisition_error,
+    record_source_retry,
 )
 
 if TYPE_CHECKING:
@@ -373,13 +375,78 @@ def _parse_retry_after_seconds(value: str) -> float | None:
 def _arxiv_429_delay(
     result_headers: dict[str, str],
     resilience: ResilienceConfig,
+    *,
+    attempt: int,
 ) -> float:
+    """Compute the per-attempt 429 backoff delay.
+
+    Issue #129: progressive doubling of ``arxiv_429_backoff_seconds``
+    by ``2 ** attempt`` so a run that hits 429 repeatedly waits longer
+    each time, capped at ``arxiv_429_backoff_max_seconds``.  An
+    ``Retry-After`` header (when present and parseable) overrides the
+    computed delay but is itself clamped to the same cap so a misbehaving
+    upstream cannot extend a run indefinitely.  ``attempt`` is the
+    zero-based index of the current attempt (0 on the first try).
+    """
+    cap = float(resilience.arxiv_429_backoff_max_seconds)
+    min_interval = float(resilience.arxiv_request_min_interval_seconds)
+    base = float(resilience.arxiv_429_backoff_seconds)
     retry_after = _header_value(result_headers, "Retry-After")
     if retry_after is not None:
         parsed = _parse_retry_after_seconds(retry_after)
         if parsed is not None:
-            return max(float(resilience.arxiv_request_min_interval_seconds), parsed)
-    return float(resilience.arxiv_429_backoff_seconds)
+            return min(max(min_interval, parsed), cap)
+    return min(base * (2**attempt), cap)
+
+
+# Issue #129: process-wide last-fetch timestamp used to enforce
+# ``arxiv_request_min_interval_seconds`` across *all* arXiv fetches in
+# the same process — not just the per-day backfill loop.  The lock
+# serialises concurrent calls (the fetch runs on ``asyncio.to_thread``,
+# so a thread lock is appropriate) and the monotonic timestamp lets
+# back-to-back scheduled-tick fetches (e.g. profile A then profile B in
+# the same tick when ``schedule.inter_profile_gap_seconds`` is 0) pace
+# themselves rather than hitting arXiv simultaneously.
+_FETCH_PACING_LOCK = threading.Lock()
+_LAST_FETCH_MONOTONIC: float | None = None
+
+
+def _reset_fetch_pacing_for_tests() -> None:
+    """Reset the module-level pacing state — test seam only.
+
+    Unit tests covering :func:`_apply_min_interval` need a clean baseline
+    between cases; production code never calls this.
+    """
+    global _LAST_FETCH_MONOTONIC  # noqa: PLW0603
+    with _FETCH_PACING_LOCK:
+        _LAST_FETCH_MONOTONIC = None
+
+
+def _apply_min_interval(min_interval: float) -> None:
+    """Sleep until at least *min_interval* has elapsed since the last fetch.
+
+    Records ``time.monotonic()`` *after* sleeping so the timestamp marks
+    the start of the new fetch.  When *min_interval* is ``0`` (or
+    negative) the helper still records the timestamp but never sleeps —
+    callers can disable pacing without removing the call.
+    """
+    global _LAST_FETCH_MONOTONIC  # noqa: PLW0603
+    if min_interval <= 0:
+        with _FETCH_PACING_LOCK:
+            _LAST_FETCH_MONOTONIC = time.monotonic()
+        return
+    with _FETCH_PACING_LOCK:
+        last = _LAST_FETCH_MONOTONIC
+        now = time.monotonic()
+        wait = 0.0
+        if last is not None:
+            elapsed = now - last
+            if elapsed < min_interval:
+                wait = min_interval - elapsed
+    if wait > 0:
+        _sleep(wait)
+    with _FETCH_PACING_LOCK:
+        _LAST_FETCH_MONOTONIC = time.monotonic()
 
 
 def fetch_arxiv(
@@ -474,6 +541,23 @@ def _fetch_with_retry(
     when omitted they are resolved from the pydantic
     :class:`~influx.config.StorageConfig` field defaults so the only
     place these tunable defaults live is config-parsing code (AC-X-1).
+
+    Issue #129 hardening:
+
+    - 429 retries use a separate, more generous budget
+      (``arxiv_429_max_retries``) than network/5xx retries
+      (``max_retries``) because 429 is a soft, recoverable signal.
+    - 429 backoff is progressive (doubling per attempt) and capped at
+      ``arxiv_429_backoff_max_seconds`` so a flapping upstream cannot
+      degrade the run while still preventing unbounded waits.
+    - The first attempt waits for ``arxiv_request_min_interval_seconds``
+      to elapse since the last in-process arXiv fetch, pacing fetches
+      across profiles within a single scheduled tick (the per-day
+      backfill loop already paces itself with the same interval, so the
+      helper fast-paths through there).
+    - Each retry decision is recorded via :func:`record_source_retry`
+      so the run ledger surfaces "we hit 429 N times but recovered"
+      distinct from the swallowed-error list.
     """
     if max_download_bytes is None or timeout_seconds is None:
         _storage_defaults = StorageConfig()
@@ -484,10 +568,20 @@ def _fetch_with_retry(
 
     max_retries = resilience.max_retries
     backoff_base = resilience.backoff_base_seconds
+    rate_limit_max_retries = resilience.arxiv_429_max_retries
+
+    # Pace this fetch against the previous in-process arXiv fetch.  A
+    # zero / negative interval is treated as "no pacing" by the helper.
+    _apply_min_interval(float(resilience.arxiv_request_min_interval_seconds))
 
     last_error: Exception | None = None
 
-    for attempt in range(max_retries + 1):
+    # The retry loop runs up to ``1 + max(network, rate-limit)`` times so
+    # the more generous 429 budget can still drive forward progress when
+    # 429s dominate.  Each branch checks its own budget before deciding
+    # to retry.
+    total_attempts = 1 + max(max_retries, rate_limit_max_retries)
+    for attempt in range(total_attempts):
         try:
             # Fetch without expected_content_type so status-code handling
             # (429 backoff, 5xx retry) runs first. Non-XML 429/5xx
@@ -509,6 +603,10 @@ def _fetch_with_retry(
                     exc.kind,
                     delay,
                 )
+                record_source_retry(
+                    source="arxiv",
+                    kind=exc.kind or "network",
+                )
                 _sleep(delay)
                 continue
             raise
@@ -519,14 +617,15 @@ def _fetch_with_retry(
                 url=url,
                 kind="rate_limit",
             )
-            if attempt < max_retries:
-                delay = _arxiv_429_delay(result.headers, resilience)
+            if attempt < rate_limit_max_retries:
+                delay = _arxiv_429_delay(result.headers, resilience, attempt=attempt)
                 _log.warning(
                     "arXiv 429 on attempt %d/%d, backing off %.1fs (FR-RES-2)",
                     attempt + 1,
-                    max_retries + 1,
+                    rate_limit_max_retries + 1,
                     delay,
                 )
+                record_source_retry(source="arxiv", kind="rate_limit")
                 _sleep(delay)
                 continue
             raise last_error
@@ -547,6 +646,7 @@ def _fetch_with_retry(
                     max_retries + 1,
                     delay,
                 )
+                record_source_retry(source="arxiv", kind="network")
                 _sleep(delay)
                 continue
             raise last_error

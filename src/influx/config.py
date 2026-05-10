@@ -480,11 +480,43 @@ class ExtractionConfig(BaseModel):
 class ResilienceConfig(BaseModel):
     """``[resilience]`` retry and backoff settings."""
 
-    max_retries: int = 3
+    # Issue #129: defaults bumped from the historical 3/10 to the
+    # staging-recommended 5/30 so a fresh deployment is production-ready
+    # without operator-side tuning.  Operator overrides in
+    # ``influx.toml`` continue to win.
+    max_retries: int = 5
     backoff_base_seconds: int = 1
     arxiv_request_min_interval_seconds: int = 3
-    arxiv_429_backoff_seconds: int = 10
+    arxiv_429_backoff_seconds: int = 30
+    # Issue #129: cap the per-attempt 429 backoff so progressive doubling
+    # (``arxiv_429_backoff_seconds * 2**attempt``) and any honoured
+    # ``Retry-After`` header cannot push the run beyond a known wall-clock
+    # ceiling.  120s gives roughly four progressive doublings starting
+    # from the default 30s before the cap binds.
+    arxiv_429_backoff_max_seconds: int = 120
+    # Issue #129: separate retry budget for HTTP 429.  Distinct from
+    # ``max_retries`` (network / 5xx) because 429 is a soft, recoverable
+    # rate-limit signal that warrants more patience than a hard network
+    # failure — the API is healthy, it's just asking us to slow down.
+    arxiv_429_max_retries: int = 5
     lithos_write_conflict_max_retries: int = 1
+
+    @field_validator(
+        "max_retries",
+        "backoff_base_seconds",
+        "arxiv_request_min_interval_seconds",
+        "arxiv_429_backoff_seconds",
+        "arxiv_429_backoff_max_seconds",
+        "arxiv_429_max_retries",
+        "lithos_write_conflict_max_retries",
+    )
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ConfigError(
+                "resilience.* retry and backoff fields must be non-negative"
+            )
+        return v
 
 
 class FeedbackConfig(BaseModel):
