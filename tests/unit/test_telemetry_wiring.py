@@ -22,7 +22,35 @@ pytest.importorskip(
 )
 
 from influx.coordinator import RunKind
+from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.telemetry import InfluxTracer, current_run_id, get_tracer
+
+
+def _bound_for(
+    item: dict[str, Any], *, source_label: str = "arxiv"
+) -> BoundScoredCandidate:
+    """Wrap a ProfileItem dict as a BoundScoredCandidate (#125 — test seam)."""
+
+    async def _acquire() -> dict[str, Any]:
+        return item
+
+    return BoundScoredCandidate(
+        scored=ScoredCandidate(
+            candidate=Candidate(
+                item_id=item.get("source_url", "test-id"),
+                title=item.get("title", ""),
+                abstract=item.get("abstract_or_summary", "") or "",
+                source_url=item.get("source_url", ""),
+            ),
+            score=int(item.get("score", 0)),
+            confidence=float(item.get("confidence", 0.0)),
+            reason=item.get("reason", ""),
+            filter_tags=tuple(item.get("filter_tags", [])),
+        ),
+        acquire=_acquire,
+        source_label=source_label,
+    )
+
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -1120,17 +1148,19 @@ class TestInfluxLithosWriteSpan:
         # Fake item provider returning one item
         async def fake_provider(
             profile: str, kind: Any, run_range: Any, prompt: str
-        ) -> list[dict[str, Any]]:
+        ) -> list[BoundScoredCandidate]:
             return [
-                {
-                    "title": "Test Note",
-                    "source_url": "https://example.com/paper",
-                    "content": "Content",
-                    "tags": ["cs.AI"],
-                    "confidence": 0.9,
-                    "path": "test/path",
-                    "score": 8,
-                }
+                _bound_for(
+                    {
+                        "title": "Test Note",
+                        "source_url": "https://example.com/paper",
+                        "content": "Content",
+                        "tags": ["cs.AI"],
+                        "confidence": 0.9,
+                        "path": "test/path",
+                        "score": 8,
+                    }
+                )
             ]
 
         # Exercise the actual write span by calling run_profile with
@@ -1172,15 +1202,23 @@ class TestInfluxLithosWriteSpan:
                 ),
                 patch("influx.service.post_run_webhook_hook"),
             ):
-                mock_client = AsyncMock()
+                mock_client = MagicMock()
                 mock_client_cls.return_value = mock_client
                 mock_client_cls_run.return_value = mock_client
                 # task_create returns a task_id
-                mock_client.task_create.return_value = MagicMock(
-                    content=[MagicMock(text='{"task_id": "task-1"}')]
+                mock_client.task_create_body = AsyncMock(
+                    return_value={"task_id": "task-1"}
                 )
-                mock_client.cache_lookup_for_item.return_value = mock_cache_result
-                mock_client.write_note.return_value = mock_write_result
+                mock_client.cache_lookup_for_item_body = AsyncMock(
+                    return_value={"hit": False}
+                )
+                mock_client.cache_lookup_by_url_body = AsyncMock(
+                    return_value={"hit": False}
+                )
+                mock_client.list_archive_terminal_arxiv_ids = AsyncMock(
+                    return_value=set()
+                )
+                mock_client.write_note = AsyncMock(return_value=mock_write_result)
                 mock_client.close = AsyncMock()
                 mock_client.task_complete = AsyncMock()
 
@@ -1216,22 +1254,21 @@ class TestInfluxLithosWriteSpan:
         mock_write_result.status = "created"
         mock_write_result.note_id = "note-456"
 
-        mock_cache_result = MagicMock()
-        mock_cache_result.content = [MagicMock(text='{"hit": false}')]
-
         async def fake_provider(
             profile: str, kind: Any, run_range: Any, prompt: str
-        ) -> list[dict[str, Any]]:
+        ) -> list[BoundScoredCandidate]:
             return [
-                {
-                    "title": "Test Note",
-                    "source_url": "https://example.com/paper",
-                    "content": "Content",
-                    "tags": ["cs.AI"],
-                    "confidence": 0.9,
-                    "path": "test/path",
-                    "score": 8,
-                }
+                _bound_for(
+                    {
+                        "title": "Test Note",
+                        "source_url": "https://example.com/paper",
+                        "content": "Content",
+                        "tags": ["cs.AI"],
+                        "confidence": 0.9,
+                        "path": "test/path",
+                        "score": 8,
+                    }
+                )
             ]
 
         with (
@@ -1263,14 +1300,18 @@ class TestInfluxLithosWriteSpan:
             ),
             patch("influx.service.post_run_webhook_hook"),
         ):
-            mock_client = AsyncMock()
+            mock_client = MagicMock()
             mock_client_cls.return_value = mock_client
             mock_client_cls_run.return_value = mock_client
-            mock_client.task_create.return_value = MagicMock(
-                content=[MagicMock(text='{"task_id": "task-1"}')]
+            mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
+            mock_client.cache_lookup_for_item_body = AsyncMock(
+                return_value={"hit": False}
             )
-            mock_client.cache_lookup_for_item.return_value = mock_cache_result
-            mock_client.write_note.return_value = mock_write_result
+            mock_client.cache_lookup_by_url_body = AsyncMock(
+                return_value={"hit": False}
+            )
+            mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=set())
+            mock_client.write_note = AsyncMock(return_value=mock_write_result)
             mock_client.close = AsyncMock()
             mock_client.task_complete = AsyncMock()
 
@@ -1300,9 +1341,7 @@ class TestInfluxLithosRetrieveSpan:
 
         # Mock the LithosClient
         mock_client = AsyncMock()
-        mock_client.retrieve.return_value = MagicMock(
-            content=[MagicMock(text='{"results": []}')]
-        )
+        mock_client.retrieve_body.return_value = {"results": []}
 
         token = current_run_id.set("test-run-retrieve")
         try:
@@ -1337,9 +1376,7 @@ class TestInfluxLithosRetrieveSpan:
         assert not disabled_tracer.enabled
 
         mock_client = AsyncMock()
-        mock_client.retrieve.return_value = MagicMock(
-            content=[MagicMock(text='{"results": []}')]
-        )
+        mock_client.retrieve_body.return_value = {"results": []}
 
         with patch("influx.lcma.get_tracer", return_value=disabled_tracer):
             from influx.lcma import after_write
@@ -1355,7 +1392,7 @@ class TestInfluxLithosRetrieveSpan:
             )
 
         # Retrieve still happened
-        mock_client.retrieve.assert_awaited_once()
+        mock_client.retrieve_body.assert_awaited_once()
 
 
 # ── (9) influx.archive.download span (US-006) ───────────────────────────

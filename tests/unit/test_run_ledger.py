@@ -140,6 +140,66 @@ def test_complete_with_source_errors_marks_run_degraded(tmp_path: Path) -> None:
     assert entry["source_acquisition_errors"] == errors
 
 
+# ── Issue #129: surface recovered source-fetch retries ──────────────
+
+
+def test_complete_without_retry_counts_persists_empty_dict(
+    tmp_path: Path,
+) -> None:
+    """A clean run with no retry-count input lands ``source_retry_counts={}``
+    so downstream consumers always see the field, never KeyError.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="ai-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.complete(run_id="run-1", sources_checked=3, ingested=2)
+    entry = ledger.recent()[0]
+    assert entry["source_retry_counts"] == {}
+
+
+def test_complete_records_source_retry_counts(tmp_path: Path) -> None:
+    """``source_retry_counts`` survives the ledger round-trip and is
+    deep-copied so post-complete mutations of the caller's dict do not
+    leak into persisted entries (issue #129).
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="ai-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    counts = {"arxiv": {"rate_limit": 2, "timeout": 1}}
+    ledger.complete(
+        run_id="run-1",
+        sources_checked=8,
+        ingested=3,
+        source_retry_counts=counts,
+    )
+    entry = ledger.recent()[0]
+    assert entry["source_retry_counts"] == {
+        "arxiv": {"rate_limit": 2, "timeout": 1},
+    }
+    # Run that recovered transient retries is **not** degraded — only
+    # *swallowed* errors land in the degraded set, retries that
+    # succeeded are pure diagnostics.
+    assert entry["degraded"] is False
+    assert entry["degraded_reasons"] == []
+
+    # Mutating the original dict after ``complete`` must not change
+    # what the ledger persisted (deep-copy invariant).
+    counts["arxiv"]["rate_limit"] = 99
+    counts["rss"] = {"timeout": 7}
+    re_read = ledger.recent()[0]
+    assert re_read["source_retry_counts"] == {
+        "arxiv": {"rate_limit": 2, "timeout": 1},
+    }
+
+
 def test_failed_run_has_degraded_false(tmp_path: Path) -> None:
     """``fail`` always lands ``degraded=false`` so the field's semantics
     stay narrow: it means *partial source-fetch failure on an otherwise
@@ -234,6 +294,8 @@ def _start_complete(
     ingested: int | None,
     fetched_total: int | None = None,
     filter_errors_total: int | None = None,
+    invalid_url_rejections_total: int | None = None,
+    archive_failures_total: int | None = None,
     source_acquisition_errors: list[dict[str, str]] | None = None,
 ) -> list[str]:
     """Helper: start + complete a run, return the degraded_reasons list.
@@ -246,6 +308,8 @@ def _start_complete(
     values explicitly.
 
     ``filter_errors_total`` defaults to ``None`` (no scorer failures).
+    ``invalid_url_rejections_total`` defaults to ``None`` (no
+    pre-acquire URL rejections — issue #131).
     """
     if fetched_total is None:
         fetched_total = sources_checked if isinstance(sources_checked, int) else 0
@@ -256,6 +320,8 @@ def _start_complete(
         ingested=ingested,
         fetched_total=fetched_total,
         filter_errors_total=filter_errors_total,
+        invalid_url_rejections_total=invalid_url_rejections_total,
+        archive_failures_total=archive_failures_total,
         source_acquisition_errors=source_acquisition_errors,
     )
 
@@ -293,6 +359,24 @@ def test_complete_returns_source_acquisition_reason(tmp_path: Path) -> None:
     entry = ledger.recent()[0]
     assert entry["degraded"] is True
     assert entry["degraded_reasons"] == ["source_acquisition"]
+
+
+def test_complete_returns_archive_acquisition_reason(tmp_path: Path) -> None:
+    """Accepted archive failures mark the run degraded for note-quality loss."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=5,
+        ingested=2,
+        archive_failures_total=2,
+    )
+    assert reasons == ["archive_acquisition"]
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is True
+    assert entry["degraded_reasons"] == ["archive_acquisition"]
+    assert entry["archive_failures_total"] == 2
 
 
 def test_single_zero_ingestion_run_is_not_yet_a_stall(tmp_path: Path) -> None:
@@ -1078,3 +1162,127 @@ def test_complete_default_filter_errors_total_when_omitted(tmp_path: Path) -> No
     assert reasons == []
     entry = ledger.recent()[0]
     assert entry.get("filter_errors_total") is None
+
+
+# ── #131 review concern 2: invalid_url_stall ────────────────────────
+
+
+def test_all_items_url_rejected_flags_invalid_url_stall(tmp_path: Path) -> None:
+    """Feed returned items but every URL was bad → invalid_url_stall.
+
+    Single-run signal — no consecutive-runs ratchet, unlike fetch_stall
+    or filter_stall.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=5,
+        invalid_url_rejections_total=5,
+    )
+    assert "invalid_url_stall" in reasons
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is True
+    assert "invalid_url_stall" in entry["degraded_reasons"]
+    assert entry["invalid_url_rejections_total"] == 5
+
+
+def test_invalid_url_stall_preempts_filter_stall(tmp_path: Path) -> None:
+    """When all items were URL-rejected, the filter never ran — don't
+    misclassify as ``filter_stall``."""
+    ledger = RunLedger(tmp_path / "state")
+    # Seed history so filter_stall ratchet would otherwise be satisfied.
+    _start_complete(
+        ledger, run_id="r-history", profile="p", sources_checked=4, ingested=2
+    )
+    _start_complete(
+        ledger,
+        run_id="r-bad",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=3,
+        invalid_url_rejections_total=3,
+    )
+    reasons = _start_complete(
+        ledger,
+        run_id="r-current",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=3,
+        invalid_url_rejections_total=3,
+    )
+    assert "invalid_url_stall" in reasons
+    assert "filter_stall" not in reasons
+
+
+def test_partial_url_rejection_does_not_flag_invalid_url_stall(
+    tmp_path: Path,
+) -> None:
+    """Some URLs invalid + others reach the filter → not invalid_url_stall.
+
+    Filter-side diagnosis (filter_stall) is correct here: items DID
+    reach the scorer.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    # Seed history so filter_stall ratchet is satisfied.
+    _start_complete(
+        ledger, run_id="r-history", profile="p", sources_checked=4, ingested=2
+    )
+    _start_complete(
+        ledger,
+        run_id="r-prev",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        invalid_url_rejections_total=2,
+    )
+    reasons = _start_complete(
+        ledger,
+        run_id="r-current",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        invalid_url_rejections_total=2,
+    )
+    # 8 items reached the filter and were rejected — that's filter_stall.
+    assert "invalid_url_stall" not in reasons
+    assert "filter_stall" in reasons
+
+
+def test_invalid_url_stall_does_not_fire_when_fetched_total_zero(
+    tmp_path: Path,
+) -> None:
+    """``fetch_stall`` (not invalid_url_stall) when nothing was fetched."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=0,
+        invalid_url_rejections_total=0,
+    )
+    assert "invalid_url_stall" not in reasons
+
+
+def test_invalid_url_stall_fires_on_first_run(tmp_path: Path) -> None:
+    """No consecutive-runs gate — single-run signal."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="brand-new-profile",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=2,
+        invalid_url_rejections_total=2,
+    )
+    assert "invalid_url_stall" in reasons

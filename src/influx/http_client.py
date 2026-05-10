@@ -10,8 +10,11 @@ See PRD §5.4 for the full contract.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urljoin, urlparse
@@ -24,7 +27,10 @@ from influx.errors import NetworkError
 __all__ = [
     "ContentTypeFamily",
     "FetchResult",
+    "aguarded_fetch",
+    "aguarded_post_json_fetch",
     "guarded_fetch",
+    "guarded_outbound_post",
     "guarded_post_json",
     "guarded_post_json_fetch",
 ]
@@ -272,25 +278,26 @@ def guarded_fetch(
     )
 
 
-def guarded_post_json(
+@contextmanager
+def guarded_outbound_post(
     url: str,
-    payload: dict[str, object],
     *,
-    headers: dict[str, str] | None = None,
     allow_private_ips: bool = False,
     timeout_seconds: int | None = None,
-) -> int:
-    """POST *payload* as JSON to *url* with scheme and SSRF guards.
+) -> Iterator[httpx.Client]:
+    """Yield a guarded :class:`httpx.Client` for outbound POSTs.
 
-    Returns the HTTP status code.  Raises
-    :class:`~influx.errors.NetworkError` on guard violations, timeouts,
-    or connection failures.  No retry logic — callers handle retries if
-    needed (FR-NOT-1).
+    Validates the URL against the scheme allow-list and SSRF
+    classifier, builds a connect+read+write+pool timeout from
+    ``timeout_seconds`` (falling back to the
+    :class:`~influx.config.NotificationsConfig` field default), and
+    translates :class:`httpx.TimeoutException` /
+    :class:`httpx.HTTPError` raised inside the ``with`` block into
+    :class:`~influx.errors.NetworkError`.
 
-    ``timeout_seconds`` defaults to ``None``; when omitted it is resolved
-    from the pydantic :class:`~influx.config.NotificationsConfig` field
-    default so the only place this tunable lives is config-parsing code
-    (AC-X-1).  Webhook callers pass the loaded config value explicitly.
+    Used by callers that need POST semantics beyond a fire-and-forget
+    status — e.g. the webhook dispatcher capturing a bounded body
+    snippet for diagnostics — without re-implementing the guard stack.
     """
     _validate_scheme(url)
     _ssrf_check(url, allow_private_ips=allow_private_ips)
@@ -307,8 +314,7 @@ def guarded_post_json(
 
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, json=payload, headers=headers)
-            return response.status_code
+            yield client
     except httpx.TimeoutException as exc:
         raise NetworkError(
             f"Request timed out: {exc}",
@@ -323,6 +329,40 @@ def guarded_post_json(
             kind="network",
             reason=str(exc),
         ) from exc
+
+
+def guarded_post_json(
+    url: str,
+    payload: dict[str, object],
+    *,
+    headers: dict[str, str] | None = None,
+    allow_private_ips: bool = False,
+    timeout_seconds: int | None = None,
+) -> int:
+    """POST *payload* as JSON to *url* with scheme and SSRF guards.
+
+    Returns the HTTP status code.  Fire-and-forget: the response body
+    is read and discarded by ``httpx``.  Callers that need to inspect
+    the body should use :func:`guarded_post_json_fetch` (full body) or
+    drive :func:`guarded_outbound_post` directly with their own
+    streaming/cap policy.
+
+    Raises :class:`~influx.errors.NetworkError` on guard violations,
+    timeouts, or connection failures.  No retry logic — callers handle
+    retries if needed (FR-NOT-1).
+
+    ``timeout_seconds`` defaults to ``None``; when omitted it is resolved
+    from the pydantic :class:`~influx.config.NotificationsConfig` field
+    default so the only place this tunable lives is config-parsing code
+    (AC-X-1).  Webhook callers pass the loaded config value explicitly.
+    """
+    with guarded_outbound_post(
+        url,
+        allow_private_ips=allow_private_ips,
+        timeout_seconds=timeout_seconds,
+    ) as client:
+        response = client.post(url, json=payload, headers=headers)
+        return response.status_code
 
 
 def guarded_post_json_fetch(
@@ -405,3 +445,56 @@ def guarded_post_json_fetch(
             kind="network",
             reason=str(exc),
         ) from exc
+
+
+# ── Async wrappers (issue #124) ─────────────────────────────────────
+#
+# The sync ``guarded_fetch`` and ``guarded_post_json_fetch`` functions
+# perform blocking I/O via ``httpx.Client``. When called from the
+# async event loop (Run path: source fetch, filter scoring, archive
+# download, content extraction), they starve the loop and stall the
+# admin HTTP API. These thin async wrappers offload the sync call to
+# a worker thread so the event loop stays responsive.
+#
+# The sync helpers are unchanged — all SSRF, redirect, size cap,
+# timeout, and content-type guard behaviour is preserved verbatim.
+
+
+async def aguarded_fetch(
+    url: str,
+    *,
+    allow_private_ips: bool = False,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
+    expected_content_type: ContentTypeFamily | None = None,
+) -> FetchResult:
+    """Async wrapper: offloads :func:`guarded_fetch` to a worker thread."""
+    return await asyncio.to_thread(
+        guarded_fetch,
+        url,
+        allow_private_ips=allow_private_ips,
+        max_download_bytes=max_download_bytes,
+        timeout_seconds=timeout_seconds,
+        expected_content_type=expected_content_type,
+    )
+
+
+async def aguarded_post_json_fetch(
+    url: str,
+    payload: dict[str, object],
+    *,
+    headers: dict[str, str] | None = None,
+    allow_private_ips: bool = False,
+    max_response_bytes: int | None = None,
+    timeout_seconds: int | None = None,
+) -> FetchResult:
+    """Async wrapper: offloads :func:`guarded_post_json_fetch` to a worker thread."""
+    return await asyncio.to_thread(
+        guarded_post_json_fetch,
+        url,
+        payload,
+        headers=headers,
+        allow_private_ips=allow_private_ips,
+        max_response_bytes=max_response_bytes,
+        timeout_seconds=timeout_seconds,
+    )

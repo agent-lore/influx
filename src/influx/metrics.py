@@ -38,6 +38,7 @@ __all__ = [
     "articles_filtered",
     "articles_inspected",
     "cache_hits",
+    "cache_hits_via_url_fallback",
     "candidates_fetched",
     "lithos_writes",
     "llm_validation_failures",
@@ -45,6 +46,7 @@ __all__ = [
     "run_completions",
     "run_duration",
     "ingestion_stalls",
+    "rss_items_rejected_invalid_url",
     "run_starts",
     "runs_skipped",
     "slug_collision_dedup_recovery",
@@ -122,6 +124,27 @@ def articles_filtered() -> Any:
     )
 
 
+def rss_items_rejected_invalid_url() -> Any:
+    """Counter of RSS items rejected pre-acquisition for invalid URL (#131).
+
+    Bumped from :func:`influx.sources.rss.parse_feed` when an entry's
+    ``link`` fails :func:`influx.urls.classify_article_url` — typically
+    upstream-malformed URLs such as ``http://localhost:5174/`` from a
+    misconfigured feed.
+
+    Labels: ``profile``, ``source`` (always ``"rss"``), ``reason``
+    (``malformed`` | ``scheme`` | ``no_host`` | ``loopback`` |
+    ``link_local`` | ``private`` | ``multicast``).
+    """
+    return get_meter().counter(
+        "influx_rss_items_rejected_invalid_url_total",
+        description=(
+            "RSS items rejected pre-acquisition because the entry link "
+            "failed syntactic URL validation."
+        ),
+    )
+
+
 def articles_inspected() -> Any:
     """Counter of items the scheduler inspected (post-filter).
 
@@ -141,6 +164,28 @@ def cache_hits() -> Any:
     return get_meter().counter(
         "influx_cache_hits_total",
         description="Lithos cache hits during the scheduler write loop.",
+    )
+
+
+def cache_hits_via_url_fallback() -> Any:
+    """Counter of pre-write dedup cache hits resolved by source-URL fallback (#128).
+
+    Increments when the primary ``compose_dedup_query``-based cache
+    lookup misses but a follow-up exact-``source_url`` lookup hits —
+    i.e. a note for the same URL is already in Lithos but its title
+    or first-sentence abstract drifted enough for the text query to
+    miss.  Sustained non-zero in steady state indicates either Lithos
+    server-side dedup needs strengthening or upstream feeds are
+    rewriting titles/summaries between runs.
+
+    Labels: ``profile``, ``source``.
+    """
+    return get_meter().counter(
+        "influx_cache_hits_via_url_fallback_total",
+        description=(
+            "pre-write dedup cache hits that required a source_url "
+            "fallback lookup after the primary title-based query missed"
+        ),
     )
 
 

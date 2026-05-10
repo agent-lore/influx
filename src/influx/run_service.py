@@ -47,8 +47,10 @@ from influx.run_ledger import RunLedger
 from influx.telemetry import (
     current_fetched_total,
     current_filter_errors,
+    current_invalid_url_rejections,
     current_run_id,
     current_source_acquisition_errors,
+    current_source_retry_counts,
     get_tracer,
 )
 
@@ -110,6 +112,23 @@ async def ledger_lifecycle(
     # misclassifying as ``filter_stall`` (scorer ran, rejected all).
     filter_errors_counter: list[int] = [0]
     filter_errors_token = current_filter_errors.set(filter_errors_counter)
+    # #131: per-run count of source items rejected because their article
+    # URL failed syntactic validation (loopback / private / malformed).
+    # Surfaced on the ledger entry as ``invalid_url_rejections_total``
+    # so a healthy fetch with bad item links is visibly distinct from a
+    # transient archive-download failure.
+    invalid_url_rejections_counter: list[int] = [0]
+    invalid_url_rejections_token = current_invalid_url_rejections.set(
+        invalid_url_rejections_counter
+    )
+    # #129: per-run counter of recovered source-fetch retries (i.e.
+    # retries followed by another attempt, distinct from the swallowed
+    # final errors recorded via :func:`record_source_acquisition_error`).
+    # A shared mutable dict so source adapters can ``setdefault`` /
+    # increment without ContextVar.set semantics — same pattern as
+    # ``current_source_acquisition_errors``.
+    source_retry_counts: dict[str, dict[str, int]] = {}
+    source_retry_counts_token = current_source_retry_counts.set(source_retry_counts)
     metric_attrs = {"profile": profile, "run_type": plan.kind.value}
 
     ledger.start(
@@ -166,6 +185,13 @@ async def ledger_lifecycle(
         outcome = session.outcome
         sources_checked = outcome.sources_checked if outcome is not None else None
         ingested = outcome.ingested if outcome is not None else None
+        archive_failures_total = 0
+        if outcome is not None and outcome.profile_run_result is not None:
+            archive_failures_total = sum(
+                1
+                for item in outcome.profile_run_result.items
+                if "influx:archive-missing" in item.tags
+            )
         # #85: pull the pre-filter fetched-count from the contextvar
         # bucket the source layer accumulated into.  ``outcome`` may be
         # ``None`` on the early-skip / abort paths; in that case we
@@ -174,13 +200,22 @@ async def ledger_lifecycle(
         fetched_total = fetched_total_counter[0]
         # #85 review: same pattern for filter-execution failures.
         filter_errors_total = filter_errors_counter[0]
+        # #131: total per-run pre-acquire URL rejections.
+        invalid_url_rejections_total = invalid_url_rejections_counter[0]
         degraded_reasons = ledger.complete(
             run_id=run_id,
             sources_checked=sources_checked,
             ingested=ingested,
             fetched_total=fetched_total,
             filter_errors_total=filter_errors_total,
+            invalid_url_rejections_total=invalid_url_rejections_total,
+            archive_failures_total=archive_failures_total,
             source_acquisition_errors=source_errors,
+            # #129: surface recovered retry counts so the ledger entry
+            # carries "we hit arXiv 429 twice but recovered" alongside
+            # the swallowed-error list, letting an operator distinguish
+            # transient retry success from a burned retry budget.
+            source_retry_counts=source_retry_counts,
         )
         run_outcome = "degraded" if source_errors else "success"
         if "ingestion_stall" in degraded_reasons:
@@ -258,6 +293,41 @@ async def ledger_lifecycle(
                 run_id,
                 filter_errors_total,
             )
+        if "archive_acquisition" in degraded_reasons:
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged archive_acquisition profile=%s kind=%s run_id=%s "
+                "archive_failures=%d "
+                "(accepted items were ingested with influx:archive-missing "
+                "after archive download failed)",
+                profile,
+                plan.kind.value,
+                run_id,
+                archive_failures_total,
+            )
+        if "invalid_url_stall" in degraded_reasons:
+            # #131 review concern 2: feed returned items but every URL
+            # was upstream-malformed.  Single-run signal — operators
+            # should look at the upstream feed's emitted ``<link>``
+            # values, not the profile description, filter prompt, or
+            # provider config.
+            metrics.ingestion_stalls().add(
+                1, {"profile": profile, "reason": "invalid_url_stall"}
+            )
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged invalid_url_stall profile=%s kind=%s run_id=%s "
+                "invalid_url_rejections=%d fetched_total=%d "
+                "(feed returned items but every entry link was "
+                "upstream-malformed — check the upstream feed publisher)",
+                profile,
+                plan.kind.value,
+                run_id,
+                invalid_url_rejections_total,
+                fetched_total,
+            )
         metrics.run_duration().record(elapsed, metric_attrs)
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
 
@@ -311,6 +381,8 @@ async def ledger_lifecycle(
         current_source_acquisition_errors.reset(source_errors_token)
         current_fetched_total.reset(fetched_total_token)
         current_filter_errors.reset(filter_errors_token)
+        current_invalid_url_rejections.reset(invalid_url_rejections_token)
+        current_source_retry_counts.reset(source_retry_counts_token)
 
 
 # ── RunService ──────────────────────────────────────────────────────

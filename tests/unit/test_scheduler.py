@@ -699,6 +699,10 @@ class TestSweepWriteErrorMarksReadinessDegraded:
                     ],
                 )
 
+            async def task_create_body(self, **kwargs: Any) -> dict[str, Any]:
+                del kwargs
+                return {"task_id": "noop-task"}
+
             async def task_complete(self, **kwargs: Any) -> Any:
                 import json as _json
 
@@ -773,6 +777,10 @@ class TestSweepWriteErrorMarksReadinessDegraded:
                         _mcp_types.TextContent(type="text", text=txt),
                     ],
                 )
+
+            async def task_create_body(self, **kwargs: Any) -> dict[str, Any]:
+                del kwargs
+                return {"task_id": "noop-task"}
 
             async def task_complete(self, **kwargs: Any) -> Any:
                 import json as _json
@@ -852,6 +860,10 @@ class TestSweepWriteErrorMarksReadinessDegraded:
                         _mcp_types.TextContent(type="text", text=txt),
                     ],
                 )
+
+            async def task_create_body(self, **kwargs: Any) -> dict[str, Any]:
+                del kwargs
+                return {"task_id": "noop-task"}
 
             async def task_complete(self, **kwargs: Any) -> Any: ...
 
@@ -935,6 +947,10 @@ class TestScheduledFireInvokesRepairSweep:
                         _mcp_types.TextContent(type="text", text=txt),
                     ],
                 )
+
+            async def task_create_body(self, **kwargs: Any) -> dict[str, Any]:
+                del kwargs
+                return {"task_id": "noop-task"}
 
             async def task_complete(self, **kwargs: Any) -> Any:
                 import json as _json
@@ -1037,6 +1053,10 @@ class TestNegativeExampleMaxTitleCharsWired:
                     ],
                 )
 
+            async def task_create_body(self, **kwargs: Any) -> dict[str, Any]:
+                del kwargs
+                return {"task_id": "noop-task"}
+
             async def task_complete(self, **kwargs: Any) -> Any:
                 import json as _json
 
@@ -1105,7 +1125,7 @@ class TestLithosCircuitBreakerShortCircuit:
             kind: RunKind,
             run_range: dict[str, str | int] | None,
             filter_prompt: str,
-        ) -> list[dict[str, Any]]:
+        ) -> list[Any]:
             nonlocal provider_called
             provider_called = True
             return []
@@ -1159,7 +1179,7 @@ class TestLithosCircuitBreakerShortCircuit:
             kind: RunKind,
             run_range: dict[str, str | int] | None,
             filter_prompt: str,
-        ) -> list[dict[str, Any]]:
+        ) -> list[Any]:
             nonlocal provider_called
             provider_called = True
             return []
@@ -1229,7 +1249,7 @@ class TestLcmaToolsUnavailableShortCircuit:
             kind: RunKind,
             run_range: dict[str, str | int] | None,
             filter_prompt: str,
-        ) -> list[dict[str, Any]]:
+        ) -> list[Any]:
             nonlocal provider_called
             provider_called = True
             return []
@@ -1321,6 +1341,10 @@ class TestManualRunDispatchesToRunModule:
                         ),
                     ],
                 )
+
+            async def task_create_body(self, **kwargs: Any) -> dict[str, Any]:
+                del kwargs
+                return {"task_id": "manual-task"}
 
             async def task_complete(self, **kwargs: Any) -> Any:
                 import json as _json
@@ -1427,6 +1451,10 @@ class TestBackfillRunDispatchesToRunModule:
                         ),
                     ],
                 )
+
+            async def task_create_body(self, **kwargs: Any) -> dict[str, Any]:
+                del kwargs
+                return {"task_id": "bf-task"}
 
             async def task_complete(self, **kwargs: Any) -> Any:
                 import json as _json

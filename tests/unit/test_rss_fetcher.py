@@ -239,7 +239,7 @@ class TestStorageTunablesThreaded:
     feed-bytes path (US-011 AC-X-1).
     """
 
-    @patch("influx.sources.rss._guarded_fetch")
+    @patch("influx.sources.rss._aguarded_fetch")
     @pytest.mark.asyncio
     async def test_fetch_rss_feed_threads_storage_tunables(
         self, mock_fetch: MagicMock
@@ -247,12 +247,16 @@ class TestStorageTunablesThreaded:
         from influx.http_client import FetchResult
         from influx.sources.rss import _fetch_rss_feed
 
-        mock_fetch.return_value = FetchResult(
-            body=b"<rss/>",
-            status_code=200,
-            content_type="application/rss+xml",
-            final_url="https://example.com/feed.xml",
-        )
+        # ``_aguarded_fetch`` is async; the mock must return a coroutine.
+        async def _stub(*_args: object, **_kwargs: object) -> FetchResult:
+            return FetchResult(
+                body=b"<rss/>",
+                status_code=200,
+                content_type="application/rss+xml",
+                final_url="https://example.com/feed.xml",
+            )
+
+        mock_fetch.side_effect = _stub
 
         feed_entry = _make_feed_entry(
             name="x", url="https://example.com/feed.xml", source_tag="rss"
@@ -266,3 +270,250 @@ class TestStorageTunablesThreaded:
         kwargs = mock_fetch.call_args.kwargs
         assert kwargs.get("max_download_bytes") == 4321
         assert kwargs.get("timeout_seconds") == 42
+
+
+# ── Issue #131: pre-acquire URL validation ─────────────────────────
+
+
+_MIXED_FEED_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+  <title>Mixed Feed</title>
+  <link>https://example.com/</link>
+  <description>One good link, one localhost link, one private link.</description>
+  <item>
+    <title>Good Public Article</title>
+    <link>https://example.com/good</link>
+    <description>Public article.</description>
+    <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
+  </item>
+  <item>
+    <title>Localhost Leak</title>
+    <link>http://localhost:5174/leak</link>
+    <description>Upstream-malformed link.</description>
+    <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
+  </item>
+  <item>
+    <title>Private Network Link</title>
+    <link>http://192.168.1.10/internal</link>
+    <description>RFC1918 link.</description>
+    <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
+  </item>
+</channel>
+</rss>
+"""
+
+
+class TestParseFeedRejectsInvalidUrls:
+    """Issue #131: ``parse_feed`` rejects loopback/private/malformed URLs."""
+
+    def test_default_drops_loopback_and_private_items(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        entry = _make_feed_entry(name="mixed", source_tag="rss")
+        with caplog.at_level("WARNING", logger="influx.sources.rss"):
+            items = parse_feed(_MIXED_FEED_XML, entry, profile="p")
+
+        assert [it.title for it in items] == ["Good Public Article"]
+        # Two WARNINGs emitted: one for localhost, one for 192.168.x.x
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        rejected_messages = [r.getMessage() for r in warnings]
+        assert any("localhost:5174" in msg for msg in rejected_messages)
+        assert any("192.168.1.10" in msg for msg in rejected_messages)
+        assert any("reason=loopback" in msg for msg in rejected_messages)
+        assert any("reason=private" in msg for msg in rejected_messages)
+
+    def test_allow_private_ips_keeps_local_items(self) -> None:
+        entry = _make_feed_entry(name="mixed", source_tag="rss")
+        items = parse_feed(_MIXED_FEED_XML, entry, allow_private_ips=True)
+
+        assert {it.title for it in items} == {
+            "Good Public Article",
+            "Localhost Leak",
+            "Private Network Link",
+        }
+
+    def test_increments_run_counter(self) -> None:
+        """Rejections bump ``current_invalid_url_rejections`` (issue #131)."""
+        from influx.telemetry import current_invalid_url_rejections
+
+        counter: list[int] = [0]
+        token = current_invalid_url_rejections.set(counter)
+        try:
+            entry = _make_feed_entry(name="mixed", source_tag="rss")
+            parse_feed(_MIXED_FEED_XML, entry, profile="p")
+        finally:
+            current_invalid_url_rejections.reset(token)
+
+        # Localhost + 192.168.x.x = 2 rejections.
+        assert counter[0] == 2
+
+    def test_counter_no_op_outside_run_context(self) -> None:
+        """``record_invalid_url_rejection`` is safe when ContextVar is unset."""
+        from influx.telemetry import current_invalid_url_rejections
+
+        # Default value is None — no run context.
+        assert current_invalid_url_rejections.get() is None
+
+        entry = _make_feed_entry(name="mixed", source_tag="rss")
+        items = parse_feed(_MIXED_FEED_XML, entry)
+
+        # Validator still runs; only the public item passes.
+        assert [it.title for it in items] == ["Good Public Article"]
+
+    def test_rejection_bumps_fetched_total(self) -> None:
+        """Issue #131 review concern 2: fetched_total reflects what the
+        feed *returned*, not just what survived URL validation.
+
+        Otherwise an all-rejected run would look like ``fetch_stall``
+        ("nothing was fetched at all"), losing the operational
+        distinction the issue requires.
+        """
+        from influx.telemetry import (
+            current_fetched_total,
+            current_invalid_url_rejections,
+        )
+
+        fetched: list[int] = [0]
+        rejected: list[int] = [0]
+        fetched_token = current_fetched_total.set(fetched)
+        rejected_token = current_invalid_url_rejections.set(rejected)
+        try:
+            entry = _make_feed_entry(name="mixed", source_tag="rss")
+            items = parse_feed(_MIXED_FEED_XML, entry, profile="p")
+        finally:
+            current_fetched_total.reset(fetched_token)
+            current_invalid_url_rejections.reset(rejected_token)
+
+        # The provider closure adds ``len(items)`` after parse_feed
+        # returns; parse_feed itself only contributes the rejection
+        # bumps.  Combined, they total the feed's full entry count (3).
+        assert rejected[0] == 2
+        assert fetched[0] == 2  # parse_feed-internal contribution
+        # Sanity: combined with what the provider would add, total == 3.
+        assert fetched[0] + len(items) == 3
+
+
+# ── #131 review concern 1: staging allow_private_ips=true must not
+#    re-allow loopback/private RSS entry URLs ────────────────────────
+
+
+class TestProductionPathIgnoresAllowPrivateIps:
+    """Regression guard: the production provider closure must NOT
+    thread ``config.security.allow_private_ips`` into ``parse_feed``.
+
+    Staging sets ``allow_private_ips = true`` for fetcher reasons.  If
+    the URL validator respected that flag in production, the original
+    Sourcegraph staging incident — RSS items advertising
+    ``http://localhost:5174/...`` — would still be ingested, defeating
+    the entire fix.
+    """
+
+    @pytest.mark.asyncio
+    async def test_provider_rejects_localhost_even_with_allow_private_ips_true(
+        self,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from influx.config import (
+            AppConfig,
+            ProfileConfig,
+            ProfileSources,
+            PromptEntryConfig,
+            PromptsConfig,
+            ScheduleConfig,
+            SecurityConfig,
+        )
+        from influx.coordinator import RunKind
+        from influx.sources.rss import make_rss_item_provider
+
+        rss_entry = _make_feed_entry(
+            name="staging-feed",
+            url="https://example.com/feed.xml",
+            source_tag="rss",
+        )
+        # Staging-style config: allow_private_ips=true.
+        config = AppConfig(
+            schedule=ScheduleConfig(
+                cron="0 6 * * *",
+                timezone="UTC",
+                misfire_grace_seconds=3600,
+            ),
+            profiles=[
+                ProfileConfig(
+                    name="ai-robotics",
+                    sources=ProfileSources(rss=[rss_entry]),
+                ),
+            ],
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="t"),
+                tier1_enrich=PromptEntryConfig(text="t"),
+                tier3_extract=PromptEntryConfig(text="t"),
+            ),
+            security=SecurityConfig(allow_private_ips=True),
+        )
+
+        # Mock the network fetch to return a feed body with one valid
+        # link plus the original Sourcegraph-style localhost leak.
+        from influx.http_client import FetchResult
+
+        async def _stub(*_args: object, **_kwargs: object) -> FetchResult:
+            return FetchResult(
+                body=_MIXED_FEED_XML,
+                status_code=200,
+                content_type="application/rss+xml",
+                final_url="https://example.com/feed.xml",
+            )
+
+        # Stub the LLM filter so the test stays unit-scoped — accept
+        # everything the validator lets through.
+        async def _score_stub(*, items: list[Any], **_kwargs: object) -> dict[str, Any]:
+            from types import SimpleNamespace
+
+            from influx.sources.rss import _rss_filter_id
+
+            return {
+                _rss_filter_id(it): SimpleNamespace(score=10, reason="ok", tags=[])
+                for it in items
+            }
+
+        with (
+            patch("influx.sources.rss._aguarded_fetch", AsyncMock(side_effect=_stub)),
+            patch(
+                "influx.sources.rss._score_rss_items",
+                AsyncMock(side_effect=_score_stub),
+            ),
+            patch(
+                "influx.sources.rss.build_rss_note_item",
+                lambda **kwargs: {
+                    "id": "x",
+                    "title": kwargs["item"].title,
+                    "source": "rss",
+                    "source_url": kwargs["item"].url,
+                    "content": "",
+                    "tags": [],
+                    "filter_tags": [],
+                    "score": kwargs.get("score", 0),
+                    "confidence": kwargs.get("confidence", 0.0),
+                    "reason": kwargs.get("reason", ""),
+                    "path": "x",
+                    "abstract_or_summary": "",
+                    "contributions": None,
+                    "builds_on": None,
+                },
+            ),
+        ):
+            provider = make_rss_item_provider(config)
+            bounds = list(
+                await provider("ai-robotics", RunKind.SCHEDULED, None, "prompt")
+            )
+            # #125: provider returns BoundScoredCandidates; invoke each
+            # closure to drive ``build_rss_note_item`` and obtain the
+            # legacy ProfileItem dict the assertions below operate on.
+            results = [item for item in [await b.acquire() for b in bounds] if item]
+
+        # Only the single public-URL item should reach the build step;
+        # localhost + 192.168.x.x must be dropped pre-acquire even
+        # though the config has allow_private_ips=True.
+        assert len(results) == 1
+        assert results[0]["source_url"] == "https://example.com/good"

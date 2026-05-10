@@ -18,6 +18,7 @@ fails), the feed item's ``<summary>`` is used instead (FR-ENR-3, AC-09-J).
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import json
 import logging
@@ -35,22 +36,21 @@ from influx.cascade import Acquired, Cascade
 from influx.coordinator import RunKind
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article
-from influx.filter import FilterScorerError
-from influx.http_client import guarded_fetch as _guarded_fetch
-from influx.http_client import guarded_post_json_fetch
+from influx.filter import FilterScorerError, _acall_filter_model_with_retry
+from influx.http_client import aguarded_fetch as _aguarded_fetch
 from influx.renderer import render
-from influx.schemas import FilterResponse
 from influx.slugs import slugify_feed_name
-from influx.source import Candidate, ScoredCandidate
+from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.storage import download_archive
 from influx.telemetry import (
     current_run_id,
     get_tracer,
     record_fetched_items,
     record_filter_error,
+    record_invalid_url_rejection,
     record_source_acquisition_error,
 )
-from influx.urls import normalise_url, url_hash
+from influx.urls import classify_article_url, normalise_url, url_hash
 
 if TYPE_CHECKING:
     from influx.config import AppConfig, ProfileConfig, RssSourceEntry
@@ -82,11 +82,33 @@ class RssFeedItem:
 def parse_feed(
     content: bytes | str,
     feed_entry: RssSourceEntry,
+    *,
+    allow_private_ips: bool = False,
+    profile: str = "",
 ) -> list[RssFeedItem]:
     """Parse RSS/Atom feed content and return per-item records.
 
     Each item inherits the feed's configured ``source_tag`` verbatim
     (FR-SRC-4).  The parser does not infer or override ``source_tag``.
+
+    Issue #131: each entry's ``link`` is validated via
+    :func:`influx.urls.classify_article_url` before the item is
+    admitted.  Items whose URL is loopback / private / link-local /
+    multicast / malformed / disallowed-scheme are dropped pre-acquire
+    (logged at WARNING, counted on the run-ledger entry, no
+    ``influx:archive-missing`` note produced).  Each rejection also
+    bumps the per-run pre-filter ``fetched_total`` so a feed that
+    returned items but had every URL rejected is not misclassified as
+    ``fetch_stall`` (review concern 2 on PR #133).
+
+    ``allow_private_ips`` is intentionally **not** threaded from
+    ``config.security.allow_private_ips`` by the production
+    :func:`_fetch_rss_feed` caller — that flag is the fetcher's
+    escape hatch for *configured* internal services and must not
+    accidentally re-allow third-party feeds to advertise localhost
+    links.  It exists here purely for direct test callers (e.g. the
+    ``FakeArticleServer`` integration tests in
+    ``tests/integration/test_rss_to_lithos.py``).
 
     Parameters
     ----------
@@ -95,6 +117,11 @@ def parse_feed(
     feed_entry:
         The ``RssSourceEntry`` from the profile config providing
         ``name``, ``url``, and ``source_tag``.
+    allow_private_ips:
+        Test-only opt-in to accept loopback / private / link-local /
+        multicast hosts.  Production callers leave this at ``False``.
+    profile:
+        Profile name used as a metric label on rejection counts.
 
     Returns
     -------
@@ -111,6 +138,36 @@ def parse_feed(
 
         if not title or not link:
             _log.debug("Skipping feed entry with missing title or link")
+            continue
+
+        validation = classify_article_url(link, allow_private=allow_private_ips)
+        if not validation.ok:
+            _log.warning(
+                "rss item rejected pre-acquire profile=%s feed=%r url=%s "
+                "reason=%s title=%r",
+                profile,
+                feed_entry.name,
+                link,
+                validation.reason,
+                title,
+            )
+            record_invalid_url_rejection()
+            # Issue #131 review concern 2: count the rejected entry
+            # toward the run's pre-filter ``fetched_total`` so a feed
+            # that returned items with every URL invalid is not
+            # misclassified as ``fetch_stall`` (which means "no source
+            # returned anything at all").  The ledger uses
+            # ``invalid_url_rejections_total`` to fire
+            # ``invalid_url_stall`` instead when warranted.
+            record_fetched_items(1)
+            metrics.rss_items_rejected_invalid_url().add(
+                1,
+                {
+                    "profile": profile,
+                    "source": "rss",
+                    "reason": validation.reason or "unknown",
+                },
+            )
             continue
 
         published = _parse_published(entry)
@@ -413,21 +470,15 @@ async def _score_rss_items(
         last_error: Exception | None = None
         for _attempt in range(attempts):
             try:
-                response = guarded_post_json_fetch(
-                    url,
-                    body,
+                response = await _acall_filter_model_with_retry(
+                    config=config,
+                    profile=profile,
+                    url=url,
+                    body=body,
                     headers=headers,
-                    allow_private_ips=config.security.allow_private_ips,
-                    max_response_bytes=config.storage.max_download_bytes,
-                    timeout_seconds=slot.request_timeout,
+                    attempts=attempts,
                 )
-                if response.status_code >= 400:
-                    last_error = FilterScorerError(f"HTTP {response.status_code}")
-                    continue
-                envelope = json.loads(response.body.decode("utf-8"))
-                content = envelope["choices"][0]["message"]["content"]
-                parsed = FilterResponse.model_validate(json.loads(content))
-                all_scores.update({result.id: result for result in parsed.results})
+                all_scores.update({result.id: result for result in response.results})
                 break
             except Exception as exc:
                 last_error = exc
@@ -575,7 +626,7 @@ def make_rss_item_provider(
         kind: RunKind,
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
-    ) -> Iterable[dict[str, Any]]:
+    ) -> Iterable[BoundScoredCandidate]:
         del kind, run_range
 
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
@@ -593,7 +644,7 @@ def make_rss_item_provider(
                 "influx.source": "rss",
             },
         ) as fetch_span:
-            results: list[dict[str, Any]] = []
+            bounds: list[BoundScoredCandidate] = []
             for feed_entry in profile_cfg.sources.rss:
                 _log.info(
                     "rss feed fetch started profile=%s feed=%r url=%s source_tag=%s",
@@ -693,8 +744,33 @@ def make_rss_item_provider(
                         item.title,
                         item.url,
                     )
-                    results.append(
-                        build_rss_note_item(
+                    # Issue #125: emit a BoundScoredCandidate so the Run
+                    # stage can run pre-acquire ``lithos_cache_lookup``
+                    # before paying the article fetch / archive / extract
+                    # cost.  ``build_rss_note_item`` is the per-item
+                    # acquire entrypoint; issue #124's ``asyncio.to_thread``
+                    # offload moves into the closure, fired only when the
+                    # orchestrator decides this candidate must be acquired.
+                    sc = ScoredCandidate(
+                        candidate=Candidate(
+                            item_id=_rss_filter_id(item),
+                            title=item.title,
+                            abstract=item.summary or "",
+                            source_url=item.url,
+                            payload=item,
+                        ),
+                        score=scored.score,
+                        confidence=1.0,
+                        reason=scored.reason,
+                        filter_tags=scored.tags,
+                    )
+
+                    async def _acquire(
+                        item: RssFeedItem = item,
+                        scored: Any = scored,
+                    ) -> dict[str, Any] | None:
+                        return await asyncio.to_thread(
+                            build_rss_note_item,
                             item=item,
                             profile_name=profile,
                             config=config,
@@ -703,22 +779,29 @@ def make_rss_item_provider(
                             reason=scored.reason,
                             filter_tags=scored.tags,
                         )
+
+                    bounds.append(
+                        BoundScoredCandidate(
+                            scored=sc,
+                            acquire=_acquire,
+                            source_label=f"rss:{feed_entry.name}",
+                        )
                     )
                 _log.info(
                     "rss feed completed profile=%s feed=%r accepted_so_far=%d",
                     profile,
                     feed_entry.name,
-                    len(results),
+                    len(bounds),
                 )
-            fetch_span.set_attribute("influx.item_count", len(results))
+            fetch_span.set_attribute("influx.item_count", len(bounds))
             _log.info(
                 "rss source completed profile=%s feeds=%d accepted=%d",
                 profile,
                 len(profile_cfg.sources.rss),
-                len(results),
+                len(bounds),
             )
 
-        return results
+        return bounds
 
     return provider
 
@@ -747,7 +830,7 @@ async def _fetch_rss_feed(
 
     async def _fetch_bytes() -> bytes | None:
         try:
-            result = _guarded_fetch(
+            result = await _aguarded_fetch(
                 feed_entry.url,
                 max_download_bytes=max_download_bytes,
                 timeout_seconds=timeout_seconds,
@@ -784,4 +867,12 @@ async def _fetch_rss_feed(
     if body is None:
         return []
 
-    return parse_feed(body, feed_entry)
+    # NB: ``allow_private_ips`` is deliberately NOT threaded from
+    # ``config.security.allow_private_ips`` here.  That flag is the
+    # fetcher's escape hatch for talking to *configured* internal
+    # services; it must NOT be a "trust upstream feeds to advertise
+    # localhost links" knob.  Issue #131: a staging config with
+    # ``allow_private_ips = true`` would otherwise re-enable the very
+    # behaviour this fix removes.  Direct test callers of
+    # :func:`parse_feed` may still opt in.
+    return parse_feed(body, feed_entry, profile=profile)

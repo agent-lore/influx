@@ -29,17 +29,22 @@ __all__ = [
     "InfluxMeter",
     "InfluxTracer",
     "SourceAcquisitionError",
+    "SourceRetryCounts",
     "SpanWrapper",
     "current_archive_terminal_arxiv_ids",
     "current_fetched_total",
     "current_filter_errors",
+    "current_invalid_url_rejections",
     "current_run_id",
     "current_source_acquisition_errors",
+    "current_source_retry_counts",
     "get_meter",
     "get_tracer",
     "record_fetched_items",
     "record_filter_error",
+    "record_invalid_url_rejection",
     "record_source_acquisition_error",
+    "record_source_retry",
 ]
 
 # Context variable for the current run ID — set by ``run_profile()`` so
@@ -108,6 +113,41 @@ def record_source_acquisition_error(
     )
 
 
+# Per-run counter of source-fetch retries that the run **recovered from**
+# (i.e. retries that did not produce a final swallowed error).  Shape:
+# ``{"arxiv": {"rate_limit": 2, "timeout": 1}}``.  Source adapters call
+# :func:`record_source_retry` once per retry decision (each non-final
+# attempt that the retry loop is about to sleep + retry).  Surfaced on
+# the run-ledger entry as ``source_retry_counts`` so operators can
+# distinguish "one transient 429 we recovered from" from "we burned the
+# entire retry budget" — issue #129.
+SourceRetryCounts = dict[str, dict[str, int]]
+
+
+current_source_retry_counts: ContextVar[SourceRetryCounts | None] = ContextVar(
+    "current_source_retry_counts",
+    default=None,
+)
+
+
+def record_source_retry(*, source: str, kind: str) -> None:
+    """Increment the current run's recovered-retry counter for *source*/*kind*.
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_source_retry_counts` is unset.  Source adapters call
+    this on every retry decision (every attempt that failed but is
+    followed by another attempt).  When the retry budget is exhausted
+    and the failure is finally swallowed, the source instead calls
+    :func:`record_source_acquisition_error`; the two records together
+    let an operator see "we retried N times before giving up".
+    """
+    counts = current_source_retry_counts.get()
+    if counts is None:
+        return
+    by_kind = counts.setdefault(source, {})
+    by_kind[kind] = by_kind.get(kind, 0) + 1
+
+
 # Per-run counter of pre-filter fetched candidates.  Set to ``[0]`` at
 # run start by ``run_service.ledger_lifecycle``; source adapters
 # increment via :func:`record_fetched_items` after a successful fetch
@@ -173,6 +213,39 @@ def record_filter_error() -> None:
     if counter is None:
         return
     counter[0] += 1
+
+
+# Per-run counter of source items rejected pre-acquisition because their
+# article URL failed syntactic validation (issue #131).  Set to ``[0]`` at
+# run start by ``run_service.ledger_lifecycle``; source adapters
+# increment via :func:`record_invalid_url_rejection` when
+# :func:`influx.urls.classify_article_url` rejects an item link.
+#
+# Surfaced on the run-ledger entry as ``invalid_url_rejections_total`` so
+# operators can distinguish "feed fetched OK, N items rejected because
+# their URLs were upstream-malformed" from "archive download failed for a
+# valid URL" (which keeps producing ``influx:archive-missing``).
+current_invalid_url_rejections: ContextVar[list[int] | None] = ContextVar(
+    "current_invalid_url_rejections",
+    default=None,
+)
+
+
+def record_invalid_url_rejection(count: int = 1) -> None:
+    """Add *count* to the current run's ``invalid_url_rejections_total`` (#131).
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_invalid_url_rejections` is unset.  Source adapters
+    call this when ``classify_article_url`` rejects an item link
+    (loopback, private, link-local, multicast, malformed, or
+    disallowed scheme).  Multiple rejections in the same run accumulate.
+    """
+    if count <= 0:
+        return
+    counter = current_invalid_url_rejections.get()
+    if counter is None:
+        return
+    counter[0] += count
 
 
 logger = logging.getLogger(__name__)

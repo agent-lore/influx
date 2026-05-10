@@ -607,6 +607,70 @@ class TestCacheLookupChokepoint:
             await client.close()
 
 
+# ── Source-URL cache lookup chokepoint (#128) ─────────────────────
+
+
+class TestCacheLookupByUrlBody:
+    """``cache_lookup_by_url_body`` is the canonical URL-only chokepoint (#128)."""
+
+    async def test_empty_source_url_raises_before_rpc(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Empty source_url raises LithosError; zero RPCs sent."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with pytest.raises(LithosError, match="missing_lookup_arg"):
+                await client.cache_lookup_by_url_body(source_url="")
+            lookup_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
+            ]
+            assert len(lookup_calls) == 0
+        finally:
+            await client.close()
+
+    async def test_sends_url_as_both_query_and_source_url(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """The URL is forwarded as both query and source_url for exact match."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            url = "https://arxiv.org/abs/1706.03762"
+            fake_lithos_server.cache_lookup_responses.append(
+                '{"hit": true, "stale_exists": false}'
+            )
+            body = await client.cache_lookup_by_url_body(source_url=url)
+            assert body == {"hit": True, "stale_exists": False}
+            lookup_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
+            ]
+            assert len(lookup_calls) == 1
+            assert lookup_calls[0][1] == {"query": url, "source_url": url}
+        finally:
+            await client.close()
+
+    async def test_decodes_miss_body_unchanged(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """A miss response is decoded verbatim (no hit-only filtering)."""
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            body = await client.cache_lookup_by_url_body(
+                source_url="https://example.com/missing"
+            )
+            assert body == {"hit": False, "stale_exists": False}
+        finally:
+            await client.close()
+
+
 # ── List wrapper (FR-MCP-5) ────────────────────────────────────────
 
 

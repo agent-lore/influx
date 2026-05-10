@@ -61,7 +61,7 @@ def _make_client(
     write_status: str = "updated",
 ) -> AsyncMock:
     client = AsyncMock()
-    client.list_notes = AsyncMock(return_value=_make_list_result(list_items))
+    client.list_notes_body = AsyncMock(return_value={"items": list_items})
     client.read_note = AsyncMock(side_effect=read_responses)
     client.call_tool = AsyncMock(return_value=_make_write_result(write_status))
     return client

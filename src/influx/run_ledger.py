@@ -81,10 +81,18 @@ class RunLedger:
             "ingested": None,
             "fetched_total": None,
             "filter_errors_total": None,
+            "invalid_url_rejections_total": None,
+            "archive_failures_total": None,
             "error": None,
             "degraded": False,
             "degraded_reasons": [],
             "source_acquisition_errors": [],
+            # #129: per-source counter of *recovered* retries (i.e.
+            # retries that did not produce a swallowed error).  Shape:
+            # ``{"arxiv": {"rate_limit": 2, "timeout": 1}}``.  Empty
+            # dict at start; populated from the per-run contextvar at
+            # ``complete`` time.
+            "source_retry_counts": {},
         }
         try:
             active = self._read_active()
@@ -101,7 +109,10 @@ class RunLedger:
         ingested: int | None,
         fetched_total: int | None = None,
         filter_errors_total: int | None = None,
+        invalid_url_rejections_total: int | None = None,
+        archive_failures_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
+        source_retry_counts: dict[str, dict[str, int]] | None = None,
     ) -> list[str]:
         """Mark an active run as completed and append it to history.
 
@@ -118,6 +129,10 @@ class RunLedger:
           exclusive with ``filter_stall``: when both would apply,
           ``filter_error`` wins because the scorer-failure diagnosis
           is more specific.
+        - ``"archive_acquisition"`` — at least one accepted item was
+          ingested with ``influx:archive-missing`` after archive
+          acquisition failed, so note quality degraded even though the
+          run continued.
         - ``"ingestion_stall"`` (issue #36) — this and the immediately
           prior scheduled run both saw ``ingested == 0`` despite
           ``sources_checked > 0``.  Typical cause: every candidate hits
@@ -135,7 +150,16 @@ class RunLedger:
           description drift, filter prompt regression, or
           ``min_score_in_results`` set too high.  Requires
           ``filter_errors_total == 0`` so a scorer failure produces
-          ``filter_error`` rather than this.
+          ``filter_error`` rather than this, AND
+          ``invalid_url_rejections_total < fetched_total`` so a feed
+          whose entries were all URL-rejected pre-filter produces
+          ``invalid_url_stall`` rather than this.
+        - ``"invalid_url_stall"`` (issue #131) — the feed returned
+          items but every URL was upstream-malformed (loopback,
+          private, link-local, multicast, unparseable, or
+          disallowed-scheme), so nothing reached the LLM filter.
+          Single-run signal — like ``filter_error`` — because URL
+          malformation is an immediately actionable upstream bug.
 
         ``fetch_stall`` and ``filter_stall`` partition the
         ``sources_checked == 0`` space by ``fetched_total``: they are
@@ -167,6 +191,35 @@ class RunLedger:
         )
         if has_filter_error:
             reasons.append("filter_error")
+        if isinstance(archive_failures_total, int) and archive_failures_total > 0:
+            reasons.append("archive_acquisition")
+
+        # #131 review concern 2: ``invalid_url_stall`` fires when the
+        # feed returned items but every URL was upstream-malformed
+        # (loopback / private / link-local / multicast / unparseable /
+        # disallowed scheme), so nothing reached the LLM filter.
+        # Single-run signal — like ``filter_error`` and
+        # ``archive_acquisition`` — because URL malformation is a
+        # clear-cut, immediately actionable upstream bug, not a
+        # noisy/transient signal that needs a consecutive-runs ratchet.
+        # Mutually exclusive with ``filter_stall`` (the gate below
+        # enforces ``items_reached_filter > 0``) and with
+        # ``fetch_stall`` (which requires ``fetched_total == 0``).
+        items_reached_filter = (
+            (fetched_total - invalid_url_rejections_total)
+            if isinstance(fetched_total, int)
+            and isinstance(invalid_url_rejections_total, int)
+            else None
+        )
+        has_invalid_url_stall = (
+            isinstance(invalid_url_rejections_total, int)
+            and invalid_url_rejections_total > 0
+            and isinstance(fetched_total, int)
+            and fetched_total > 0
+            and items_reached_filter == 0
+        )
+        if has_invalid_url_stall:
+            reasons.append("invalid_url_stall")
 
         # Resolve profile + kind once for the stall checks.  All three
         # stall flags only apply to scheduled runs (backfills
@@ -213,11 +266,15 @@ class RunLedger:
                 # rejected them all.  Requires filter_errors_total == 0
                 # — a scorer-execution failure has a distinct, more
                 # specific reason (``filter_error``) and shouldn't
-                # double-fire as a filter_stall (#85 review).  Streak
-                # counts prior scheduled runs that match the same
-                # shape (sources_checked == 0 AND fetched_total > 0).
-                if has_filter_error:
-                    pass  # filter_error already appended above
+                # double-fire as a filter_stall (#85 review).  #131
+                # review concern 2: also requires that items actually
+                # reached the filter (i.e. weren't all dropped pre-acquire
+                # by the URL validator); otherwise ``invalid_url_stall``
+                # is the correct diagnosis.  Streak counts prior
+                # scheduled runs that match the same shape
+                # (sources_checked == 0 AND fetched_total > 0).
+                if has_filter_error or has_invalid_url_stall:
+                    pass  # more-specific reason already appended above
                 else:
                     consecutive_filter = (
                         1
@@ -249,10 +306,13 @@ class RunLedger:
             ingested=ingested,
             fetched_total=fetched_total,
             filter_errors_total=filter_errors_total,
+            invalid_url_rejections_total=invalid_url_rejections_total,
+            archive_failures_total=archive_failures_total,
             error=None,
             degraded=bool(reasons),
             source_acquisition_errors=errors,
             degraded_reasons=reasons,
+            source_retry_counts=source_retry_counts,
         )
         return reasons
 
@@ -509,6 +569,12 @@ class RunLedger:
                         "source_acquisition_errors": list(
                             entry.get("source_acquisition_errors") or []
                         ),
+                        "source_retry_counts": {
+                            source: dict(by_kind)
+                            for source, by_kind in (
+                                entry.get("source_retry_counts") or {}
+                            ).items()
+                        },
                     }
                 )
                 self._append(entry)
@@ -565,9 +631,12 @@ class RunLedger:
         error: str | None,
         fetched_total: int | None = None,
         filter_errors_total: int | None = None,
+        invalid_url_rejections_total: int | None = None,
+        archive_failures_total: int | None = None,
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
+        source_retry_counts: dict[str, dict[str, int]] | None = None,
     ) -> None:
         try:
             active = self._read_active()
@@ -596,10 +665,19 @@ class RunLedger:
                     "ingested": ingested,
                     "fetched_total": fetched_total,
                     "filter_errors_total": filter_errors_total,
+                    "invalid_url_rejections_total": invalid_url_rejections_total,
+                    "archive_failures_total": archive_failures_total,
                     "error": error,
                     "degraded": degraded,
                     "degraded_reasons": list(degraded_reasons or []),
                     "source_acquisition_errors": list(source_acquisition_errors or []),
+                    # #129: deep-copy the per-source retry-count dict so
+                    # later mutations of the contextvar bucket do not
+                    # leak into the persisted ledger entry.
+                    "source_retry_counts": {
+                        source: dict(by_kind)
+                        for source, by_kind in (source_retry_counts or {}).items()
+                    },
                 }
             )
             self._append(entry)

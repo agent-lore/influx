@@ -167,6 +167,50 @@ async def test_scheduler_drains_context_into_ledger_complete(
     ]
 
 
+async def test_scheduler_drains_retry_counts_into_ledger_complete(
+    tmp_path: Any,
+) -> None:
+    """Issue #129: ``record_source_retry`` calls during a run land on
+    the ledger entry as ``source_retry_counts`` so an operator can see
+    "we hit arXiv 429 twice but recovered" alongside the swallowed
+    final-error list.
+    """
+    from unittest.mock import AsyncMock
+
+    from influx.run_ledger import RunLedger
+    from influx.scheduler import run_profile
+    from influx.telemetry import record_source_retry
+
+    config = _make_minimal_config()
+    ledger = RunLedger(tmp_path / "state")
+
+    from influx.run import RunOutcome
+
+    async def fake_body(*_args: Any, **_kwargs: Any) -> RunOutcome:
+        # Mimic two recovered 429 retries plus one recovered timeout.
+        record_source_retry(source="arxiv", kind="rate_limit")
+        record_source_retry(source="arxiv", kind="rate_limit")
+        record_source_retry(source="arxiv", kind="timeout")
+        return RunOutcome()
+
+    fake = AsyncMock(side_effect=fake_body)
+    with patch("influx.run.Run.execute", new=fake):
+        await run_profile(
+            "ai-robotics",
+            RunKind.SCHEDULED,
+            config=config,
+            run_ledger=ledger,
+        )
+
+    entry = ledger.recent()[0]
+    # Recovered retries do **not** degrade the run on their own —
+    # they are pure diagnostics for triaging upstream pressure.
+    assert entry["degraded"] is False
+    assert entry["source_retry_counts"] == {
+        "arxiv": {"rate_limit": 2, "timeout": 1},
+    }
+
+
 async def test_scheduler_writes_clean_ledger_on_no_errors(tmp_path: Any) -> None:
     """A run with no swallowed errors writes ``degraded=false`` and an
     empty list — preserves the dashboard semantics that "degraded" means

@@ -8,6 +8,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: ${INFLUX_CONTAINER_NAME:-influx}
     user: "${INFLUX_UID:-1000}:${INFLUX_GID:-1000}"
+    restart: unless-stopped
     volumes:
       - ${INFLUX_DATA_PATH:-./data}:/data
       - ${INFLUX_ARCHIVE_PATH:-./archive}:/archive

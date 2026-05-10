@@ -9,7 +9,9 @@ disambiguator for archive filenames (PRD 09 FR-ST-1).
 from __future__ import annotations
 
 import hashlib
-from urllib.parse import urlparse, urlunparse
+import ipaddress
+from dataclasses import dataclass
+from urllib.parse import urlparse, urlsplit, urlunparse
 
 # Non-``utm_*`` tracking query parameters stripped during normalisation.
 # Any key starting with ``utm_`` is also stripped (FR-MCP-4).
@@ -121,3 +123,111 @@ def arxiv_canonical_url(arxiv_id: str) -> str:
     'https://arxiv.org/abs/2601.12345'
     """
     return f"https://arxiv.org/abs/{arxiv_id}"
+
+
+# ── Article URL validation (issue #131) ─────────────────────────────
+
+
+_ALLOWED_URL_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+
+@dataclass(frozen=True, slots=True)
+class UrlValidation:
+    """Result of :func:`classify_article_url`.
+
+    ``ok`` is ``True`` when the URL passed every check; ``reason`` is
+    ``None`` in that case.  When ``ok`` is ``False``, ``reason`` carries
+    one of: ``"malformed"``, ``"scheme"``, ``"no_host"``, ``"loopback"``,
+    ``"link_local"``, ``"private"``, ``"multicast"``.
+
+    The classification labels mirror :func:`influx.http_client._classify_ip`
+    so log messages and dashboards stay consistent across the syntactic
+    pre-fetch guard and the DNS-resolved SSRF guard.
+    """
+
+    ok: bool
+    reason: str | None = None
+
+
+def classify_article_url(raw: str, *, allow_private: bool = False) -> UrlValidation:
+    """Validate an article URL syntactically before expensive acquisition.
+
+    Issue #131: RSS feeds can advertise loopback / private-host article
+    links (the staging Sourcegraph incident emitted ``http://localhost:5174/``
+    URLs).  This guard rejects such links before
+    :func:`~influx.storage.download_archive` /
+    :func:`~influx.extraction.article.extract_article` are attempted, so
+    the offending item never enters the run's pre-filter population and
+    never produces an ``influx:archive-missing`` note.
+
+    Pure-syntactic — does **no** DNS resolution.  Hostname literals that
+    parse as IP addresses are classified via :mod:`ipaddress`; non-IP
+    hostnames are accepted unless they equal ``"localhost"``.  DNS-based
+    rejection of hostnames that resolve to private addresses remains the
+    SSRF guard's job at fetch time (defence in depth).
+
+    Parameters
+    ----------
+    raw:
+        The candidate URL string (e.g. an RSS ``entry.link``).
+    allow_private:
+        When ``True``, loopback / private / link-local / multicast hosts
+        pass.  Mirrors the existing ``allow_private_ips`` config flag
+        used by the SSRF guard so test fixtures (FakeArticleServer on
+        ``127.0.0.1``) keep working unchanged.
+
+    Returns
+    -------
+    UrlValidation
+    """
+    if not raw or not raw.strip():
+        return UrlValidation(ok=False, reason="malformed")
+
+    try:
+        parsed = urlsplit(raw.strip())
+    except ValueError:
+        return UrlValidation(ok=False, reason="malformed")
+
+    scheme = parsed.scheme.lower()
+    if not scheme:
+        return UrlValidation(ok=False, reason="malformed")
+    if scheme not in _ALLOWED_URL_SCHEMES:
+        return UrlValidation(ok=False, reason="scheme")
+
+    try:
+        hostname = parsed.hostname
+    except ValueError:
+        return UrlValidation(ok=False, reason="malformed")
+    if not hostname:
+        return UrlValidation(ok=False, reason="no_host")
+
+    host_label = _classify_host(hostname)
+    if host_label is not None and not allow_private:
+        return UrlValidation(ok=False, reason=host_label)
+
+    return UrlValidation(ok=True, reason=None)
+
+
+def _classify_host(hostname: str) -> str | None:
+    """Return a classification label for *hostname*, or ``None`` if public.
+
+    Recognises the literal ``localhost`` (case-insensitive) and any
+    hostname that parses as an IPv4 / IPv6 literal.  Non-IP hostnames
+    that aren't ``localhost`` are treated as public — DNS-resolved
+    classification is the SSRF guard's responsibility at fetch time.
+    """
+    if hostname.lower() == "localhost":
+        return "loopback"
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        return None
+    if addr.is_loopback:
+        return "loopback"
+    if addr.is_link_local:
+        return "link_local"
+    if addr.is_private:
+        return "private"
+    if addr.is_multicast:
+        return "multicast"
+    return None

@@ -13,10 +13,13 @@ implementations ship with PRD 07.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import copy
 import enum
 import json
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -24,6 +27,7 @@ from influx import metrics
 from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.notes import merge_tags
 from influx.repair_counters import (
+    CountedStage,
     classify_failure,
     record_counted_failure,
 )
@@ -489,6 +493,102 @@ def _log_stage_failure(
     )
 
 
+# ── Shared per-stage execution envelope ───────────────────────────
+
+
+@contextlib.contextmanager
+def _stage_attempt(
+    note: dict[str, Any],
+    *,
+    profile: str,
+    kind: str,
+    span_name: str,
+    sync_tags: list[str] | None = None,
+) -> Iterator[None]:
+    """Common per-stage hook-call envelope.
+
+    Increments the per-kind candidate metric, opens an OTEL span tagged
+    with note id / profile / run id, and snapshots the live note dict so
+    a hook that mutates it and then raises does NOT leak partial state
+    into the rewrite (finding #1).  When *sync_tags* is supplied,
+    ``note["tags"]`` is set to a copy of it before the snapshot so the
+    snapshot reflects the latest stage-output tag state callers expect
+    rolled back on failure.
+
+    On any exception the snapshot is restored before re-raising so the
+    caller can compute counted-failure advancement / source-specific
+    recovery against the rolled-back note state.
+    """
+    if sync_tags is not None:
+        note["tags"] = list(sync_tags)
+    metrics.repair_candidates().add(1, {"profile": profile, "kind": kind})
+    snapshot = _snapshot_note(note)
+    tracer = get_tracer()
+    try:
+        with tracer.span(
+            span_name,
+            attributes={
+                "influx.note_id": note.get("id", ""),
+                "influx.profile": profile,
+                "influx.run_id": current_run_id.get() or "",
+            },
+        ):
+            yield
+    except BaseException:
+        _restore_note(note, snapshot)
+        raise
+
+
+def _apply_counted_failure(
+    *,
+    note: dict[str, Any],
+    current_tags: list[str],
+    exc: BaseException,
+    profile: str,
+    stage: CountedStage,
+    failure_stage: str,
+) -> list[str]:
+    """Advance the per-stage counter and emit terminal-flip logging.
+
+    No-op for transient failures (returns *current_tags* unchanged).
+    For counted failures, mutates ``note["content"]`` with the bumped
+    ``## Repair`` section and, when the cap is just crossed, also writes
+    ``note["tags"]`` and emits a structured WARNING so operators see the
+    stage flip in logs.  The ``<stage>_attempts`` log field is named per
+    *stage* so existing log-filter rules keep matching.
+    """
+    if classify_failure(exc) != "counted":
+        return current_tags
+    advance = record_counted_failure(
+        content=str(note.get("content", "")),
+        tags=current_tags,
+        stage=stage,
+        failure_stage=failure_stage,
+        failure_error=str(exc),
+    )
+    note["content"] = advance.new_content
+    if advance.terminal_tag_added:
+        note["tags"] = list(advance.new_tags)
+        logger.warning(
+            "sweep: %s marked terminal after %d counted failures for %s",
+            stage,
+            advance.attempts,
+            note.get("id", "?"),
+            extra={
+                "sweep_stage": f"{stage}_terminal_flip",
+                "note_id": note.get("id"),
+                "profile": profile,
+                "run_id": current_run_id.get() or "",
+                f"{stage}_attempts": advance.attempts,
+                "exc_type": type(exc).__name__,
+                "stage": getattr(exc, "stage", None),
+                "kind": getattr(exc, "kind", None) or failure_stage,
+                "detail": getattr(exc, "detail", None),
+            },
+        )
+    return advance.new_tags
+
+
 # ── Abstract-only re-extraction stage (§5.2) ──────────────────────
 
 
@@ -763,6 +863,27 @@ async def _sweep_resolve_version_conflict(
     return status
 
 
+async def _attempt_sweep_write(
+    client: LithosClient,
+    args: dict[str, Any],
+    *,
+    pending_tags: list[str],
+    note_id: str,
+) -> str:
+    """Single rewrite attempt with FR-MCP-7 version-conflict retry.
+
+    Returns the final response status (after one re-read + retry on
+    ``version_conflict``).  Raises :class:`SweepWriteError` on
+    transport failure or unresolved conflict.
+    """
+    status = await _sweep_call_write(client, args, note_id)
+    if status == "version_conflict":
+        status = await _sweep_resolve_version_conflict(
+            client, args, pending_tags, note_id
+        )
+    return status
+
+
 async def _rewrite_sweep_note(
     client: LithosClient,
     note: dict[str, Any],
@@ -825,38 +946,34 @@ async def _rewrite_sweep_note(
     if version is not None:
         base_args["expected_version"] = version
 
-    # ── Attempt 1: original content + tags. ───────────────────────
-    status = await _sweep_call_write(client, base_args, note_id)
-    if status == "version_conflict":
-        status = await _sweep_resolve_version_conflict(
-            client, base_args, list(tags), note_id
-        )
+    # Attempt 1: original content + tags.
+    status = await _attempt_sweep_write(
+        client, base_args, pending_tags=list(tags), note_id=note_id
+    )
     if status != "content_too_large":
         return
 
-    # ── Attempt 2: drop Tier 2 (## Full Text) and retry. ─────────
-    tier2_args = dict(base_args)
-    tier2_args["content"] = _drop_tier2(base_args["content"])
-    status = await _sweep_call_write(client, tier2_args, note_id)
-    if status == "version_conflict":
-        status = await _sweep_resolve_version_conflict(
-            client, tier2_args, list(tags), note_id
-        )
+    # Attempt 2: drop ## Full Text (Tier 2) and retry.
+    tier2_args = {**base_args, "content": _drop_tier2(base_args["content"])}
+    status = await _attempt_sweep_write(
+        client, tier2_args, pending_tags=list(tags), note_id=note_id
+    )
     if status != "content_too_large":
         return
 
-    # ── Attempt 3: drop Tier 2 + Tier 3, ensure repair-needed. ───
-    tier1_args = dict(base_args)
-    tier1_args["content"] = _drop_tier2_and_tier3(base_args["content"])
+    # Attempt 3: drop Tier 2 + Tier 3 and ensure influx:repair-needed
+    # so the note re-enters the sweep on a later run.
     repair_tags = list(tags)
     if "influx:repair-needed" not in repair_tags:
         repair_tags.append("influx:repair-needed")
-    tier1_args["tags"] = repair_tags
-    status = await _sweep_call_write(client, tier1_args, note_id)
-    if status == "version_conflict":
-        status = await _sweep_resolve_version_conflict(
-            client, tier1_args, list(repair_tags), note_id
-        )
+    tier1_args = {
+        **base_args,
+        "content": _drop_tier2_and_tier3(base_args["content"]),
+        "tags": repair_tags,
+    }
+    status = await _attempt_sweep_write(
+        client, tier1_args, pending_tags=repair_tags, note_id=note_id
+    )
     if status != "content_too_large":
         return
 
@@ -877,6 +994,178 @@ def _get_profile_thresholds(
             return p.thresholds.full_text, p.thresholds.deep_extract
     # Fallback defaults from ProfileThresholds.
     return 8, 9
+
+
+def _run_archive_retry(
+    note: dict[str, Any],
+    *,
+    profile: str,
+    current_tags: list[str],
+    archive_path: str | None,
+    hook: ArchiveDownloadHook,
+) -> tuple[list[str], str | None, bool]:
+    """Run the archive-download retry stage (FR-REP-1).
+
+    Returns ``(tags, archive_path, succeeded)``.  On failure the tag
+    list reflects any counted-failure terminal flip and the archive
+    path is left at its prior value; callers feed the returned path
+    back into :func:`compute_clearing` and the abstract-only
+    re-extraction eligibility re-check.
+    """
+    try:
+        with _stage_attempt(
+            note,
+            profile=profile,
+            kind="archive",
+            span_name="influx.repair.archive",
+        ):
+            downloaded_path = hook(note)
+        # Patch ## Archive with the freshly downloaded path (idempotent —
+        # only inserts when no path: line is already present).
+        content = str(note.get("content", ""))
+        marker = "## Archive\n"
+        idx = content.find(marker)
+        if idx >= 0:
+            insert_pos = idx + len(marker)
+            rest = content[insert_pos:]
+            if not rest.startswith("path:"):
+                note["content"] = (
+                    content[:insert_pos]
+                    + f"path: {downloaded_path}\n"
+                    + content[insert_pos:]
+                )
+        return current_tags, downloaded_path, True
+    except (ExtractionError, LithosError) as exc:
+        failure_stage = (
+            getattr(exc, "stage", "") or getattr(exc, "kind", "") or "archive_failed"
+        )
+        new_tags = _apply_counted_failure(
+            note=note,
+            current_tags=current_tags,
+            exc=exc,
+            profile=profile,
+            stage="archive",
+            failure_stage=failure_stage,
+        )
+        _log_stage_failure(
+            "archive_download",
+            note=note,
+            profile=profile,
+            exc=exc,
+        )
+        return new_tags, archive_path, False
+
+
+def _terminate_unsupported_text_source(note: dict[str, Any]) -> list[str]:
+    """Mark text extraction terminal when the note's source is unsupported.
+
+    Without a per-source resolver the text-extraction hook raises
+    ``ExtractionError(stage="unsupported_source")`` every pass and the
+    note loops forever.  We pin Tier 1 quality to ``text:abstract-only``,
+    add ``influx:text-terminal`` so later sweeps skip the stage, and
+    drop ``influx:repair-needed`` (when no other repair condition holds)
+    so the note exits the sweep entirely.
+    """
+    restored_tags = list(note.get("tags", []))
+    if not any(tag.startswith("text:") for tag in restored_tags):
+        restored_tags.append("text:abstract-only")
+    if "influx:text-terminal" not in restored_tags:
+        restored_tags.append("influx:text-terminal")
+    if "influx:archive-missing" not in restored_tags:
+        restored_tags = [tag for tag in restored_tags if tag != "influx:repair-needed"]
+    note["tags"] = list(restored_tags)
+    return restored_tags
+
+
+def _run_text_extraction_retry(
+    note: dict[str, Any],
+    *,
+    profile: str,
+    current_tags: list[str],
+    hook: TextExtractionHook,
+) -> list[str]:
+    """Run the text-extraction retry stage (FR-REP-1 stage 2).
+
+    Distinct from the abstract-only re-extraction stage below, which
+    upgrades ``text:abstract-only`` against an existing archive.  No
+    new terminal tag is introduced for normal failures (out of scope
+    for issue #24); ``unsupported_source`` failures are flipped to
+    terminal so the note exits the sweep instead of looping.
+    """
+    try:
+        with _stage_attempt(
+            note,
+            profile=profile,
+            kind="text_extraction",
+            span_name="influx.repair.text_extraction",
+            sync_tags=current_tags,
+        ):
+            new_text_tag = hook(note)
+        new_tags = list(current_tags)
+        if new_text_tag and not any(t.startswith("text:") for t in new_tags):
+            new_tags.append(new_text_tag)
+            note["tags"] = list(new_tags)
+        return new_tags
+    except (ExtractionError, LCMAError, LithosError) as exc:
+        new_tags = current_tags
+        if (
+            isinstance(exc, ExtractionError)
+            and getattr(exc, "stage", "") == "unsupported_source"
+        ):
+            new_tags = _terminate_unsupported_text_source(note)
+        _log_stage_failure(
+            "text_extraction",
+            note=note,
+            profile=profile,
+            exc=exc,
+        )
+        return new_tags
+
+
+def _run_tier_retry(
+    note: dict[str, Any],
+    *,
+    profile: str,
+    current_tags: list[str],
+    hook: Tier2EnrichHook | Tier3ExtractHook,
+    stage: CountedStage,
+    log_subject: str,
+) -> list[str]:
+    """Run a Tier 2 / Tier 3 retry stage.
+
+    Both tiers share the same shape — counted-failure cap, terminal-tag
+    flip, hook-mutation rollback — so they delegate to a single helper
+    parameterised on *stage* (``"tier2"`` / ``"tier3"``) and the log
+    subject used for the per-stage failure WARN line.
+    """
+    try:
+        with _stage_attempt(
+            note,
+            profile=profile,
+            kind=stage,
+            span_name=f"influx.repair.{stage}",
+            sync_tags=current_tags,
+        ):
+            hook(note)
+        # Sync any tag/content mutations the hook applied to the note
+        # dict back into the working tag set.
+        return list(note.get("tags", current_tags))
+    except (ExtractionError, LCMAError, LithosError) as exc:
+        new_tags = _apply_counted_failure(
+            note=note,
+            current_tags=current_tags,
+            exc=exc,
+            profile=profile,
+            stage=stage,
+            failure_stage=getattr(exc, "stage", "") or "",
+        )
+        _log_stage_failure(
+            log_subject,
+            note=note,
+            profile=profile,
+            exc=exc,
+        )
+        return new_tags
 
 
 async def _process_sweep_note(
@@ -932,278 +1221,94 @@ async def _process_sweep_note(
 
     # ── Execute selected stages ─────────────────────────────────
     current_tags = list(tags)
-
-    # Archive retry.
     archive_succeeded = False
+
+    # Issue #124: each per-stage helper invokes a sync hook that does
+    # blocking work — archive download (sync HTTP), text extraction
+    # (sync HTML/PDF), and tier 2/3 model calls (sync POST). Running
+    # them on the event loop starves the admin API exactly the way the
+    # acquire/filter path used to. Offload each helper to a worker
+    # thread; the helpers themselves stay sync (preserving the
+    # _stage_attempt context manager, telemetry, and tag-mutation
+    # rollback semantics inside them).
     if stages.archive_retry and hooks.archive_download:
-        # Snapshot before the hook so a raise rolls back any partial
-        # in-place note mutations the hook applied (finding #1).
-        snapshot = _snapshot_note(note)
-        metrics.repair_candidates().add(1, {"profile": profile, "kind": "archive"})
-        tracer = get_tracer()
-        try:
-            with tracer.span(
-                "influx.repair.archive",
-                attributes={
-                    "influx.note_id": note.get("id", ""),
-                    "influx.profile": profile,
-                    "influx.run_id": current_run_id.get() or "",
-                },
-            ):
-                downloaded_path = hooks.archive_download(note)
-            archive_path = downloaded_path
-            archive_succeeded = True
-            # Update ## Archive in note content with the new path.
-            content = str(note.get("content", ""))
-            marker = "## Archive\n"
-            idx = content.find(marker)
-            if idx >= 0:
-                insert_pos = idx + len(marker)
-                rest = content[insert_pos:]
-                if not rest.startswith("path:"):
-                    note["content"] = (
-                        content[:insert_pos]
-                        + f"path: {downloaded_path}\n"
-                        + content[insert_pos:]
-                    )
-        except (ExtractionError, LithosError) as exc:
-            # Hook raises are per-stage failures, not fatal aborts.
-            # Restore the note dict so partial in-place mutations from
-            # the failing hook are NOT persisted (finding #1).
-            _restore_note(note, snapshot)
-            if classify_failure(exc) == "counted":
-                kind = (
-                    getattr(exc, "stage", "")
-                    or getattr(exc, "kind", "")
-                    or "archive_failed"
-                )
-                advance = record_counted_failure(
-                    content=str(note.get("content", "")),
-                    tags=current_tags,
-                    stage="archive",
-                    failure_stage=kind,
-                    failure_error=str(exc),
-                )
-                note["content"] = advance.new_content
-                current_tags = advance.new_tags
-                if advance.terminal_tag_added:
-                    note["tags"] = list(current_tags)
-                    logger.warning(
-                        "sweep: archive marked terminal after %d failures for %s",
-                        advance.attempts,
-                        note.get("id", "?"),
-                        extra={
-                            "sweep_stage": "archive_terminal_flip",
-                            "note_id": note.get("id"),
-                            "profile": profile,
-                            "run_id": current_run_id.get() or "",
-                            "archive_attempts": advance.attempts,
-                            "exc_type": type(exc).__name__,
-                            "kind": kind,
-                            "detail": getattr(exc, "detail", None),
-                        },
-                    )
-            _log_stage_failure(
-                "archive_download",
-                note=note,
-                profile=profile,
-                exc=exc,
-            )
-
-    # Text extraction retry (FR-REP-1 stage 2).  Runs when the note
-    # carries no ``text:*`` tag at all — distinct from the abstract-
-    # only re-extraction stage below, which upgrades ``text:abstract-
-    # only`` against an existing archive.  No new terminal tag is
-    # introduced here (out of scope for #24); failures roll back the
-    # in-place note mutations and re-enter the sweep next pass.
-    if stages.text_extraction_retry and hooks.text_extraction:
-        note["tags"] = list(current_tags)
-        snapshot = _snapshot_note(note)
-        metrics.repair_candidates().add(
-            1, {"profile": profile, "kind": "text_extraction"}
+        current_tags, archive_path, archive_succeeded = await asyncio.to_thread(
+            _run_archive_retry,
+            note,
+            profile=profile,
+            current_tags=current_tags,
+            archive_path=archive_path,
+            hook=hooks.archive_download,
         )
-        tracer = get_tracer()
-        try:
-            with tracer.span(
-                "influx.repair.text_extraction",
-                attributes={
-                    "influx.note_id": note.get("id", ""),
-                    "influx.profile": profile,
-                    "influx.run_id": current_run_id.get() or "",
-                },
-            ):
-                new_text_tag = hooks.text_extraction(note)
-            if new_text_tag and not any(t.startswith("text:") for t in current_tags):
-                current_tags.append(new_text_tag)
-                note["tags"] = list(current_tags)
-        except (ExtractionError, LCMAError, LithosError) as exc:
-            _restore_note(note, snapshot)
-            _log_stage_failure(
-                "text_extraction",
-                note=note,
-                profile=profile,
-                exc=exc,
-            )
 
-    # Abstract-only re-extraction.
-    # Re-evaluate eligibility if archive just succeeded this pass
-    # (initial selection used archive_succeeded_this_pass=False).
-    run_abstract_reextraction = stages.abstract_only_reextraction
-    if (
-        not run_abstract_reextraction
-        and archive_succeeded
+    if stages.text_extraction_retry and hooks.text_extraction:
+        current_tags = await asyncio.to_thread(
+            _run_text_extraction_retry,
+            note,
+            profile=profile,
+            current_tags=current_tags,
+            hook=hooks.text_extraction,
+        )
+
+    # Re-evaluate abstract-only re-extraction eligibility now that the
+    # archive download outcome is known (initial selection above used
+    # archive_succeeded_this_pass=False).
+    run_abstract_reextraction = stages.abstract_only_reextraction or (
+        archive_succeeded
         and "text:abstract-only" in set(tags)
         and "influx:text-terminal" not in set(tags)
-    ):
-        run_abstract_reextraction = True
-
+    )
     if (
         run_abstract_reextraction
         and hooks.re_extract_archive
         and archive_path is not None
     ):
-        current_tags = apply_abstract_only_reextraction(
+        current_tags = await asyncio.to_thread(
+            apply_abstract_only_reextraction,
             tags=current_tags,
             note=note,
             archive_path=archive_path,
             hook=hooks.re_extract_archive,
         )
 
-    # Tier 2 retry.
     if stages.tier2_retry and hooks.tier2_enrich:
-        # Expose any tag mutations from earlier stages so the hook sees
-        # the latest tag set on the note dict.
-        note["tags"] = list(current_tags)
-        # Snapshot AFTER updating tags so an exception rolls back to
-        # the expected pre-hook state — including the latest current_tags
-        # rather than whatever was on the note before this stage ran.
-        snapshot = _snapshot_note(note)
-        metrics.repair_candidates().add(1, {"profile": profile, "kind": "tier2"})
-        tracer = get_tracer()
-        try:
-            with tracer.span(
-                "influx.repair.tier2",
-                attributes={
-                    "influx.note_id": note.get("id", ""),
-                    "influx.profile": profile,
-                    "influx.run_id": current_run_id.get() or "",
-                },
-            ):
-                hooks.tier2_enrich(note)
-            # Sync any tag/content mutations the hook applied to the
-            # note dict back into the local working set.
-            current_tags = list(note.get("tags", current_tags))
-        except (ExtractionError, LCMAError, LithosError) as exc:
-            # Per-stage failure: roll back any partial in-place
-            # mutations from the failing hook (finding #1).  Do NOT
-            # sync hook mutations into ``current_tags``.
-            _restore_note(note, snapshot)
-            if classify_failure(exc) == "counted":
-                advance = record_counted_failure(
-                    content=str(note.get("content", "")),
-                    tags=current_tags,
-                    stage="tier2",
-                    failure_stage=getattr(exc, "stage", "") or "",
-                    failure_error=str(exc),
-                )
-                note["content"] = advance.new_content
-                current_tags = advance.new_tags
-                if advance.terminal_tag_added:
-                    note["tags"] = list(current_tags)
-                    logger.warning(
-                        "sweep: tier2 marked terminal after %d counted failures for %s",
-                        advance.attempts,
-                        note.get("id", "?"),
-                        extra={
-                            "sweep_stage": "tier2_terminal_flip",
-                            "note_id": note.get("id"),
-                            "profile": profile,
-                            "run_id": current_run_id.get() or "",
-                            "tier2_attempts": advance.attempts,
-                            "exc_type": type(exc).__name__,
-                            "stage": getattr(exc, "stage", None),
-                            "detail": getattr(exc, "detail", None),
-                        },
-                    )
-            _log_stage_failure(
-                "tier2_enrichment",
-                note=note,
-                profile=profile,
-                exc=exc,
-            )
+        current_tags = await asyncio.to_thread(
+            _run_tier_retry,
+            note,
+            profile=profile,
+            current_tags=current_tags,
+            hook=hooks.tier2_enrich,
+            stage="tier2",
+            log_subject="tier2_enrichment",
+        )
 
-    # Tier 3 retry.
     if stages.tier3_retry and hooks.tier3_extract:
-        note["tags"] = list(current_tags)
-        snapshot = _snapshot_note(note)
-        metrics.repair_candidates().add(1, {"profile": profile, "kind": "tier3"})
-        tracer = get_tracer()
-        try:
-            with tracer.span(
-                "influx.repair.tier3",
-                attributes={
-                    "influx.note_id": note.get("id", ""),
-                    "influx.profile": profile,
-                    "influx.run_id": current_run_id.get() or "",
-                },
-            ):
-                hooks.tier3_extract(note)
-            current_tags = list(note.get("tags", current_tags))
-        except (ExtractionError, LCMAError, LithosError) as exc:
-            _restore_note(note, snapshot)
-            if classify_failure(exc) == "counted":
-                advance = record_counted_failure(
-                    content=str(note.get("content", "")),
-                    tags=current_tags,
-                    stage="tier3",
-                    failure_stage=getattr(exc, "stage", "") or "",
-                    failure_error=str(exc),
-                )
-                note["content"] = advance.new_content
-                current_tags = advance.new_tags
-                if advance.terminal_tag_added:
-                    note["tags"] = list(current_tags)
-                    logger.warning(
-                        "sweep: tier3 marked terminal after %d counted failures for %s",
-                        advance.attempts,
-                        note.get("id", "?"),
-                        extra={
-                            "sweep_stage": "tier3_terminal_flip",
-                            "note_id": note.get("id"),
-                            "profile": profile,
-                            "run_id": current_run_id.get() or "",
-                            "tier3_attempts": advance.attempts,
-                            "exc_type": type(exc).__name__,
-                            "stage": getattr(exc, "stage", None),
-                            "detail": getattr(exc, "detail", None),
-                        },
-                    )
-            _log_stage_failure(
-                "tier3_extraction",
-                note=note,
-                profile=profile,
-                exc=exc,
-            )
+        current_tags = await asyncio.to_thread(
+            _run_tier_retry,
+            note,
+            profile=profile,
+            current_tags=current_tags,
+            hook=hooks.tier3_extract,
+            stage="tier3",
+            log_subject="tier3_extraction",
+        )
 
     # ── Compute and apply clearing ──────────────────────────────
-    post_archive_path = archive_path
-
     clearing = compute_clearing(
         tags=current_tags,
-        archive_path=post_archive_path,
+        archive_path=archive_path,
         max_profile_score=max_profile_score,
         full_text_threshold=ft_thresh,
         deep_extract_threshold=de_thresh,
     )
-
     if clearing.clear_archive_missing:
         current_tags = [t for t in current_tags if t != "influx:archive-missing"]
     if clearing.clear_repair_needed:
         current_tags = [t for t in current_tags if t != "influx:repair-needed"]
 
-    # Apply rejection guard (FR-NOTE-6, AC-M3-6): ensure the final
-    # tag set preserves influx:rejected:<profile> tags and does NOT
-    # re-add profile:<name> for rejected profiles.
+    # Apply rejection guard (FR-NOTE-6, AC-M3-6): preserve any
+    # influx:rejected:<profile> tags and do NOT re-add profile:<name>
+    # for rejected profiles.
     current_tags = merge_tags(existing_tags=tags, new_tags=current_tags)
 
     # ── Rewrite (§5.4 retry-order advancement) ──────────────────
@@ -1261,21 +1366,12 @@ async def sweep(
         effective_hooks = make_default_sweep_hooks(config).to_sweep_hooks()
 
     limit = config.repair.max_items_per_run
-    list_result = await client.list_notes(
+    body = await client.list_notes_body(
         tags=["influx:repair-needed", f"profile:{profile}"],
         limit=limit,
         order_by="updated_at",
         order="asc",
     )
-
-    text = list_result.content[0].text  # type: ignore[union-attr]
-    if getattr(list_result, "isError", False) is True:
-        raise LithosError(
-            "lithos_list failed during repair sweep",
-            operation="repair_sweep",
-            detail=text,
-        )
-    body = json.loads(text)
     items: list[dict[str, Any]] = body.get("items", [])
     items.sort(
         key=lambda item: str(item.get("updated_at") or item.get("updated") or "")

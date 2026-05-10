@@ -15,7 +15,7 @@ This module owns the seam.  Source adapters live under
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -23,6 +23,7 @@ from influx.config import AppConfig, ProfileConfig
 from influx.coordinator import RunKind
 
 __all__ = [
+    "BoundScoredCandidate",
     "Candidate",
     "ScoredCandidate",
     "Source",
@@ -65,6 +66,30 @@ class ScoredCandidate:
     confidence: float
     reason: str
     filter_tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BoundScoredCandidate:
+    """A :class:`ScoredCandidate` plus a thunk that performs source-specific
+    acquire (#125).
+
+    Returned by the unified ``ItemProvider`` so the orchestration layer
+    can run ``lithos_cache_lookup`` on candidate identity *before* the
+    source adapter pays the full download/archive/extract cost.
+
+    ``acquire`` is a no-arg async callable that captures the source
+    adapter, ``profile_cfg``, and ``config`` from the provider scope;
+    invoking it runs the per-item acquire (typically wrapping
+    :func:`asyncio.to_thread` around blocking work, #124) and returns
+    the ready-to-yield ``ProfileItem`` dict.
+
+    ``source_label`` carries the source family used for metric labels and
+    log lines — ``"arxiv"`` or ``"rss:<feed_name>"``.
+    """
+
+    scored: ScoredCandidate
+    acquire: Callable[[], Awaitable[dict[str, Any] | None]]
+    source_label: str
 
 
 @runtime_checkable

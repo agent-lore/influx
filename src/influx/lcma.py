@@ -6,7 +6,6 @@ and the post-write retrieve + edge wiring used by the LCMA flow.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any
@@ -190,15 +189,13 @@ async def after_write(
             "influx.run_id": current_run_id.get() or "",
         },
     ):
-        result = await client.retrieve(
+        body = await client.retrieve_body(
             query=query,
             limit=5,
             agent_id="influx",
             task_id=run_task_id,
             tags=[f"profile:{profile}"],
         )
-
-    body = json.loads(result.content[0].text)  # type: ignore[union-attr]
     results: list[dict[str, Any]] = body.get("results", [])
     logger.info(
         "LCMA retrieve completed profile=%s run_id=%s source_url=%s "
@@ -215,6 +212,20 @@ async def after_write(
     for r in results:
         score = float(r.get("score", 0.0))
         if score < lcma_edge_score:
+            logger.debug(
+                "LCMA related_to result below threshold profile=%s run_id=%s "
+                "source_url=%s note_id=%s tool=%s target_note_id=%s "
+                "target_title=%r score=%.3f threshold=%.3f",
+                profile,
+                current_run_id.get() or "",
+                source_url,
+                source_note_id,
+                "lithos_retrieve",
+                r.get("note_id", ""),
+                r.get("title", ""),
+                score,
+                lcma_edge_score,
+            )
             continue
 
         receipt_id = r.get("receipt_id", "")
@@ -290,27 +301,37 @@ async def resolve_builds_on(
     for item in builds_on:
         ref = extract_arxiv_ref(item)
         if ref is None:
+            logger.info(
+                "LCMA builds_on item missing arxiv_id profile=%s run_id=%s "
+                "source_url=%s note_id=%s item=%r",
+                profile,
+                current_run_id.get() or "",
+                written_source_url,
+                source_note_id,
+                item,
+            )
             continue
 
         prior_title, arxiv_id = ref
         source_url = f"https://arxiv.org/abs/{arxiv_id}"
 
-        result = await client.cache_lookup(
+        body = await client.cache_lookup_body(
             query=prior_title,
             source_url=source_url,
         )
-
-        body = json.loads(result.content[0].text)  # type: ignore[union-attr]
         if not body.get("hit"):
             logger.info(
                 "LCMA builds_on lookup miss profile=%s run_id=%s "
-                "source_url=%s note_id=%s tool=%s target_source_url=%s",
+                "source_url=%s note_id=%s tool=%s target_source_url=%s "
+                "prior_title=%r arxiv_id=%s",
                 profile,
                 current_run_id.get() or "",
                 written_source_url,
                 source_note_id,
                 "lithos_cache_lookup",
                 source_url,
+                prior_title,
+                arxiv_id,
             )
             continue
 
@@ -319,7 +340,7 @@ async def resolve_builds_on(
             logger.info(
                 "LCMA builds_on lookup source_url mismatch profile=%s run_id=%s "
                 "source_url=%s note_id=%s tool=%s expected_source_url=%s "
-                "actual_source_url=%s",
+                "actual_source_url=%s prior_title=%r arxiv_id=%s",
                 profile,
                 current_run_id.get() or "",
                 written_source_url,
@@ -327,6 +348,8 @@ async def resolve_builds_on(
                 "lithos_cache_lookup",
                 source_url,
                 body.get("source_url", ""),
+                prior_title,
+                arxiv_id,
             )
             continue
 

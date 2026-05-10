@@ -270,13 +270,20 @@ class TestBackfillCacheLookupSkip:
         # Queue Lithos: feedback
         fake_lithos.list_responses.append(json.dumps({"items": []}))
 
-        # First item: cache miss (will be written)
-        # Second item: cache hit (should be skipped)
+        # #125 ordering — pre-acquire dedup runs primary lookup on every
+        # scored candidate FIRST (fetch+score order), then for cache-miss
+        # items the Ingest URL fallback (#128) runs.
+        #   1. item1 (Alpha) primary  → miss (goes to acquire)
+        #   2. item2 (Beta)  primary  → hit  (backfill drops pre-acquire)
+        #   3. item1 (Alpha) URL fbk  → miss (write proceeds)
         fake_lithos.cache_lookup_responses.append(
             json.dumps({"hit": False, "stale_exists": False})
         )
         fake_lithos.cache_lookup_responses.append(
             json.dumps({"hit": True, "stale_exists": False})
+        )
+        fake_lithos.cache_lookup_responses.append(
+            json.dumps({"hit": False, "stale_exists": False})
         )
 
         with patch(
@@ -299,9 +306,12 @@ class TestBackfillCacheLookupSkip:
         assert len(write_calls) == 1
         assert write_calls[0][1]["title"] == "Backfill Paper Alpha"
 
-        # Verify: TWO cache_lookup calls (both items checked).
+        # Verify: THREE cache_lookup calls — both items get primary
+        # pre-acquire (#125), then item 1 also does the source_url
+        # fallback (#128) on its primary miss before write.  Item 2's
+        # primary hit short-circuits in Acquire so no fallback runs.
         cache_calls = [c for c in fake_lithos.calls if c[0] == "lithos_cache_lookup"]
-        assert len(cache_calls) == 2
+        assert len(cache_calls) == 3
 
     def test_all_cache_hits_produce_zero_writes(
         self,
@@ -881,12 +891,13 @@ class TestBackfillEndpointEndToEnd:
                 return_value=list(_FIXTURE_ARXIV_ITEMS),
             ),
             patch("influx.sources.arxiv._sleep"),
-            # ``send_digest`` lazily imports ``guarded_post_json`` from
-            # ``influx.http_client``, so the patch must target the
-            # source module rather than ``influx.notifications``.
+            # The webhook dispatcher uses ``_dispatch_webhook_post`` from
+            # ``influx.notifications``; patching it here keeps the
+            # backfill path off the network entirely while still
+            # exercising the dispatch decision (which must NOT fire
+            # for kind=BACKFILL).
             patch(
-                "influx.http_client.guarded_post_json",
-                return_value=200,
+                "influx.notifications._dispatch_webhook_post",
             ) as mock_webhook_post,
             TestClient(app) as client,
         ):
@@ -911,7 +922,7 @@ class TestBackfillEndpointEndToEnd:
 
         # ── AC-09-G: no webhook HTTP call ─────────────────────────────
         # ``send_digest`` short-circuits for ``kind=BACKFILL`` so the
-        # real ``guarded_post_json`` sender must never be invoked.
+        # real webhook dispatcher must never be invoked.
         mock_webhook_post.assert_not_called()
 
         # ── AC-09-H: no repair-sweep ``lithos_list`` call ─────────────

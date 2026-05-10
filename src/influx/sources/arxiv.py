@@ -18,7 +18,9 @@ abstract-only extraction cascade and rendering the canonical note.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
@@ -44,7 +46,7 @@ from influx.extraction.pipeline import extract_arxiv_text
 from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
 from influx.renderer import render
-from influx.source import Candidate, ScoredCandidate
+from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.storage import download_archive
 from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
@@ -53,6 +55,7 @@ from influx.telemetry import (
     record_fetched_items,
     record_filter_error,
     record_source_acquisition_error,
+    record_source_retry,
 )
 
 if TYPE_CHECKING:
@@ -372,13 +375,86 @@ def _parse_retry_after_seconds(value: str) -> float | None:
 def _arxiv_429_delay(
     result_headers: dict[str, str],
     resilience: ResilienceConfig,
+    *,
+    attempt: int,
 ) -> float:
+    """Compute the per-attempt 429 backoff delay.
+
+    Issue #129: progressive doubling of ``arxiv_429_backoff_seconds``
+    by ``2 ** attempt`` so a run that hits 429 repeatedly waits longer
+    each time, capped at ``arxiv_429_backoff_max_seconds``.  An
+    ``Retry-After`` header (when present and parseable) overrides the
+    computed delay but is itself clamped to the same cap so a misbehaving
+    upstream cannot extend a run indefinitely.  ``attempt`` is the
+    zero-based index of the current attempt (0 on the first try).
+    """
+    cap = float(resilience.arxiv_429_backoff_max_seconds)
+    min_interval = float(resilience.arxiv_request_min_interval_seconds)
+    base = float(resilience.arxiv_429_backoff_seconds)
     retry_after = _header_value(result_headers, "Retry-After")
     if retry_after is not None:
         parsed = _parse_retry_after_seconds(retry_after)
         if parsed is not None:
-            return max(float(resilience.arxiv_request_min_interval_seconds), parsed)
-    return float(resilience.arxiv_429_backoff_seconds)
+            return min(max(min_interval, parsed), cap)
+    return min(base * (2**attempt), cap)
+
+
+# Issue #129: process-wide next-slot allocator used to enforce
+# ``arxiv_request_min_interval_seconds`` across *all* arXiv fetches in
+# the same process — not just the per-day backfill loop.
+#
+# The pattern is a token-bucket-style "claim a slot under the lock,
+# then sleep until that slot outside the lock" scheme.  Storing
+# *next-allowed* (rather than *last-fetched*) lets concurrent callers
+# claim distinct, non-overlapping slots in a single critical section —
+# review of the original implementation flagged that holding the lock
+# only across the read/write but not across the sleep let two
+# concurrent callers observe the same ``last`` timestamp, compute the
+# same wait, and then start their HTTP fetches together, defeating the
+# pacing guarantee.  Slot allocation runs under the lock; the wait
+# itself happens with the lock released so a long ``Retry-After``-style
+# sleep does not block fetches that already hold a later slot.
+_FETCH_PACING_LOCK = threading.Lock()
+_NEXT_FETCH_SLOT_MONOTONIC: float | None = None
+
+
+def _reset_fetch_pacing_for_tests() -> None:
+    """Reset the module-level pacing state — test seam only.
+
+    Unit tests covering :func:`_apply_min_interval` need a clean baseline
+    between cases; production code never calls this.
+    """
+    global _NEXT_FETCH_SLOT_MONOTONIC  # noqa: PLW0603
+    with _FETCH_PACING_LOCK:
+        _NEXT_FETCH_SLOT_MONOTONIC = None
+
+
+def _apply_min_interval(min_interval: float) -> None:
+    """Block until this caller's paced slot starts.
+
+    Atomically claims the next ``min_interval``-spaced slot under
+    :data:`_FETCH_PACING_LOCK`, then sleeps the difference between the
+    claimed slot and ``now`` with the lock released.  Two concurrent
+    callers therefore receive *different* slots — caller A sleeps zero
+    and starts immediately, caller B sleeps ``min_interval`` and starts
+    after A — instead of both observing the same "last fetch" timestamp
+    and racing each other to the wire.
+
+    When *min_interval* is ``0`` (or negative) the helper short-circuits
+    without touching the slot state: pacing is disabled wholesale and a
+    later paced call starts from a clean baseline.
+    """
+    global _NEXT_FETCH_SLOT_MONOTONIC  # noqa: PLW0603
+    if min_interval <= 0:
+        return
+    now = time.monotonic()
+    with _FETCH_PACING_LOCK:
+        next_slot = _NEXT_FETCH_SLOT_MONOTONIC
+        my_slot = now if next_slot is None or next_slot <= now else next_slot
+        _NEXT_FETCH_SLOT_MONOTONIC = my_slot + min_interval
+    wait = my_slot - now
+    if wait > 0:
+        _sleep(wait)
 
 
 def fetch_arxiv(
@@ -473,6 +549,23 @@ def _fetch_with_retry(
     when omitted they are resolved from the pydantic
     :class:`~influx.config.StorageConfig` field defaults so the only
     place these tunable defaults live is config-parsing code (AC-X-1).
+
+    Issue #129 hardening:
+
+    - 429 retries use a separate, more generous budget
+      (``arxiv_429_max_retries``) than network/5xx retries
+      (``max_retries``) because 429 is a soft, recoverable signal.
+    - 429 backoff is progressive (doubling per attempt) and capped at
+      ``arxiv_429_backoff_max_seconds`` so a flapping upstream cannot
+      degrade the run while still preventing unbounded waits.
+    - The first attempt waits for ``arxiv_request_min_interval_seconds``
+      to elapse since the last in-process arXiv fetch, pacing fetches
+      across profiles within a single scheduled tick (the per-day
+      backfill loop already paces itself with the same interval, so the
+      helper fast-paths through there).
+    - Each retry decision is recorded via :func:`record_source_retry`
+      so the run ledger surfaces "we hit 429 N times but recovered"
+      distinct from the swallowed-error list.
     """
     if max_download_bytes is None or timeout_seconds is None:
         _storage_defaults = StorageConfig()
@@ -483,10 +576,20 @@ def _fetch_with_retry(
 
     max_retries = resilience.max_retries
     backoff_base = resilience.backoff_base_seconds
+    rate_limit_max_retries = resilience.arxiv_429_max_retries
+
+    # Pace this fetch against the previous in-process arXiv fetch.  A
+    # zero / negative interval is treated as "no pacing" by the helper.
+    _apply_min_interval(float(resilience.arxiv_request_min_interval_seconds))
 
     last_error: Exception | None = None
 
-    for attempt in range(max_retries + 1):
+    # The retry loop runs up to ``1 + max(network, rate-limit)`` times so
+    # the more generous 429 budget can still drive forward progress when
+    # 429s dominate.  Each branch checks its own budget before deciding
+    # to retry.
+    total_attempts = 1 + max(max_retries, rate_limit_max_retries)
+    for attempt in range(total_attempts):
         try:
             # Fetch without expected_content_type so status-code handling
             # (429 backoff, 5xx retry) runs first. Non-XML 429/5xx
@@ -508,6 +611,10 @@ def _fetch_with_retry(
                     exc.kind,
                     delay,
                 )
+                record_source_retry(
+                    source="arxiv",
+                    kind=exc.kind or "network",
+                )
                 _sleep(delay)
                 continue
             raise
@@ -518,14 +625,15 @@ def _fetch_with_retry(
                 url=url,
                 kind="rate_limit",
             )
-            if attempt < max_retries:
-                delay = _arxiv_429_delay(result.headers, resilience)
+            if attempt < rate_limit_max_retries:
+                delay = _arxiv_429_delay(result.headers, resilience, attempt=attempt)
                 _log.warning(
                     "arXiv 429 on attempt %d/%d, backing off %.1fs (FR-RES-2)",
                     attempt + 1,
-                    max_retries + 1,
+                    rate_limit_max_retries + 1,
                     delay,
                 )
+                record_source_retry(source="arxiv", kind="rate_limit")
                 _sleep(delay)
                 continue
             raise last_error
@@ -546,6 +654,7 @@ def _fetch_with_retry(
                     max_retries + 1,
                     delay,
                 )
+                record_source_retry(source="arxiv", kind="network")
                 _sleep(delay)
                 continue
             raise last_error
@@ -972,7 +1081,12 @@ async def _fetch_arxiv_items(
             arxiv_cfg.max_results_per_category,
             arxiv_cfg.lookback_days,
         )
-        return fetch_arxiv(
+        # Issue #124: ``fetch_arxiv`` is synchronous and performs
+        # blocking HTTP via ``guarded_fetch`` plus blocking ``_sleep``
+        # backoff for arxiv 429s. Offload to a worker thread so the
+        # admin event loop stays responsive throughout the fetch.
+        return await asyncio.to_thread(
+            fetch_arxiv,
             arxiv_config=arxiv_cfg,
             resilience=config.resilience,
             backfill_range=backfill_range,
@@ -1005,9 +1119,13 @@ async def _fetch_arxiv_items(
             arxiv_cfg.categories,
             per_day_max,
         )
-        _sleep(pacing)
+        # Issue #124: blocking sleep + sync fetch on the event loop —
+        # offload both to a worker thread so the admin API stays
+        # responsive across the per-day backfill loop.
+        await asyncio.to_thread(_sleep, pacing)
         try:
-            day_items = fetch_arxiv(
+            day_items = await asyncio.to_thread(
+                fetch_arxiv,
                 arxiv_config=per_day_arxiv_cfg,
                 resilience=config.resilience,
                 backfill_range=day_range,
@@ -1090,7 +1208,7 @@ def make_arxiv_item_provider(
         kind: RunKind,
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
-    ) -> Iterable[dict[str, Any]]:
+    ) -> Iterable[BoundScoredCandidate]:
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
         if profile_cfg is None:
             _log.info("arxiv source skipped profile=%s reason=unknown_profile", profile)
@@ -1116,19 +1234,38 @@ def make_arxiv_item_provider(
             filter_scorer=filter_scorer,
         )
 
-        # ── 3. Source.acquire per scored candidate ────────────────
-        results: list[dict[str, Any]] = [
-            source.acquire(sc, profile_cfg=profile_cfg, config=config)
-            for sc in scored_list
-        ]
+        # ── 3. Bind per-item acquire as closures (#125) ────────────
+        # ``Source.acquire`` is invoked by the Run's Acquire stage after
+        # pre-acquire cache_lookup partitions cache misses + merge-bound
+        # hits from outright skips.  Issue #124 still applies — the
+        # closure wraps the blocking acquire in ``asyncio.to_thread`` so
+        # admin endpoints stay responsive once the closure is invoked.
+        bounds: list[BoundScoredCandidate] = []
+        for sc in scored_list:
+
+            async def _acquire(sc: ScoredCandidate = sc) -> dict[str, Any] | None:
+                return await asyncio.to_thread(
+                    source.acquire,
+                    sc,
+                    profile_cfg=profile_cfg,
+                    config=config,
+                )
+
+            bounds.append(
+                BoundScoredCandidate(
+                    scored=sc,
+                    acquire=_acquire,
+                    source_label="arxiv",
+                )
+            )
 
         _log.info(
-            "arxiv source completed profile=%s fetched=%d accepted=%d",
+            "arxiv source completed profile=%s fetched=%d scored=%d",
             profile,
             len(candidates),
-            len(results),
+            len(bounds),
         )
-        return results
+        return bounds
 
     return provider
 

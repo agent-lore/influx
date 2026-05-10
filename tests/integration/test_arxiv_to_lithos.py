@@ -45,6 +45,7 @@ from influx.notifications import (
 from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler
 from influx.service import post_run_webhook_hook
+from tests._bound_helpers import bounds_for
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Fake webhook receiver ──────────────────────────────────────────
@@ -228,11 +229,11 @@ def _make_item_provider(
         kind: RunKind,
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
-    ) -> Iterable[dict[str, Any]]:
+    ) -> Iterable[Any]:
         del profile, kind, run_range
         if captured is not None:
             captured["filter_prompt"] = filter_prompt
-        return list(items)
+        return bounds_for(items)
 
     return provider
 

@@ -32,6 +32,7 @@ from influx.config import (
 from influx.coordinator import RunKind
 from influx.probes import ProbeLoop
 from influx.scheduler import run_profile
+from tests._bound_helpers import bounds_for
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -219,7 +220,7 @@ class TestTaskBracketing:
             kind: RunKind,
             run_range: Any,
             filter_prompt: str,
-        ) -> list[dict[str, Any]]:
+        ) -> list[Any]:
             raise RuntimeError("simulated provider failure")
 
         with pytest.raises(RuntimeError, match="simulated provider failure"):
@@ -254,9 +255,9 @@ def _single_item_provider(
         kind: RunKind,
         run_range: Any,
         filter_prompt: str,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Any]:
         del profile, kind, run_range, filter_prompt
-        return items
+        return bounds_for(items)
 
     return _provider
 
@@ -440,11 +441,16 @@ class TestBuildsOnResolver:
         fake_lithos.retrieve_responses.append(_json.dumps({"results": []}))
 
         # Queue a cache_lookup hit for the builds_on arXiv URL.
-        # First cache_lookup is the per-item dedup check (miss).
+        # First cache_lookup is the per-item dedup check (primary miss).
         fake_lithos.cache_lookup_responses.append(
             _json.dumps({"hit": False, "stale_exists": False})
         )
-        # Second cache_lookup is the builds_on resolver (hit).
+        # Second cache_lookup is the per-item dedup source_url fallback
+        # (#128) — also a miss, so the write proceeds.
+        fake_lithos.cache_lookup_responses.append(
+            _json.dumps({"hit": False, "stale_exists": False})
+        )
+        # Third cache_lookup is the builds_on resolver (hit).
         fake_lithos.cache_lookup_responses.append(
             _json.dumps(
                 {
@@ -479,9 +485,10 @@ class TestBuildsOnResolver:
 
         # Verify cache_lookup was called with correct args (FR-MCP-3, R-7).
         cache_calls = _calls_by_tool(fake_lithos.calls, "lithos_cache_lookup")
-        # One for dedup + one for builds_on.
-        assert len(cache_calls) == 2
-        builds_on_lookup = cache_calls[1]
+        # One for dedup primary + one for dedup source_url fallback (#128)
+        # + one for builds_on resolver.
+        assert len(cache_calls) == 3
+        builds_on_lookup = cache_calls[2]
         assert builds_on_lookup["query"] == "FooNet"
         assert builds_on_lookup["source_url"] == "https://arxiv.org/abs/2412.12345"
 
@@ -540,7 +547,8 @@ class TestBuildsOnResolver:
 
         # builds_on cache_lookup was called.
         cache_calls = _calls_by_tool(fake_lithos.calls, "lithos_cache_lookup")
-        assert len(cache_calls) == 2
+        # dedup primary + dedup source_url fallback (#128) + builds_on resolver.
+        assert len(cache_calls) == 3
 
         # No builds_on edges upserted.
         edge_calls = _calls_by_tool(fake_lithos.calls, "lithos_edge_upsert")

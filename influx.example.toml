@@ -293,13 +293,25 @@ strip_tags = ["script", "iframe", "object", "embed"]
 # ---------------------------------------------------------------------------
 
 [resilience]
-# Recommended for staging/prod arXiv traffic: max_retries = 5 and
-# arxiv_429_backoff_seconds = 30. Retry-After headers override the flat
-# 429 backoff when arXiv provides them.
-max_retries = 3
+# Issue #129: defaults are now production-tuned out of the box.
+# - max_retries (5) covers transient network / 5xx failures.
+# - arxiv_429_backoff_seconds (30) is the *base* delay on HTTP 429;
+#   each subsequent 429 in the same fetch doubles the wait
+#   (30, 60, 120, ...) up to arxiv_429_backoff_max_seconds.
+# - arxiv_429_max_retries (5) is a separate, more generous budget for
+#   429 specifically — 429 is a soft rate-limit signal, not a hard
+#   network failure, and warrants more patience.
+# - arxiv_request_min_interval_seconds (3) is enforced *per process*
+#   across all arXiv fetches (scheduled and backfill), so two profiles
+#   in the same tick cannot hit arXiv back-to-back.
+# Retry-After headers, when present, override the computed 429 backoff
+# but are themselves clamped to arxiv_429_backoff_max_seconds.
+max_retries = 5
 backoff_base_seconds = 1
 arxiv_request_min_interval_seconds = 3
-arxiv_429_backoff_seconds = 10
+arxiv_429_backoff_seconds = 30
+arxiv_429_backoff_max_seconds = 120
+arxiv_429_max_retries = 5
 lithos_write_conflict_max_retries = 1
 
 # ---------------------------------------------------------------------------

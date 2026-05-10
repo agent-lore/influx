@@ -17,23 +17,13 @@ Lower-level retrieve / cache-lookup primitives are exercised in
 
 from __future__ import annotations
 
-import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from influx.errors import LCMAError
 from influx.lcma_wiring import CascadeOutput, LcmaWiringDeps, wire
-
-
-def _mcp_text_result(payload: dict[str, Any]) -> MagicMock:
-    """Build a fake MCP-style result whose ``content[0].text`` is JSON."""
-    text_content = MagicMock()
-    text_content.text = json.dumps(payload)
-    result = MagicMock()
-    result.content = [text_content]
-    return result
 
 
 def _make_client(
@@ -43,11 +33,9 @@ def _make_client(
 ) -> AsyncMock:
     """Build an AsyncMock LithosClient with the listed call returns."""
     client = AsyncMock()
-    client.retrieve = AsyncMock(
-        return_value=_mcp_text_result(retrieve_payload or {"results": []})
-    )
-    client.cache_lookup = AsyncMock(
-        return_value=_mcp_text_result(cache_lookup_payload or {"hit": False})
+    client.retrieve_body = AsyncMock(return_value=retrieve_payload or {"results": []})
+    client.cache_lookup_body = AsyncMock(
+        return_value=cache_lookup_payload or {"hit": False}
     )
     client.edge_upsert = AsyncMock()
     return client
@@ -127,6 +115,41 @@ class TestRelatedToEdgeScoreThreshold:
         client.edge_upsert.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_below_threshold_emits_debug_log_with_item_identity(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Per-result below-threshold skips are observable at debug level (#108)."""
+        caplog.set_level("DEBUG")
+        client = _make_client(
+            retrieve_payload={
+                "results": [
+                    {"title": "Weak match", "score": 0.5, "note_id": "note-weak"},
+                ]
+            }
+        )
+        deps = _make_deps(client, lcma_edge_score=0.75)
+
+        await wire(
+            written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
+            cascade=CascadeOutput(title="A Paper"),
+            deps=deps,
+        )
+
+        skip_records = [
+            record
+            for record in caplog.records
+            if "LCMA related_to result below threshold" in record.message
+        ]
+        assert skip_records, "expected a below-threshold debug log"
+        message = skip_records[0].getMessage()
+        assert "Weak match" in message
+        assert "note-weak" in message
+        assert "0.500" in message  # score
+        assert "0.750" in message  # threshold
+
+    @pytest.mark.asyncio
     async def test_threshold_boundary_is_inclusive(self) -> None:
         """A result scoring exactly at the threshold is kept (>=, not >)."""
         client = _make_client(
@@ -176,7 +199,7 @@ class TestBuildsOnResolution:
             deps=deps,
         )
 
-        client.cache_lookup.assert_awaited_once()
+        client.cache_lookup_body.assert_awaited_once()
         # Find the builds_on edge among the upsert calls.
         upserts = [
             call.kwargs
@@ -204,7 +227,36 @@ class TestBuildsOnResolution:
             deps=deps,
         )
 
-        client.cache_lookup.assert_not_awaited()
+        client.cache_lookup_body.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_arxiv_id_logs_skipped_item(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Items without a parseable arXiv ID emit a diagnostic log (#108)."""
+        caplog.set_level("INFO")
+        client = _make_client()
+        deps = _make_deps(client)
+
+        await wire(
+            written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
+            cascade=CascadeOutput(
+                title="A Paper",
+                builds_on=["A handwave reference with no id"],
+            ),
+            deps=deps,
+        )
+
+        skip_records = [
+            record
+            for record in caplog.records
+            if "LCMA builds_on item missing arxiv_id" in record.message
+        ]
+        assert skip_records, "expected a missing-arxiv-id log line"
+        message = skip_records[0].getMessage()
+        assert "A handwave reference with no id" in message
 
     @pytest.mark.asyncio
     async def test_cache_miss_skips_edge(self) -> None:
@@ -221,13 +273,79 @@ class TestBuildsOnResolution:
             deps=deps,
         )
 
-        client.cache_lookup.assert_awaited_once()
+        client.cache_lookup_body.assert_awaited_once()
         builds_on_upserts = [
             call.kwargs
             for call in client.edge_upsert.await_args_list
             if call.kwargs.get("type") == "builds_on"
         ]
         assert builds_on_upserts == []
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_logs_item_identity_context(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No-hit log carries item identity for diagnosis (#108)."""
+        caplog.set_level("INFO")
+        client = _make_client(cache_lookup_payload={"hit": False})
+        deps = _make_deps(client)
+
+        await wire(
+            written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
+            cascade=CascadeOutput(
+                title="A Paper",
+                builds_on=["FooNet (arXiv:2412.12345)"],
+            ),
+            deps=deps,
+        )
+
+        miss_records = [
+            record
+            for record in caplog.records
+            if "LCMA builds_on lookup miss" in record.message
+        ]
+        assert miss_records, "expected a no-hit log line"
+        message = miss_records[0].getMessage()
+        assert "FooNet" in message
+        assert "2412.12345" in message
+
+    @pytest.mark.asyncio
+    async def test_source_url_mismatch_logs_item_identity_context(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """source_url mismatch log carries item identity for diagnosis (#108)."""
+        caplog.set_level("INFO")
+        client = _make_client(
+            cache_lookup_payload={
+                "hit": True,
+                "source_url": "https://arxiv.org/abs/9999.99999",
+                "note_id": "note-other",
+            }
+        )
+        deps = _make_deps(client)
+
+        await wire(
+            written_note_id="note-new",
+            source_url="https://arxiv.org/abs/2601.00001",
+            cascade=CascadeOutput(
+                title="A Paper",
+                builds_on=["FooNet (arXiv:2412.12345)"],
+            ),
+            deps=deps,
+        )
+
+        mismatch_records = [
+            record
+            for record in caplog.records
+            if "LCMA builds_on lookup source_url mismatch" in record.message
+        ]
+        assert mismatch_records, "expected a source_url mismatch log line"
+        message = mismatch_records[0].getMessage()
+        assert "FooNet" in message
+        assert "2412.12345" in message
 
     @pytest.mark.asyncio
     async def test_source_url_mismatch_skips_edge(
@@ -293,7 +411,7 @@ class TestLcmaErrorPropagation:
     @pytest.mark.asyncio
     async def test_unknown_tool_on_retrieve_is_contained(self) -> None:
         client = _make_client()
-        client.retrieve = AsyncMock(
+        client.retrieve_body = AsyncMock(
             side_effect=LCMAError("unknown_tool", stage="lithos_retrieve")
         )
         deps = _make_deps(client)
@@ -310,7 +428,7 @@ class TestLcmaErrorPropagation:
     @pytest.mark.asyncio
     async def test_other_lcma_error_is_contained_and_builds_on_still_runs(self) -> None:
         client = _make_client()
-        client.retrieve = AsyncMock(
+        client.retrieve_body = AsyncMock(
             side_effect=LCMAError("transport refused", stage="http")
         )
         deps = _make_deps(client)
@@ -326,4 +444,4 @@ class TestLcmaErrorPropagation:
         )
 
         assert related == []
-        client.cache_lookup.assert_awaited_once()
+        client.cache_lookup_body.assert_awaited_once()

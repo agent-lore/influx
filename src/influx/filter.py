@@ -33,10 +33,14 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from pydantic import ValidationError
@@ -81,6 +85,185 @@ class FilterScorerError(RuntimeError):
 
 
 _log = logging.getLogger(__name__)
+
+_RETRY_AFTER_MAX_SECONDS = 300.0
+
+
+def _sleep(seconds: float) -> None:
+    """Sleep wrapper for monkeypatching in tests."""
+    time.sleep(seconds)
+
+
+def _header_value(headers: dict[str, str], name: str) -> str | None:
+    """Return an HTTP header value using case-insensitive lookup."""
+    name_lower = name.lower()
+    for key, value in headers.items():
+        if key.lower() == name_lower:
+            return value
+    return None
+
+
+def _parse_retry_after_seconds(value: str) -> float | None:
+    """Parse RFC 7231 ``Retry-After`` as seconds or HTTP-date."""
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        seconds = retry_at.timestamp() - time.time()
+    if seconds < 0:
+        return 0.0
+    return min(seconds, _RETRY_AFTER_MAX_SECONDS)
+
+
+def _filter_429_delay(
+    headers: dict[str, str],
+    config: AppConfig,
+    attempt: int,
+) -> float:
+    """Return the backoff delay for a filter-model 429 response."""
+    retry_after = _header_value(headers, "Retry-After")
+    if retry_after is not None:
+        parsed = _parse_retry_after_seconds(retry_after)
+        if parsed is not None:
+            return parsed
+    return float(config.resilience.backoff_base_seconds * (2**attempt))
+
+
+def _call_filter_model_with_retry(
+    *,
+    config: AppConfig,
+    profile: str,
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    attempts: int,
+) -> FilterResponse:
+    """POST to the configured filter model and parse the response with retries."""
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            result = guarded_post_json_fetch(
+                url,
+                body,
+                headers=headers,
+                allow_private_ips=config.security.allow_private_ips,
+                max_response_bytes=config.storage.max_download_bytes,
+                timeout_seconds=config.models["filter"].request_timeout,
+            )
+        except NetworkError as exc:
+            last_error = exc
+            if attempt + 1 >= attempts:
+                break
+            delay = float(config.resilience.backoff_base_seconds * (2**attempt))
+            _log.warning(
+                "filter HTTP error for profile %r on attempt %d/%d: %s; "
+                "retrying in %.1fs",
+                profile,
+                attempt + 1,
+                attempts,
+                exc,
+                delay,
+            )
+            _sleep(delay)
+            continue
+
+        if result.status_code == 429:
+            last_error = FilterScorerError("filter slot HTTP 429")
+            if attempt + 1 >= attempts:
+                break
+            delay = _filter_429_delay(result.headers, config, attempt)
+            _log.warning(
+                "filter slot HTTP 429 for profile %r on attempt %d/%d; "
+                "backing off %.1fs",
+                profile,
+                attempt + 1,
+                attempts,
+                delay,
+            )
+            _sleep(delay)
+            continue
+
+        if result.status_code >= 500:
+            last_error = FilterScorerError(f"filter slot HTTP {result.status_code}")
+            if attempt + 1 >= attempts:
+                break
+            delay = float(config.resilience.backoff_base_seconds * (2**attempt))
+            _log.warning(
+                "filter slot HTTP %d for profile %r on attempt %d/%d; "
+                "retrying in %.1fs",
+                result.status_code,
+                profile,
+                attempt + 1,
+                attempts,
+                delay,
+            )
+            _sleep(delay)
+            continue
+
+        if result.status_code >= 400:
+            raise FilterScorerError(f"filter slot HTTP {result.status_code}")
+
+        try:
+            resp_json = json.loads(result.body.decode("utf-8"))
+            content_str: str = resp_json["choices"][0]["message"]["content"]
+            parsed = json.loads(content_str)
+            return FilterResponse.model_validate(parsed)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValidationError,
+            ValueError,
+        ) as exc:
+            last_error = exc
+            _log.warning(
+                "filter response parse failure for profile %r on attempt %d/%d: %s",
+                profile,
+                attempt + 1,
+                attempts,
+                exc,
+            )
+            continue
+
+    raise FilterScorerError(f"filter failed after {attempts} attempts") from last_error
+
+
+async def _acall_filter_model_with_retry(
+    *,
+    config: AppConfig,
+    profile: str,
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    attempts: int,
+) -> FilterResponse:
+    """Async wrapper: offloads :func:`_call_filter_model_with_retry` to a worker thread.
+
+    Issue #124: the sync retry path uses blocking ``time.sleep`` and a
+    sync HTTP client. Calling it directly from the async event loop
+    (RSS scoring path, batched-scorer path) starves the loop and stalls
+    the admin HTTP API. Threaded offload preserves the existing retry,
+    backoff, and Retry-After semantics verbatim.
+    """
+    return await asyncio.to_thread(
+        _call_filter_model_with_retry,
+        config=config,
+        profile=profile,
+        url=url,
+        body=body,
+        headers=headers,
+        attempts=attempts,
+    )
 
 
 def make_default_arxiv_filter_scorer(
@@ -160,76 +343,23 @@ def make_default_arxiv_filter_scorer(
         if slot.json_mode:
             body["response_format"] = {"type": "json_object"}
 
-        attempts = slot.max_retries + 1
-        last_error: Exception | None = None
-        for attempt in range(attempts):
-            try:
-                result = guarded_post_json_fetch(
-                    url,
-                    body,
-                    headers=headers,
-                    allow_private_ips=config.security.allow_private_ips,
-                    max_response_bytes=config.storage.max_download_bytes,
-                    timeout_seconds=slot.request_timeout,
-                )
-            except NetworkError as exc:
-                last_error = exc
-                _log.warning(
-                    "filter HTTP error for profile %r on attempt %d/%d: %s",
-                    profile,
-                    attempt + 1,
-                    attempts,
-                    exc,
-                )
-                continue
-
-            if result.status_code >= 400:
-                last_error = FilterScorerError(f"filter slot HTTP {result.status_code}")
-                _log.warning(
-                    "filter slot HTTP %d for profile %r on attempt %d/%d",
-                    result.status_code,
-                    profile,
-                    attempt + 1,
-                    attempts,
-                )
-                continue
-
-            try:
-                resp_json = json.loads(result.body.decode("utf-8"))
-                content_str: str = resp_json["choices"][0]["message"]["content"]
-                parsed = json.loads(content_str)
-                response = FilterResponse.model_validate(parsed)
-                return {
-                    r.id: ArxivScoreResult(
-                        score=r.score,
-                        confidence=1.0,
-                        reason=r.reason,
-                        filter_tags=tuple(r.tags),
-                    )
-                    for r in response.results
-                }
-            except (
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                KeyError,
-                IndexError,
-                TypeError,
-                ValidationError,
-                ValueError,
-            ) as exc:
-                last_error = exc
-                _log.warning(
-                    "filter response parse failure for profile %r on attempt %d/%d: %s",
-                    profile,
-                    attempt + 1,
-                    attempts,
-                    exc,
-                )
-                continue
-
-        raise FilterScorerError(f"filter failed after {attempts} attempts") from (
-            last_error
+        response = await _acall_filter_model_with_retry(
+            config=config,
+            profile=profile,
+            url=url,
+            body=body,
+            headers=headers,
+            attempts=slot.max_retries + 1,
         )
+        return {
+            r.id: ArxivScoreResult(
+                score=r.score,
+                confidence=1.0,
+                reason=r.reason,
+                filter_tags=tuple(r.tags),
+            )
+            for r in response.results
+        }
 
     return _scorer
 
@@ -294,64 +424,25 @@ def make_default_batch_scorer(config: AppConfig) -> BatchScorer | None:
             body["response_format"] = {"type": "json_object"}
 
         by_id: dict[str, Candidate] = {c.item_id: c for c in candidates}
-        attempts = slot.max_retries + 1
-        last_error: Exception | None = None
-        for attempt in range(attempts):
-            try:
-                result = guarded_post_json_fetch(
-                    url,
-                    body,
-                    headers=headers,
-                    allow_private_ips=config.security.allow_private_ips,
-                    max_response_bytes=config.storage.max_download_bytes,
-                    timeout_seconds=slot.request_timeout,
-                )
-            except NetworkError as exc:
-                last_error = exc
-                _log.warning(
-                    "filter HTTP error for profile %r on attempt %d/%d: %s",
-                    profile,
-                    attempt + 1,
-                    attempts,
-                    exc,
-                )
-                continue
-
-            if result.status_code >= 400:
-                last_error = FilterScorerError(f"filter slot HTTP {result.status_code}")
-                continue
-
-            try:
-                resp_json = json.loads(result.body.decode("utf-8"))
-                content_str: str = resp_json["choices"][0]["message"]["content"]
-                parsed = json.loads(content_str)
-                response = FilterResponse.model_validate(parsed)
-                return {
-                    r.id: ScoredCandidate(
-                        candidate=by_id[r.id],
-                        score=r.score,
-                        confidence=1.0,
-                        reason=r.reason,
-                        filter_tags=tuple(r.tags),
-                    )
-                    for r in response.results
-                    if r.id in by_id
-                }
-            except (
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                KeyError,
-                IndexError,
-                TypeError,
-                ValidationError,
-                ValueError,
-            ) as exc:
-                last_error = exc
-                continue
-
-        raise FilterScorerError(f"filter failed after {attempts} attempts") from (
-            last_error
+        response = await _acall_filter_model_with_retry(
+            config=config,
+            profile=profile,
+            url=url,
+            body=body,
+            headers=headers,
+            attempts=slot.max_retries + 1,
         )
+        return {
+            r.id: ScoredCandidate(
+                candidate=by_id[r.id],
+                score=r.score,
+                confidence=1.0,
+                reason=r.reason,
+                filter_tags=tuple(r.tags),
+            )
+            for r in response.results
+            if r.id in by_id
+        }
 
     return _scorer
 

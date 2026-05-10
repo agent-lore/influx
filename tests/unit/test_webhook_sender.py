@@ -86,6 +86,25 @@ class _RedirectHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _ErrorBodyHandler(BaseHTTPRequestHandler):
+    """HTTP handler that returns a 4xx with an explanatory JSON body."""
+
+    request_count: int
+    response_body: bytes
+    response_status: int
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.__class__.request_count += 1
+        self.send_response(self.__class__.response_status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.__class__.response_body)))
+        self.end_headers()
+        self.wfile.write(self.__class__.response_body)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        pass
+
+
 @pytest.fixture()
 def fake_webhook_url() -> Generator[str]:
     _RecordingHandler.received = []
@@ -117,6 +136,22 @@ def redirect_webhook_url() -> Generator[str]:
     _RedirectHandler.request_count = 0
 
     srv = HTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}/webhook"
+    srv.shutdown()
+
+
+@pytest.fixture()
+def error_body_webhook_url() -> Generator[str]:
+    _ErrorBodyHandler.request_count = 0
+    _ErrorBodyHandler.response_status = 400
+    _ErrorBodyHandler.response_body = (
+        b'{"error":"missing context","detail":"context field is required"}'
+    )
+
+    srv = HTTPServer(("127.0.0.1", 0), _ErrorBodyHandler)
     port = srv.server_address[1]
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
@@ -538,3 +573,89 @@ class TestNotificationDeliveryBehavior:
         assert any(
             "unexpected HTTP status" in record.message for record in caplog.records
         )
+
+    def test_non_2xx_response_logs_truncated_response_body(
+        self,
+        error_body_webhook_url: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Non-2xx webhook responses include a body snippet for diagnosis (#108)."""
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="agent-zero-toast",
+                    type="agent_zero_notification_create",
+                    url=error_body_webhook_url,
+                    event_mode="article",
+                    min_score=8,
+                )
+            ]
+        )
+
+        with caplog.at_level(logging.WARNING, logger="influx.notifications"):
+            dispatch_notifications(
+                _make_result(),
+                config,
+                kind=RunKind.MANUAL,
+                run_id="error-body-1",
+            )
+
+        assert _ErrorBodyHandler.request_count == 1
+        unexpected_records = [
+            record
+            for record in caplog.records
+            if "unexpected HTTP status" in record.message
+        ]
+        assert unexpected_records, "expected unexpected-status warning to be emitted"
+        record = unexpected_records[0]
+        assert getattr(record, "status_code", None) == 400
+        body_snippet = getattr(record, "response_body", None)
+        assert isinstance(body_snippet, str)
+        assert "missing context" in body_snippet
+        assert "context field is required" in body_snippet
+        # A body that fits within the cap is NOT marked truncated.
+        assert getattr(record, "response_body_truncated", None) is False
+        assert "[truncated]" not in body_snippet
+
+    def test_non_2xx_response_body_is_capped_and_marked_truncated(
+        self,
+        error_body_webhook_url: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Oversized webhook error bodies are truncated and flagged (#108)."""
+        # Override the fixture's defaults for this test.
+        _ErrorBodyHandler.response_status = 500
+        _ErrorBodyHandler.response_body = b"x" * 16384
+
+        config = _make_config(
+            webhooks=[
+                NotificationWebhookConfig(
+                    name="agent-zero-toast",
+                    type="agent_zero_notification_create",
+                    url=error_body_webhook_url,
+                    event_mode="article",
+                    min_score=8,
+                )
+            ]
+        )
+
+        with caplog.at_level(logging.WARNING, logger="influx.notifications"):
+            dispatch_notifications(
+                _make_result(),
+                config,
+                kind=RunKind.MANUAL,
+                run_id="error-body-large",
+            )
+
+        unexpected_records = [
+            record
+            for record in caplog.records
+            if "unexpected HTTP status" in record.message
+        ]
+        assert unexpected_records
+        record = unexpected_records[0]
+        body_snippet = getattr(record, "response_body", "")
+        assert getattr(record, "response_body_truncated", None) is True
+        # 4096 captured ASCII bytes plus the truncation marker.
+        assert "[truncated]" in body_snippet
+        assert body_snippet.startswith("x" * 4096)

@@ -45,6 +45,38 @@ from influx.run import (
     _run_repair_stage,
 )
 from influx.run_ledger import RunLedger
+from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
+
+
+def _bound_for(
+    item: dict[str, Any], *, source_label: str = "arxiv"
+) -> BoundScoredCandidate:
+    """Wrap a ProfileItem dict as a BoundScoredCandidate whose acquire
+    closure returns the dict (#125 — the Run stage now drives acquire
+    after pre-acquire dedup, so test providers yield bounds rather than
+    pre-baked items).
+    """
+
+    async def _acquire() -> dict[str, Any]:
+        return item
+
+    return BoundScoredCandidate(
+        scored=ScoredCandidate(
+            candidate=Candidate(
+                item_id=item.get("source_url", "test-id"),
+                title=item.get("title", ""),
+                abstract=item.get("abstract_or_summary", "") or "",
+                source_url=item.get("source_url", ""),
+            ),
+            score=int(item.get("score", 0)),
+            confidence=float(item.get("confidence", 0.0)),
+            reason=item.get("reason", ""),
+            filter_tags=tuple(item.get("filter_tags", [])),
+        ),
+        acquire=_acquire,
+        source_label=source_label,
+    )
+
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -90,6 +122,10 @@ class _NoopClient:
                 )
             ]
         )
+
+    async def task_create_body(self, **kwargs: Any) -> dict[str, Any]:
+        await self.task_create(**kwargs)
+        return {"task_id": "task-1"}
 
     async def task_complete(self, **kwargs: Any) -> Any:
         from mcp import types as mcp_types
@@ -195,7 +231,7 @@ async def test_repair_stage_raises_run_aborted_on_sweep_write_error() -> None:
 
 async def _empty_provider(
     profile: str, kind: RunKind, run_range: Any, filter_prompt: str
-) -> list[dict[str, Any]]:
+) -> list[BoundScoredCandidate]:
     return []
 
 
@@ -414,8 +450,8 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
 
     async def provider(
         profile: str, kind: RunKind, run_range: Any, filter_prompt: str
-    ) -> list[dict[str, Any]]:
-        return items
+    ) -> list[BoundScoredCandidate]:
+        return [_bound_for(it) for it in items]
 
     from mcp import types as mcp_types
 
@@ -424,15 +460,7 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
     mock_client = MagicMock()
     mock_client.close = AsyncMock()
     mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
-    mock_client.task_create = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[
-                mcp_types.TextContent(
-                    type="text", text=json.dumps({"task_id": "task-1"})
-                )
-            ]
-        )
-    )
+    mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
     mock_client.task_complete = AsyncMock(
         return_value=mcp_types.CallToolResult(
             content=[
@@ -442,11 +470,8 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
             ]
         )
     )
-    mock_client.cache_lookup_for_item = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
-        )
-    )
+    mock_client.cache_lookup_for_item_body = AsyncMock(return_value={"hit": False})
+    mock_client.cache_lookup_by_url_body = AsyncMock(return_value={"hit": False})
     write_result = MagicMock()
     write_result.status = "created"
     write_result.note_id = "note-new"
@@ -497,8 +522,8 @@ async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
 
     async def provider(
         profile: str, kind: RunKind, run_range: Any, filter_prompt: str
-    ) -> list[dict[str, Any]]:
-        return items
+    ) -> list[BoundScoredCandidate]:
+        return [_bound_for(it) for it in items]
 
     from mcp import types as mcp_types
 
@@ -507,15 +532,7 @@ async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
     mock_client = MagicMock()
     mock_client.close = AsyncMock()
     mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
-    mock_client.task_create = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[
-                mcp_types.TextContent(
-                    type="text", text=json.dumps({"task_id": "task-1"})
-                )
-            ]
-        )
-    )
+    mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
     mock_client.task_complete = AsyncMock(
         return_value=mcp_types.CallToolResult(
             content=[
@@ -525,11 +542,8 @@ async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
             ]
         )
     )
-    mock_client.cache_lookup_for_item = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
-        )
-    )
+    mock_client.cache_lookup_for_item_body = AsyncMock(return_value={"hit": False})
+    mock_client.cache_lookup_by_url_body = AsyncMock(return_value={"hit": False})
     write_result_1 = MagicMock()
     write_result_1.status = "created"
     write_result_1.note_id = "note-1"
@@ -586,23 +600,15 @@ async def test_run_execute_persists_unresolved_slug_collision_without_injected_l
 
     async def provider(
         profile: str, kind: RunKind, run_range: Any, filter_prompt: str
-    ) -> list[dict[str, Any]]:
-        return items
+    ) -> list[BoundScoredCandidate]:
+        return [_bound_for(it) for it in items]
 
     deps = RunDeps(config=config, item_provider=provider, probe_loop=None, ledger=None)
 
     mock_client = MagicMock()
     mock_client.close = AsyncMock()
     mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
-    mock_client.task_create = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[
-                mcp_types.TextContent(
-                    type="text", text=json.dumps({"task_id": "task-1"})
-                )
-            ]
-        )
-    )
+    mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
     mock_client.task_complete = AsyncMock(
         return_value=mcp_types.CallToolResult(
             content=[
@@ -612,11 +618,8 @@ async def test_run_execute_persists_unresolved_slug_collision_without_injected_l
             ]
         )
     )
-    mock_client.cache_lookup_for_item = AsyncMock(
-        return_value=mcp_types.CallToolResult(
-            content=[mcp_types.TextContent(type="text", text='{"hit": false}')]
-        )
-    )
+    mock_client.cache_lookup_for_item_body = AsyncMock(return_value={"hit": False})
+    mock_client.cache_lookup_by_url_body = AsyncMock(return_value={"hit": False})
     write_result = MagicMock()
     write_result.status = "slug_collision"
     write_result.note_id = ""

@@ -100,19 +100,16 @@ def _full_config() -> Any:
 
 def _mock_lithos_client() -> AsyncMock:
     client = AsyncMock()
-    client.task_create.return_value = MagicMock(
-        content=[MagicMock(text='{"task_id": "task-1"}')],
-    )
-    client.cache_lookup_for_item.return_value = MagicMock(
-        content=[MagicMock(text='{"hit": false}')],
-    )
+    client.task_create_body.return_value = {"task_id": "task-1"}
+    client.cache_lookup_for_item_body.return_value = {"hit": False}
+    client.cache_lookup_by_url_body.return_value = {"hit": False}
+    client.list_notes_body.return_value = {"items": []}
+    client.read_note.return_value = {}
     write_result = MagicMock()
     write_result.status = "created"
     write_result.note_id = "note-123"
     client.write_note.return_value = write_result
-    client.retrieve.return_value = MagicMock(
-        content=[MagicMock(text='{"results": []}')],
-    )
+    client.retrieve_body.return_value = {"results": []}
     client.close = AsyncMock()
     client.task_complete = AsyncMock()
     return client
@@ -222,18 +219,11 @@ async def _run_arxiv_scenario(meter: InfluxMeter, config: Any) -> None:
             return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
         ),
         patch("influx.run.LithosClient", return_value=mock_client),
-        patch("influx.run.LithosClient", return_value=mock_client),
         patch(
             "influx.run.build_negative_examples_block",
             new_callable=AsyncMock,
             return_value="",
         ),
-        patch(
-            "influx.run.build_negative_examples_block",
-            new_callable=AsyncMock,
-            return_value="",
-        ),
-        patch("influx.run.repair_sweep", new_callable=AsyncMock),
         patch("influx.run.repair_sweep", new_callable=AsyncMock),
         patch("influx.service.post_run_webhook_hook"),
     ):
@@ -268,13 +258,15 @@ class TestRunLifecycleAndFunnelMetrics:
             {"profile": "ai-robotics", "run_type": "scheduled"},
         )
         assert "influx_run_completions_total" in points
-        # Outcome is "success" (no source_acquisition_errors in the fake run).
+        # Archive persistence fails in this isolated test environment, so the
+        # accepted item is tagged ``influx:archive-missing`` and the run
+        # completes as degraded via archive_acquisition.
         assert _has_label_set(
             points["influx_run_completions_total"],
             {
                 "profile": "ai-robotics",
                 "run_type": "scheduled",
-                "outcome": "success",
+                "outcome": "degraded",
             },
         )
         assert "influx_run_duration_seconds" in points
@@ -410,18 +402,11 @@ class TestOtelDisabledZeroMetrics:
                 return_value=Tier3Extraction(claims=["claim1"], builds_on=["b1"]),
             ),
             patch("influx.run.LithosClient", return_value=mock_client),
-            patch("influx.run.LithosClient", return_value=mock_client),
             patch(
                 "influx.run.build_negative_examples_block",
                 new_callable=AsyncMock,
                 return_value="",
             ),
-            patch(
-                "influx.run.build_negative_examples_block",
-                new_callable=AsyncMock,
-                return_value="",
-            ),
-            patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch("influx.run.repair_sweep", new_callable=AsyncMock),
             patch("influx.service.post_run_webhook_hook"),
         ):
