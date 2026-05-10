@@ -379,9 +379,7 @@ def _resolve_archive_download_args(
         return _resolve_arxiv_download_args(note, config)
     if _is_rss_source(source):
         return _resolve_rss_download_args(note, config)
-    _raise_unsupported_source(
-        note, stage_label="archive_download retry", source=source
-    )
+    _raise_unsupported_source(note, stage_label="archive_download retry", source=source)
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -475,9 +473,7 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
     return hook
 
 
-def _run_arxiv_text_extraction(
-    note: dict[str, object], config: AppConfig
-) -> str:
+def _run_arxiv_text_extraction(note: dict[str, object], config: AppConfig) -> str:
     """Run the arxiv text-extraction cascade and return the resulting tag."""
     arxiv_id = _find_tag(_note_tags(note), _ARXIV_ID_TAG_PREFIX)
     if not arxiv_id:
@@ -503,9 +499,7 @@ def _run_arxiv_text_extraction(
     return result.source_tag
 
 
-def _run_rss_text_extraction(
-    note: dict[str, object], config: AppConfig
-) -> str:
+def _run_rss_text_extraction(note: dict[str, object], config: AppConfig) -> str:
     """Run RSS web-article extraction for a degraded RSS note.
 
     Reads ``source_url`` from frontmatter and re-runs

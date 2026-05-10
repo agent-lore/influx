@@ -935,9 +935,14 @@ def _make_rss_archive_missing_note(
     if omit_source_url:
         # Strip the source_url frontmatter line so the resolver hits the
         # missing-field branch.
-        content = "\n".join(
-            line for line in content.splitlines() if not line.startswith("source_url:")
-        ) + "\n"
+        content = (
+            "\n".join(
+                line
+                for line in content.splitlines()
+                if not line.startswith("source_url:")
+            )
+            + "\n"
+        )
     return {
         "id": note_id,
         "title": "RSS Article Title",
