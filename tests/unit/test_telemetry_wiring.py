@@ -1182,6 +1182,9 @@ class TestInfluxLithosWriteSpan:
                 mock_client.cache_lookup_for_item_body = AsyncMock(
                     return_value={"hit": False}
                 )
+                mock_client.cache_lookup_by_url_body = AsyncMock(
+                    return_value={"hit": False}
+                )
                 mock_client.list_archive_terminal_arxiv_ids = AsyncMock(
                     return_value=set()
                 )
@@ -1270,6 +1273,9 @@ class TestInfluxLithosWriteSpan:
             mock_client_cls_run.return_value = mock_client
             mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
             mock_client.cache_lookup_for_item_body = AsyncMock(
+                return_value={"hit": False}
+            )
+            mock_client.cache_lookup_by_url_body = AsyncMock(
                 return_value={"hit": False}
             )
             mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=set())

@@ -657,6 +657,30 @@ class LithosClient:
         query = compose_dedup_query(title, abstract_or_summary)
         return await self.cache_lookup(query=query, source_url=source_url)
 
+    async def cache_lookup_by_url_body(
+        self,
+        *,
+        source_url: str,
+    ) -> dict[str, Any]:
+        """Source-URL-only cache lookup (issue #128).
+
+        Sends ``query=source_url`` so the Lithos server matches on
+        the exact URL.  Used as a defensive fallback after the primary
+        title-based dedup query misses, and as the canonical chokepoint
+        for any caller that needs to ask "do you have a note for this
+        exact source_url?" (e.g. ``content_too_large`` recovery).
+
+        Raises ``LithosError("missing_lookup_arg")`` before any RPC
+        when *source_url* is empty.
+        """
+        if not source_url:
+            raise LithosError(
+                "missing_lookup_arg",
+                operation="cache_lookup",
+                detail="source_url is required",
+            )
+        return await self.cache_lookup_body(query=source_url, source_url=source_url)
+
     async def cache_lookup_for_item_body(
         self,
         *,
@@ -954,17 +978,12 @@ class LithosClient:
     async def _check_existing_note(self, source_url: str) -> dict[str, Any] | None:
         """Check whether an Influx-authored note exists for *source_url*.
 
-        Uses ``lithos_cache_lookup`` with the source URL.  Returns the
-        existing note dict if found, ``None`` otherwise.  The detection
-        mechanism is a cache lookup by ``source_url`` — implementation-
-        defined per AC of US-010.
+        Thin wrapper over :meth:`cache_lookup_by_url_body`: returns the
+        decoded body when ``hit`` is true, ``None`` otherwise.  The
+        detection mechanism is a cache lookup by ``source_url`` —
+        implementation-defined per AC of US-010.
         """
-        result = await self.call_tool(
-            "lithos_cache_lookup",
-            {"query": source_url, "source_url": source_url},
-        )
-        text = result.content[0].text  # type: ignore[union-attr]
-        body = json.loads(text)
+        body = await self.cache_lookup_by_url_body(source_url=source_url)
         if body.get("hit"):
             return body
         return None
