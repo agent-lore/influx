@@ -38,6 +38,7 @@ from influx.http_api import router
 from influx.probes import ProbeLoop
 from influx.renderer import ProfileRelevanceEntry, render_note
 from influx.scheduler import InfluxScheduler
+from tests._bound_helpers import bounds_for
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -152,9 +153,9 @@ def _make_item_provider(
         kind: RunKind,
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
-    ) -> Iterable[dict[str, Any]]:
+    ) -> Iterable[Any]:
         del kind, run_range, filter_prompt
-        return list(profile_items.get(profile, []))
+        return bounds_for(profile_items.get(profile, []))
 
     return provider
 

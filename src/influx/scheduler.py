@@ -35,6 +35,7 @@ from influx.config import AppConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.notifications import ProfileRunResult
 from influx.run_ledger import RunLedger
+from influx.source import BoundScoredCandidate
 
 __all__ = [
     "InfluxScheduler",
@@ -46,15 +47,17 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# An item provider yields the iterable of dicts that ``run_profile``
-# turns into ``lithos_write`` calls.  Each dict must include ``title``,
-# ``source_url``, ``content``, ``tags``, and ``confidence``; ``score``,
-# ``path``, and ``abstract_or_summary`` are optional.  PRD 04 replaces
-# the default no-op provider with the real arXiv + RSS pipeline.
+# An item provider yields the iterable of :class:`BoundScoredCandidate`
+# that the Run's Acquire stage runs through pre-acquire dedup (#125)
+# before invoking the per-item ``acquire`` closure.  Each closure
+# eventually returns a ``ProfileItem`` dict that ``run_profile`` turns
+# into ``lithos_write`` calls — must include ``title``, ``source_url``,
+# ``content``, ``tags``, ``confidence``; ``score``, ``path``, and
+# ``abstract_or_summary`` are optional.
 ProfileItem = dict[str, Any]
 ItemProvider = Callable[
     [str, RunKind, dict[str, str | int] | None, str],
-    Awaitable[Iterable[ProfileItem]],
+    Awaitable[Iterable[BoundScoredCandidate]],
 ]
 # Per-tick factory: returns a fresh ``(item_provider, fetch_cache)`` pair so
 # each cron fire has its own dedup scope and cron tick N+1 cannot see cron
@@ -94,7 +97,7 @@ async def default_item_provider(
     kind: RunKind,
     run_range: dict[str, str | int] | None,
     filter_prompt: str,
-) -> Iterable[ProfileItem]:
+) -> Iterable[BoundScoredCandidate]:
     """No-op item provider — PRD 04 replaces this with arXiv + RSS fetch.
 
     Returns an empty iterable so that PRD 03 / PRD 05 production runs

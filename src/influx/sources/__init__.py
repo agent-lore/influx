@@ -14,6 +14,7 @@ from typing import Any
 
 from influx.config import AppConfig
 from influx.coordinator import RunKind
+from influx.source import BoundScoredCandidate
 
 __all__ = [
     "FetchCache",
@@ -152,7 +153,7 @@ def make_item_provider(
     arxiv_filter_scorer: Any | None = None,
 ) -> Callable[
     [str, RunKind, dict[str, str | int] | None, str],
-    Awaitable[Iterable[dict[str, Any]]],
+    Awaitable[Iterable[BoundScoredCandidate]],
 ]:
     """Build a unified item provider for arXiv + RSS with fetch dedup.
 
@@ -192,11 +193,11 @@ def make_item_provider(
         kind: RunKind,
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
-    ) -> Iterable[dict[str, Any]]:
-        arxiv_items = list(
+    ) -> Iterable[BoundScoredCandidate]:
+        arxiv_bounds = list(
             await arxiv_provider(profile, kind, run_range, filter_prompt)
         )
-        rss_items = list(await rss_provider(profile, kind, run_range, filter_prompt))
-        return arxiv_items + rss_items
+        rss_bounds = list(await rss_provider(profile, kind, run_range, filter_prompt))
+        return arxiv_bounds + rss_bounds
 
     return provider

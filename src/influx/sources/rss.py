@@ -40,7 +40,7 @@ from influx.filter import FilterScorerError, _acall_filter_model_with_retry
 from influx.http_client import aguarded_fetch as _aguarded_fetch
 from influx.renderer import render
 from influx.slugs import slugify_feed_name
-from influx.source import Candidate, ScoredCandidate
+from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.storage import download_archive
 from influx.telemetry import (
     current_run_id,
@@ -626,7 +626,7 @@ def make_rss_item_provider(
         kind: RunKind,
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
-    ) -> Iterable[dict[str, Any]]:
+    ) -> Iterable[BoundScoredCandidate]:
         del kind, run_range
 
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
@@ -644,7 +644,7 @@ def make_rss_item_provider(
                 "influx.source": "rss",
             },
         ) as fetch_span:
-            results: list[dict[str, Any]] = []
+            bounds: list[BoundScoredCandidate] = []
             for feed_entry in profile_cfg.sources.rss:
                 _log.info(
                     "rss feed fetch started profile=%s feed=%r url=%s source_tag=%s",
@@ -744,13 +744,32 @@ def make_rss_item_provider(
                         item.title,
                         item.url,
                     )
-                    # Issue #124: build_rss_note_item performs sync HTTP
-                    # (article fetch + archive download) and PDF/HTML
-                    # extraction. Offload to a worker thread so the
-                    # admin event loop stays responsive during long
-                    # acquisition + cascade work.
-                    results.append(
-                        await asyncio.to_thread(
+                    # Issue #125: emit a BoundScoredCandidate so the Run
+                    # stage can run pre-acquire ``lithos_cache_lookup``
+                    # before paying the article fetch / archive / extract
+                    # cost.  ``build_rss_note_item`` is the per-item
+                    # acquire entrypoint; issue #124's ``asyncio.to_thread``
+                    # offload moves into the closure, fired only when the
+                    # orchestrator decides this candidate must be acquired.
+                    sc = ScoredCandidate(
+                        candidate=Candidate(
+                            item_id=_rss_filter_id(item),
+                            title=item.title,
+                            abstract=item.summary or "",
+                            source_url=item.url,
+                            payload=item,
+                        ),
+                        score=scored.score,
+                        confidence=1.0,
+                        reason=scored.reason,
+                        filter_tags=scored.tags,
+                    )
+
+                    async def _acquire(
+                        item: RssFeedItem = item,
+                        scored: Any = scored,
+                    ) -> dict[str, Any] | None:
+                        return await asyncio.to_thread(
                             build_rss_note_item,
                             item=item,
                             profile_name=profile,
@@ -760,22 +779,29 @@ def make_rss_item_provider(
                             reason=scored.reason,
                             filter_tags=scored.tags,
                         )
+
+                    bounds.append(
+                        BoundScoredCandidate(
+                            scored=sc,
+                            acquire=_acquire,
+                            source_label=f"rss:{feed_entry.name}",
+                        )
                     )
                 _log.info(
                     "rss feed completed profile=%s feed=%r accepted_so_far=%d",
                     profile,
                     feed_entry.name,
-                    len(results),
+                    len(bounds),
                 )
-            fetch_span.set_attribute("influx.item_count", len(results))
+            fetch_span.set_attribute("influx.item_count", len(bounds))
             _log.info(
                 "rss source completed profile=%s feeds=%d accepted=%d",
                 profile,
                 len(profile_cfg.sources.rss),
-                len(results),
+                len(bounds),
             )
 
-        return results
+        return bounds
 
     return provider
 

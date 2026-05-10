@@ -32,6 +32,7 @@ from influx.coordinator import Coordinator, RunKind
 from influx.http_api import router
 from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler
+from tests._bound_helpers import bounds_for
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Fixtures ───────────────────────────────────────────────────────
@@ -99,9 +100,9 @@ def _make_item_provider(
         kind: RunKind,
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
-    ) -> Iterable[dict[str, Any]]:
+    ) -> Iterable[Any]:
         del profile, kind, run_range, filter_prompt
-        return list(items or [])
+        return bounds_for(items or [])
 
     return provider
 

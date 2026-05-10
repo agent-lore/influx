@@ -1125,7 +1125,7 @@ class TestLithosCircuitBreakerShortCircuit:
             kind: RunKind,
             run_range: dict[str, str | int] | None,
             filter_prompt: str,
-        ) -> list[dict[str, Any]]:
+        ) -> list[Any]:
             nonlocal provider_called
             provider_called = True
             return []
@@ -1179,7 +1179,7 @@ class TestLithosCircuitBreakerShortCircuit:
             kind: RunKind,
             run_range: dict[str, str | int] | None,
             filter_prompt: str,
-        ) -> list[dict[str, Any]]:
+        ) -> list[Any]:
             nonlocal provider_called
             provider_called = True
             return []
@@ -1249,7 +1249,7 @@ class TestLcmaToolsUnavailableShortCircuit:
             kind: RunKind,
             run_range: dict[str, str | int] | None,
             filter_prompt: str,
-        ) -> list[dict[str, Any]]:
+        ) -> list[Any]:
             nonlocal provider_called
             provider_called = True
             return []

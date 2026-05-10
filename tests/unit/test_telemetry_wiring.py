@@ -22,7 +22,35 @@ pytest.importorskip(
 )
 
 from influx.coordinator import RunKind
+from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.telemetry import InfluxTracer, current_run_id, get_tracer
+
+
+def _bound_for(
+    item: dict[str, Any], *, source_label: str = "arxiv"
+) -> BoundScoredCandidate:
+    """Wrap a ProfileItem dict as a BoundScoredCandidate (#125 — test seam)."""
+
+    async def _acquire() -> dict[str, Any]:
+        return item
+
+    return BoundScoredCandidate(
+        scored=ScoredCandidate(
+            candidate=Candidate(
+                item_id=item.get("source_url", "test-id"),
+                title=item.get("title", ""),
+                abstract=item.get("abstract_or_summary", "") or "",
+                source_url=item.get("source_url", ""),
+            ),
+            score=int(item.get("score", 0)),
+            confidence=float(item.get("confidence", 0.0)),
+            reason=item.get("reason", ""),
+            filter_tags=tuple(item.get("filter_tags", [])),
+        ),
+        acquire=_acquire,
+        source_label=source_label,
+    )
+
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -1120,17 +1148,19 @@ class TestInfluxLithosWriteSpan:
         # Fake item provider returning one item
         async def fake_provider(
             profile: str, kind: Any, run_range: Any, prompt: str
-        ) -> list[dict[str, Any]]:
+        ) -> list[BoundScoredCandidate]:
             return [
-                {
-                    "title": "Test Note",
-                    "source_url": "https://example.com/paper",
-                    "content": "Content",
-                    "tags": ["cs.AI"],
-                    "confidence": 0.9,
-                    "path": "test/path",
-                    "score": 8,
-                }
+                _bound_for(
+                    {
+                        "title": "Test Note",
+                        "source_url": "https://example.com/paper",
+                        "content": "Content",
+                        "tags": ["cs.AI"],
+                        "confidence": 0.9,
+                        "path": "test/path",
+                        "score": 8,
+                    }
+                )
             ]
 
         # Exercise the actual write span by calling run_profile with
@@ -1226,17 +1256,19 @@ class TestInfluxLithosWriteSpan:
 
         async def fake_provider(
             profile: str, kind: Any, run_range: Any, prompt: str
-        ) -> list[dict[str, Any]]:
+        ) -> list[BoundScoredCandidate]:
             return [
-                {
-                    "title": "Test Note",
-                    "source_url": "https://example.com/paper",
-                    "content": "Content",
-                    "tags": ["cs.AI"],
-                    "confidence": 0.9,
-                    "path": "test/path",
-                    "score": 8,
-                }
+                _bound_for(
+                    {
+                        "title": "Test Note",
+                        "source_url": "https://example.com/paper",
+                        "content": "Content",
+                        "tags": ["cs.AI"],
+                        "confidence": 0.9,
+                        "path": "test/path",
+                        "score": 8,
+                    }
+                )
             ]
 
         with (
