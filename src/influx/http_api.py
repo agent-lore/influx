@@ -374,6 +374,12 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
             )
         acquired_profiles.append(profile_cfg.name)
 
+    run_log_context: dict[str, Any] = {
+        "request_id": request_id,
+        "kind": "manual",
+        "scope": "all",
+        "profiles": list(acquired_profiles),
+    }
     _spawn_tracked_task(
         request.app,
         _run_many_and_release(
@@ -386,13 +392,9 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
             fetch_cache=getattr(request.app.state, "fetch_cache", None),
             request_id=request_id,
             run_ledger=run_ledger,
+            log_context=run_log_context,
         ),
-        log_context={
-            "request_id": request_id,
-            "kind": "manual",
-            "scope": "all",
-            "profiles": list(acquired_profiles),
-        },
+        log_context=run_log_context,
     )
     logger.info(
         "manual run accepted request_id=%s scope=all profiles=%s submitted_at=%s",
@@ -544,12 +546,16 @@ async def _run_many_and_release(
     fetch_cache: Any = None,
     request_id: str | None = None,
     run_ledger: RunLedger | None = None,
+    log_context: dict[str, Any] | None = None,
 ) -> None:
     """Run several already-acquired profiles and release all locks.
 
     Per-profile failures from the underlying ``asyncio.gather`` are
-    inspected and logged with request context (#105) so that multi-
-    profile partial failures are visible in operator logs.
+    logged with request context (#105) so that multi-profile partial
+    failures are visible. When ``log_context`` is supplied, the helper
+    records ``failed_count`` / ``total_count`` / ``failed_profiles``
+    onto it so the request-level done-callback can distinguish
+    ``completed`` from ``partial_failure`` for the same ``request_id``.
     """
     if fetch_cache is not None:
         fetch_cache.begin_fire()
@@ -603,23 +609,10 @@ async def _run_many_and_release(
                         "status": "completed",
                     },
                 )
-        log_fn = logger.warning if failed else logger.info
-        log_fn(
-            "%s run %s aggregate: %d/%d profiles failed",
-            kind.value,
-            request_id,
-            len(failed),
-            len(profiles),
-            extra={
-                "request_id": request_id,
-                "kind": kind.value,
-                "scope": "all",
-                "failed_count": len(failed),
-                "total_count": len(profiles),
-                "failed_profiles": [p for p, _ in failed],
-                "status": "partial_failure" if failed else "completed",
-            },
-        )
+        if log_context is not None:
+            log_context["failed_count"] = len(failed)
+            log_context["total_count"] = len(profiles)
+            log_context["failed_profiles"] = [p for p, _ in failed]
     finally:
         for profile in profiles:
             coordinator.release(profile)
@@ -642,15 +635,7 @@ def _log_task_completion(
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is None:
-            logger.info(
-                "background task completed request_id=%s kind=%s scope=%s",
-                log_context.get("request_id"),
-                log_context.get("kind"),
-                log_context.get("scope"),
-                extra={**log_context, "status": "completed"},
-            )
-        else:
+        if exc is not None:
             logger.error(
                 "background task failed request_id=%s kind=%s scope=%s: %s",
                 log_context.get("request_id"),
@@ -660,6 +645,31 @@ def _log_task_completion(
                 exc_info=exc,
                 extra={**log_context, "status": "failed"},
             )
+            return
+        # Task itself succeeded — but for all-profiles fan-out a
+        # partial failure surfaces via ``failed_count`` written back
+        # onto the shared ``log_context`` by ``_run_many_and_release``.
+        # We must NOT report ``completed`` for those requests (#105).
+        failed_count = int(log_context.get("failed_count") or 0)
+        if failed_count > 0:
+            logger.warning(
+                "background task partial failure request_id=%s kind=%s "
+                "scope=%s failed=%d/%d",
+                log_context.get("request_id"),
+                log_context.get("kind"),
+                log_context.get("scope"),
+                failed_count,
+                int(log_context.get("total_count") or 0),
+                extra={**log_context, "status": "partial_failure"},
+            )
+            return
+        logger.info(
+            "background task completed request_id=%s kind=%s scope=%s",
+            log_context.get("request_id"),
+            log_context.get("kind"),
+            log_context.get("scope"),
+            extra={**log_context, "status": "completed"},
+        )
 
     return _callback
 
@@ -941,6 +951,12 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
             )
         acquired_profiles.append(profile_cfg.name)
 
+    backfill_log_context: dict[str, Any] = {
+        "request_id": request_id,
+        "kind": "backfill",
+        "scope": "all",
+        "profiles": list(acquired_profiles),
+    }
     _spawn_tracked_task(
         request.app,
         _run_many_and_release(
@@ -954,13 +970,9 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
             fetch_cache=getattr(request.app.state, "fetch_cache", None),
             request_id=request_id,
             run_ledger=run_ledger,
+            log_context=backfill_log_context,
         ),
-        log_context={
-            "request_id": request_id,
-            "kind": "backfill",
-            "scope": "all",
-            "profiles": list(acquired_profiles),
-        },
+        log_context=backfill_log_context,
     )
     logger.info(
         "backfill accepted request_id=%s scope=all profiles=%s submitted_at=%s",

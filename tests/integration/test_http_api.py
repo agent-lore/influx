@@ -847,10 +847,24 @@ class TestRunObservability:
         ]
         assert len(aggregate) == 1
         agg = aggregate[0]
+        assert agg.message.startswith("background task partial failure")
         assert agg.failed_count == 1
         assert agg.total_count == 2
         assert agg.failed_profiles == ["web-tech"]
         assert agg.levelname == "WARNING"
+
+        # The request-level done-callback must NOT also report
+        # ``status="completed"`` for a request that had failures —
+        # that contradiction is exactly what #105 is meant to remove.
+        request_level_completed = [
+            r
+            for r in _records_with_status(caplog, "completed")
+            if r.message.startswith("background task")
+            and getattr(r, "request_id", None) == request_id
+        ]
+        assert request_level_completed == [], [
+            r.message for r in request_level_completed
+        ]
 
 
 class TestBackfillObservability:
@@ -958,6 +972,18 @@ class TestBackfillObservability:
         ]
         assert len(aggregate) == 1
         agg = aggregate[0]
+        assert agg.message.startswith("background task partial failure")
         assert agg.failed_count == 1
         assert agg.total_count == 2
         assert agg.failed_profiles == ["ai-robotics"]
+        assert agg.levelname == "WARNING"
+
+        request_level_completed = [
+            r
+            for r in _records_with_status(caplog, "completed")
+            if r.message.startswith("background task")
+            and getattr(r, "request_id", None) == request_id
+        ]
+        assert request_level_completed == [], [
+            r.message for r in request_level_completed
+        ]
