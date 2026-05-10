@@ -13,6 +13,7 @@ implementations ship with PRD 07.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import enum
@@ -1222,8 +1223,17 @@ async def _process_sweep_note(
     current_tags = list(tags)
     archive_succeeded = False
 
+    # Issue #124: each per-stage helper invokes a sync hook that does
+    # blocking work — archive download (sync HTTP), text extraction
+    # (sync HTML/PDF), and tier 2/3 model calls (sync POST). Running
+    # them on the event loop starves the admin API exactly the way the
+    # acquire/filter path used to. Offload each helper to a worker
+    # thread; the helpers themselves stay sync (preserving the
+    # _stage_attempt context manager, telemetry, and tag-mutation
+    # rollback semantics inside them).
     if stages.archive_retry and hooks.archive_download:
-        current_tags, archive_path, archive_succeeded = _run_archive_retry(
+        current_tags, archive_path, archive_succeeded = await asyncio.to_thread(
+            _run_archive_retry,
             note,
             profile=profile,
             current_tags=current_tags,
@@ -1232,7 +1242,8 @@ async def _process_sweep_note(
         )
 
     if stages.text_extraction_retry and hooks.text_extraction:
-        current_tags = _run_text_extraction_retry(
+        current_tags = await asyncio.to_thread(
+            _run_text_extraction_retry,
             note,
             profile=profile,
             current_tags=current_tags,
@@ -1252,7 +1263,8 @@ async def _process_sweep_note(
         and hooks.re_extract_archive
         and archive_path is not None
     ):
-        current_tags = apply_abstract_only_reextraction(
+        current_tags = await asyncio.to_thread(
+            apply_abstract_only_reextraction,
             tags=current_tags,
             note=note,
             archive_path=archive_path,
@@ -1260,7 +1272,8 @@ async def _process_sweep_note(
         )
 
     if stages.tier2_retry and hooks.tier2_enrich:
-        current_tags = _run_tier_retry(
+        current_tags = await asyncio.to_thread(
+            _run_tier_retry,
             note,
             profile=profile,
             current_tags=current_tags,
@@ -1270,7 +1283,8 @@ async def _process_sweep_note(
         )
 
     if stages.tier3_retry and hooks.tier3_extract:
-        current_tags = _run_tier_retry(
+        current_tags = await asyncio.to_thread(
+            _run_tier_retry,
             note,
             profile=profile,
             current_tags=current_tags,

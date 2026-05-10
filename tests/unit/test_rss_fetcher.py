@@ -239,7 +239,7 @@ class TestStorageTunablesThreaded:
     feed-bytes path (US-011 AC-X-1).
     """
 
-    @patch("influx.sources.rss._guarded_fetch")
+    @patch("influx.sources.rss._aguarded_fetch")
     @pytest.mark.asyncio
     async def test_fetch_rss_feed_threads_storage_tunables(
         self, mock_fetch: MagicMock
@@ -247,12 +247,16 @@ class TestStorageTunablesThreaded:
         from influx.http_client import FetchResult
         from influx.sources.rss import _fetch_rss_feed
 
-        mock_fetch.return_value = FetchResult(
-            body=b"<rss/>",
-            status_code=200,
-            content_type="application/rss+xml",
-            final_url="https://example.com/feed.xml",
-        )
+        # ``_aguarded_fetch`` is async; the mock must return a coroutine.
+        async def _stub(*_args: object, **_kwargs: object) -> FetchResult:
+            return FetchResult(
+                body=b"<rss/>",
+                status_code=200,
+                content_type="application/rss+xml",
+                final_url="https://example.com/feed.xml",
+            )
+
+        mock_fetch.side_effect = _stub
 
         feed_entry = _make_feed_entry(
             name="x", url="https://example.com/feed.xml", source_tag="rss"
