@@ -42,6 +42,24 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _metric_source(source_label: str) -> str:
+    """Normalise ``source_label`` to the bounded ``source`` metric label.
+
+    ``BoundScoredCandidate.source_label`` is rich — ``"arxiv"`` or
+    ``"rss:<feed_name>"`` — so logs can carry per-feed provenance.  The
+    ``source`` label on :func:`metrics.cache_hits` (and every other
+    Influx metric) is contractually bounded to ``"arxiv"`` / ``"rss"``
+    (see ``influx/metrics.py`` "Cardinality discipline").  Collapse the
+    per-feed suffix here so dashboards/alerts keyed on the bounded set
+    keep working and per-feed cardinality never leaks into metrics.
+    """
+    if source_label == "arxiv":
+        return "arxiv"
+    if source_label == "rss" or source_label.startswith("rss:"):
+        return "rss"
+    return "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class DedupDecision:
     """One scored candidate's pre-acquire dedup outcome.
@@ -97,7 +115,7 @@ async def dedup_scored_candidates(
 
         if hit:
             metrics.cache_hits().add(
-                1, {"profile": profile, "source": bound.source_label}
+                1, {"profile": profile, "source": _metric_source(bound.source_label)}
             )
             action = "skip" if skip_cache_hits else "merge-profile"
             logger.info(

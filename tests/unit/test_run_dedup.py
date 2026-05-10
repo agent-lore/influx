@@ -276,3 +276,34 @@ async def test_metric_incremented_per_hit(monkeypatch: pytest.MonkeyPatch) -> No
     )
 
     assert counter.add.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_metric_source_label_bounded_for_rss_feed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-feed RSS bounds carry ``source_label="rss:<feed_name>"`` for
+    log richness, but the ``source`` *metric* label must collapse to the
+    bounded ``"rss"`` per ``influx/metrics.py`` cardinality discipline.
+    Otherwise per-feed names would leak into metric series and skew any
+    dashboard / alert keyed on the bounded set."""
+    counter = MagicMock()
+    monkeypatch.setattr("influx.metrics.cache_hits", lambda: counter)
+
+    rss_bound = _make_bound(item_id="rss-hit", source_label="rss:Mozilla Hacks")
+    arxiv_bound = _make_bound(item_id="arxiv-hit", source_label="arxiv")
+    client = _client_with_responses({"hit": True}, {"hit": True})
+
+    await dedup_scored_candidates(
+        [rss_bound, arxiv_bound],
+        client=client,
+        profile="p1",
+        skip_cache_hits=True,
+    )
+
+    label_sets = [call.args[1] for call in counter.add.call_args_list]
+    assert {"profile": "p1", "source": "rss"} in label_sets
+    assert {"profile": "p1", "source": "arxiv"} in label_sets
+    # No per-feed cardinality leak.
+    for labels in label_sets:
+        assert ":" not in labels["source"]
