@@ -360,3 +360,156 @@ class TestParseFeedRejectsInvalidUrls:
 
         # Validator still runs; only the public item passes.
         assert [it.title for it in items] == ["Good Public Article"]
+
+    def test_rejection_bumps_fetched_total(self) -> None:
+        """Issue #131 review concern 2: fetched_total reflects what the
+        feed *returned*, not just what survived URL validation.
+
+        Otherwise an all-rejected run would look like ``fetch_stall``
+        ("nothing was fetched at all"), losing the operational
+        distinction the issue requires.
+        """
+        from influx.telemetry import (
+            current_fetched_total,
+            current_invalid_url_rejections,
+        )
+
+        fetched: list[int] = [0]
+        rejected: list[int] = [0]
+        fetched_token = current_fetched_total.set(fetched)
+        rejected_token = current_invalid_url_rejections.set(rejected)
+        try:
+            entry = _make_feed_entry(name="mixed", source_tag="rss")
+            items = parse_feed(_MIXED_FEED_XML, entry, profile="p")
+        finally:
+            current_fetched_total.reset(fetched_token)
+            current_invalid_url_rejections.reset(rejected_token)
+
+        # The provider closure adds ``len(items)`` after parse_feed
+        # returns; parse_feed itself only contributes the rejection
+        # bumps.  Combined, they total the feed's full entry count (3).
+        assert rejected[0] == 2
+        assert fetched[0] == 2  # parse_feed-internal contribution
+        # Sanity: combined with what the provider would add, total == 3.
+        assert fetched[0] + len(items) == 3
+
+
+# ── #131 review concern 1: staging allow_private_ips=true must not
+#    re-allow loopback/private RSS entry URLs ────────────────────────
+
+
+class TestProductionPathIgnoresAllowPrivateIps:
+    """Regression guard: the production provider closure must NOT
+    thread ``config.security.allow_private_ips`` into ``parse_feed``.
+
+    Staging sets ``allow_private_ips = true`` for fetcher reasons.  If
+    the URL validator respected that flag in production, the original
+    Sourcegraph staging incident — RSS items advertising
+    ``http://localhost:5174/...`` — would still be ingested, defeating
+    the entire fix.
+    """
+
+    @pytest.mark.asyncio
+    async def test_provider_rejects_localhost_even_with_allow_private_ips_true(
+        self,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from influx.config import (
+            AppConfig,
+            ProfileConfig,
+            ProfileSources,
+            PromptEntryConfig,
+            PromptsConfig,
+            ScheduleConfig,
+            SecurityConfig,
+        )
+        from influx.coordinator import RunKind
+        from influx.sources.rss import make_rss_item_provider
+
+        rss_entry = _make_feed_entry(
+            name="staging-feed",
+            url="https://example.com/feed.xml",
+            source_tag="rss",
+        )
+        # Staging-style config: allow_private_ips=true.
+        config = AppConfig(
+            schedule=ScheduleConfig(
+                cron="0 6 * * *",
+                timezone="UTC",
+                misfire_grace_seconds=3600,
+            ),
+            profiles=[
+                ProfileConfig(
+                    name="ai-robotics",
+                    sources=ProfileSources(rss=[rss_entry]),
+                ),
+            ],
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="t"),
+                tier1_enrich=PromptEntryConfig(text="t"),
+                tier3_extract=PromptEntryConfig(text="t"),
+            ),
+            security=SecurityConfig(allow_private_ips=True),
+        )
+
+        # Mock the network fetch to return a feed body with one valid
+        # link plus the original Sourcegraph-style localhost leak.
+        from influx.http_client import FetchResult
+
+        async def _stub(*_args: object, **_kwargs: object) -> FetchResult:
+            return FetchResult(
+                body=_MIXED_FEED_XML,
+                status_code=200,
+                content_type="application/rss+xml",
+                final_url="https://example.com/feed.xml",
+            )
+
+        # Stub the LLM filter so the test stays unit-scoped — accept
+        # everything the validator lets through.
+        async def _score_stub(*, items: list[Any], **_kwargs: object) -> dict[str, Any]:
+            from types import SimpleNamespace
+
+            from influx.sources.rss import _rss_filter_id
+
+            return {
+                _rss_filter_id(it): SimpleNamespace(score=10, reason="ok", tags=[])
+                for it in items
+            }
+
+        with (
+            patch("influx.sources.rss._aguarded_fetch", AsyncMock(side_effect=_stub)),
+            patch(
+                "influx.sources.rss._score_rss_items",
+                AsyncMock(side_effect=_score_stub),
+            ),
+            patch(
+                "influx.sources.rss.build_rss_note_item",
+                lambda **kwargs: {
+                    "id": "x",
+                    "title": kwargs["item"].title,
+                    "source": "rss",
+                    "source_url": kwargs["item"].url,
+                    "content": "",
+                    "tags": [],
+                    "filter_tags": [],
+                    "score": kwargs.get("score", 0),
+                    "confidence": kwargs.get("confidence", 0.0),
+                    "reason": kwargs.get("reason", ""),
+                    "path": "x",
+                    "abstract_or_summary": "",
+                    "contributions": None,
+                    "builds_on": None,
+                },
+            ),
+        ):
+            provider = make_rss_item_provider(config)
+            results = list(
+                await provider("ai-robotics", RunKind.SCHEDULED, None, "prompt")
+            )
+
+        # Only the single public-URL item should reach the build step;
+        # localhost + 192.168.x.x must be dropped pre-acquire even
+        # though the config has allow_private_ips=True.
+        assert len(results) == 1
+        assert results[0]["source_url"] == "https://example.com/good"

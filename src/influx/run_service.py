@@ -292,6 +292,28 @@ async def ledger_lifecycle(
                 run_id,
                 archive_failures_total,
             )
+        if "invalid_url_stall" in degraded_reasons:
+            # #131 review concern 2: feed returned items but every URL
+            # was upstream-malformed.  Single-run signal — operators
+            # should look at the upstream feed's emitted ``<link>``
+            # values, not the profile description, filter prompt, or
+            # provider config.
+            metrics.ingestion_stalls().add(
+                1, {"profile": profile, "reason": "invalid_url_stall"}
+            )
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged invalid_url_stall profile=%s kind=%s run_id=%s "
+                "invalid_url_rejections=%d fetched_total=%d "
+                "(feed returned items but every entry link was "
+                "upstream-malformed — check the upstream feed publisher)",
+                profile,
+                plan.kind.value,
+                run_id,
+                invalid_url_rejections_total,
+                fetched_total,
+            )
         metrics.run_duration().record(elapsed, metric_attrs)
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
 
