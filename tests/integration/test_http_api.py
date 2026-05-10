@@ -783,7 +783,7 @@ class TestRunObservability:
         assert record.profile == "ai-robotics"
         assert record.exc_info is not None
 
-        helper_warnings = [
+        helper_warnings: list[Any] = [
             r
             for r in caplog.records
             if r.message.startswith("run_profile")
