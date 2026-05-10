@@ -18,6 +18,7 @@ fails), the feed item's ``<summary>`` is used instead (FR-ENR-3, AC-09-J).
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import json
 import logging
@@ -35,8 +36,8 @@ from influx.cascade import Acquired, Cascade
 from influx.coordinator import RunKind
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article
-from influx.filter import FilterScorerError, _call_filter_model_with_retry
-from influx.http_client import guarded_fetch as _guarded_fetch
+from influx.filter import FilterScorerError, _acall_filter_model_with_retry
+from influx.http_client import aguarded_fetch as _aguarded_fetch
 from influx.renderer import render
 from influx.slugs import slugify_feed_name
 from influx.source import Candidate, ScoredCandidate
@@ -411,7 +412,7 @@ async def _score_rss_items(
         last_error: Exception | None = None
         for _attempt in range(attempts):
             try:
-                response = _call_filter_model_with_retry(
+                response = await _acall_filter_model_with_retry(
                     config=config,
                     profile=profile,
                     url=url,
@@ -685,8 +686,14 @@ def make_rss_item_provider(
                         item.title,
                         item.url,
                     )
+                    # Issue #124: build_rss_note_item performs sync HTTP
+                    # (article fetch + archive download) and PDF/HTML
+                    # extraction. Offload to a worker thread so the
+                    # admin event loop stays responsive during long
+                    # acquisition + cascade work.
                     results.append(
-                        build_rss_note_item(
+                        await asyncio.to_thread(
+                            build_rss_note_item,
                             item=item,
                             profile_name=profile,
                             config=config,
@@ -739,7 +746,7 @@ async def _fetch_rss_feed(
 
     async def _fetch_bytes() -> bytes | None:
         try:
-            result = _guarded_fetch(
+            result = await _aguarded_fetch(
                 feed_entry.url,
                 max_download_bytes=max_download_bytes,
                 timeout_seconds=timeout_seconds,

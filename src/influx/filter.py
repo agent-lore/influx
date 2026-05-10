@@ -33,6 +33,7 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -237,6 +238,34 @@ def _call_filter_model_with_retry(
     raise FilterScorerError(f"filter failed after {attempts} attempts") from last_error
 
 
+async def _acall_filter_model_with_retry(
+    *,
+    config: AppConfig,
+    profile: str,
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    attempts: int,
+) -> FilterResponse:
+    """Async wrapper: offloads :func:`_call_filter_model_with_retry` to a worker thread.
+
+    Issue #124: the sync retry path uses blocking ``time.sleep`` and a
+    sync HTTP client. Calling it directly from the async event loop
+    (RSS scoring path, batched-scorer path) starves the loop and stalls
+    the admin HTTP API. Threaded offload preserves the existing retry,
+    backoff, and Retry-After semantics verbatim.
+    """
+    return await asyncio.to_thread(
+        _call_filter_model_with_retry,
+        config=config,
+        profile=profile,
+        url=url,
+        body=body,
+        headers=headers,
+        attempts=attempts,
+    )
+
+
 def make_default_arxiv_filter_scorer(
     config: AppConfig,
 ) -> Any | None:
@@ -314,7 +343,7 @@ def make_default_arxiv_filter_scorer(
         if slot.json_mode:
             body["response_format"] = {"type": "json_object"}
 
-        response = _call_filter_model_with_retry(
+        response = await _acall_filter_model_with_retry(
             config=config,
             profile=profile,
             url=url,
@@ -395,7 +424,7 @@ def make_default_batch_scorer(config: AppConfig) -> BatchScorer | None:
             body["response_format"] = {"type": "json_object"}
 
         by_id: dict[str, Candidate] = {c.item_id: c for c in candidates}
-        response = _call_filter_model_with_retry(
+        response = await _acall_filter_model_with_retry(
             config=config,
             profile=profile,
             url=url,

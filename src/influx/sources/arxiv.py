@@ -18,6 +18,7 @@ abstract-only extraction cascade and rendering the canonical note.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import xml.etree.ElementTree as ET
@@ -972,7 +973,12 @@ async def _fetch_arxiv_items(
             arxiv_cfg.max_results_per_category,
             arxiv_cfg.lookback_days,
         )
-        return fetch_arxiv(
+        # Issue #124: ``fetch_arxiv`` is synchronous and performs
+        # blocking HTTP via ``guarded_fetch`` plus blocking ``_sleep``
+        # backoff for arxiv 429s. Offload to a worker thread so the
+        # admin event loop stays responsive throughout the fetch.
+        return await asyncio.to_thread(
+            fetch_arxiv,
             arxiv_config=arxiv_cfg,
             resilience=config.resilience,
             backfill_range=backfill_range,
@@ -1005,9 +1011,13 @@ async def _fetch_arxiv_items(
             arxiv_cfg.categories,
             per_day_max,
         )
-        _sleep(pacing)
+        # Issue #124: blocking sleep + sync fetch on the event loop —
+        # offload both to a worker thread so the admin API stays
+        # responsive across the per-day backfill loop.
+        await asyncio.to_thread(_sleep, pacing)
         try:
-            day_items = fetch_arxiv(
+            day_items = await asyncio.to_thread(
+                fetch_arxiv,
                 arxiv_config=per_day_arxiv_cfg,
                 resilience=config.resilience,
                 backfill_range=day_range,
@@ -1117,8 +1127,17 @@ def make_arxiv_item_provider(
         )
 
         # ── 3. Source.acquire per scored candidate ────────────────
+        # Issue #124: ``acquire`` performs blocking archive download
+        # (sync ``guarded_fetch``) plus the cascade enrichment chain
+        # (sync HTTP for tier 1/2/3). Offload each per-item acquisition
+        # to a worker thread so admin endpoints stay responsive.
         results: list[dict[str, Any]] = [
-            source.acquire(sc, profile_cfg=profile_cfg, config=config)
+            await asyncio.to_thread(
+                source.acquire,
+                sc,
+                profile_cfg=profile_cfg,
+                config=config,
+            )
             for sc in scored_list
         ]
 

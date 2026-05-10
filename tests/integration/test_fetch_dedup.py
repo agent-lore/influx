@@ -448,6 +448,9 @@ class TestRssFetchDedup:
                 final_url=url,
             )
 
+        async def acounting_guarded_fetch(url: str, **kwargs: Any) -> FetchResult:
+            return counting_guarded_fetch(url, **kwargs)
+
         async def score_rss_items(**kwargs: Any) -> dict[str, FilterResult]:
             return {
                 url_hash("https://shared-blog.example/post-1"): FilterResult(
@@ -476,8 +479,8 @@ class TestRssFetchDedup:
         # (for archive download + article extraction).
         with (
             patch(
-                "influx.sources.rss._guarded_fetch",
-                side_effect=counting_guarded_fetch,
+                "influx.sources.rss._aguarded_fetch",
+                side_effect=acounting_guarded_fetch,
             ),
             patch(
                 "influx.storage.guarded_fetch",
@@ -571,10 +574,13 @@ class TestRssFetchDedup:
                 final_url=url,
             )
 
+        async def acounting_guarded_fetch(url: str, **kwargs: Any) -> FetchResult:
+            return counting_guarded_fetch(url, **kwargs)
+
         cache = FetchCache()
         with patch(
-            "influx.sources.rss._guarded_fetch",
-            side_effect=counting_guarded_fetch,
+            "influx.sources.rss._aguarded_fetch",
+            side_effect=acounting_guarded_fetch,
         ):
             items_a = asyncio.run(_fetch_rss_feed(feed_a, cache))
             items_b = asyncio.run(_fetch_rss_feed(feed_b, cache))

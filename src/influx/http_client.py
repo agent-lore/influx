@@ -10,6 +10,7 @@ See PRD §5.4 for the full contract.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 from collections.abc import Iterator
@@ -26,6 +27,8 @@ from influx.errors import NetworkError
 __all__ = [
     "ContentTypeFamily",
     "FetchResult",
+    "aguarded_fetch",
+    "aguarded_post_json_fetch",
     "guarded_fetch",
     "guarded_outbound_post",
     "guarded_post_json",
@@ -442,3 +445,56 @@ def guarded_post_json_fetch(
             kind="network",
             reason=str(exc),
         ) from exc
+
+
+# ── Async wrappers (issue #124) ─────────────────────────────────────
+#
+# The sync ``guarded_fetch`` and ``guarded_post_json_fetch`` functions
+# perform blocking I/O via ``httpx.Client``. When called from the
+# async event loop (Run path: source fetch, filter scoring, archive
+# download, content extraction), they starve the loop and stall the
+# admin HTTP API. These thin async wrappers offload the sync call to
+# a worker thread so the event loop stays responsive.
+#
+# The sync helpers are unchanged — all SSRF, redirect, size cap,
+# timeout, and content-type guard behaviour is preserved verbatim.
+
+
+async def aguarded_fetch(
+    url: str,
+    *,
+    allow_private_ips: bool = False,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
+    expected_content_type: ContentTypeFamily | None = None,
+) -> FetchResult:
+    """Async wrapper: offloads :func:`guarded_fetch` to a worker thread."""
+    return await asyncio.to_thread(
+        guarded_fetch,
+        url,
+        allow_private_ips=allow_private_ips,
+        max_download_bytes=max_download_bytes,
+        timeout_seconds=timeout_seconds,
+        expected_content_type=expected_content_type,
+    )
+
+
+async def aguarded_post_json_fetch(
+    url: str,
+    payload: dict[str, object],
+    *,
+    headers: dict[str, str] | None = None,
+    allow_private_ips: bool = False,
+    max_response_bytes: int | None = None,
+    timeout_seconds: int | None = None,
+) -> FetchResult:
+    """Async wrapper: offloads :func:`guarded_post_json_fetch` to a worker thread."""
+    return await asyncio.to_thread(
+        guarded_post_json_fetch,
+        url,
+        payload,
+        headers=headers,
+        allow_private_ips=allow_private_ips,
+        max_response_bytes=max_response_bytes,
+        timeout_seconds=timeout_seconds,
+    )
