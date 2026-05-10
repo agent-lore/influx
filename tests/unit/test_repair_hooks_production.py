@@ -793,9 +793,18 @@ class TestTextExtractionHookSuccess:
 
 
 class TestTextExtractionHookFailures:
-    def test_cascade_failure_propagates_extraction_error(self, tmp_path: Path) -> None:
-        from influx.repair_counters import classify_failure
+    """Live extraction failure converges to ``text:abstract-only`` (issue #137).
 
+    Per the :class:`~influx.repair.TextExtractionHook` protocol the
+    hook returns ``"text:abstract-only"`` on cascade fall-through so
+    the sweep stamps a ``text:*`` tag and the note exits the
+    text-extraction stage.  Re-extraction from a stored archive (via
+    the source-agnostic ``re_extract_archive`` hook) can still upgrade
+    the tag to ``text:html`` / ``text:pdf`` once ``archive_download``
+    lands.
+    """
+
+    def test_cascade_failure_returns_abstract_only(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
         note = _make_textless_note()
@@ -807,15 +816,11 @@ class TestTextExtractionHookFailures:
                 detail="both html and pdf failed",
             )
             assert hooks.text_extraction is not None
-            with pytest.raises(ExtractionError) as exc_info:
-                hooks.text_extraction(note)
+            tag = hooks.text_extraction(note)
 
-        assert exc_info.value.stage == "cascade"
-        # ``cascade`` is not in _COUNTED_STAGES, so it stays transient —
-        # the note re-enters the sweep next pass.
-        assert classify_failure(exc_info.value) == "transient"
+        assert tag == "text:abstract-only"
 
-    def test_network_error_rewrapped_as_extraction_error(self, tmp_path: Path) -> None:
+    def test_network_error_returns_abstract_only(self, tmp_path: Path) -> None:
         from influx.errors import NetworkError
 
         config = _make_config(tmp_path)
@@ -829,10 +834,34 @@ class TestTextExtractionHookFailures:
                 kind="ssrf",
             )
             assert hooks.text_extraction is not None
-            with pytest.raises(ExtractionError) as exc_info:
+            tag = hooks.text_extraction(note)
+
+        assert tag == "text:abstract-only"
+
+    def test_logs_warning_on_failure(self, tmp_path: Path, caplog) -> None:
+        """Operator visibility: the structural failure stage is logged."""
+        import logging
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_textless_note()
+
+        with patch("influx.repair_hooks.extract_arxiv_text") as mock_x:
+            mock_x.side_effect = ExtractionError(
+                "cascade fell through",
+                stage="cascade",
+                detail="both html and pdf failed",
+            )
+            assert hooks.text_extraction is not None
+            with caplog.at_level(logging.WARNING, logger="influx.repair_hooks"):
                 hooks.text_extraction(note)
 
-        assert exc_info.value.stage == "ssrf"
+        assert any(
+            "stage=cascade" in record.message
+            and "text:abstract-only" in record.message
+            and "2604.26946" in record.message
+            for record in caplog.records
+        )
 
 
 class TestTextExtractionHookMetadataRecovery:

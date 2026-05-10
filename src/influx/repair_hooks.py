@@ -474,7 +474,27 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
 
 
 def _run_arxiv_text_extraction(note: dict[str, object], config: AppConfig) -> str:
-    """Run the arxiv text-extraction cascade and return the resulting tag."""
+    """Run the arxiv text-extraction cascade and return the resulting tag.
+
+    Returns ``"text:html"`` / ``"text:pdf"`` from the cascade's success
+    paths.  On cascade fall-through (``ExtractionError`` from
+    :func:`extract_arxiv_text`) or a ``NetworkError`` leaking from
+    helpers it calls (e.g. SSRF / TLS / timeout on the PDF fetch),
+    returns ``"text:abstract-only"`` per the
+    :class:`~influx.repair.TextExtractionHook` protocol so the sweep
+    stamps a ``text:*`` tag and the note converges out of the
+    text-extraction stage.  The note can still be upgraded to
+    ``text:html`` / ``text:pdf`` later via
+    :func:`_make_re_extract_archive_hook` once
+    :func:`_make_archive_download_hook` lands an archive on disk.  A
+    WARN is emitted so operators can see the structural reason behind
+    the convergence.
+
+    Only ``ExtractionError(stage="resolve")`` is raised — that signals
+    a missing ``arxiv-id:`` tag which only an operator fix can repair,
+    and it should keep surfacing through the sweep's failure-logging
+    path until corrected.
+    """
     arxiv_id = _find_tag(_note_tags(note), _ARXIV_ID_TAG_PREFIX)
     if not arxiv_id:
         raise ExtractionError(
@@ -485,17 +505,16 @@ def _run_arxiv_text_extraction(note: dict[str, object], config: AppConfig) -> st
 
     try:
         result = extract_arxiv_text(arxiv_id, config)
-    except NetworkError as exc:
-        # extract_arxiv_text raises ExtractionError on full cascade
-        # fall-through, but a NetworkError can leak from helpers it
-        # calls (e.g. SSRF guards on the PDF fetch).  Re-wrap so the
-        # sweep's ``(ExtractionError, ...)`` branch handles it.
-        raise ExtractionError(
-            f"text_extraction retry network failure: {exc.kind}",
-            url=getattr(exc, "url", "") or "",
-            stage=exc.kind or "network",
-            detail=str(exc),
-        ) from exc
+    except (ExtractionError, NetworkError) as exc:
+        stage = getattr(exc, "stage", None) or getattr(exc, "kind", None) or "extract"
+        _log.warning(
+            "arxiv text_extraction retry: live extraction failed for %s "
+            "(stage=%s arxiv_id=%s); converging to text:abstract-only",
+            note.get("id", "?"),
+            stage,
+            arxiv_id,
+        )
+        return "text:abstract-only"
     return result.source_tag
 
 
