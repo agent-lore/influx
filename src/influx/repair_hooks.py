@@ -22,6 +22,7 @@ import trafilatura
 from influx.config import AppConfig
 from influx.enrich import tier3_extract as _tier3_extract
 from influx.errors import ExtractionError, LCMAError, NetworkError
+from influx.extraction.article import extract_article
 from influx.extraction.html import _clean_html_fragments, _strip_tags
 from influx.extraction.pdf import extract_pdf
 from influx.extraction.pipeline import extract_arxiv_text
@@ -193,7 +194,11 @@ def _extract_from_archive(
 
 _ARXIV_ID_TAG_PREFIX = "arxiv-id:"
 _SOURCE_TAG_PREFIX = "source:"
-_NOTE_PATH_RE = re.compile(r"papers/(?P<source>[^/]+)/(?P<year>\d{4})/(?P<month>\d{2})")
+_NOTE_PATH_RE = re.compile(
+    r"(?:papers|articles)/(?P<source>[^/]+)/(?P<year>\d{4})/(?P<month>\d{2})"
+)
+_RSS_NOTE_ID_PREFIX = "rss-"
+_SOURCE_URL_FRONTMATTER_KEY = "source_url:"
 
 
 def _find_tag(tags: list[str], prefix: str) -> str | None:
@@ -210,22 +215,37 @@ def _note_tags(note: dict[str, object]) -> list[str]:
     return list(raw) if isinstance(raw, list) else []
 
 
-def _require_arxiv_source(note: dict[str, object], *, stage_label: str) -> None:
-    """Raise ``ExtractionError(stage="unsupported_source")`` for non-arxiv notes.
+def _note_source_tag(note: dict[str, object]) -> str:
+    """Return the note's ``source:*`` tag suffix or an empty string."""
+    return _find_tag(_note_tags(note), _SOURCE_TAG_PREFIX) or ""
 
-    The current sweep-side hooks only know how to retry archive download
-    and text extraction for arxiv notes; other sources surface this
-    sentinel which the sweep classifies as transient (and which
-    :func:`influx.repair._terminate_unsupported_text_source` flips to
-    terminal so the note exits the sweep instead of looping).
+
+def _is_rss_source(source: str) -> bool:
+    """Return whether *source* names an RSS feed source tag.
+
+    Production RSS notes carry ``source:rss-<feed-slug>``; the bare
+    ``source:rss`` sentinel is accepted to keep the dispatcher robust
+    to historical or hand-edited notes.
     """
-    source = _find_tag(_note_tags(note), _SOURCE_TAG_PREFIX) or ""
-    if source != "arxiv":
-        raise ExtractionError(
-            f"{stage_label}: source {source!r} not supported",
-            stage="unsupported_source",
-            detail=f"note id={note.get('id', '?')}",
-        )
+    return source == "rss" or source.startswith(_RSS_NOTE_ID_PREFIX)
+
+
+def _raise_unsupported_source(
+    note: dict[str, object], *, stage_label: str, source: str
+) -> None:
+    """Raise ``ExtractionError(stage="unsupported_source")`` for an unknown source.
+
+    The text-extraction path flips this to terminal via
+    :func:`influx.repair._terminate_unsupported_text_source`; the
+    archive-download path leaves it transient (the note re-enters the
+    sweep next pass and is repaired automatically once a per-source
+    resolver is added).
+    """
+    raise ExtractionError(
+        f"{stage_label}: source {source!r} not supported",
+        stage="unsupported_source",
+        detail=f"note id={note.get('id', '?')}",
+    )
 
 
 def _parse_year_month_from_note_path(note_path: str) -> tuple[int, int] | None:
@@ -252,6 +272,117 @@ def _classify_download_kind(error: str) -> str:
     head, _, _rest = error.partition(":")
     head = head.strip()
     return head or "archive_failed"
+
+
+def _parse_source_url_from_note(note: dict[str, object]) -> str | None:
+    """Return the ``source_url`` value from the note's YAML frontmatter, if any.
+
+    Reuses :func:`influx.notes.parse_note` so the sweep does not carry
+    its own YAML parser.  Returns ``None`` when the note cannot be
+    parsed or the field is absent.
+    """
+    content = str(note.get("content", ""))
+    try:
+        parsed = parse_note(content)
+    except Exception:
+        return None
+    for line in parsed.frontmatter_raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_SOURCE_URL_FRONTMATTER_KEY):
+            return stripped[len(_SOURCE_URL_FRONTMATTER_KEY) :].strip() or None
+    return None
+
+
+def _rss_item_id_from_note(note: dict[str, object]) -> str | None:
+    """Recover an archive ``item_id`` from an RSS note's ``id`` field.
+
+    RSS notes are written with ``id = "rss-<feed-slug>-<url-hash>"``
+    (see ``influx.sources.rss.build_rss_note_item``).  The leading
+    ``rss-`` prefix is dropped to mirror arxiv's
+    ``id = "arxiv-<arxiv-id>" -> item_id = "<arxiv-id>"`` convention.
+
+    The retry archive path will differ from what initial acquisition
+    would have produced (the original embedded a ``YYYY-MM-DD``
+    component that is not recoverable from the persisted note); this is
+    fine because acquisition failed and no archive currently lives on
+    disk for the original path.
+    """
+    note_id = str(note.get("id", ""))
+    if not note_id.startswith(_RSS_NOTE_ID_PREFIX):
+        return None
+    item_id = note_id[len(_RSS_NOTE_ID_PREFIX) :]
+    return item_id or None
+
+
+def _resolve_rss_download_args(
+    note: dict[str, object],
+    config: AppConfig,
+) -> dict[str, object]:
+    """Build kwargs for :func:`download_archive` from an RSS note's state.
+
+    Raises :class:`ExtractionError` (stage ``"resolve"``) when the note
+    is missing fields needed to retry — the sweep treats this as
+    transient so an operator hand-fix lands the next pass.
+    """
+    source = _note_source_tag(note)
+    source_url = _parse_source_url_from_note(note)
+    if not source_url:
+        raise ExtractionError(
+            "Cannot retry archive download: no source_url in frontmatter",
+            stage="resolve",
+            detail=f"note id={note.get('id', '?')}",
+        )
+    item_id = _rss_item_id_from_note(note)
+    if not item_id:
+        raise ExtractionError(
+            "Cannot retry archive download: note id missing 'rss-' prefix",
+            stage="resolve",
+            detail=f"note id={note.get('id', '?')}",
+        )
+    note_path = str(note.get("path", ""))
+    ym = _parse_year_month_from_note_path(note_path)
+    if ym is None:
+        raise ExtractionError(
+            "Cannot retry archive download: note path missing year/month",
+            stage="resolve",
+            detail=f"path={note_path!r}",
+        )
+    year, month = ym
+    return {
+        "url": source_url,
+        "archive_root": Path(config.storage.archive_dir),
+        "source": source,
+        "item_id": item_id,
+        "published_year": year,
+        "published_month": month,
+        "ext": ".html",
+        "allow_private_ips": config.security.allow_private_ips,
+        "max_download_bytes": config.storage.max_download_bytes,
+        "timeout_seconds": config.storage.download_timeout_seconds,
+        "expected_content_type": "html",
+    }
+
+
+def _resolve_archive_download_args(
+    note: dict[str, object],
+    config: AppConfig,
+) -> dict[str, object]:
+    """Dispatch :func:`download_archive` kwarg construction by note source.
+
+    Currently supports ``arxiv`` and ``rss-*`` (plus the bare ``rss``
+    sentinel).  Other sources raise ``unsupported_source`` so the sweep
+    keeps existing transient-retry behavior until a per-source
+    resolver lands.
+    """
+    source = _note_source_tag(note)
+    if source == "arxiv":
+        return _resolve_arxiv_download_args(note, config)
+    if _is_rss_source(source):
+        return _resolve_rss_download_args(note, config)
+    _raise_unsupported_source(
+        note, stage_label="archive_download retry", source=source
+    )
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _resolve_arxiv_download_args(
@@ -310,16 +441,15 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
     counted-class kinds — currently ``"oversize"``) and flips
     ``influx:archive-terminal`` once the cap is reached.
 
-    Currently scoped to ``source:arxiv`` notes.  Other sources raise an
+    Supports ``source:arxiv`` and ``source:rss-*`` notes via
+    :func:`_resolve_archive_download_args`.  Other sources raise an
     ``ExtractionError(stage="unsupported_source")`` which classifies as
     transient — the note re-enters the sweep next pass and is fixed
     automatically once a per-source resolver is added.
     """
 
     def hook(note: dict[str, object]) -> str:
-        _require_arxiv_source(note, stage_label="archive_download retry")
-
-        kwargs = _resolve_arxiv_download_args(note, config)
+        kwargs = _resolve_archive_download_args(note, config)
         result = download_archive(**kwargs)  # type: ignore[arg-type]
         if result.ok and result.rel_posix_path:
             _log.info(
@@ -345,49 +475,113 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
     return hook
 
 
+def _run_arxiv_text_extraction(
+    note: dict[str, object], config: AppConfig
+) -> str:
+    """Run the arxiv text-extraction cascade and return the resulting tag."""
+    arxiv_id = _find_tag(_note_tags(note), _ARXIV_ID_TAG_PREFIX)
+    if not arxiv_id:
+        raise ExtractionError(
+            "Cannot retry text extraction: no arxiv-id tag on note",
+            stage="resolve",
+            detail=f"note id={note.get('id', '?')}",
+        )
+
+    try:
+        result = extract_arxiv_text(arxiv_id, config)
+    except NetworkError as exc:
+        # extract_arxiv_text raises ExtractionError on full cascade
+        # fall-through, but a NetworkError can leak from helpers it
+        # calls (e.g. SSRF guards on the PDF fetch).  Re-wrap so the
+        # sweep's ``(ExtractionError, ...)`` branch handles it.
+        raise ExtractionError(
+            f"text_extraction retry network failure: {exc.kind}",
+            url=getattr(exc, "url", "") or "",
+            stage=exc.kind or "network",
+            detail=str(exc),
+        ) from exc
+    return result.source_tag
+
+
+def _run_rss_text_extraction(
+    note: dict[str, object], config: AppConfig
+) -> str:
+    """Run RSS web-article extraction for a degraded RSS note.
+
+    Reads ``source_url`` from frontmatter and re-runs
+    :func:`influx.extraction.article.extract_article` with the same
+    config knobs as initial RSS acquisition.  Returns ``"text:html"``
+    on success so the sweep adds the provenance tag and the note exits
+    the text-extraction stage.
+
+    A ``NetworkError`` (e.g. SSRF guard, TLS failure) is re-wrapped as
+    ``ExtractionError`` carrying the network kind as ``stage`` — same
+    pattern as the arxiv branch — so the sweep's failure-classifier
+    keeps the existing transient-vs-counted semantics.
+    """
+    source_url = _parse_source_url_from_note(note)
+    if not source_url:
+        raise ExtractionError(
+            "Cannot retry text extraction: no source_url in frontmatter",
+            stage="resolve",
+            detail=f"note id={note.get('id', '?')}",
+        )
+
+    extraction_cfg = config.extraction
+    storage_cfg = config.storage
+    try:
+        extract_article(
+            source_url,
+            min_web_chars=extraction_cfg.min_web_chars,
+            strip_tags=list(extraction_cfg.strip_tags),
+            allow_private_ips=config.security.allow_private_ips,
+            max_download_bytes=storage_cfg.max_download_bytes,
+            timeout_seconds=storage_cfg.download_timeout_seconds,
+        )
+    except NetworkError as exc:
+        raise ExtractionError(
+            f"text_extraction retry network failure: {exc.kind}",
+            url=getattr(exc, "url", "") or source_url,
+            stage=exc.kind or "network",
+            detail=str(exc),
+        ) from exc
+    return "text:html"
+
+
 def _make_text_extraction_hook(config: AppConfig) -> TextExtractionHook:
     """Create the production ``text_extraction`` hook (FR-REP-1 stage 2).
 
     The hook re-runs the source-specific extraction cascade for a note
     that carries no ``text:*`` tag and returns the resulting tag.  On
-    cascade fall-through (both HTML and PDF failed) the underlying
-    helper raises :class:`ExtractionError`; we surface it to the sweep
-    so the per-stage failure logging path fires.
+    cascade fall-through the underlying helper raises
+    :class:`ExtractionError`; we surface it to the sweep so the
+    per-stage failure logging path fires.
 
-    Currently scoped to ``source:arxiv`` — RSS support follows when
-    the multi-source resolver lands (out of scope for issue #24).
+    Supports ``source:arxiv`` (cascade via
+    :func:`extract_arxiv_text`) and ``source:rss-*`` (web article
+    extraction via :func:`extract_article`).  Other sources raise
+    ``ExtractionError(stage="unsupported_source")`` so the sweep
+    terminalises the note via
+    :func:`influx.repair._terminate_unsupported_text_source`.
     """
 
     def hook(note: dict[str, object]) -> str:
-        _require_arxiv_source(note, stage_label="text_extraction retry")
-
-        arxiv_id = _find_tag(_note_tags(note), _ARXIV_ID_TAG_PREFIX)
-        if not arxiv_id:
-            raise ExtractionError(
-                "Cannot retry text extraction: no arxiv-id tag on note",
-                stage="resolve",
-                detail=f"note id={note.get('id', '?')}",
+        source = _note_source_tag(note)
+        if source == "arxiv":
+            tag = _run_arxiv_text_extraction(note, config)
+        elif _is_rss_source(source):
+            tag = _run_rss_text_extraction(note, config)
+        else:
+            _raise_unsupported_source(
+                note, stage_label="text_extraction retry", source=source
             )
-
-        try:
-            result = extract_arxiv_text(arxiv_id, config)
-        except NetworkError as exc:
-            # extract_arxiv_text raises ExtractionError on full cascade
-            # fall-through, but a NetworkError can leak from helpers it
-            # calls (e.g. SSRF guards on the PDF fetch).  Re-wrap so the
-            # sweep's ``(ExtractionError, ...)`` branch handles it.
-            raise ExtractionError(
-                f"text_extraction retry network failure: {exc.kind}",
-                url=getattr(exc, "url", "") or "",
-                stage=exc.kind or "network",
-                detail=str(exc),
-            ) from exc
+            raise AssertionError("unreachable")  # pragma: no cover
         _log.info(
             "text_extraction retry succeeded for %s tag=%s",
             note.get("id", "?"),
-            result.source_tag,
+            tag,
         )
-        return result.source_tag
+        return tag
 
     return hook
 
