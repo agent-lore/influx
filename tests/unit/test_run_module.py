@@ -45,6 +45,35 @@ from influx.run import (
     _run_repair_stage,
 )
 from influx.run_ledger import RunLedger
+from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
+
+
+def _bound_for(item: dict[str, Any], *, source_label: str = "arxiv") -> BoundScoredCandidate:
+    """Wrap a ProfileItem dict as a BoundScoredCandidate whose acquire
+    closure returns the dict (#125 — the Run stage now drives acquire
+    after pre-acquire dedup, so test providers yield bounds rather than
+    pre-baked items).
+    """
+
+    async def _acquire() -> dict[str, Any]:
+        return item
+
+    return BoundScoredCandidate(
+        scored=ScoredCandidate(
+            candidate=Candidate(
+                item_id=item.get("source_url", "test-id"),
+                title=item.get("title", ""),
+                abstract=item.get("abstract_or_summary", "") or "",
+                source_url=item.get("source_url", ""),
+            ),
+            score=int(item.get("score", 0)),
+            confidence=float(item.get("confidence", 0.0)),
+            reason=item.get("reason", ""),
+            filter_tags=tuple(item.get("filter_tags", [])),
+        ),
+        acquire=_acquire,
+        source_label=source_label,
+    )
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -199,7 +228,7 @@ async def test_repair_stage_raises_run_aborted_on_sweep_write_error() -> None:
 
 async def _empty_provider(
     profile: str, kind: RunKind, run_range: Any, filter_prompt: str
-) -> list[dict[str, Any]]:
+) -> list[BoundScoredCandidate]:
     return []
 
 
@@ -418,8 +447,8 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
 
     async def provider(
         profile: str, kind: RunKind, run_range: Any, filter_prompt: str
-    ) -> list[dict[str, Any]]:
-        return items
+    ) -> list[BoundScoredCandidate]:
+        return [_bound_for(it) for it in items]
 
     from mcp import types as mcp_types
 
@@ -490,8 +519,8 @@ async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
 
     async def provider(
         profile: str, kind: RunKind, run_range: Any, filter_prompt: str
-    ) -> list[dict[str, Any]]:
-        return items
+    ) -> list[BoundScoredCandidate]:
+        return [_bound_for(it) for it in items]
 
     from mcp import types as mcp_types
 
@@ -568,8 +597,8 @@ async def test_run_execute_persists_unresolved_slug_collision_without_injected_l
 
     async def provider(
         profile: str, kind: RunKind, run_range: Any, filter_prompt: str
-    ) -> list[dict[str, Any]]:
-        return items
+    ) -> list[BoundScoredCandidate]:
+        return [_bound_for(it) for it in items]
 
     deps = RunDeps(config=config, item_provider=provider, probe_loop=None, ledger=None)
 

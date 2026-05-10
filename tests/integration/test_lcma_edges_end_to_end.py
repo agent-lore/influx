@@ -32,6 +32,7 @@ from influx.config import (
 from influx.coordinator import RunKind
 from influx.probes import ProbeLoop
 from influx.scheduler import run_profile
+from tests._bound_helpers import bounds_for
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -254,9 +255,9 @@ def _single_item_provider(
         kind: RunKind,
         run_range: Any,
         filter_prompt: str,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Any]:
         del profile, kind, run_range, filter_prompt
-        return items
+        return bounds_for(items)
 
     return _provider
 

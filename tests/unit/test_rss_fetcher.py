@@ -504,9 +504,13 @@ class TestProductionPathIgnoresAllowPrivateIps:
             ),
         ):
             provider = make_rss_item_provider(config)
-            results = list(
+            bounds = list(
                 await provider("ai-robotics", RunKind.SCHEDULED, None, "prompt")
             )
+            # #125: provider returns BoundScoredCandidates; invoke each
+            # closure to drive ``build_rss_note_item`` and obtain the
+            # legacy ProfileItem dict the assertions below operate on.
+            results = [item for item in [await b.acquire() for b in bounds] if item]
 
         # Only the single public-URL item should reach the build step;
         # localhost + 192.168.x.x must be dropped pre-acquire even

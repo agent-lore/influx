@@ -102,8 +102,8 @@ _Avoid_: probes (one input to Health), readiness (one output of Health).
 
 - A **Profile** has many **Runs** over time; at most one Run per Profile is active at once (enforced by the **Coordinator**).
 - A **Run** consumes a **RunPlan** and produces a **RunOutcome**; its history lives in the **RunLedger**.
-- A **Run**'s Acquire stage walks: **Source**.fetch_candidates → **Filter** → **Source**.acquire → **Acquired**.
-- A **Run**'s Ingest stage walks: cache_lookup → **Cascade**.enrich → **Renderer** → **LithosClient**.write_note → **LcmaWiring**.wire. The cache_lookup step is two-stage: a primary `compose_dedup_query` lookup (title + first sentence of summary) followed, on miss, by a defensive exact-`source_url` fallback (#128). Either hit is treated as a cache hit for the rest of the per-item flow — so notes already present under the same URL never silently fall through to a write-time `duplicate` rejection.
+- A **Run**'s Acquire stage walks: **Source**.fetch_candidates → **Filter** → pre-acquire `lithos_cache_lookup` → **Source**.acquire → **Acquired**. The pre-acquire `cache_lookup` is the primary `compose_dedup_query` lookup (title + first sentence of summary, #125). Backfill cache hits short-circuit before `Source.acquire`, so duplicate items skip the download / archive / extract cost; normal-run hits still acquire so the multi-profile merge path inside `LithosClient.write_note` runs.
+- A **Run**'s Ingest stage walks: **Cascade**.enrich → **Renderer** → **LithosClient**.write_note → **LcmaWiring**.wire. On items the Acquire stage flagged as cache misses, Ingest also runs a defensive exact-`source_url` fallback (#128) before write — catching notes whose `source_url` is already in Lithos but whose title/first-sentence abstract drifted between runs, so they never silently fall through to a write-time `duplicate` rejection.
 - A **Cascade** consults **RepairCounters** before each tier and after counted failures.
 - A **LithosClient** owns **WriteResult** parsing and **Squatter-shape dispatch** internally.
 - **Health** latches are flipped by Run stages and read by the scheduler before starting a new Run.

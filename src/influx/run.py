@@ -46,6 +46,8 @@ from influx.lcma_wiring import CascadeOutput, LcmaWiringDeps
 from influx.lcma_wiring import wire as lcma_wire
 from influx.lithos_client import LithosClient
 from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+from influx.run_dedup import dedup_scored_candidates
+from influx.source import BoundScoredCandidate
 from influx.rejection_rate import on_run_complete as rejection_rate_on_run_complete
 from influx.rejection_rate import record_filter_result
 from influx.repair import SweepWriteError
@@ -83,7 +85,7 @@ logger = logging.getLogger(__name__)
 ProfileItem = dict[str, Any]
 ItemProvider = Callable[
     [str, RunKind, dict[str, str | int] | None, str],
-    Awaitable[Iterable[ProfileItem]],
+    Awaitable[Iterable[BoundScoredCandidate]],
 ]
 
 
@@ -397,21 +399,64 @@ async def _run_acquire_stage(
     client: LithosClient,
     filter_prompt: str,
 ) -> tuple[AcquireResult, StageDiagnostics]:
-    """Stage 3 — Source.fetch_candidates → Filter.score → Source.acquire."""
+    """Stage 3 — fetch_candidates → score → pre-acquire dedup → acquire (#125).
+
+    The provider returns :class:`BoundScoredCandidate`s rather than fully
+    acquired ProfileItems.  The Run stage runs ``lithos_cache_lookup``
+    on each candidate's identity and partitions:
+
+    - cache miss → invoke the bound's ``acquire`` closure;
+    - cache hit + ``skip_cache_hits=True`` (backfill) → drop, no acquire;
+    - cache hit + normal run → invoke ``acquire`` so the multi-profile
+      merge path inside :meth:`LithosClient.write_note` still runs.
+
+    Each acquired ProfileItem is stamped with ``cache_hit`` (and
+    ``cache_hit_reason`` on hits) so the Ingest stage can skip its own
+    primary lookup and reach the URL-fallback (#128) only when needed.
+    """
     terminal_ids = await client.list_archive_terminal_arxiv_ids(
         profile=plan.profile,
     )
     terminal_token = current_archive_terminal_arxiv_ids.set(terminal_ids)
     try:
-        items = list(
+        bounds = list(
             await item_provider(
                 plan.profile, plan.kind, plan.date_window, filter_prompt
             )
         )
+        logger.info(
+            "source fetch+score completed profile=%s kind=%s scored=%d",
+            plan.profile,
+            plan.kind.value,
+            len(bounds),
+        )
+
+        outcome = await dedup_scored_candidates(
+            bounds,
+            client=client,
+            profile=plan.profile,
+            skip_cache_hits=plan.skip_cache_hits,
+        )
+        logger.info(
+            "pre-acquire dedup completed profile=%s to_acquire=%d hits_skipped=%d",
+            plan.profile,
+            len(outcome.to_acquire),
+            len(outcome.hits_to_skip),
+        )
+
+        items: list[ProfileItem] = []
+        for decision in outcome.to_acquire:
+            acquired = await decision.bound.acquire()
+            if acquired is None:
+                continue
+            acquired["cache_hit"] = decision.cache_hit
+            if decision.cache_hit_reason is not None:
+                acquired["cache_hit_reason"] = decision.cache_hit_reason
+            items.append(acquired)
     finally:
         current_archive_terminal_arxiv_ids.reset(terminal_token)
     logger.info(
-        "source acquisition completed profile=%s kind=%s candidates=%d",
+        "source acquisition completed profile=%s kind=%s items=%d",
         plan.profile,
         plan.kind.value,
         len(items),
@@ -468,13 +513,29 @@ async def _run_ingest_stage(
             item.get("path", ""),
             item.get("tags", []),
         )
-        cache_body = await client.cache_lookup_for_item_body(
-            title=title,
-            source_url=source_url,
-            abstract_or_summary=item.get("abstract_or_summary"),
-        )
-        cache_hit = bool(cache_body.get("hit"))
-        cache_hit_reason: str | None = "primary" if cache_hit else None
+        # #125: the Acquire stage now performs the primary
+        # ``lithos_cache_lookup`` *before* ``Source.acquire`` and stamps
+        # the verdict on the ProfileItem.  The legacy primary-lookup
+        # branch below is reached only when ``cache_hit`` is absent —
+        # i.e. tests that hand-build ProfileItems and call
+        # ``_run_ingest_stage`` directly without going through the
+        # Acquire stage.  Production runs always carry the metadata.
+        cache_hit_meta = item.get("cache_hit")
+        if cache_hit_meta is None:
+            cache_body = await client.cache_lookup_for_item_body(
+                title=title,
+                source_url=source_url,
+                abstract_or_summary=item.get("abstract_or_summary"),
+            )
+            cache_hit = bool(cache_body.get("hit"))
+            cache_hit_reason: str | None = "primary" if cache_hit else None
+            if cache_hit:
+                metrics.cache_hits().add(
+                    1, {"profile": profile, "source": item_source}
+                )
+        else:
+            cache_hit = bool(cache_hit_meta)
+            cache_hit_reason = item.get("cache_hit_reason") if cache_hit else None
 
         # #128: defensive source_url-only fallback when the primary
         # title+abstract dedup misses.  Catches notes whose source_url
@@ -492,7 +553,6 @@ async def _run_ingest_stage(
                 )
 
         if cache_hit:
-            metrics.cache_hits().add(1, {"profile": profile, "source": item_source})
             logger.info(
                 "article cache hit profile=%s source_url=%s title=%r "
                 "kind=%s action=%s reason=%s",

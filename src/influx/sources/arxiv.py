@@ -46,7 +46,7 @@ from influx.extraction.pipeline import extract_arxiv_text
 from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
 from influx.renderer import render
-from influx.source import Candidate, ScoredCandidate
+from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.storage import download_archive
 from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
@@ -1208,7 +1208,7 @@ def make_arxiv_item_provider(
         kind: RunKind,
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
-    ) -> Iterable[dict[str, Any]]:
+    ) -> Iterable[BoundScoredCandidate]:
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
         if profile_cfg is None:
             _log.info("arxiv source skipped profile=%s reason=unknown_profile", profile)
@@ -1234,28 +1234,38 @@ def make_arxiv_item_provider(
             filter_scorer=filter_scorer,
         )
 
-        # ── 3. Source.acquire per scored candidate ────────────────
-        # Issue #124: ``acquire`` performs blocking archive download
-        # (sync ``guarded_fetch``) plus the cascade enrichment chain
-        # (sync HTTP for tier 1/2/3). Offload each per-item acquisition
-        # to a worker thread so admin endpoints stay responsive.
-        results: list[dict[str, Any]] = [
-            await asyncio.to_thread(
-                source.acquire,
-                sc,
-                profile_cfg=profile_cfg,
-                config=config,
+        # ── 3. Bind per-item acquire as closures (#125) ────────────
+        # ``Source.acquire`` is invoked by the Run's Acquire stage after
+        # pre-acquire cache_lookup partitions cache misses + merge-bound
+        # hits from outright skips.  Issue #124 still applies — the
+        # closure wraps the blocking acquire in ``asyncio.to_thread`` so
+        # admin endpoints stay responsive once the closure is invoked.
+        bounds: list[BoundScoredCandidate] = []
+        for sc in scored_list:
+
+            async def _acquire(sc: ScoredCandidate = sc) -> dict[str, Any] | None:
+                return await asyncio.to_thread(
+                    source.acquire,
+                    sc,
+                    profile_cfg=profile_cfg,
+                    config=config,
+                )
+
+            bounds.append(
+                BoundScoredCandidate(
+                    scored=sc,
+                    acquire=_acquire,
+                    source_label="arxiv",
+                )
             )
-            for sc in scored_list
-        ]
 
         _log.info(
-            "arxiv source completed profile=%s fetched=%d accepted=%d",
+            "arxiv source completed profile=%s fetched=%d scored=%d",
             profile,
             len(candidates),
-            len(results),
+            len(bounds),
         )
-        return results
+        return bounds
 
     return provider
 
