@@ -46,13 +46,13 @@ from influx.lcma_wiring import CascadeOutput, LcmaWiringDeps
 from influx.lcma_wiring import wire as lcma_wire
 from influx.lithos_client import LithosClient
 from influx.notifications import HighlightItem, ProfileRunResult, RunStats
-from influx.run_dedup import dedup_scored_candidates
-from influx.source import BoundScoredCandidate
 from influx.rejection_rate import on_run_complete as rejection_rate_on_run_complete
 from influx.rejection_rate import record_filter_result
 from influx.repair import SweepWriteError
 from influx.repair import sweep as repair_sweep
+from influx.run_dedup import dedup_scored_candidates
 from influx.run_ledger import RunLedger
+from influx.source import BoundScoredCandidate
 from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
     current_fetched_total,
@@ -530,9 +530,7 @@ async def _run_ingest_stage(
             cache_hit = bool(cache_body.get("hit"))
             cache_hit_reason: str | None = "primary" if cache_hit else None
             if cache_hit:
-                metrics.cache_hits().add(
-                    1, {"profile": profile, "source": item_source}
-                )
+                metrics.cache_hits().add(1, {"profile": profile, "source": item_source})
         else:
             cache_hit = bool(cache_hit_meta)
             cache_hit_reason = item.get("cache_hit_reason") if cache_hit else None

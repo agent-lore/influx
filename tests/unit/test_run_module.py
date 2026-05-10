@@ -48,7 +48,9 @@ from influx.run_ledger import RunLedger
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 
 
-def _bound_for(item: dict[str, Any], *, source_label: str = "arxiv") -> BoundScoredCandidate:
+def _bound_for(
+    item: dict[str, Any], *, source_label: str = "arxiv"
+) -> BoundScoredCandidate:
     """Wrap a ProfileItem dict as a BoundScoredCandidate whose acquire
     closure returns the dict (#125 — the Run stage now drives acquire
     after pre-acquire dedup, so test providers yield bounds rather than
@@ -74,6 +76,7 @@ def _bound_for(item: dict[str, Any], *, source_label: str = "arxiv") -> BoundSco
         acquire=_acquire,
         source_label=source_label,
     )
+
 
 # ── Helpers ─────────────────────────────────────────────────────────
 

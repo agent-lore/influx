@@ -26,7 +26,9 @@ from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.telemetry import InfluxTracer, current_run_id, get_tracer
 
 
-def _bound_for(item: dict[str, Any], *, source_label: str = "arxiv") -> BoundScoredCandidate:
+def _bound_for(
+    item: dict[str, Any], *, source_label: str = "arxiv"
+) -> BoundScoredCandidate:
     """Wrap a ProfileItem dict as a BoundScoredCandidate (#125 — test seam)."""
 
     async def _acquire() -> dict[str, Any]:
@@ -48,6 +50,7 @@ def _bound_for(item: dict[str, Any], *, source_label: str = "arxiv") -> BoundSco
         acquire=_acquire,
         source_label=source_label,
     )
+
 
 # ── Helpers ────────────────────────────────────────────────────────────
 

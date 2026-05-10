@@ -63,7 +63,6 @@ from influx.sources.arxiv import (
 from influx.sources.rss import RssFeedItem
 from tests.contract.test_lithos_client import FakeLithosServer
 
-
 PROFILE = "ai-robotics"
 
 
@@ -240,9 +239,7 @@ class TestPreAcquireDedupArxivBackfill:
                 "influx.sources.arxiv.fetch_arxiv",
                 return_value=list(_ARXIV_FIXTURE),
             ),
-            patch(
-                "influx.sources.arxiv.build_arxiv_note_item"
-            ) as mock_build,
+            patch("influx.sources.arxiv.build_arxiv_note_item") as mock_build,
         ):
             result = asyncio.run(
                 run_backfill(
@@ -292,7 +289,11 @@ class TestPreAcquireDedupRssBackfill:
         )
 
         async def _fake_score_rss_items(
-            *, items: list[RssFeedItem], profile: str, filter_prompt: str, config: AppConfig
+            *,
+            items: list[RssFeedItem],
+            profile: str,
+            filter_prompt: str,
+            config: AppConfig,
         ) -> dict[str, Any]:
             from influx.schemas import FilterResult
             from influx.urls import url_hash
@@ -316,9 +317,7 @@ class TestPreAcquireDedupRssBackfill:
                 "influx.sources.rss._score_rss_items",
                 side_effect=_fake_score_rss_items,
             ),
-            patch(
-                "influx.sources.rss.build_rss_note_item"
-            ) as mock_build,
+            patch("influx.sources.rss.build_rss_note_item") as mock_build,
         ):
             result = asyncio.run(
                 run_backfill(

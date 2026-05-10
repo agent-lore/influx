@@ -44,8 +44,8 @@ from influx.notifications import (
 )
 from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler
-from tests._bound_helpers import bounds_for
 from influx.service import post_run_webhook_hook
+from tests._bound_helpers import bounds_for
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Fake webhook receiver ──────────────────────────────────────────
