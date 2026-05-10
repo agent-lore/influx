@@ -232,3 +232,146 @@ async def test_live_responsive_during_blocking_filter_work(
             )
 
             await slow_task
+
+
+@pytest.mark.asyncio
+async def test_admin_endpoints_responsive_during_repair_sweep(
+    fake_lithos_sse_url: str, tmp_path: Path
+) -> None:
+    """Repair sweep stage hooks must not starve the admin event loop.
+
+    Stage 1 of every Run is the repair sweep, which calls per-stage
+    sync hooks (``archive_download``, ``re_extract_archive``,
+    ``tier2_enrich``, ``tier3_extract``, ``text_extraction``) that do
+    blocking HTTP / extraction / model work — exactly the same class
+    of bug as the acquire/filter starvation.
+
+    This test drives :func:`influx.repair._process_sweep_note`
+    directly with a hook that hangs on a ``threading.Event``, so the
+    sweep is provably still in flight when ``/status`` and
+    ``/runs/recent`` are polled. If the hook ran inline on the event
+    loop instead of via ``asyncio.to_thread``, the loop would be
+    blocked for the full hook duration and these polls could not
+    interleave — the discriminator is "polls succeed AND sweep_task
+    is still in flight."
+    """
+    import threading
+
+    from influx.repair import SweepHooks, _process_sweep_note
+
+    app = _make_app(fake_lithos_sse_url, tmp_path)
+    profile = "ai-robotics"
+
+    hook_started = threading.Event()
+    release_hook = threading.Event()
+
+    def slow_archive_download(_note: dict[str, Any]) -> str:
+        # Signals "I'm running" then blocks until the test releases me.
+        # Simulates a slow archive HTTP fetch (the blocking
+        # ``download_archive`` call inside the real hook). Using an
+        # Event rather than ``time.sleep`` makes the discrimination
+        # deterministic: the hook is provably mid-flight while the
+        # test polls happen.
+        hook_started.set()
+        # 10s ceiling so a regression that breaks the offload eventually
+        # fails the test instead of hanging forever.
+        if not release_hook.wait(timeout=10.0):
+            raise TimeoutError("hook never released by test")
+        return "blog/2026/05/some-archive-path.html"
+
+    note: dict[str, Any] = {
+        "id": "test-note-1",
+        "tags": [
+            "ingested-by:influx",
+            "source:blog",
+            "profile:ai-robotics",
+            "influx:archive-missing",
+            "influx:repair-needed",
+            "text:abstract-only",
+        ],
+        "content": (
+            "---\nsource_url: https://example.com/post-1\n"
+            "tags:\n  - influx:archive-missing\n"
+            "confidence: 1.0\n---\n"
+            "# Test note\n## Archive\n\n## Summary\nfallback\n## User Notes\n"
+        ),
+        "version": 1,
+    }
+
+    hooks = SweepHooks(
+        archive_download=slow_archive_download,
+        # Other stage hooks left as None so only archive_retry runs.
+    )
+
+    # Stub out the rewrite path — this test isolates the per-stage
+    # hook offload, not the lithos_write retry/conflict semantics.
+    async def fake_rewrite(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("influx.repair._rewrite_sweep_note", side_effect=fake_rewrite):
+            sweep_task = asyncio.create_task(
+                _process_sweep_note(
+                    note,
+                    profile=profile,
+                    client=None,  # type: ignore[arg-type] # rewrite is stubbed
+                    config=app.state.config,
+                    hooks=hooks,
+                )
+            )
+
+            # Wait for the hook to actually start running. ``Event.wait``
+            # is sync; we use ``asyncio.to_thread`` so the wait itself
+            # doesn't block the loop. If the production code routes the
+            # hook through ``asyncio.to_thread`` (the fix), the hook
+            # starts on a worker thread and ``hook_started`` fires.
+            # If the production code calls the hook inline, the hook
+            # is on the main loop, the main loop is blocked on
+            # ``release_hook.wait``, and ``hook_started`` is never set
+            # within the wait window — the assertion below fails.
+            wait_seconds = 4.0
+            started = await asyncio.to_thread(hook_started.wait, wait_seconds)
+            if not started:
+                release_hook.set()
+                sweep_task.cancel()
+                raise AssertionError(
+                    f"hook never reported started within {wait_seconds}s — "
+                    "event loop is being starved by inline sync hook I/O "
+                    "(fix not in place)"
+                )
+
+            # Hook is mid-flight on a worker thread. Main loop must be
+            # free to service admin requests. The discriminator: each
+            # poll succeeds quickly AND ``sweep_task`` remains
+            # un-finished throughout — proving the polls interleaved
+            # with the in-flight hook.
+            status_budget_seconds = 1.0
+            for _ in range(5):
+                assert not sweep_task.done(), (
+                    "sweep_task completed before polls could observe in-flight "
+                    "interleaving — the hook ran fully before polling started, "
+                    "which means the loop was blocked through the hook."
+                )
+
+                req_start = time.monotonic()
+                status_resp = await client.get("/status")
+                status_elapsed = time.monotonic() - req_start
+                assert status_resp.status_code == 200, status_resp.text
+                assert status_elapsed < status_budget_seconds, (
+                    f"GET /status took {status_elapsed:.2f}s while repair "
+                    f"sweep was in flight (budget {status_budget_seconds}s)"
+                )
+
+                req_start = time.monotonic()
+                recent_resp = await client.get("/runs/recent")
+                recent_elapsed = time.monotonic() - req_start
+                assert recent_resp.status_code == 200, recent_resp.text
+                assert recent_elapsed < status_budget_seconds, (
+                    f"GET /runs/recent took {recent_elapsed:.2f}s while "
+                    f"repair sweep was in flight (budget {status_budget_seconds}s)"
+                )
+
+            # Release the hook so the sweep finishes and we clean up.
+            release_hook.set()
+            await sweep_task
