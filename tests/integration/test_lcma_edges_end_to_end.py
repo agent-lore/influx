@@ -220,7 +220,7 @@ class TestTaskBracketing:
             kind: RunKind,
             run_range: Any,
             filter_prompt: str,
-        ) -> list[dict[str, Any]]:
+        ) -> list[Any]:
             raise RuntimeError("simulated provider failure")
 
         with pytest.raises(RuntimeError, match="simulated provider failure"):

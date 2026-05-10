@@ -905,7 +905,7 @@ async def default_item_provider(
     kind: RunKind,
     run_range: dict[str, str | int] | None,
     filter_prompt: str,
-) -> Iterable[ProfileItem]:
+) -> Iterable[BoundScoredCandidate]:
     """No-op fallback (mirrors ``influx.scheduler.default_item_provider``)."""
     del profile, kind, run_range, filter_prompt
     return ()

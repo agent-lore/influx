@@ -31,7 +31,7 @@ from influx.coordinator import Coordinator, RunKind
 from influx.http_api import router
 from influx.notifications import ProfileRunResult
 from influx.probes import ProbeLoop
-from influx.scheduler import InfluxScheduler, ProfileItem, run_profile
+from influx.scheduler import InfluxScheduler, run_profile
 from tests.contract.test_lithos_client import FakeLithosServer
 
 
@@ -169,7 +169,7 @@ class TestServiceWithOtelAbsent:
             kind: RunKind,
             run_range: dict[str, str | int] | None,
             filter_prompt: str,
-        ) -> Iterable[ProfileItem]:
+        ) -> Iterable[Any]:
             del profile, kind, run_range, filter_prompt
             return ()
 
