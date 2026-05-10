@@ -685,3 +685,289 @@ class TestBackfillSchedulerOverlap:
             coordinator.release("ai-robotics")
             if coordinator.is_busy("web-tech"):
                 coordinator.release("web-tech")
+
+
+# ── #105: request-level observability for background runs / backfills ──
+
+
+async def _drain_active_tasks(app: FastAPI) -> None:
+    """Wait for HTTP-spawned background tasks to finish so log assertions
+    have a stable target.
+    """
+    pending = [t for t in getattr(app.state, "active_tasks", set()) if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _records_with_status(
+    caplog: pytest.LogCaptureFixture, status: str
+) -> list[Any]:
+    return [
+        r
+        for r in caplog.records
+        if getattr(r, "status", None) == status
+    ]
+
+
+class TestRunObservability:
+    """``POST /runs`` emits request-keyed completion / failure logs (#105)."""
+
+    async def test_single_profile_run_logs_completion_with_request_id(
+        self,
+        app_with_state: FastAPI,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import httpx
+
+        from influx import http_api as http_api_mod
+
+        async def fake_run_profile(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(http_api_mod, "run_profile", fake_run_profile)
+
+        with caplog.at_level("INFO", logger="influx.http_api"):
+            transport = httpx.ASGITransport(app=app_with_state)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/runs", json={"profile": "ai-robotics"}
+                )
+            await _drain_active_tasks(app_with_state)
+
+        assert resp.status_code == 202
+        request_id = resp.json()["request_id"]
+
+        completed = [
+            r
+            for r in _records_with_status(caplog, "completed")
+            if r.message.startswith("background task completed")
+        ]
+        assert len(completed) == 1, [r.message for r in caplog.records]
+        record = completed[0]
+        assert record.request_id == request_id
+        assert record.kind == "manual"
+        assert record.scope == "ai-robotics"
+        assert record.profile == "ai-robotics"
+
+    async def test_single_profile_run_logs_failure_with_exc_info(
+        self,
+        app_with_state: FastAPI,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import httpx
+
+        from influx import http_api as http_api_mod
+
+        async def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(http_api_mod, "run_profile", boom)
+
+        with caplog.at_level("INFO", logger="influx.http_api"):
+            transport = httpx.ASGITransport(app=app_with_state)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/runs", json={"profile": "ai-robotics"}
+                )
+            await _drain_active_tasks(app_with_state)
+
+        assert resp.status_code == 202
+        request_id = resp.json()["request_id"]
+
+        failed = [
+            r
+            for r in _records_with_status(caplog, "failed")
+            if r.message.startswith("background task failed")
+            and getattr(r, "request_id", None) == request_id
+        ]
+        assert len(failed) == 1
+        record = failed[0]
+        assert record.levelname == "ERROR"
+        assert record.kind == "manual"
+        assert record.profile == "ai-robotics"
+        assert record.exc_info is not None
+
+        helper_warnings = [
+            r
+            for r in caplog.records
+            if r.message.startswith("run_profile")
+            and getattr(r, "request_id", None) == request_id
+        ]
+        assert len(helper_warnings) == 1
+        assert helper_warnings[0].exc_info is not None
+        assert helper_warnings[0].kind == "manual"
+
+    async def test_all_profiles_run_logs_per_profile_failure_and_aggregate(
+        self,
+        app_with_state: FastAPI,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import httpx
+
+        from influx import http_api as http_api_mod
+
+        async def selective_run_profile(
+            profile: str, *args: Any, **kwargs: Any
+        ) -> None:
+            if profile == "web-tech":
+                raise RuntimeError("web-tech blew up")
+            return None
+
+        monkeypatch.setattr(http_api_mod, "run_profile", selective_run_profile)
+
+        with caplog.at_level("INFO", logger="influx.http_api"):
+            transport = httpx.ASGITransport(app=app_with_state)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                resp = await client.post("/runs", json={"all_profiles": True})
+            await _drain_active_tasks(app_with_state)
+
+        assert resp.status_code == 202
+        request_id = resp.json()["request_id"]
+
+        per_profile_failed = [
+            r
+            for r in _records_with_status(caplog, "failed")
+            if getattr(r, "profile", None) == "web-tech"
+            and getattr(r, "request_id", None) == request_id
+        ]
+        assert len(per_profile_failed) == 1
+        assert per_profile_failed[0].levelname == "WARNING"
+
+        per_profile_ok = [
+            r
+            for r in _records_with_status(caplog, "completed")
+            if getattr(r, "profile", None) == "ai-robotics"
+            and getattr(r, "request_id", None) == request_id
+        ]
+        assert len(per_profile_ok) == 1
+
+        aggregate = [
+            r
+            for r in _records_with_status(caplog, "partial_failure")
+            if getattr(r, "request_id", None) == request_id
+        ]
+        assert len(aggregate) == 1
+        agg = aggregate[0]
+        assert agg.failed_count == 1
+        assert agg.total_count == 2
+        assert agg.failed_profiles == ["web-tech"]
+        assert agg.levelname == "WARNING"
+
+
+class TestBackfillObservability:
+    """``POST /backfills`` emits acceptance + request-keyed completion logs (#105)."""
+
+    async def test_single_profile_backfill_logs_acceptance_and_completion(
+        self,
+        app_with_state: FastAPI,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import httpx
+
+        import influx.backfill as backfill_mod
+
+        async def fake_run_backfill(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(backfill_mod, "run_backfill", fake_run_backfill)
+
+        with caplog.at_level("INFO", logger="influx.http_api"):
+            transport = httpx.ASGITransport(app=app_with_state)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/backfills",
+                    json={
+                        "profile": "ai-robotics",
+                        "days": 7,
+                        "confirm": True,
+                    },
+                )
+            await _drain_active_tasks(app_with_state)
+
+        assert resp.status_code == 202
+        request_id = resp.json()["request_id"]
+
+        accepted = [
+            r
+            for r in _records_with_status(caplog, "accepted")
+            if r.message.startswith("backfill accepted")
+            and getattr(r, "request_id", None) == request_id
+        ]
+        assert len(accepted) == 1
+        assert accepted[0].kind == "backfill"
+        assert accepted[0].profile == "ai-robotics"
+
+        completed = [
+            r
+            for r in _records_with_status(caplog, "completed")
+            if r.message.startswith("background task completed")
+            and getattr(r, "request_id", None) == request_id
+        ]
+        assert len(completed) == 1
+        assert completed[0].kind == "backfill"
+        assert completed[0].scope == "ai-robotics"
+
+    async def test_all_profiles_backfill_logs_per_profile_failure_and_aggregate(
+        self,
+        app_with_state: FastAPI,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import httpx
+
+        from influx import http_api as http_api_mod
+
+        async def selective_run_profile(
+            profile: str, *args: Any, **kwargs: Any
+        ) -> None:
+            if profile == "ai-robotics":
+                raise RuntimeError("ai-robotics blew up")
+            return None
+
+        monkeypatch.setattr(http_api_mod, "run_profile", selective_run_profile)
+
+        with caplog.at_level("INFO", logger="influx.http_api"):
+            transport = httpx.ASGITransport(app=app_with_state)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/backfills",
+                    json={"all_profiles": True, "days": 7, "confirm": True},
+                )
+            await _drain_active_tasks(app_with_state)
+
+        assert resp.status_code == 202
+        request_id = resp.json()["request_id"]
+
+        accepted = [
+            r
+            for r in _records_with_status(caplog, "accepted")
+            if r.message.startswith("backfill accepted")
+            and getattr(r, "request_id", None) == request_id
+        ]
+        assert len(accepted) == 1
+        assert accepted[0].scope == "all"
+
+        aggregate = [
+            r
+            for r in _records_with_status(caplog, "partial_failure")
+            if getattr(r, "request_id", None) == request_id
+        ]
+        assert len(aggregate) == 1
+        agg = aggregate[0]
+        assert agg.failed_count == 1
+        assert agg.total_count == 2
+        assert agg.failed_profiles == ["ai-robotics"]
