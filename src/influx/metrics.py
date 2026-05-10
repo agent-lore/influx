@@ -45,6 +45,7 @@ __all__ = [
     "run_completions",
     "run_duration",
     "ingestion_stalls",
+    "rss_items_rejected_invalid_url",
     "run_starts",
     "runs_skipped",
     "slug_collision_dedup_recovery",
@@ -119,6 +120,27 @@ def articles_filtered() -> Any:
     return get_meter().counter(
         "influx_articles_filtered_total",
         description="Items processed by the LLM filter, broken down by decision.",
+    )
+
+
+def rss_items_rejected_invalid_url() -> Any:
+    """Counter of RSS items rejected pre-acquisition for invalid URL (#131).
+
+    Bumped from :func:`influx.sources.rss.parse_feed` when an entry's
+    ``link`` fails :func:`influx.urls.classify_article_url` — typically
+    upstream-malformed URLs such as ``http://localhost:5174/`` from a
+    misconfigured feed.
+
+    Labels: ``profile``, ``source`` (always ``"rss"``), ``reason``
+    (``malformed`` | ``scheme`` | ``no_host`` | ``loopback`` |
+    ``link_local`` | ``private`` | ``multicast``).
+    """
+    return get_meter().counter(
+        "influx_rss_items_rejected_invalid_url_total",
+        description=(
+            "RSS items rejected pre-acquisition because the entry link "
+            "failed syntactic URL validation."
+        ),
     )
 
 

@@ -33,12 +33,14 @@ __all__ = [
     "current_archive_terminal_arxiv_ids",
     "current_fetched_total",
     "current_filter_errors",
+    "current_invalid_url_rejections",
     "current_run_id",
     "current_source_acquisition_errors",
     "get_meter",
     "get_tracer",
     "record_fetched_items",
     "record_filter_error",
+    "record_invalid_url_rejection",
     "record_source_acquisition_error",
 ]
 
@@ -173,6 +175,39 @@ def record_filter_error() -> None:
     if counter is None:
         return
     counter[0] += 1
+
+
+# Per-run counter of source items rejected pre-acquisition because their
+# article URL failed syntactic validation (issue #131).  Set to ``[0]`` at
+# run start by ``run_service.ledger_lifecycle``; source adapters
+# increment via :func:`record_invalid_url_rejection` when
+# :func:`influx.urls.classify_article_url` rejects an item link.
+#
+# Surfaced on the run-ledger entry as ``invalid_url_rejections_total`` so
+# operators can distinguish "feed fetched OK, N items rejected because
+# their URLs were upstream-malformed" from "archive download failed for a
+# valid URL" (which keeps producing ``influx:archive-missing``).
+current_invalid_url_rejections: ContextVar[list[int] | None] = ContextVar(
+    "current_invalid_url_rejections",
+    default=None,
+)
+
+
+def record_invalid_url_rejection(count: int = 1) -> None:
+    """Add *count* to the current run's ``invalid_url_rejections_total`` (#131).
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_invalid_url_rejections` is unset.  Source adapters
+    call this when ``classify_article_url`` rejects an item link
+    (loopback, private, link-local, multicast, malformed, or
+    disallowed scheme).  Multiple rejections in the same run accumulate.
+    """
+    if count <= 0:
+        return
+    counter = current_invalid_url_rejections.get()
+    if counter is None:
+        return
+    counter[0] += count
 
 
 logger = logging.getLogger(__name__)

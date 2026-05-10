@@ -270,3 +270,93 @@ class TestStorageTunablesThreaded:
         kwargs = mock_fetch.call_args.kwargs
         assert kwargs.get("max_download_bytes") == 4321
         assert kwargs.get("timeout_seconds") == 42
+
+
+# ── Issue #131: pre-acquire URL validation ─────────────────────────
+
+
+_MIXED_FEED_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+  <title>Mixed Feed</title>
+  <link>https://example.com/</link>
+  <description>One good link, one localhost link, one private link.</description>
+  <item>
+    <title>Good Public Article</title>
+    <link>https://example.com/good</link>
+    <description>Public article.</description>
+    <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
+  </item>
+  <item>
+    <title>Localhost Leak</title>
+    <link>http://localhost:5174/leak</link>
+    <description>Upstream-malformed link.</description>
+    <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
+  </item>
+  <item>
+    <title>Private Network Link</title>
+    <link>http://192.168.1.10/internal</link>
+    <description>RFC1918 link.</description>
+    <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
+  </item>
+</channel>
+</rss>
+"""
+
+
+class TestParseFeedRejectsInvalidUrls:
+    """Issue #131: ``parse_feed`` rejects loopback/private/malformed URLs."""
+
+    def test_default_drops_loopback_and_private_items(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        entry = _make_feed_entry(name="mixed", source_tag="rss")
+        with caplog.at_level("WARNING", logger="influx.sources.rss"):
+            items = parse_feed(_MIXED_FEED_XML, entry, profile="p")
+
+        assert [it.title for it in items] == ["Good Public Article"]
+        # Two WARNINGs emitted: one for localhost, one for 192.168.x.x
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        rejected_messages = [r.getMessage() for r in warnings]
+        assert any("localhost:5174" in msg for msg in rejected_messages)
+        assert any("192.168.1.10" in msg for msg in rejected_messages)
+        assert any("reason=loopback" in msg for msg in rejected_messages)
+        assert any("reason=private" in msg for msg in rejected_messages)
+
+    def test_allow_private_ips_keeps_local_items(self) -> None:
+        entry = _make_feed_entry(name="mixed", source_tag="rss")
+        items = parse_feed(_MIXED_FEED_XML, entry, allow_private_ips=True)
+
+        assert {it.title for it in items} == {
+            "Good Public Article",
+            "Localhost Leak",
+            "Private Network Link",
+        }
+
+    def test_increments_run_counter(self) -> None:
+        """Rejections bump ``current_invalid_url_rejections`` (issue #131)."""
+        from influx.telemetry import current_invalid_url_rejections
+
+        counter: list[int] = [0]
+        token = current_invalid_url_rejections.set(counter)
+        try:
+            entry = _make_feed_entry(name="mixed", source_tag="rss")
+            parse_feed(_MIXED_FEED_XML, entry, profile="p")
+        finally:
+            current_invalid_url_rejections.reset(token)
+
+        # Localhost + 192.168.x.x = 2 rejections.
+        assert counter[0] == 2
+
+    def test_counter_no_op_outside_run_context(self) -> None:
+        """``record_invalid_url_rejection`` is safe when ContextVar is unset."""
+        from influx.telemetry import current_invalid_url_rejections
+
+        # Default value is None — no run context.
+        assert current_invalid_url_rejections.get() is None
+
+        entry = _make_feed_entry(name="mixed", source_tag="rss")
+        items = parse_feed(_MIXED_FEED_XML, entry)
+
+        # Validator still runs; only the public item passes.
+        assert [it.title for it in items] == ["Good Public Article"]

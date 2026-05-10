@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from influx.urls import arxiv_canonical_url, normalise_url
+import pytest
+
+from influx.urls import arxiv_canonical_url, classify_article_url, normalise_url
 
 
 class TestNormaliseUrl:
@@ -133,3 +135,97 @@ class TestArxivCanonicalUrl:
             arxiv_canonical_url("hep-ph/0601001")
             == "https://arxiv.org/abs/hep-ph/0601001"
         )
+
+
+class TestClassifyArticleUrl:
+    """Issue #131: pre-acquire URL validation for RSS entry links."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/article",
+            "http://news.example.org/2026/05/post.html",
+            "https://blog.example.com/path?q=1#frag",
+            "https://example.com:8443/article",
+        ],
+    )
+    def test_public_https_and_http_pass(self, url: str) -> None:
+        result = classify_article_url(url)
+        assert result.ok is True
+        assert result.reason is None
+
+    @pytest.mark.parametrize(
+        ("url", "reason"),
+        [
+            ("http://localhost:5174/leak", "loopback"),
+            ("http://LOCALHOST/x", "loopback"),
+            ("http://127.0.0.1/x", "loopback"),
+            ("http://127.5.5.5/x", "loopback"),
+            ("http://[::1]/x", "loopback"),
+            ("http://192.168.1.10/x", "private"),
+            ("http://10.0.0.1/x", "private"),
+            ("http://172.16.5.5/x", "private"),
+            ("http://169.254.1.1/x", "link_local"),
+            ("http://224.0.0.1/x", "multicast"),
+        ],
+    )
+    def test_loopback_private_link_local_multicast_rejected(
+        self, url: str, reason: str
+    ) -> None:
+        result = classify_article_url(url)
+        assert result.ok is False
+        assert result.reason == reason
+
+    @pytest.mark.parametrize(
+        ("url", "reason"),
+        [
+            ("ftp://example.com/file", "scheme"),
+            ("file:///etc/passwd", "scheme"),
+            ("javascript:alert(1)", "scheme"),
+            ("not-a-url", "malformed"),
+            ("", "malformed"),
+            ("   ", "malformed"),
+            ("http:///just-path", "no_host"),
+        ],
+    )
+    def test_malformed_or_disallowed_scheme_rejected(
+        self, url: str, reason: str
+    ) -> None:
+        result = classify_article_url(url)
+        assert result.ok is False
+        assert result.reason == reason
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost:5174/leak",
+            "http://127.0.0.1/x",
+            "http://192.168.1.10/x",
+            "http://[::1]/x",
+            "http://169.254.1.1/x",
+        ],
+    )
+    def test_allow_private_lets_local_addresses_through(self, url: str) -> None:
+        result = classify_article_url(url, allow_private=True)
+        assert result.ok is True
+        assert result.reason is None
+
+    def test_allow_private_does_not_excuse_disallowed_scheme(self) -> None:
+        """``allow_private`` only relaxes host classification, not scheme."""
+        result = classify_article_url("ftp://example.com/x", allow_private=True)
+        assert result.ok is False
+        assert result.reason == "scheme"
+
+    def test_allow_private_does_not_excuse_malformed(self) -> None:
+        result = classify_article_url("not-a-url", allow_private=True)
+        assert result.ok is False
+        assert result.reason == "malformed"
+
+    def test_public_hostname_passes_without_dns(self) -> None:
+        """Non-IP hostnames that aren't ``localhost`` are accepted.
+
+        DNS-resolved classification is the SSRF guard's job at fetch
+        time; the syntactic guard does not perform DNS.
+        """
+        result = classify_article_url("https://internal.corp/x")
+        assert result.ok is True

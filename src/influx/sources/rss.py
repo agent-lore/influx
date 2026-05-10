@@ -47,9 +47,10 @@ from influx.telemetry import (
     get_tracer,
     record_fetched_items,
     record_filter_error,
+    record_invalid_url_rejection,
     record_source_acquisition_error,
 )
-from influx.urls import normalise_url, url_hash
+from influx.urls import classify_article_url, normalise_url, url_hash
 
 if TYPE_CHECKING:
     from influx.config import AppConfig, ProfileConfig, RssSourceEntry
@@ -81,11 +82,23 @@ class RssFeedItem:
 def parse_feed(
     content: bytes | str,
     feed_entry: RssSourceEntry,
+    *,
+    allow_private_ips: bool = False,
+    profile: str = "",
 ) -> list[RssFeedItem]:
     """Parse RSS/Atom feed content and return per-item records.
 
     Each item inherits the feed's configured ``source_tag`` verbatim
     (FR-SRC-4).  The parser does not infer or override ``source_tag``.
+
+    Issue #131: each entry's ``link`` is validated via
+    :func:`influx.urls.classify_article_url` before the item is
+    admitted.  Items whose URL is loopback / private / link-local /
+    multicast / malformed / disallowed-scheme are dropped pre-acquire
+    (logged at WARNING, counted on the run-ledger entry, no
+    ``influx:archive-missing`` note produced).  ``allow_private_ips``
+    mirrors the SSRF guard's flag so test fixtures using ``127.0.0.1``
+    keep working.
 
     Parameters
     ----------
@@ -94,6 +107,11 @@ def parse_feed(
     feed_entry:
         The ``RssSourceEntry`` from the profile config providing
         ``name``, ``url``, and ``source_tag``.
+    allow_private_ips:
+        Pass-through of ``config.security.allow_private_ips`` so the
+        URL validator and the SSRF guard agree.
+    profile:
+        Profile name used as a metric label on rejection counts.
 
     Returns
     -------
@@ -110,6 +128,28 @@ def parse_feed(
 
         if not title or not link:
             _log.debug("Skipping feed entry with missing title or link")
+            continue
+
+        validation = classify_article_url(link, allow_private=allow_private_ips)
+        if not validation.ok:
+            _log.warning(
+                "rss item rejected pre-acquire profile=%s feed=%r url=%s "
+                "reason=%s title=%r",
+                profile,
+                feed_entry.name,
+                link,
+                validation.reason,
+                title,
+            )
+            record_invalid_url_rejection()
+            metrics.rss_items_rejected_invalid_url().add(
+                1,
+                {
+                    "profile": profile,
+                    "source": "rss",
+                    "reason": validation.reason or "unknown",
+                },
+            )
             continue
 
         published = _parse_published(entry)
@@ -601,6 +641,7 @@ def make_rss_item_provider(
                     max_download_bytes=config.storage.max_download_bytes,
                     timeout_seconds=config.storage.download_timeout_seconds,
                     profile=profile,
+                    allow_private_ips=config.security.allow_private_ips,
                 )
                 metrics.candidates_fetched().add(
                     len(items), {"profile": profile, "source": "rss"}
@@ -729,6 +770,7 @@ async def _fetch_rss_feed(
     max_download_bytes: int | None = None,
     timeout_seconds: int | None = None,
     profile: str = "",
+    allow_private_ips: bool = False,
 ) -> list[RssFeedItem]:
     """Fetch raw feed bytes, then parse-and-stamp per *feed_entry*.
 
@@ -783,4 +825,9 @@ async def _fetch_rss_feed(
     if body is None:
         return []
 
-    return parse_feed(body, feed_entry)
+    return parse_feed(
+        body,
+        feed_entry,
+        allow_private_ips=allow_private_ips,
+        profile=profile,
+    )
