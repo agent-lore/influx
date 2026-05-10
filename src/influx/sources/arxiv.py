@@ -399,16 +399,23 @@ def _arxiv_429_delay(
     return min(base * (2**attempt), cap)
 
 
-# Issue #129: process-wide last-fetch timestamp used to enforce
+# Issue #129: process-wide next-slot allocator used to enforce
 # ``arxiv_request_min_interval_seconds`` across *all* arXiv fetches in
-# the same process — not just the per-day backfill loop.  The lock
-# serialises concurrent calls (the fetch runs on ``asyncio.to_thread``,
-# so a thread lock is appropriate) and the monotonic timestamp lets
-# back-to-back scheduled-tick fetches (e.g. profile A then profile B in
-# the same tick when ``schedule.inter_profile_gap_seconds`` is 0) pace
-# themselves rather than hitting arXiv simultaneously.
+# the same process — not just the per-day backfill loop.
+#
+# The pattern is a token-bucket-style "claim a slot under the lock,
+# then sleep until that slot outside the lock" scheme.  Storing
+# *next-allowed* (rather than *last-fetched*) lets concurrent callers
+# claim distinct, non-overlapping slots in a single critical section —
+# review of the original implementation flagged that holding the lock
+# only across the read/write but not across the sleep let two
+# concurrent callers observe the same ``last`` timestamp, compute the
+# same wait, and then start their HTTP fetches together, defeating the
+# pacing guarantee.  Slot allocation runs under the lock; the wait
+# itself happens with the lock released so a long ``Retry-After``-style
+# sleep does not block fetches that already hold a later slot.
 _FETCH_PACING_LOCK = threading.Lock()
-_LAST_FETCH_MONOTONIC: float | None = None
+_NEXT_FETCH_SLOT_MONOTONIC: float | None = None
 
 
 def _reset_fetch_pacing_for_tests() -> None:
@@ -417,36 +424,37 @@ def _reset_fetch_pacing_for_tests() -> None:
     Unit tests covering :func:`_apply_min_interval` need a clean baseline
     between cases; production code never calls this.
     """
-    global _LAST_FETCH_MONOTONIC  # noqa: PLW0603
+    global _NEXT_FETCH_SLOT_MONOTONIC  # noqa: PLW0603
     with _FETCH_PACING_LOCK:
-        _LAST_FETCH_MONOTONIC = None
+        _NEXT_FETCH_SLOT_MONOTONIC = None
 
 
 def _apply_min_interval(min_interval: float) -> None:
-    """Sleep until at least *min_interval* has elapsed since the last fetch.
+    """Block until this caller's paced slot starts.
 
-    Records ``time.monotonic()`` *after* sleeping so the timestamp marks
-    the start of the new fetch.  When *min_interval* is ``0`` (or
-    negative) the helper still records the timestamp but never sleeps —
-    callers can disable pacing without removing the call.
+    Atomically claims the next ``min_interval``-spaced slot under
+    :data:`_FETCH_PACING_LOCK`, then sleeps the difference between the
+    claimed slot and ``now`` with the lock released.  Two concurrent
+    callers therefore receive *different* slots — caller A sleeps zero
+    and starts immediately, caller B sleeps ``min_interval`` and starts
+    after A — instead of both observing the same "last fetch" timestamp
+    and racing each other to the wire.
+
+    When *min_interval* is ``0`` (or negative) the helper short-circuits
+    without touching the slot state: pacing is disabled wholesale and a
+    later paced call starts from a clean baseline.
     """
-    global _LAST_FETCH_MONOTONIC  # noqa: PLW0603
+    global _NEXT_FETCH_SLOT_MONOTONIC  # noqa: PLW0603
     if min_interval <= 0:
-        with _FETCH_PACING_LOCK:
-            _LAST_FETCH_MONOTONIC = time.monotonic()
         return
+    now = time.monotonic()
     with _FETCH_PACING_LOCK:
-        last = _LAST_FETCH_MONOTONIC
-        now = time.monotonic()
-        wait = 0.0
-        if last is not None:
-            elapsed = now - last
-            if elapsed < min_interval:
-                wait = min_interval - elapsed
+        next_slot = _NEXT_FETCH_SLOT_MONOTONIC
+        my_slot = now if next_slot is None or next_slot <= now else next_slot
+        _NEXT_FETCH_SLOT_MONOTONIC = my_slot + min_interval
+    wait = my_slot - now
     if wait > 0:
         _sleep(wait)
-    with _FETCH_PACING_LOCK:
-        _LAST_FETCH_MONOTONIC = time.monotonic()
 
 
 def fetch_arxiv(

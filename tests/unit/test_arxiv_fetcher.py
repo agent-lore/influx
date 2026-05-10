@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -14,6 +15,7 @@ from influx.http_client import FetchResult
 from influx.sources.arxiv import (
     ArxivItem,
     BackfillRange,
+    _apply_min_interval,
     _extract_arxiv_id,
     _filter_by_lookback,
     _parse_atom,
@@ -931,3 +933,76 @@ class TestArxivHardening:
         sources = [c.kwargs["source"] for c in mock_record.call_args_list]
         assert kinds == ["timeout", "rate_limit"]
         assert sources == ["arxiv", "arxiv"]
+
+
+class TestApplyMinInterval:
+    """Direct tests for the cross-fetch pacing slot allocator (#129).
+
+    Review feedback: the original implementation released the lock
+    before sleeping, so two concurrent callers could observe the same
+    ``last`` timestamp, compute the same wait, and then both start
+    their HTTP fetch together.  The slot-allocator version below
+    serialises *slot allocation* under the lock — concurrent callers
+    therefore receive *different* slots and pace themselves correctly.
+    """
+
+    @patch("influx.sources.arxiv._sleep")
+    def test_first_call_does_not_sleep(self, mock_sleep: MagicMock) -> None:
+        _apply_min_interval(3.0)
+        mock_sleep.assert_not_called()
+
+    @patch("influx.sources.arxiv._sleep")
+    def test_zero_interval_is_no_op(self, mock_sleep: MagicMock) -> None:
+        """``min_interval=0`` short-circuits and never touches the slot
+        state, so a subsequent paced call sees a clean baseline."""
+        _apply_min_interval(0.0)
+        _apply_min_interval(3.0)
+        # First call: short-circuit. Second call: clean baseline → no
+        # waiting slot, sleeps zero.
+        mock_sleep.assert_not_called()
+
+    @patch("influx.sources.arxiv._sleep")
+    def test_three_back_to_back_callers_get_distinct_slots(
+        self, mock_sleep: MagicMock
+    ) -> None:
+        """Three calls in rapid succession (``_sleep`` mocked, so wall-
+        clock barely advances) each claim a slot
+        ``min_interval`` apart: the first sleeps zero, the second
+        sleeps ~``min_interval``, the third sleeps ~``2 * min_interval``.
+
+        This is the property that cross-profile pacing depends on:
+        even if profiles A, B, and C all reach
+        ``_fetch_with_retry`` at the same wall-clock instant (the
+        scheduled-tick concurrency case the original review flagged),
+        each gets a unique slot under the lock and they hit arXiv
+        ``min_interval`` apart on the wire — not all together.
+        """
+        _apply_min_interval(3.0)
+        _apply_min_interval(3.0)
+        _apply_min_interval(3.0)
+        # The first call short-circuits the sleep guard with wait=0.
+        # The remaining two each call ``_sleep`` with their full slot
+        # offset because ``_sleep`` is mocked and so wall-clock time
+        # barely advances between calls.
+        assert mock_sleep.call_count == 2
+        slept_first = mock_sleep.call_args_list[0].args[0]
+        slept_second = mock_sleep.call_args_list[1].args[0]
+        # Generous lower bounds to absorb the few microseconds that
+        # *do* advance during the test; tight upper bounds to verify
+        # the slot allocator is not over-spacing.
+        assert 2.9 < slept_first <= 3.0
+        assert 5.9 < slept_second <= 6.0
+
+    @patch("influx.sources.arxiv._sleep")
+    def test_call_after_slot_already_passed_does_not_sleep(
+        self, mock_sleep: MagicMock
+    ) -> None:
+        """When the previously claimed slot is already in the past, a
+        fresh call starts immediately at ``now`` — pacing only kicks in
+        when calls cluster within a single interval window."""
+        _apply_min_interval(0.001)  # claims a slot ~1 ms in the future
+        # Sleep so the previously-claimed slot is firmly in the past.
+        time.sleep(0.01)
+        mock_sleep.reset_mock()
+        _apply_min_interval(3.0)
+        mock_sleep.assert_not_called()
