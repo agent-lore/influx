@@ -265,7 +265,8 @@ async def test_admin_endpoints_responsive_during_repair_sweep(
     hook_started = threading.Event()
     release_hook = threading.Event()
 
-    def slow_archive_download(_note: dict[str, Any]) -> str:
+    def slow_archive_download(note: dict[str, Any]) -> str:  # noqa: ARG001
+        del note  # unused — hook only signals the test, not the note
         # Signals "I'm running" then blocks until the test releases me.
         # Simulates a slow archive HTTP fetch (the blocking
         # ``download_archive`` call inside the real hook). Using an
