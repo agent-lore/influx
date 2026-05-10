@@ -505,13 +505,22 @@ def _run_rss_text_extraction(note: dict[str, object], config: AppConfig) -> str:
     Reads ``source_url`` from frontmatter and re-runs
     :func:`influx.extraction.article.extract_article` with the same
     config knobs as initial RSS acquisition.  Returns ``"text:html"``
-    on success so the sweep adds the provenance tag and the note exits
-    the text-extraction stage.
+    on success.
 
-    A ``NetworkError`` (e.g. SSRF guard, TLS failure) is re-wrapped as
-    ``ExtractionError`` carrying the network kind as ``stage`` — same
-    pattern as the arxiv branch — so the sweep's failure-classifier
-    keeps the existing transient-vs-counted semantics.
+    On any extraction failure (HTTP, network, min_length, parse, …)
+    returns ``"text:abstract-only"`` per the
+    :class:`~influx.repair.TextExtractionHook` protocol, so the sweep
+    stamps a ``text:*`` tag and the note converges out of the
+    text-extraction stage.  The note can still be upgraded to
+    ``text:html`` later via :func:`_make_re_extract_archive_hook`
+    once :func:`_make_archive_download_hook` lands an archive on disk.
+    A WARN is emitted so operators can see the structural reason
+    behind the convergence.
+
+    Only ``ExtractionError(stage="resolve")`` is raised — that signals
+    a missing ``source_url`` frontmatter field which only an operator
+    fix can repair, and it should keep surfacing through the sweep's
+    failure-logging path until corrected.
     """
     source_url = _parse_source_url_from_note(note)
     if not source_url:
@@ -532,13 +541,16 @@ def _run_rss_text_extraction(note: dict[str, object], config: AppConfig) -> str:
             max_download_bytes=storage_cfg.max_download_bytes,
             timeout_seconds=storage_cfg.download_timeout_seconds,
         )
-    except NetworkError as exc:
-        raise ExtractionError(
-            f"text_extraction retry network failure: {exc.kind}",
-            url=getattr(exc, "url", "") or source_url,
-            stage=exc.kind or "network",
-            detail=str(exc),
-        ) from exc
+    except (ExtractionError, NetworkError) as exc:
+        stage = getattr(exc, "stage", None) or getattr(exc, "kind", None) or "extract"
+        _log.warning(
+            "rss text_extraction retry: live extraction failed for %s "
+            "(stage=%s url=%s); converging to text:abstract-only",
+            note.get("id", "?"),
+            stage,
+            source_url,
+        )
+        return "text:abstract-only"
     return "text:html"
 
 
