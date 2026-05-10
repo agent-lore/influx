@@ -47,9 +47,10 @@ from influx.telemetry import (
     get_tracer,
     record_fetched_items,
     record_filter_error,
+    record_invalid_url_rejection,
     record_source_acquisition_error,
 )
-from influx.urls import normalise_url, url_hash
+from influx.urls import classify_article_url, normalise_url, url_hash
 
 if TYPE_CHECKING:
     from influx.config import AppConfig, ProfileConfig, RssSourceEntry
@@ -81,11 +82,33 @@ class RssFeedItem:
 def parse_feed(
     content: bytes | str,
     feed_entry: RssSourceEntry,
+    *,
+    allow_private_ips: bool = False,
+    profile: str = "",
 ) -> list[RssFeedItem]:
     """Parse RSS/Atom feed content and return per-item records.
 
     Each item inherits the feed's configured ``source_tag`` verbatim
     (FR-SRC-4).  The parser does not infer or override ``source_tag``.
+
+    Issue #131: each entry's ``link`` is validated via
+    :func:`influx.urls.classify_article_url` before the item is
+    admitted.  Items whose URL is loopback / private / link-local /
+    multicast / malformed / disallowed-scheme are dropped pre-acquire
+    (logged at WARNING, counted on the run-ledger entry, no
+    ``influx:archive-missing`` note produced).  Each rejection also
+    bumps the per-run pre-filter ``fetched_total`` so a feed that
+    returned items but had every URL rejected is not misclassified as
+    ``fetch_stall`` (review concern 2 on PR #133).
+
+    ``allow_private_ips`` is intentionally **not** threaded from
+    ``config.security.allow_private_ips`` by the production
+    :func:`_fetch_rss_feed` caller — that flag is the fetcher's
+    escape hatch for *configured* internal services and must not
+    accidentally re-allow third-party feeds to advertise localhost
+    links.  It exists here purely for direct test callers (e.g. the
+    ``FakeArticleServer`` integration tests in
+    ``tests/integration/test_rss_to_lithos.py``).
 
     Parameters
     ----------
@@ -94,6 +117,11 @@ def parse_feed(
     feed_entry:
         The ``RssSourceEntry`` from the profile config providing
         ``name``, ``url``, and ``source_tag``.
+    allow_private_ips:
+        Test-only opt-in to accept loopback / private / link-local /
+        multicast hosts.  Production callers leave this at ``False``.
+    profile:
+        Profile name used as a metric label on rejection counts.
 
     Returns
     -------
@@ -110,6 +138,36 @@ def parse_feed(
 
         if not title or not link:
             _log.debug("Skipping feed entry with missing title or link")
+            continue
+
+        validation = classify_article_url(link, allow_private=allow_private_ips)
+        if not validation.ok:
+            _log.warning(
+                "rss item rejected pre-acquire profile=%s feed=%r url=%s "
+                "reason=%s title=%r",
+                profile,
+                feed_entry.name,
+                link,
+                validation.reason,
+                title,
+            )
+            record_invalid_url_rejection()
+            # Issue #131 review concern 2: count the rejected entry
+            # toward the run's pre-filter ``fetched_total`` so a feed
+            # that returned items with every URL invalid is not
+            # misclassified as ``fetch_stall`` (which means "no source
+            # returned anything at all").  The ledger uses
+            # ``invalid_url_rejections_total`` to fire
+            # ``invalid_url_stall`` instead when warranted.
+            record_fetched_items(1)
+            metrics.rss_items_rejected_invalid_url().add(
+                1,
+                {
+                    "profile": profile,
+                    "source": "rss",
+                    "reason": validation.reason or "unknown",
+                },
+            )
             continue
 
         published = _parse_published(entry)
@@ -783,4 +841,12 @@ async def _fetch_rss_feed(
     if body is None:
         return []
 
-    return parse_feed(body, feed_entry)
+    # NB: ``allow_private_ips`` is deliberately NOT threaded from
+    # ``config.security.allow_private_ips`` here.  That flag is the
+    # fetcher's escape hatch for talking to *configured* internal
+    # services; it must NOT be a "trust upstream feeds to advertise
+    # localhost links" knob.  Issue #131: a staging config with
+    # ``allow_private_ips = true`` would otherwise re-enable the very
+    # behaviour this fix removes.  Direct test callers of
+    # :func:`parse_feed` may still opt in.
+    return parse_feed(body, feed_entry, profile=profile)

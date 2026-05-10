@@ -565,7 +565,10 @@ class TestCollision:
             url=f"{article_server.url}/feed.atom",
             source_tag="rss",
         )
-        items = parse_feed(feed_content, feed_entry)
+        # Test fixture serves articles from 127.0.0.1, so the syntactic
+        # URL validator (issue #131) needs the same opt-in the SSRF
+        # guard uses for these integration tests.
+        items = parse_feed(feed_content, feed_entry, allow_private_ips=True)
         assert len(items) == 2
 
         config = _make_config(
@@ -688,7 +691,7 @@ class TestEndToEndFixtureFeed:
             url=f"{article_server.url}/feed.atom",
             source_tag="rss",
         )
-        items = parse_feed(feed_content, feed_entry)
+        items = parse_feed(feed_content, feed_entry, allow_private_ips=True)
         assert len(items) == 2
 
         config = _make_config(
@@ -737,7 +740,7 @@ class TestEndToEndFixtureFeed:
             url=f"{article_server.url}/feed.xml",
             source_tag="blog",
         )
-        items = parse_feed(feed_content, feed_entry)
+        items = parse_feed(feed_content, feed_entry, allow_private_ips=True)
         assert len(items) == 2
 
         config = _make_config(

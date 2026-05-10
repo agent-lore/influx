@@ -234,6 +234,7 @@ def _start_complete(
     ingested: int | None,
     fetched_total: int | None = None,
     filter_errors_total: int | None = None,
+    invalid_url_rejections_total: int | None = None,
     archive_failures_total: int | None = None,
     source_acquisition_errors: list[dict[str, str]] | None = None,
 ) -> list[str]:
@@ -247,6 +248,8 @@ def _start_complete(
     values explicitly.
 
     ``filter_errors_total`` defaults to ``None`` (no scorer failures).
+    ``invalid_url_rejections_total`` defaults to ``None`` (no
+    pre-acquire URL rejections — issue #131).
     """
     if fetched_total is None:
         fetched_total = sources_checked if isinstance(sources_checked, int) else 0
@@ -257,6 +260,7 @@ def _start_complete(
         ingested=ingested,
         fetched_total=fetched_total,
         filter_errors_total=filter_errors_total,
+        invalid_url_rejections_total=invalid_url_rejections_total,
         archive_failures_total=archive_failures_total,
         source_acquisition_errors=source_acquisition_errors,
     )
@@ -1098,3 +1102,127 @@ def test_complete_default_filter_errors_total_when_omitted(tmp_path: Path) -> No
     assert reasons == []
     entry = ledger.recent()[0]
     assert entry.get("filter_errors_total") is None
+
+
+# ── #131 review concern 2: invalid_url_stall ────────────────────────
+
+
+def test_all_items_url_rejected_flags_invalid_url_stall(tmp_path: Path) -> None:
+    """Feed returned items but every URL was bad → invalid_url_stall.
+
+    Single-run signal — no consecutive-runs ratchet, unlike fetch_stall
+    or filter_stall.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=5,
+        invalid_url_rejections_total=5,
+    )
+    assert "invalid_url_stall" in reasons
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is True
+    assert "invalid_url_stall" in entry["degraded_reasons"]
+    assert entry["invalid_url_rejections_total"] == 5
+
+
+def test_invalid_url_stall_preempts_filter_stall(tmp_path: Path) -> None:
+    """When all items were URL-rejected, the filter never ran — don't
+    misclassify as ``filter_stall``."""
+    ledger = RunLedger(tmp_path / "state")
+    # Seed history so filter_stall ratchet would otherwise be satisfied.
+    _start_complete(
+        ledger, run_id="r-history", profile="p", sources_checked=4, ingested=2
+    )
+    _start_complete(
+        ledger,
+        run_id="r-bad",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=3,
+        invalid_url_rejections_total=3,
+    )
+    reasons = _start_complete(
+        ledger,
+        run_id="r-current",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=3,
+        invalid_url_rejections_total=3,
+    )
+    assert "invalid_url_stall" in reasons
+    assert "filter_stall" not in reasons
+
+
+def test_partial_url_rejection_does_not_flag_invalid_url_stall(
+    tmp_path: Path,
+) -> None:
+    """Some URLs invalid + others reach the filter → not invalid_url_stall.
+
+    Filter-side diagnosis (filter_stall) is correct here: items DID
+    reach the scorer.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    # Seed history so filter_stall ratchet is satisfied.
+    _start_complete(
+        ledger, run_id="r-history", profile="p", sources_checked=4, ingested=2
+    )
+    _start_complete(
+        ledger,
+        run_id="r-prev",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        invalid_url_rejections_total=2,
+    )
+    reasons = _start_complete(
+        ledger,
+        run_id="r-current",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=10,
+        invalid_url_rejections_total=2,
+    )
+    # 8 items reached the filter and were rejected — that's filter_stall.
+    assert "invalid_url_stall" not in reasons
+    assert "filter_stall" in reasons
+
+
+def test_invalid_url_stall_does_not_fire_when_fetched_total_zero(
+    tmp_path: Path,
+) -> None:
+    """``fetch_stall`` (not invalid_url_stall) when nothing was fetched."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=0,
+        invalid_url_rejections_total=0,
+    )
+    assert "invalid_url_stall" not in reasons
+
+
+def test_invalid_url_stall_fires_on_first_run(tmp_path: Path) -> None:
+    """No consecutive-runs gate — single-run signal."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="brand-new-profile",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=2,
+        invalid_url_rejections_total=2,
+    )
+    assert "invalid_url_stall" in reasons

@@ -47,6 +47,7 @@ from influx.run_ledger import RunLedger
 from influx.telemetry import (
     current_fetched_total,
     current_filter_errors,
+    current_invalid_url_rejections,
     current_run_id,
     current_source_acquisition_errors,
     get_tracer,
@@ -110,6 +111,15 @@ async def ledger_lifecycle(
     # misclassifying as ``filter_stall`` (scorer ran, rejected all).
     filter_errors_counter: list[int] = [0]
     filter_errors_token = current_filter_errors.set(filter_errors_counter)
+    # #131: per-run count of source items rejected because their article
+    # URL failed syntactic validation (loopback / private / malformed).
+    # Surfaced on the ledger entry as ``invalid_url_rejections_total``
+    # so a healthy fetch with bad item links is visibly distinct from a
+    # transient archive-download failure.
+    invalid_url_rejections_counter: list[int] = [0]
+    invalid_url_rejections_token = current_invalid_url_rejections.set(
+        invalid_url_rejections_counter
+    )
     metric_attrs = {"profile": profile, "run_type": plan.kind.value}
 
     ledger.start(
@@ -181,12 +191,15 @@ async def ledger_lifecycle(
         fetched_total = fetched_total_counter[0]
         # #85 review: same pattern for filter-execution failures.
         filter_errors_total = filter_errors_counter[0]
+        # #131: total per-run pre-acquire URL rejections.
+        invalid_url_rejections_total = invalid_url_rejections_counter[0]
         degraded_reasons = ledger.complete(
             run_id=run_id,
             sources_checked=sources_checked,
             ingested=ingested,
             fetched_total=fetched_total,
             filter_errors_total=filter_errors_total,
+            invalid_url_rejections_total=invalid_url_rejections_total,
             archive_failures_total=archive_failures_total,
             source_acquisition_errors=source_errors,
         )
@@ -279,6 +292,28 @@ async def ledger_lifecycle(
                 run_id,
                 archive_failures_total,
             )
+        if "invalid_url_stall" in degraded_reasons:
+            # #131 review concern 2: feed returned items but every URL
+            # was upstream-malformed.  Single-run signal — operators
+            # should look at the upstream feed's emitted ``<link>``
+            # values, not the profile description, filter prompt, or
+            # provider config.
+            metrics.ingestion_stalls().add(
+                1, {"profile": profile, "reason": "invalid_url_stall"}
+            )
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged invalid_url_stall profile=%s kind=%s run_id=%s "
+                "invalid_url_rejections=%d fetched_total=%d "
+                "(feed returned items but every entry link was "
+                "upstream-malformed — check the upstream feed publisher)",
+                profile,
+                plan.kind.value,
+                run_id,
+                invalid_url_rejections_total,
+                fetched_total,
+            )
         metrics.run_duration().record(elapsed, metric_attrs)
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
 
@@ -332,6 +367,7 @@ async def ledger_lifecycle(
         current_source_acquisition_errors.reset(source_errors_token)
         current_fetched_total.reset(fetched_total_token)
         current_filter_errors.reset(filter_errors_token)
+        current_invalid_url_rejections.reset(invalid_url_rejections_token)
 
 
 # ── RunService ──────────────────────────────────────────────────────
