@@ -714,13 +714,17 @@ class TestArchiveDownloadHookMetadataRecovery:
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
         note = _make_archive_missing_note()
-        note["tags"] = [t.replace("source:arxiv", "source:rss") for t in note["tags"]]
+        # ``hackernews`` is a stand-in for any future source that hasn't
+        # yet had a per-source resolver wired in (issue #130 added rss).
+        note["tags"] = [
+            t.replace("source:arxiv", "source:hackernews") for t in note["tags"]
+        ]
 
         assert hooks.archive_download is not None
         with pytest.raises(ExtractionError) as exc_info:
             hooks.archive_download(note)
         assert exc_info.value.stage == "unsupported_source"
-        # Still transient — RSS support can land later without a forced cap.
+        # Transient — future sources can land later without a forced cap.
         assert classify_failure(exc_info.value) == "transient"
 
 
@@ -852,10 +856,334 @@ class TestTextExtractionHookMetadataRecovery:
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
         note = _make_textless_note()
-        note["tags"] = [t.replace("source:arxiv", "source:rss") for t in note["tags"]]
+        # See archive_download equivalent test — ``hackernews`` represents
+        # any future source without a per-source resolver.
+        note["tags"] = [
+            t.replace("source:arxiv", "source:hackernews") for t in note["tags"]
+        ]
 
         assert hooks.text_extraction is not None
         with pytest.raises(ExtractionError) as exc_info:
             hooks.text_extraction(note)
         assert exc_info.value.stage == "unsupported_source"
+        assert classify_failure(exc_info.value) == "transient"
+
+
+# ── RSS archive_download / text_extraction (issue #130) ─────────────
+
+
+def _rss_note_content(
+    *,
+    source_url: str = "https://example.com/article-42",
+    archive_path: str | None = None,
+    score: int = 6,
+) -> str:
+    """Build a canonical RSS note content string."""
+    archive_body = f"path: {archive_path}\n" if archive_path else ""
+    return (
+        "---\n"
+        "note_type: summary\n"
+        "namespace: influx\n"
+        f"source_url: {source_url}\n"
+        "tags:\n"
+        "  - profile:ai-robotics\n"
+        "  - source:rss-techcrunch\n"
+        "  - feed-slug:techcrunch\n"
+        "  - influx:archive-missing\n"
+        "  - influx:repair-needed\n"
+        "confidence: 0.7\n"
+        "---\n"
+        "# RSS Article Title\n"
+        "\n"
+        "## Archive\n"
+        f"{archive_body}"
+        "\n"
+        "## Summary\n"
+        "An RSS article summary.\n"
+        "\n"
+        "## Profile Relevance\n"
+        "### ai-robotics\n"
+        f"Score: {score}/10\n"
+        "Relevant.\n"
+        "\n"
+        "## User Notes\n"
+    )
+
+
+def _make_rss_archive_missing_note(
+    *,
+    feed_slug: str = "techcrunch",
+    url_hash: str = "abc123def",
+    note_path: str = "articles/rss-techcrunch/2026/05",
+    source_url: str = "https://example.com/article-42",
+    omit_source_url: bool = False,
+    omit_id_prefix: bool = False,
+) -> dict[str, Any]:
+    """Build an RSS note dict in the ``influx:archive-missing`` state.
+
+    Mirrors the shape produced by
+    :func:`influx.sources.rss.build_rss_note_item` for a feed item
+    whose archive download failed.
+    """
+    note_id = (
+        f"{feed_slug}-{url_hash}" if omit_id_prefix else f"rss-{feed_slug}-{url_hash}"
+    )
+    fm_url = "" if omit_source_url else source_url
+    content = _rss_note_content(
+        source_url=fm_url if fm_url else "https://example.com/article-42"
+    )
+    if omit_source_url:
+        # Strip the source_url frontmatter line so the resolver hits the
+        # missing-field branch.
+        content = (
+            "\n".join(
+                line
+                for line in content.splitlines()
+                if not line.startswith("source_url:")
+            )
+            + "\n"
+        )
+    return {
+        "id": note_id,
+        "title": "RSS Article Title",
+        "source_url": source_url,
+        "path": note_path,
+        "content": content,
+        "tags": [
+            "profile:ai-robotics",
+            "source:rss-techcrunch",
+            f"feed-slug:{feed_slug}",
+            "influx:archive-missing",
+            "influx:repair-needed",
+        ],
+        "version": 1,
+    }
+
+
+class TestArchiveDownloadHookRssSuccess:
+    def test_returns_relative_path_on_success(self, tmp_path: Path) -> None:
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=True,
+                rel_posix_path="rss-techcrunch/2026/05/techcrunch-abc123def.html",
+                error="",
+            )
+            assert hooks.archive_download is not None
+            result = hooks.archive_download(note)
+
+        assert result == "rss-techcrunch/2026/05/techcrunch-abc123def.html"
+        kwargs = mock_dl.call_args.kwargs
+        assert kwargs["url"] == "https://example.com/article-42"
+        assert kwargs["source"] == "rss-techcrunch"
+        assert kwargs["item_id"] == "techcrunch-abc123def"
+        assert kwargs["published_year"] == 2026
+        assert kwargs["published_month"] == 5
+        assert kwargs["ext"] == ".html"
+        assert kwargs["expected_content_type"] == "html"
+
+
+class TestArchiveDownloadHookRssFailures:
+    def test_oversize_is_counted(self, tmp_path: Path) -> None:
+        """Oversize is counted for RSS the same way as for arxiv."""
+        from influx.repair_counters import classify_failure
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error="oversize: response body 12000000 bytes exceeds limit",
+            )
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.archive_download(note)
+
+        assert exc_info.value.stage == "oversize"
+        assert classify_failure(exc_info.value) == "counted"
+
+    def test_http_error_is_transient(self, tmp_path: Path) -> None:
+        """HTTP 4xx/5xx leaves the RSS note re-enterable next sweep."""
+        from influx.repair_counters import classify_failure
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error="HTTP 503 for https://example.com/article-42",
+            )
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.archive_download(note)
+
+        assert exc_info.value.stage == "http"
+        assert classify_failure(exc_info.value) == "transient"
+
+
+class TestArchiveDownloadHookRssMetadataRecovery:
+    def test_missing_source_url_raises_resolve(self, tmp_path: Path) -> None:
+        from influx.repair_counters import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_archive_missing_note(omit_source_url=True)
+
+        assert hooks.archive_download is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.archive_download(note)
+        assert exc_info.value.stage == "resolve"
+        assert classify_failure(exc_info.value) == "transient"
+
+    def test_missing_id_prefix_raises_resolve(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_archive_missing_note(omit_id_prefix=True)
+
+        assert hooks.archive_download is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.archive_download(note)
+        assert exc_info.value.stage == "resolve"
+
+    def test_missing_year_month_in_path_raises_resolve(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_archive_missing_note(note_path="articles/rss-techcrunch/")
+
+        assert hooks.archive_download is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.archive_download(note)
+        assert exc_info.value.stage == "resolve"
+
+
+def _make_rss_textless_note(
+    *,
+    source_url: str = "https://example.com/article-42",
+    omit_source_url: bool = False,
+) -> dict[str, Any]:
+    """Build an RSS note dict with no ``text:*`` tag (text_extraction stage)."""
+    note = _make_rss_archive_missing_note(
+        source_url=source_url,
+        omit_source_url=omit_source_url,
+    )
+    # Drop archive-missing so the note is in the pure text-extraction
+    # state; the text_extraction hook only inspects source + frontmatter.
+    note["tags"] = [t for t in note["tags"] if t != "influx:archive-missing"]
+    return note
+
+
+class TestTextExtractionHookRssSuccess:
+    def test_returns_html_tag_on_extract_success(self, tmp_path: Path) -> None:
+        from influx.extraction.article import ArticleExtractionResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_textless_note()
+
+        with patch("influx.repair_hooks.extract_article") as mock_ex:
+            mock_ex.return_value = ArticleExtractionResult(
+                text="extracted body",
+                source="article",
+            )
+            assert hooks.text_extraction is not None
+            tag = hooks.text_extraction(note)
+
+        assert tag == "text:html"
+        # First positional arg is the source_url from frontmatter.
+        assert mock_ex.call_args.args[0] == "https://example.com/article-42"
+
+
+class TestTextExtractionHookRssFailures:
+    """Live extraction failure converges to ``text:abstract-only`` (issue #130).
+
+    Per the :class:`~influx.repair.TextExtractionHook` protocol the
+    hook returns ``"text:abstract-only"`` on cascade fall-through so
+    the sweep stamps a ``text:*`` tag and the note exits the
+    text-extraction stage.  Re-extraction from a stored archive (via
+    the source-agnostic ``re_extract_archive`` hook) can still upgrade
+    the tag to ``text:html`` once ``archive_download`` lands.
+    """
+
+    def test_extraction_error_returns_abstract_only(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_textless_note()
+
+        with patch("influx.repair_hooks.extract_article") as mock_ex:
+            mock_ex.side_effect = ExtractionError(
+                "extracted body too short",
+                stage="min_length",
+                detail="got 100 chars, need 500",
+            )
+            assert hooks.text_extraction is not None
+            tag = hooks.text_extraction(note)
+
+        assert tag == "text:abstract-only"
+
+    def test_network_error_returns_abstract_only(self, tmp_path: Path) -> None:
+        from influx.errors import NetworkError
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_textless_note()
+
+        with patch("influx.repair_hooks.extract_article") as mock_ex:
+            mock_ex.side_effect = NetworkError(
+                "tls handshake failed",
+                url="https://example.com/article-42",
+                kind="tls",
+            )
+            assert hooks.text_extraction is not None
+            tag = hooks.text_extraction(note)
+
+        assert tag == "text:abstract-only"
+
+    def test_logs_warning_on_failure(self, tmp_path: Path, caplog) -> None:
+        """Operator visibility: the structural failure stage is logged."""
+        import logging
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_textless_note()
+
+        with patch("influx.repair_hooks.extract_article") as mock_ex:
+            mock_ex.side_effect = ExtractionError(
+                "trafilatura returned no content",
+                stage="extract",
+            )
+            assert hooks.text_extraction is not None
+            with caplog.at_level(logging.WARNING, logger="influx.repair_hooks"):
+                hooks.text_extraction(note)
+
+        assert any(
+            "stage=extract" in record.message and "text:abstract-only" in record.message
+            for record in caplog.records
+        )
+
+
+class TestTextExtractionHookRssMetadataRecovery:
+    def test_missing_source_url_raises_resolve(self, tmp_path: Path) -> None:
+        from influx.repair_counters import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_rss_textless_note(omit_source_url=True)
+
+        assert hooks.text_extraction is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.text_extraction(note)
+        assert exc_info.value.stage == "resolve"
         assert classify_failure(exc_info.value) == "transient"
