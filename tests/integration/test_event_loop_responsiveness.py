@@ -126,9 +126,7 @@ async def test_status_responsive_during_blocking_filter_work(
         )
 
     transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://test"
-    ) as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         # Patch the local re-export inside filter.py (which is what
         # ``_call_filter_model_with_retry`` actually calls), not the
         # http_client source module — ``from … import …`` creates a
@@ -201,9 +199,7 @@ async def test_live_responsive_during_blocking_filter_work(
         )
 
     transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://test"
-    ) as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         # Patch the local re-export inside filter.py (which is what
         # ``_call_filter_model_with_retry`` actually calls), not the
         # http_client source module — ``from … import …`` creates a
