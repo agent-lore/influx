@@ -29,6 +29,34 @@ retain_days = 3650              # ~10 years
 max_download_bytes = 52_428_800 # 50 MB per file
 download_timeout_seconds = 30
 
+# Issue #149: domain-aware archive acquisition policy.  Maps a host
+# suffix to one of three modes:
+#   blocked       — try the download but expect HTTP 403 / WAF; the
+#                    note is tagged ``influx:archive-blocked`` and
+#                    ``influx:archive-terminal`` so the repair sweep
+#                    stops re-attempting the doomed path.
+#   rate_limited  — try the download but expect HTTP 429; the note is
+#                    tagged ``influx:archive-rate-limited`` and stays
+#                    in the normal repair-needed loop.
+#   skip          — do not attempt the download at all; the note is
+#                    tagged ``influx:archive-skipped-by-policy``.
+# A built-in defaults set already covers the staging hot offenders
+# (``science.org``, ``alignmentforum.org``, ``therobotreport.com``,
+# ``tnmoc.org``, ``lesswrong.com``); set ``include_defaults = false``
+# to opt out, or override per-domain in the maps below.
+#
+# [storage.archive_policy]
+# include_defaults = true
+#
+# [storage.archive_policy.blocked]
+# "example.com" = "WAF challenge observed 2026-04-15 onward"
+#
+# [storage.archive_policy.rate_limited]
+# "slow.example" = "429 under 1-min cadence; cool-down before retry"
+#
+# [storage.archive_policy.skip]
+# "never.example" = "auth-walled; archive disabled permanently"
+
 [notifications]
 timeout_seconds = 5
 

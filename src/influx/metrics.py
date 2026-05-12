@@ -35,6 +35,7 @@ from influx.telemetry import get_meter
 __all__ = [
     "active_runs",
     "archive_missing",
+    "archive_policy_failures",
     "articles_filtered",
     "articles_inspected",
     "cache_hits",
@@ -235,6 +236,35 @@ def archive_missing() -> Any:
     return get_meter().counter(
         "influx_archive_missing_total",
         description="Items tagged influx:archive-missing during a run.",
+    )
+
+
+def archive_policy_failures() -> Any:
+    """Counter of archive failures classified by domain-aware policy (#149).
+
+    Increments alongside :func:`archive_missing` whenever
+    :class:`~influx.archive_policy.ArchivePolicy` reclassifies an
+    archive failure into a structural shape (``blocked`` /
+    ``rate_limited`` / ``missing_by_policy``).  ``kind="generic"`` is
+    reserved for the (large, expected) baseline of unclassified
+    failures so dashboards can compute the ratio without subtracting
+    series.
+
+    Labels: ``profile``, ``source``, ``kind``
+    (``"blocked"`` | ``"rate_limited"`` | ``"missing_by_policy"`` |
+    ``"http_403"`` | ``"http_429"`` | ``"http_404"`` | ``"http_4xx"`` |
+    ``"http_5xx"`` | ``"oversize"`` | ``"timeout"`` | ``"ssrf"`` |
+    ``"dns"`` | ``"network"`` | ``"content_type_mismatch"`` |
+    ``"write"`` | ``"unknown"``).
+    """
+    return get_meter().counter(
+        "influx_archive_policy_failures_total",
+        description=(
+            "Archive download failures classified by domain-aware policy; "
+            "the ``kind`` label distinguishes blocked / rate-limited / "
+            "missing-by-policy from generic HTTP / network shapes (issue "
+            "#149)."
+        ),
     )
 
 
