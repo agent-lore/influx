@@ -268,6 +268,11 @@ _INFLUX_OWNED_EXACT: frozenset[str] = frozenset(
         # download failures — caps the archive_retry stage in select_stages
         # the same way tier{2,3}-terminal cap their respective stages.
         "influx:archive-terminal",
+        # Set by the repair sweep when a note's source metadata is
+        # unrecoverable (#150) — pins the bad-state notes terminal AND
+        # makes them discoverable via Lithos tag search for operator
+        # cleanup.  Mirrors the influx:text-terminal lifecycle.
+        "influx:source-invalid",
     }
 )
 

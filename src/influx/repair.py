@@ -1077,6 +1077,38 @@ def _terminate_unsupported_text_source(note: dict[str, Any]) -> list[str]:
     return restored_tags
 
 
+def _terminate_invalid_source_metadata(note: dict[str, Any]) -> list[str]:
+    """Mark a note terminal because its source metadata is unrecoverable (#150).
+
+    Distinct from :func:`_terminate_unsupported_text_source` — that
+    helper covers legitimate future sources without a resolver yet
+    (``source:hackernews``).  This helper covers notes whose source
+    tag is empty/garbled AND whose URL/path/id provide no inference
+    fallback, so the previous behaviour was an infinite loop of
+    ``text_extraction retry: source '' not supported`` warnings every
+    sweep.
+
+    The note is pinned at ``text:abstract-only`` with
+    ``influx:text-terminal`` so the text-extraction stage is skipped,
+    AND tagged with ``influx:source-invalid`` so the bad-state notes
+    are independently discoverable (Lithos tag search) for later
+    operator cleanup.  ``influx:repair-needed`` is dropped when no
+    other repair condition remains pending, mirroring the unsupported-
+    source path so the note exits the sweep entirely.
+    """
+    restored_tags = list(note.get("tags", []))
+    if not any(tag.startswith("text:") for tag in restored_tags):
+        restored_tags.append("text:abstract-only")
+    if "influx:text-terminal" not in restored_tags:
+        restored_tags.append("influx:text-terminal")
+    if "influx:source-invalid" not in restored_tags:
+        restored_tags.append("influx:source-invalid")
+    if "influx:archive-missing" not in restored_tags:
+        restored_tags = [tag for tag in restored_tags if tag != "influx:repair-needed"]
+    note["tags"] = list(restored_tags)
+    return restored_tags
+
+
 def _run_text_extraction_retry(
     note: dict[str, Any],
     *,
@@ -1091,6 +1123,13 @@ def _run_text_extraction_retry(
     new terminal tag is introduced for normal failures (out of scope
     for issue #24); ``unsupported_source`` failures are flipped to
     terminal so the note exits the sweep instead of looping.
+
+    ``invalid_source_metadata`` failures (#150) are also flipped to
+    terminal — distinct from ``unsupported_source`` so logs and tags
+    cleanly separate the metadata-integrity case from the future-
+    source case.  The terminal flip also adds the
+    ``influx:source-invalid`` tag so the bad-state notes are
+    independently discoverable for operator cleanup.
     """
     try:
         with _stage_attempt(
@@ -1102,17 +1141,25 @@ def _run_text_extraction_retry(
         ):
             new_text_tag = hook(note)
         new_tags = list(current_tags)
+        # The hook may have backfilled the ``source:*`` tag on the
+        # note dict during inference (#150); reflect that mutation in
+        # the working tag set so the rewrite persists it even on the
+        # success path.
+        hook_tags = list(note.get("tags", new_tags))
+        if hook_tags != new_tags:
+            new_tags = merge_tags(existing_tags=new_tags, new_tags=hook_tags)
         if new_text_tag and not any(t.startswith("text:") for t in new_tags):
             new_tags.append(new_text_tag)
-            note["tags"] = list(new_tags)
+        note["tags"] = list(new_tags)
         return new_tags
     except (ExtractionError, LCMAError, LithosError) as exc:
         new_tags = current_tags
-        if (
-            isinstance(exc, ExtractionError)
-            and getattr(exc, "stage", "") == "unsupported_source"
-        ):
-            new_tags = _terminate_unsupported_text_source(note)
+        if isinstance(exc, ExtractionError):
+            stage = getattr(exc, "stage", "")
+            if stage == "unsupported_source":
+                new_tags = _terminate_unsupported_text_source(note)
+            elif stage == "invalid_source_metadata":
+                new_tags = _terminate_invalid_source_metadata(note)
         _log_stage_failure(
             "text_extraction",
             note=note,
