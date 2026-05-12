@@ -153,9 +153,7 @@ def _extract_arxiv_429_classification(error: NetworkError) -> str | None:
     return rest.split(" ", 1)[0] or None
 
 
-def _classify_arxiv_429(
-    *, body: bytes, headers: dict[str, str]
-) -> tuple[str, bool]:
+def _classify_arxiv_429(*, body: bytes, headers: dict[str, str]) -> tuple[str, bool]:
     """Classify an arXiv 429 into a refined retry/error kind (issue #145).
 
     Returns a ``(kind, retry_after_present)`` pair.  *kind* is one of:
@@ -182,10 +180,7 @@ def _classify_arxiv_429(
     on the header signal.
     """
     retry_after_present = _header_value(headers, "Retry-After") is not None
-    body_marker = (
-        body is not None
-        and _ARXIV_UPSTREAM_CAPACITY_MARKER in body.lower()
-    )
+    body_marker = body is not None and _ARXIV_UPSTREAM_CAPACITY_MARKER in body.lower()
     if body_marker:
         return "rate_limit_upstream_capacity", retry_after_present
     if retry_after_present:
@@ -1102,9 +1097,7 @@ class ArxivSource:
                 # generic ``rate_limit``.  Non-429 errors fall back
                 # to ``exc.kind`` unchanged.
                 ledger_kind = (
-                    _extract_arxiv_429_classification(exc)
-                    or exc.kind
-                    or "unknown"
+                    _extract_arxiv_429_classification(exc) or exc.kind or "unknown"
                 )
                 _log.warning(
                     "arxiv fetch failed for profile %r kind=%s; yielding zero items",
