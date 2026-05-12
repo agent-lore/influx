@@ -42,6 +42,7 @@ from influx.renderer import (
 from influx.renderer import (
     _render_profile_relevance_body as _render_pr_body,
 )
+from influx.urls import normalise_url
 
 __all__ = ["LithosClient", "WriteResult"]
 
@@ -226,6 +227,20 @@ class SquatterClassification:
     reason: str  # human-readable explanation, surfaced in detail / logs
 
 
+def _safe_normalise_url(url: str) -> str:
+    """Return :func:`normalise_url` output, falling back to *url* on error.
+
+    The classifier is on the conflict-recovery hot path; a malformed URL
+    must not crash the write loop.  Empty input returns ``""``.
+    """
+    if not url:
+        return ""
+    try:
+        return normalise_url(url)
+    except Exception:  # noqa: BLE001 — defensive: never crash recovery on bad URLs
+        return url
+
+
 def _classify_squatter(
     doc: dict[str, Any],
     *,
@@ -237,9 +252,10 @@ def _classify_squatter(
     Returns one of three outcomes:
 
     * ``"duplicate"`` — the squatter already represents the same paper
-      as the incoming write (matching ``arxiv-id:<id>`` tag, or
-      matching ``source_url``).  Lithos's URL/cache dedup should have
-      caught this; surfacing it here recovers from that miss.
+      as the incoming write (matching ``arxiv-id:<id>`` tag, matching
+      ``source_url``, or canonical-URL equivalence).  Lithos's URL/cache
+      dedup should have caught this; surfacing it here recovers from
+      that miss.
     * ``"reclaimable"`` — the squatter is an empty residue from an
       aborted prior write (no tags AND no source_url AND no body).
       Safe to delete and retry the original write.
@@ -247,6 +263,19 @@ def _classify_squatter(
       happens to slugify the same.  The caller should fall back to
       the suffix-retry path; if THAT also collides, the entry goes
       to the unresolved-collisions backlog.
+
+    Stable-identity matches (#148) now include:
+
+    * arxiv-id tag equality (existing);
+    * exact ``source_url`` equality (existing);
+    * canonical-URL equality via :func:`influx.urls.normalise_url`
+      (handles scheme case, default ports, tracking params, trailing
+      slashes) — catches the staging cases where two writes for the
+      same paper differ only in URL normalisation;
+    * arxiv id extracted from the squatter's ``source_url`` when no
+      explicit ``arxiv-id:`` tag is present — catches squatters whose
+      tagset was truncated by an earlier merge but whose ``source_url``
+      still names the same paper.
 
     This function is pure: I/O lives in :meth:`LithosClient._retry_slug_collision`.
     """
@@ -269,16 +298,48 @@ def _classify_squatter(
                     ),
                 )
 
-    # Match #2: source_url equality.
-    if sq_source_url and sq_source_url == incoming_source_url:
-        return SquatterClassification(
-            kind="duplicate",
-            squatter_id=squatter_id,
-            reason=(
-                f"squatter source_url matches incoming ({sq_source_url}) — "
-                "treat as duplicate of the same paper"
-            ),
-        )
+    # Match #1b: arxiv-id extracted from the squatter's source_url matches the
+    # incoming arxiv-id.  Squatters whose tagset was truncated by an earlier
+    # merge can still be identified by URL alone.
+    if incoming_arxiv_id and sq_source_url:
+        sq_arxiv_id = _arxiv_id_from_url(sq_source_url)
+        if sq_arxiv_id == incoming_arxiv_id:
+            return SquatterClassification(
+                kind="duplicate",
+                squatter_id=squatter_id,
+                reason=(
+                    f"squatter source_url names arxiv-id:{incoming_arxiv_id} — "
+                    "treat as duplicate of the same paper"
+                ),
+            )
+
+    # Match #2: source_url equality (exact or canonical).
+    if sq_source_url:
+        if sq_source_url == incoming_source_url:
+            return SquatterClassification(
+                kind="duplicate",
+                squatter_id=squatter_id,
+                reason=(
+                    f"squatter source_url matches incoming ({sq_source_url}) — "
+                    "treat as duplicate of the same paper"
+                ),
+            )
+        # Canonical-URL equality: handles scheme case, default ports,
+        # tracking params, trailing slashes.  Same paper, different URL
+        # shape — Lithos's URL dedup missed it because the stored URL
+        # was a slightly different rendering of the same logical link.
+        sq_canonical = _safe_normalise_url(sq_source_url)
+        incoming_canonical = _safe_normalise_url(incoming_source_url)
+        if sq_canonical and incoming_canonical and sq_canonical == incoming_canonical:
+            return SquatterClassification(
+                kind="duplicate",
+                squatter_id=squatter_id,
+                reason=(
+                    f"squatter source_url is canonical match for incoming "
+                    f"({sq_source_url} ≡ {incoming_source_url}) — "
+                    "treat as duplicate of the same paper"
+                ),
+            )
 
     # Reclaim path: empty residue.  Conservative: ALL of the following
     # must hold so we never delete a real note that just shares a slug.
@@ -774,16 +835,24 @@ class LithosClient:
         source_url: str,
         initial_collision: WriteResult,
     ) -> WriteResult:
-        """Recover from slug_collision by inspecting the squatter (#31).
+        """Recover from slug_collision by stable-identity then squatter shape.
 
-        Strategy (replaces the original AC-05-D ""one suffix retry"" form):
+        Strategy (issue #148 builds on the #31 squatter-shape dispatch):
 
+        0. **Stable-identity pre-check** (#148): before any squatter
+           inspection, run a source-URL-keyed ``lithos_cache_lookup``.
+           A hit means Lithos already has a note for this exact source
+           URL — slug collision was incidental and the right answer is
+           ``duplicate``.  This converts the "Lithos found the conflict
+           only at write time" noise into a clean dedupe outcome and
+           keeps the ingestion path idempotent for repeated runs.
         1. Read the squatter via the ``existing_id`` lithos returned in
            the initial collision envelope.
         2. Classify (:func:`_classify_squatter`):
 
            * ``duplicate`` — squatter shares the incoming write's
-             ``arxiv-id`` or ``source_url``.  Return as ``duplicate``.
+             ``arxiv-id``, ``source_url``, or canonical URL.  Return as
+             ``duplicate``.
            * ``reclaimable`` — squatter is empty residue (no tags, no
              source_url, no body).  Delete it then re-issue the original
              write.
@@ -799,6 +868,16 @@ class LithosClient:
         from influx import metrics
 
         first_title = args["title"]
+
+        # Round 0 (#148): stable-identity pre-check.  If Lithos already
+        # has a note for this source URL, the slug collision is just
+        # noise around an existing duplicate — fold it into the dedup
+        # outcome rather than fighting through suffix retries.
+        url_recovery = await self._url_identity_recovery(
+            source_url=source_url, metrics_module=metrics
+        )
+        if url_recovery is not None:
+            return url_recovery
 
         # Round 1: inspect the squatter named in the initial collision.
         recovered = await self._try_recover_collision(
@@ -849,6 +928,76 @@ class LithosClient:
                 recovered.detail,
             )
         return recovered
+
+    async def _url_identity_recovery(
+        self,
+        *,
+        source_url: str,
+        metrics_module: Any,
+    ) -> WriteResult | None:
+        """Stable-identity pre-check for slug_collision recovery (#148).
+
+        Issues a ``source_url``-keyed ``lithos_cache_lookup``.  When the
+        lookup hits, Lithos already has a note for this exact URL — the
+        slug collision is incidental, the correct outcome is
+        ``duplicate``.  Returns ``None`` when the lookup misses (caller
+        falls through to the existing squatter-shape dispatch) or when
+        *source_url* is empty.
+
+        Lookup failures (network, malformed response) return ``None`` so
+        the recovery chain still runs — this pre-check is purely a
+        latency/noise optimisation, never a correctness gate.
+        """
+        if not source_url:
+            return None
+        try:
+            body = await self.cache_lookup_by_url_body(source_url=source_url)
+        except (LithosError, McpError):
+            # Defensive: never crash the write loop because the
+            # pre-check failed.  Fall through to squatter inspection.
+            logger.warning(
+                "slug_collision url-identity pre-check failed for %s; "
+                "falling back to squatter inspection",
+                source_url,
+                exc_info=True,
+            )
+            return None
+        except Exception:  # noqa: BLE001 — see comment above
+            logger.warning(
+                "slug_collision url-identity pre-check raised unexpectedly "
+                "for %s; falling back to squatter inspection",
+                source_url,
+                exc_info=True,
+            )
+            return None
+
+        if not body.get("hit"):
+            return None
+
+        existing_id = ""
+        if isinstance(body, dict):
+            for key in ("id", "note_id", "existing_id"):
+                value = body.get(key)
+                if isinstance(value, str) and value:
+                    existing_id = value
+                    break
+
+        metrics_module.slug_collision_url_recovery().add(1)
+        logger.info(
+            "slug_collision recovered via source_url identity for %s "
+            "(existing_id=%s) — Lithos already had this URL",
+            source_url,
+            existing_id or "<unknown>",
+        )
+        return WriteResult(
+            status="duplicate",
+            source_url=source_url,
+            detail=(
+                f"recovered: source_url already in lithos "
+                f"(existing_id={existing_id or '<unknown>'})"
+            ),
+            note_id=existing_id,
+        )
 
     async def _try_recover_collision(
         self,

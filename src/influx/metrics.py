@@ -52,6 +52,7 @@ __all__ = [
     "slug_collision_dedup_recovery",
     "slug_collision_reclaimed",
     "slug_collision_unresolved",
+    "slug_collision_url_recovery",
     "source_acquisition_errors",
 ]
 
@@ -364,6 +365,32 @@ def slug_collision_reclaimed() -> Any:
         description=(
             "slug_collision events resolved by deleting an empty stale "
             "squatter and re-issuing the write"
+        ),
+    )
+
+
+def slug_collision_url_recovery() -> Any:
+    """Counter of slug collisions short-circuited via source-URL identity (#148).
+
+    Increments when the pre-suffix-retry source-URL ``cache_lookup`` hits,
+    proving Lithos already owns a note for the incoming write's URL.
+    Influx treats the write as a duplicate without descending into the
+    squatter-shape dispatch (squatter inspection, suffix retry,
+    unresolved-collision backlog).
+
+    A steadily non-zero value indicates Lithos's URL/cache dedup is
+    missing items that source-URL equality would catch — file a Lithos
+    issue if the rate is significant.
+
+    No labels: low-volume signal that mostly tracks the quality of
+    upstream URL dedup.
+    """
+    return get_meter().counter(
+        "influx_slug_collision_url_recovery_total",
+        description=(
+            "slug_collision events short-circuited via source-URL identity "
+            "lookup (Lithos already had the URL; no squatter inspection "
+            "needed)"
         ),
     )
 
