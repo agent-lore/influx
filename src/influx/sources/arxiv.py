@@ -40,6 +40,12 @@ from influx.config import (
     ResilienceConfig,
     StorageConfig,
 )
+from influx.archive_policy import (
+    tag_for_failure_kind as _tag_for_archive_failure_kind,
+)
+from influx.archive_policy import (
+    registry_from_config as _archive_policy_registry_from_config,
+)
 from influx.coordinator import RunKind
 from influx.errors import NetworkError
 from influx.extraction.pipeline import extract_arxiv_text
@@ -744,6 +750,10 @@ def build_arxiv_note_item(
     is_archive_terminal = item.arxiv_id in archive_terminal_ids
     archive_path: str | None = None
     archive_missing = False
+    # Issue #149: per-domain policy tag (blocked / rate-limited /
+    # skipped-by-policy) the acquire stage adds when the policy
+    # short-circuits or reclassifies the failure.
+    archive_policy_tag: str | None = None
     pdf_url = f"https://arxiv.org/pdf/{item.arxiv_id}.pdf"
     tracer = get_tracer()
 
@@ -760,6 +770,13 @@ def build_arxiv_note_item(
             item.arxiv_id,
         )
     else:
+        # Issue #149: build the policy registry from config so the
+        # operator's blocked / rate-limited / skip overrides win.  The
+        # registry is built once per acquire (cheap — pure dataclass
+        # composition); a per-run cache would help only at high QPS.
+        policy_registry = _archive_policy_registry_from_config(
+            config.storage.archive_policy
+        )
         with tracer.span(
             "influx.archive.download",
             attributes={
@@ -780,6 +797,7 @@ def build_arxiv_note_item(
                 max_download_bytes=config.storage.max_download_bytes,
                 timeout_seconds=config.storage.download_timeout_seconds,
                 expected_content_type="pdf",
+                policy_registry=policy_registry,
             )
         if archive_result.ok:
             archive_path = archive_result.rel_posix_path
@@ -787,6 +805,23 @@ def build_arxiv_note_item(
             archive_missing = True
             metrics.archive_missing().add(
                 1, {"profile": profile_name, "source": "arxiv"}
+            )
+            # Issue #149: reclassify the failure into a policy tag
+            # when the failure_kind is one of blocked / rate_limited /
+            # missing_by_policy.  Generic failures (http_404, oversize,
+            # timeout, …) keep the default ``influx:archive-missing``
+            # shape so repair-sweep behaviour is unchanged for them.
+            archive_policy_tag = _tag_for_archive_failure_kind(
+                # ArchiveFailureKind is a Literal; mypy needs a cast.
+                archive_result.failure_kind  # type: ignore[arg-type]
+            )
+            metrics.archive_policy_failures().add(
+                1,
+                {
+                    "profile": profile_name,
+                    "source": "arxiv",
+                    "kind": archive_result.failure_kind or "unknown",
+                },
             )
 
     acquired = Acquired(
@@ -822,6 +857,23 @@ def build_arxiv_note_item(
     if archive_missing:
         tags.append("influx:archive-missing")
     if is_archive_terminal:
+        tags.append("influx:archive-terminal")
+    # Issue #149: domain-policy tag (blocked / rate-limited /
+    # skipped-by-policy) — applied alongside ``influx:archive-missing``
+    # so existing repair-sweep selectors keep working, but the
+    # diagnostic shape is now visible in the tag list.  For ``blocked``
+    # and ``missing_by_policy`` (skip) the note is also flipped to
+    # ``influx:archive-terminal`` so the repair sweep does NOT
+    # tight-loop on a doomed path (this is the staging-log behaviour
+    # we are fixing).  ``rate_limited`` retries on cool-down, so it
+    # stays in the normal repair-needed loop.
+    if archive_policy_tag is not None and archive_policy_tag not in tags:
+        tags.append(archive_policy_tag)
+    if (
+        archive_policy_tag
+        in ("influx:archive-blocked", "influx:archive-skipped-by-policy")
+        and "influx:archive-terminal" not in tags
+    ):
         tags.append("influx:archive-terminal")
     tags.append(sections.text_tag)
     if sections.full_text is not None:

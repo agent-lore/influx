@@ -32,6 +32,12 @@ from typing import TYPE_CHECKING, Any
 import feedparser
 
 from influx import metrics
+from influx.archive_policy import (
+    registry_from_config as _archive_policy_registry_from_config,
+)
+from influx.archive_policy import (
+    tag_for_failure_kind as _tag_for_archive_failure_kind,
+)
 from influx.cascade import Acquired, Cascade
 from influx.coordinator import RunKind
 from influx.errors import ExtractionError, NetworkError
@@ -256,6 +262,13 @@ def build_rss_note_item(
 
     # ── Acquire stage (RSS-specific) ──────────────────────────────
     # Download and archive the article HTML (FR-SRC-5 / FR-RES-4).
+    # Issue #149: build the per-domain archive policy registry from
+    # config; ``download_archive`` short-circuits skip-mode policies
+    # and tags blocked / rate-limited failures distinctly so the
+    # repair sweep does not tight-loop on doomed paths.
+    archive_policy_registry = _archive_policy_registry_from_config(
+        config.storage.archive_policy
+    )
     tracer = get_tracer()
     with tracer.span(
         "influx.archive.download",
@@ -277,10 +290,34 @@ def build_rss_note_item(
             max_download_bytes=config.storage.max_download_bytes,
             timeout_seconds=config.storage.download_timeout_seconds,
             expected_content_type="html",
+            policy_registry=archive_policy_registry,
         )
 
     archive_path = archive_result.rel_posix_path
     archive_missing = not archive_result.ok
+    # Issue #149: extract the policy-driven tag (if any) so the tag
+    # composition below can apply ``influx:archive-blocked`` /
+    # ``influx:archive-rate-limited`` /
+    # ``influx:archive-skipped-by-policy`` alongside
+    # ``influx:archive-missing``.  Returns ``None`` for generic
+    # failures (http_404, oversize, timeout, …) so the existing
+    # ``influx:archive-missing`` shape is preserved.
+    archive_policy_tag = (
+        _tag_for_archive_failure_kind(
+            archive_result.failure_kind  # type: ignore[arg-type]
+        )
+        if archive_missing
+        else None
+    )
+    if archive_missing:
+        metrics.archive_policy_failures().add(
+            1,
+            {
+                "profile": profile_name,
+                "source": item.source_tag,
+                "kind": archive_result.failure_kind or "unknown",
+            },
+        )
 
     # Article text extraction with summary fallback (FR-ENR-3): try web
     # article extraction; fall back to the feed item's ``<summary>``
@@ -358,6 +395,23 @@ def build_rss_note_item(
     ]
     if archive_missing:
         tags.append("influx:archive-missing")
+    # Issue #149: domain-policy tag (blocked / rate-limited /
+    # skipped-by-policy) — applied alongside ``influx:archive-missing``
+    # so existing repair-sweep selectors keep working, but the
+    # diagnostic shape is now visible in the tag list.  For ``blocked``
+    # and ``missing_by_policy`` (skip) the note is also flipped to
+    # ``influx:archive-terminal`` so the repair sweep does NOT
+    # tight-loop on a doomed path (this is the staging-log behaviour
+    # we are fixing).  ``rate_limited`` retries on cool-down, so it
+    # stays in the normal repair-needed loop.
+    if archive_policy_tag is not None and archive_policy_tag not in tags:
+        tags.append(archive_policy_tag)
+    if (
+        archive_policy_tag
+        in ("influx:archive-blocked", "influx:archive-skipped-by-policy")
+        and "influx:archive-terminal" not in tags
+    ):
+        tags.append("influx:archive-terminal")
     if sections.full_text is not None:
         tags.append("full-text")
     if archive_missing and "influx:repair-needed" not in tags:

@@ -4,14 +4,31 @@ Builds archive filesystem paths and note-facing relative paths for
 archived PDFs and other source documents.  Path-safety checks prevent
 directory traversal attacks (AC-04-C).  The download helper uses the
 guarded HTTP client from PRD 02 (FR-ST-4).
+
+Issue #149: :func:`download_archive` consults an
+:class:`~influx.archive_policy.ArchivePolicyRegistry` so that known
+blocked / rate-limited / skip-by-policy domains are classified
+distinctly instead of producing identical generic
+``influx:archive-missing`` failures.  The classification surfaces on
+:attr:`ArchiveResult.failure_kind` so callers can apply the matching
+``influx:archive-blocked`` / ``influx:archive-rate-limited`` /
+``influx:archive-skipped-by-policy`` tag and the run-ledger
+discriminator picks up the structural signal.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+from influx.archive_policy import (
+    ArchiveFailureKind,
+    ArchivePolicy,
+    ArchivePolicyRegistry,
+    classify_failure_kind,
+    default_registry,
+)
 from influx.config import StorageConfig
 from influx.errors import InfluxError, NetworkError
 from influx.http_client import ContentTypeFamily, guarded_fetch
@@ -122,11 +139,34 @@ class ArchiveResult:
     *error* describes what went wrong.  The caller should render the
     note with an empty ``## Archive`` body and tag it with
     ``influx:repair-needed`` + ``influx:archive-missing`` (FR-ST-4).
+
+    Issue #149: :attr:`failure_kind` is a stable
+    :data:`~influx.archive_policy.ArchiveFailureKind` discriminator
+    (``blocked`` / ``rate_limited`` / ``missing_by_policy`` / ``http_*``
+    / ``oversize`` / ``timeout`` / …).  :attr:`policy_mode` records the
+    :class:`~influx.archive_policy.ArchivePolicy` that was applied for
+    the request URL — ``attempt`` for the no-op default case.  Both
+    are empty strings on success so the field remains the failure
+    side's concern.
     """
 
     ok: bool
     rel_posix_path: str | None
     error: str
+    # Issue #149: stable discriminator for the failure shape.  Empty
+    # string on success; one of :data:`ArchiveFailureKind` on failure.
+    failure_kind: str = ""
+    # Issue #149: the policy mode applied for this URL — ``""`` when
+    # no policy was applied (no registry threaded through), otherwise
+    # one of :data:`ArchivePolicyMode`.  Surfaced on
+    # ``ArchiveResult`` rather than inferred from ``failure_kind``
+    # because the ``skip`` mode never produces a failure_kind beyond
+    # ``missing_by_policy`` yet the run summary still wants to log
+    # which domain policy fired.
+    policy_mode: str = ""
+    # Domain (host) of the URL the policy was applied against.
+    # Convenience field so callers don't have to re-parse the URL.
+    domain: str = ""
 
 
 # ── Archive download ────────────────────────────────────────────────
@@ -145,6 +185,7 @@ def download_archive(
     max_download_bytes: int | None = None,
     timeout_seconds: int | None = None,
     expected_content_type: ContentTypeFamily = "pdf",
+    policy_registry: ArchivePolicyRegistry | None = None,
 ) -> ArchiveResult:
     """Download a file via the guarded HTTP client and archive it.
 
@@ -160,6 +201,20 @@ def download_archive(
     when omitted they are resolved from the pydantic
     :class:`~influx.config.StorageConfig` field defaults so the only
     place these tunable defaults live is config-parsing code (AC-X-1).
+
+    Issue #149: when *policy_registry* is provided, the URL's host is
+    looked up to obtain an :class:`ArchivePolicy`.  For ``skip``-mode
+    policies the function returns immediately with
+    ``failure_kind="missing_by_policy"`` and no network call is made.
+    For ``blocked`` / ``rate_limited`` policies the download is still
+    attempted; the failure (if any) is classified into the
+    domain-aware :data:`ArchiveFailureKind` shape so callers can apply
+    the matching ``influx:archive-blocked`` /
+    ``influx:archive-rate-limited`` tag.  When *policy_registry* is
+    ``None``, the module-level
+    :func:`~influx.archive_policy.default_registry` is used so even
+    untargeted callers (CLI smoke commands, repair sweep) honour the
+    staging-defaults set.
     """
     if max_download_bytes is None or timeout_seconds is None:
         _storage_defaults = StorageConfig()
@@ -167,6 +222,33 @@ def download_archive(
             max_download_bytes = _storage_defaults.max_download_bytes
         if timeout_seconds is None:
             timeout_seconds = _storage_defaults.download_timeout_seconds
+
+    # Issue #149: resolve the policy for this URL.  Defaults to the
+    # module-level registry so legacy callers (CLI, scripts) still
+    # honour the staging-defaults block-list without rewiring.
+    registry = policy_registry if policy_registry is not None else default_registry()
+    policy = registry.policy_for(url)
+    domain = _domain_from_url(url)
+
+    # Skip-mode policies short-circuit before path construction so an
+    # entire blocked domain pays zero IO cost (the staging issue: the
+    # same blocked domain was retried on every sweep, generating
+    # hundreds of repair-noise failures per 12h window).
+    if policy.mode == "skip":
+        _log.info(
+            "archive download skipped (policy=skip) url=%s domain=%s note=%s",
+            url,
+            domain,
+            policy.note,
+        )
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=f"missing_by_policy: {policy.note or 'archive disabled by policy'}",
+            failure_kind="missing_by_policy",
+            policy_mode=policy.mode,
+            domain=domain,
+        )
 
     # Path construction first — reject unsafe IDs before any download
     fs_path, rel_posix = build_archive_path(
@@ -187,40 +269,79 @@ def download_archive(
             expected_content_type=expected_content_type,
         )
     except NetworkError as exc:
+        error = f"{exc.kind}: {exc}"
+        failure_kind = classify_failure_kind(error=error, policy_mode=policy.mode)
         _log.warning(
-            "Archive download failed for %s: [%s] %s",
+            "Archive download failed for %s: [%s] %s (failure_kind=%s "
+            "policy=%s domain=%s)",
             url,
             exc.kind,
             exc,
+            failure_kind,
+            policy.mode,
+            domain,
         )
         return ArchiveResult(
             ok=False,
             rel_posix_path=None,
-            error=f"{exc.kind}: {exc}",
+            error=error,
+            failure_kind=failure_kind,
+            policy_mode=policy.mode,
+            domain=domain,
         )
 
     if result.status_code >= 400:
         msg = f"HTTP {result.status_code} for {url}"
-        _log.warning("Archive download failed: %s", msg)
+        failure_kind = classify_failure_kind(error=msg, policy_mode=policy.mode)
+        _log.warning(
+            "Archive download failed: %s (failure_kind=%s policy=%s domain=%s)",
+            msg,
+            failure_kind,
+            policy.mode,
+            domain,
+        )
         return ArchiveResult(
             ok=False,
             rel_posix_path=None,
             error=msg,
+            failure_kind=failure_kind,
+            policy_mode=policy.mode,
+            domain=domain,
         )
 
     try:
         fs_path.parent.mkdir(parents=True, exist_ok=True)
         fs_path.write_bytes(result.body)
     except OSError as exc:
+        error = f"write: {exc}"
         _log.warning("Archive write failed for %s: %s", fs_path, exc)
         return ArchiveResult(
             ok=False,
             rel_posix_path=None,
-            error=f"write: {exc}",
+            error=error,
+            failure_kind="write",
+            policy_mode=policy.mode,
+            domain=domain,
         )
 
     return ArchiveResult(
         ok=True,
         rel_posix_path=rel_posix,
         error="",
+        failure_kind="",
+        policy_mode=policy.mode,
+        domain=domain,
     )
+
+
+def _domain_from_url(url: str) -> str:
+    """Best-effort host extraction without raising — for ArchiveResult.domain.
+
+    Wraps :func:`~influx.archive_policy.extract_domain` but kept local
+    so the storage module does not pull the policy module into a tight
+    import cycle if the policy registry is ever bootstrapped from
+    storage code (defence-in-depth).
+    """
+    from influx.archive_policy import extract_domain
+
+    return extract_domain(url)
