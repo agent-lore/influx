@@ -1432,11 +1432,7 @@ class TestInferNoteSource:
         from influx.repair_hooks import infer_note_source
 
         body = (
-            "---\n"
-            "source_url: https://example.com/not-arxiv\n"
-            "tags: []\n"
-            "---\n"
-            "# Paper\n"
+            "---\nsource_url: https://example.com/not-arxiv\ntags: []\n---\n# Paper\n"
         )
         note = {
             "tags": [],

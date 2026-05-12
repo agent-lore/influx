@@ -11,7 +11,7 @@ advancement invariant, §5.4), and handles chronic
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1477,9 +1477,9 @@ class TestSweepTextExtractionRetry:
         # Simulate a hook that backfills the tag (as the production
         # hook does via infer_note_source) and then succeeds.
         def hook(note: dict[str, object]) -> str:
-            tags = list(note.get("tags", []))
+            tags = cast(list[str], note.get("tags") or [])
             if not any(t.startswith("source:") for t in tags):
-                tags.append("source:arxiv")
+                tags = [*tags, "source:arxiv"]
                 note["tags"] = tags
             return "text:html"
 
