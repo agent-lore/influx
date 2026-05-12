@@ -318,11 +318,19 @@ def infer_note_source(note: dict[str, object]) -> str | None:
        well-formed metadata" and is handled by the existing
        :func:`_raise_unsupported_source` path; we don't second-guess
        an explicit operator/source label here.
-    2. (When the existing tag is empty/absent.)  A ``source_url`` in
-       the note's frontmatter pointing at arxiv.
-    3. The Lithos note ``path`` (``papers/<source>/...`` or
+    2. (When the existing tag is empty/absent.)  The top-level
+       ``source_url`` field on the note dict pointing at arxiv.
+       This is the canonical persisted shape (see
+       ``influx.repair._rewrite_note_via_lithos`` and the read-note
+       coverage in ``tests/unit/test_repair_sweep.py``); it survives
+       even when the note body / frontmatter has been corrupted or
+       stripped, so we prefer it over the parsed frontmatter copy.
+    3. A ``source_url`` recovered from the note's YAML frontmatter
+       pointing at arxiv — the fallback when the top-level field is
+       absent (e.g. legacy notes, hand-edited dicts in tests).
+    4. The Lithos note ``path`` (``papers/<source>/...`` or
        ``articles/<feed-slug>/...``).
-    4. The Lithos note ``id`` prefix (``arxiv-`` / ``rss-``).
+    5. The Lithos note ``id`` prefix (``arxiv-`` / ``rss-``).
 
     Returns ``None`` only when the source tag is empty AND every
     inference signal is missing/unrecognised — the caller treats
@@ -332,6 +340,12 @@ def infer_note_source(note: dict[str, object]) -> str | None:
     existing = _note_source_tag(note)
     if existing:
         return existing
+
+    top_level_url = note.get("source_url")
+    top_level_url_str = top_level_url if isinstance(top_level_url, str) else ""
+    inferred = _infer_source_from_url(top_level_url_str)
+    if inferred is not None:
+        return inferred
 
     source_url = _parse_source_url_from_note(note) or ""
     inferred = _infer_source_from_url(source_url)

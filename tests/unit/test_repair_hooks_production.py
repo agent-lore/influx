@@ -1355,6 +1355,101 @@ class TestInferNoteSource:
         # for a non-arxiv URL — caller treats this as terminal.
         assert infer_note_source(note) is None
 
+    def test_infers_arxiv_from_top_level_source_url_when_frontmatter_missing(
+        self,
+    ) -> None:
+        """Top-level ``source_url`` repairs notes with stripped frontmatter.
+
+        Repair reads/writes ``source_url`` as a first-class top-level
+        field on the note dict (see ``tests/unit/test_repair_sweep.py``
+        coverage of ``test_rewrite_includes_note_fields``).  When the
+        body has been corrupted/stripped and the frontmatter no longer
+        carries the URL, the top-level field must still rescue the
+        note from terminalisation.
+        """
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            # Body has no frontmatter at all — only top-level field survives.
+            "content": "# Paper\n\nBody text only.\n",
+            "source_url": "https://arxiv.org/abs/2604.26946",
+            "path": "",
+            "id": "",
+        }
+        assert infer_note_source(note) == "arxiv"
+
+    def test_infers_arxiv_from_top_level_source_url_with_malformed_frontmatter(
+        self,
+    ) -> None:
+        """Malformed YAML must not block the top-level fallback."""
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            # Unbalanced frontmatter / unparsable YAML — parse_note may
+            # return empty frontmatter_raw or raise; top-level wins.
+            "content": "---\nnot: [valid: yaml\n",
+            "source_url": "https://arxiv.org/abs/2604.26946",
+            "path": "",
+            "id": "",
+        }
+        assert infer_note_source(note) == "arxiv"
+
+    def test_top_level_non_arxiv_source_url_falls_through_to_other_signals(
+        self,
+    ) -> None:
+        """Non-arxiv top-level URL must not short-circuit path/id inference.
+
+        ``_infer_source_from_url`` only returns ``"arxiv"`` for arxiv
+        hosts; for anything else it returns ``None``.  The top-level
+        check must therefore fall through to path/id signals so an
+        article from e.g. ``example.com`` whose canonical path lives
+        under ``articles/rss-techcrunch/`` is still dispatched to RSS.
+        """
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            "content": "# Article\n",
+            "source_url": "https://example.com/post",
+            "path": "articles/rss-techcrunch/2026/04",
+            "id": "",
+        }
+        assert infer_note_source(note) == "rss-techcrunch"
+
+    def test_top_level_source_url_preferred_over_frontmatter(self) -> None:
+        """When both are present, the top-level field wins.
+
+        Rationale: the top-level field is the canonical persisted
+        shape on read/write; the frontmatter copy is a re-derived
+        view that can drift if the body is hand-edited or partially
+        rewritten.  Both happen to map to ``arxiv`` here so the
+        observable assertion is on the return value; the ordering
+        is documented for future signal types where a divergence
+        would matter.
+        """
+        from influx.repair_hooks import infer_note_source
+
+        body = (
+            "---\n"
+            "source_url: https://example.com/not-arxiv\n"
+            "tags: []\n"
+            "---\n"
+            "# Paper\n"
+        )
+        note = {
+            "tags": [],
+            "content": body,
+            # Top-level points at arxiv; frontmatter points elsewhere.
+            "source_url": "https://arxiv.org/abs/2604.26946",
+            "path": "",
+            "id": "",
+        }
+        # Top-level wins → "arxiv".  If ordering were flipped we'd
+        # get None (frontmatter URL is non-arxiv, no other signals).
+        assert infer_note_source(note) == "arxiv"
+
 
 class TestTextExtractionHookSourceInvariant:
     """The text-extraction hook tightens the source-metadata invariant (#150).
