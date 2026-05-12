@@ -200,7 +200,10 @@ _SOURCE_TAG_PREFIX = "source:"
 _NOTE_PATH_RE = re.compile(
     r"(?:papers|articles)/(?P<source>[^/]+)/(?P<year>\d{4})/(?P<month>\d{2})"
 )
+_NOTE_PATH_SOURCE_RE = re.compile(r"(?:^|/)(?:papers|articles)/(?P<source>[^/]+)/")
 _RSS_NOTE_ID_PREFIX = "rss-"
+_ARXIV_NOTE_ID_PREFIX = "arxiv-"
+_ARXIV_HOSTNAMES: frozenset[str] = frozenset({"arxiv.org", "www.arxiv.org"})
 _SOURCE_URL_FRONTMATTER_KEY = "source_url:"
 
 
@@ -233,6 +236,151 @@ def _is_rss_source(source: str) -> bool:
     return source == "rss" or source.startswith(_RSS_NOTE_ID_PREFIX)
 
 
+# ── Source metadata invariant (#150) ────────────────────────────────
+
+
+def _infer_source_from_url(source_url: str) -> str | None:
+    """Infer a ``source:*`` suffix from an arxiv URL.
+
+    Returns ``"arxiv"`` for any URL whose host is in
+    :data:`_ARXIV_HOSTNAMES`.  Returns ``None`` for everything else —
+    RSS feeds carry a ``feed-slug:`` derived value that can't be
+    reconstructed from the article URL alone.
+    """
+    if not source_url:
+        return None
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(source_url).hostname or ""
+    except ValueError:
+        return None
+    if host.lower() in _ARXIV_HOSTNAMES:
+        return "arxiv"
+    return None
+
+
+def _infer_source_from_note_path(note_path: str) -> str | None:
+    """Infer a ``source:*`` suffix from a Lithos note path.
+
+    ``papers/arxiv/...`` → ``"arxiv"``; ``articles/<feed-slug>/...``
+    → ``"rss-<feed-slug>"`` (RSS notes live under
+    ``articles/<source_tag>/{YYYY}/{MM}`` per
+    :mod:`influx.sources.rss`, so the path's first segment after
+    ``articles/`` is already the full source-tag suffix).  Returns
+    ``None`` when the path doesn't match either canonical layout.
+    """
+    if not note_path:
+        return None
+    m = _NOTE_PATH_SOURCE_RE.search(note_path)
+    if not m:
+        return None
+    candidate = m.group("source")
+    if "/" in candidate:  # defensive — shouldn't trigger with the regex above
+        return None
+    # ``papers/`` carries arxiv exclusively; ``articles/`` carries RSS.
+    if note_path.lstrip("/").startswith("papers/") and candidate == "arxiv":
+        return "arxiv"
+    if note_path.lstrip("/").startswith("articles/"):
+        # The configured RSS source_tag may or may not already include
+        # the ``rss-`` prefix; the path stores it verbatim.  Normalise to
+        # the canonical ``rss-<slug>`` shape if missing.
+        if candidate.startswith(_RSS_NOTE_ID_PREFIX) or candidate == "rss":
+            return candidate
+        return f"{_RSS_NOTE_ID_PREFIX}{candidate}"
+    return None
+
+
+def _infer_source_from_note_id(note_id: str) -> str | None:
+    """Infer a ``source:*`` suffix from a Lithos note ``id``.
+
+    Production note ids carry an explicit source-prefix: ``arxiv-<id>``
+    for arxiv, ``rss-<feed-slug>-<hash>`` for RSS.  The RSS case
+    returns the bare ``"rss"`` sentinel because the feed-slug-hash
+    suffix is not safely separable here (it can contain hyphens of its
+    own); the dispatcher accepts the bare sentinel via
+    :func:`_is_rss_source` so this is still actionable.
+    """
+    if not note_id:
+        return None
+    if note_id.startswith(_ARXIV_NOTE_ID_PREFIX):
+        return "arxiv"
+    if note_id.startswith(_RSS_NOTE_ID_PREFIX):
+        return "rss"
+    return None
+
+
+def infer_note_source(note: dict[str, object]) -> str | None:
+    """Return a dispatchable ``source:*`` suffix for *note*, or ``None``.
+
+    Resolution order, stopping at the first hit:
+
+    1. Any **non-empty** existing ``source:*`` tag is honoured
+       verbatim — even if it names a source we don't support yet
+       (e.g. ``hackernews``).  That case is "unsupported but
+       well-formed metadata" and is handled by the existing
+       :func:`_raise_unsupported_source` path; we don't second-guess
+       an explicit operator/source label here.
+    2. (When the existing tag is empty/absent.)  The top-level
+       ``source_url`` field on the note dict pointing at arxiv.
+       This is the canonical persisted shape (see
+       ``influx.repair._rewrite_note_via_lithos`` and the read-note
+       coverage in ``tests/unit/test_repair_sweep.py``); it survives
+       even when the note body / frontmatter has been corrupted or
+       stripped, so we prefer it over the parsed frontmatter copy.
+    3. A ``source_url`` recovered from the note's YAML frontmatter
+       pointing at arxiv — the fallback when the top-level field is
+       absent (e.g. legacy notes, hand-edited dicts in tests).
+    4. The Lithos note ``path`` (``papers/<source>/...`` or
+       ``articles/<feed-slug>/...``).
+    5. The Lithos note ``id`` prefix (``arxiv-`` / ``rss-``).
+
+    Returns ``None`` only when the source tag is empty AND every
+    inference signal is missing/unrecognised — the caller treats
+    that as a terminal metadata failure (#150) rather than a
+    transient extraction failure.
+    """
+    existing = _note_source_tag(note)
+    if existing:
+        return existing
+
+    top_level_url = note.get("source_url")
+    top_level_url_str = top_level_url if isinstance(top_level_url, str) else ""
+    inferred = _infer_source_from_url(top_level_url_str)
+    if inferred is not None:
+        return inferred
+
+    source_url = _parse_source_url_from_note(note) or ""
+    inferred = _infer_source_from_url(source_url)
+    if inferred is not None:
+        return inferred
+
+    inferred = _infer_source_from_note_path(str(note.get("path", "")))
+    if inferred is not None:
+        return inferred
+
+    inferred = _infer_source_from_note_id(str(note.get("id", "")))
+    if inferred is not None:
+        return inferred
+
+    return None
+
+
+def _backfill_source_tag(note: dict[str, object], inferred: str) -> None:
+    """Replace any (possibly empty/garbled) ``source:*`` tag on *note*.
+
+    Mutates ``note["tags"]`` in place so the rewrite step persists the
+    repaired tag.  Idempotent — calling twice with the same value is a
+    no-op.  Used after :func:`infer_note_source` returns a non-``None``
+    suffix so the next sweep pass never re-enters the inference path
+    for the same note.
+    """
+    tags = _note_tags(note)
+    rebuilt = [t for t in tags if not t.startswith(_SOURCE_TAG_PREFIX)]
+    rebuilt.append(f"{_SOURCE_TAG_PREFIX}{inferred}")
+    note["tags"] = rebuilt
+
+
 def _raise_unsupported_source(
     note: dict[str, object], *, stage_label: str, source: str
 ) -> None:
@@ -248,6 +396,34 @@ def _raise_unsupported_source(
         f"{stage_label}: source {source!r} not supported",
         stage="unsupported_source",
         detail=f"note id={note.get('id', '?')}",
+    )
+
+
+def _raise_invalid_source_metadata(
+    note: dict[str, object], *, stage_label: str
+) -> None:
+    """Raise ``ExtractionError(stage="invalid_source_metadata")`` (#150).
+
+    Distinct from ``unsupported_source`` (a legitimate future source
+    without a resolver yet): this signals a note whose ``source:*``
+    tag is empty/garbled AND whose URL/path/id provide no fallback,
+    so the same retry will loop forever emitting
+    ``source '' not supported``.  The text-extraction path flips this
+    to terminal via
+    :func:`influx.repair._terminate_invalid_source_metadata`, adding
+    a discoverable ``influx:source-invalid`` tag for later cleanup.
+    """
+    raise ExtractionError(
+        (
+            f"{stage_label}: note has no recoverable source metadata "
+            "(empty/garbled source tag and no arxiv URL / canonical path / id prefix)"
+        ),
+        stage="invalid_source_metadata",
+        detail=(
+            f"note id={note.get('id', '?')} "
+            f"path={note.get('path', '?')!r} "
+            f"existing_source={_note_source_tag(note)!r}"
+        ),
     )
 
 
@@ -602,14 +778,59 @@ def _make_text_extraction_hook(config: AppConfig) -> TextExtractionHook:
 
     Supports ``source:arxiv`` (cascade via
     :func:`extract_arxiv_text`) and ``source:rss-*`` (web article
-    extraction via :func:`extract_article`).  Other sources raise
+    extraction via :func:`extract_article`).
+
+    Source-metadata invariant (#150)
+    --------------------------------
+    Before dispatching, the hook normalises the note's source tag via
+    :func:`infer_note_source`:
+
+    * If the existing ``source:*`` suffix is already dispatchable
+      (``arxiv`` / ``rss-*``), it is used as-is.
+    * If it is empty or garbled but can be inferred from
+      ``source_url`` / note path / note id, the tag is **backfilled
+      in-place** so subsequent sweeps don't re-trigger inference, and
+      dispatch proceeds with the inferred source.
+    * If inference fails entirely, the hook raises
+      ``ExtractionError(stage="invalid_source_metadata")`` — distinct
+      from ``unsupported_source`` (a legitimate future source) — so
+      the sweep can flip the note to terminal via
+      :func:`influx.repair._terminate_invalid_source_metadata` and
+      stop the staging-incident retry loop.
+
+    Other (genuinely unsupported but well-formed) sources raise
     ``ExtractionError(stage="unsupported_source")`` so the sweep
     terminalises the note via
     :func:`influx.repair._terminate_unsupported_text_source`.
     """
 
     def hook(note: dict[str, object]) -> str:
-        source = _note_source_tag(note)
+        existing_source = _note_source_tag(note)
+        source = infer_note_source(note)
+        if source is None:
+            _log.warning(
+                "text_extraction retry: invalid source metadata for %s "
+                "(existing_source=%r, path=%r); marking terminal",
+                note.get("id", "?"),
+                existing_source,
+                note.get("path", ""),
+            )
+            _raise_invalid_source_metadata(note, stage_label="text_extraction retry")
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        # Backfill the tag when inference produced a different (or
+        # newly-populated) value, so the next pass starts from a
+        # clean state and we never re-emit the diagnostic for the
+        # same note.
+        if source != existing_source:
+            _log.info(
+                "text_extraction retry: backfilled source tag for %s (was %r, now %r)",
+                note.get("id", "?"),
+                existing_source,
+                source,
+            )
+            _backfill_source_tag(note, source)
+
         if source == "arxiv":
             tag = _run_arxiv_text_extraction(note, config)
         elif _is_rss_source(source):

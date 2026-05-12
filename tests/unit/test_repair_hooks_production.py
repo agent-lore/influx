@@ -1227,6 +1227,346 @@ class TestTextExtractionHookRssMetadataRecovery:
         assert classify_failure(exc_info.value) == "transient"
 
 
+# ── Source metadata invariant (#150) ────────────────────────────────
+
+
+class TestInferNoteSource:
+    """Source inference for notes with missing/empty ``source:*`` tags (#150)."""
+
+    def test_existing_known_source_tag_honoured(self) -> None:
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": ["source:arxiv", "profile:ai-robotics"],
+            "source_url": "https://arxiv.org/abs/2604.26946",
+            "path": "papers/arxiv/2026/04",
+            "id": "arxiv-2604.26946",
+        }
+        assert infer_note_source(note) == "arxiv"
+
+    def test_existing_unsupported_source_tag_honoured_verbatim(self) -> None:
+        """An explicit but unsupported source tag is well-formed metadata.
+
+        Inference must not second-guess an operator/source label —
+        ``hackernews`` is the dispatcher's problem, not the
+        invariant's problem (#150 distinguishes invalid-metadata
+        from unsupported-source).
+        """
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": ["source:hackernews"],
+            "source_url": "https://arxiv.org/abs/2604.26946",
+            "path": "papers/arxiv/2026/04",
+        }
+        assert infer_note_source(note) == "hackernews"
+
+    def test_infers_arxiv_from_source_url_when_tag_missing(self) -> None:
+        from influx.repair_hooks import infer_note_source
+
+        body = (
+            "---\n"
+            "source_url: https://arxiv.org/abs/2604.26946\n"
+            "tags: []\n"
+            "---\n"
+            "# Paper\n"
+        )
+        note = {
+            "tags": [],
+            "content": body,
+            "path": "",
+            "id": "",
+        }
+        assert infer_note_source(note) == "arxiv"
+
+    def test_infers_arxiv_from_canonical_path(self) -> None:
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            "content": "---\ntags: []\n---\n",
+            "path": "papers/arxiv/2026/04",
+            "id": "",
+        }
+        assert infer_note_source(note) == "arxiv"
+
+    def test_infers_rss_with_slug_from_articles_path(self) -> None:
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            "content": "---\ntags: []\n---\n",
+            "path": "articles/rss-techcrunch/2026/04",
+            "id": "",
+        }
+        assert infer_note_source(note) == "rss-techcrunch"
+
+    def test_infers_rss_normalises_bare_slug_path(self) -> None:
+        """``articles/<slug>/`` without ``rss-`` prefix is normalised."""
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            "content": "---\ntags: []\n---\n",
+            "path": "articles/techcrunch/2026/04",
+            "id": "",
+        }
+        assert infer_note_source(note) == "rss-techcrunch"
+
+    def test_infers_arxiv_from_note_id_prefix(self) -> None:
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            "content": "---\ntags: []\n---\n",
+            "path": "",
+            "id": "arxiv-2604.26946",
+        }
+        assert infer_note_source(note) == "arxiv"
+
+    def test_infers_bare_rss_from_note_id_prefix(self) -> None:
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            "content": "---\ntags: []\n---\n",
+            "path": "",
+            "id": "rss-techcrunch-abc123",
+        }
+        # Bare ``rss`` sentinel is accepted by the RSS dispatcher
+        # (see ``_is_rss_source``); the path-based inference produces
+        # the richer ``rss-<slug>`` shape when a path is available.
+        assert infer_note_source(note) == "rss"
+
+    def test_returns_none_when_no_signal_present(self) -> None:
+        """The classic staging-incident shape: empty source, no fallback."""
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": ["profile:ai-robotics"],
+            "content": "---\ntags: []\n---\n",
+            "path": "",
+            "id": "",
+        }
+        assert infer_note_source(note) is None
+
+    def test_returns_none_when_url_is_non_arxiv_and_other_signals_empty(self) -> None:
+        from influx.repair_hooks import infer_note_source
+
+        body = "---\nsource_url: https://example.com/something\ntags: []\n---\n"
+        note = {
+            "tags": [],
+            "content": body,
+            "path": "",
+            "id": "",
+        }
+        # Without a tag/path/id we can't safely guess the feed-slug
+        # for a non-arxiv URL — caller treats this as terminal.
+        assert infer_note_source(note) is None
+
+    def test_infers_arxiv_from_top_level_source_url_when_frontmatter_missing(
+        self,
+    ) -> None:
+        """Top-level ``source_url`` repairs notes with stripped frontmatter.
+
+        Repair reads/writes ``source_url`` as a first-class top-level
+        field on the note dict (see ``tests/unit/test_repair_sweep.py``
+        coverage of ``test_rewrite_includes_note_fields``).  When the
+        body has been corrupted/stripped and the frontmatter no longer
+        carries the URL, the top-level field must still rescue the
+        note from terminalisation.
+        """
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            # Body has no frontmatter at all — only top-level field survives.
+            "content": "# Paper\n\nBody text only.\n",
+            "source_url": "https://arxiv.org/abs/2604.26946",
+            "path": "",
+            "id": "",
+        }
+        assert infer_note_source(note) == "arxiv"
+
+    def test_infers_arxiv_from_top_level_source_url_with_malformed_frontmatter(
+        self,
+    ) -> None:
+        """Malformed YAML must not block the top-level fallback."""
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            # Unbalanced frontmatter / unparsable YAML — parse_note may
+            # return empty frontmatter_raw or raise; top-level wins.
+            "content": "---\nnot: [valid: yaml\n",
+            "source_url": "https://arxiv.org/abs/2604.26946",
+            "path": "",
+            "id": "",
+        }
+        assert infer_note_source(note) == "arxiv"
+
+    def test_top_level_non_arxiv_source_url_falls_through_to_other_signals(
+        self,
+    ) -> None:
+        """Non-arxiv top-level URL must not short-circuit path/id inference.
+
+        ``_infer_source_from_url`` only returns ``"arxiv"`` for arxiv
+        hosts; for anything else it returns ``None``.  The top-level
+        check must therefore fall through to path/id signals so an
+        article from e.g. ``example.com`` whose canonical path lives
+        under ``articles/rss-techcrunch/`` is still dispatched to RSS.
+        """
+        from influx.repair_hooks import infer_note_source
+
+        note = {
+            "tags": [],
+            "content": "# Article\n",
+            "source_url": "https://example.com/post",
+            "path": "articles/rss-techcrunch/2026/04",
+            "id": "",
+        }
+        assert infer_note_source(note) == "rss-techcrunch"
+
+    def test_top_level_source_url_preferred_over_frontmatter(self) -> None:
+        """When both are present, the top-level field wins.
+
+        Rationale: the top-level field is the canonical persisted
+        shape on read/write; the frontmatter copy is a re-derived
+        view that can drift if the body is hand-edited or partially
+        rewritten.  Both happen to map to ``arxiv`` here so the
+        observable assertion is on the return value; the ordering
+        is documented for future signal types where a divergence
+        would matter.
+        """
+        from influx.repair_hooks import infer_note_source
+
+        body = (
+            "---\nsource_url: https://example.com/not-arxiv\ntags: []\n---\n# Paper\n"
+        )
+        note = {
+            "tags": [],
+            "content": body,
+            # Top-level points at arxiv; frontmatter points elsewhere.
+            "source_url": "https://arxiv.org/abs/2604.26946",
+            "path": "",
+            "id": "",
+        }
+        # Top-level wins → "arxiv".  If ordering were flipped we'd
+        # get None (frontmatter URL is non-arxiv, no other signals).
+        assert infer_note_source(note) == "arxiv"
+
+
+class TestTextExtractionHookSourceInvariant:
+    """The text-extraction hook tightens the source-metadata invariant (#150).
+
+    Empty-source notes that *can* be inferred from URL/path/id are
+    backfilled and dispatched; empty-source notes with *no* fallback
+    raise ``invalid_source_metadata`` instead of looping on
+    ``source '' not supported``.
+    """
+
+    def test_backfills_arxiv_source_tag_from_source_url(self, tmp_path: Path) -> None:
+        """Empty source + arxiv URL → backfilled tag + arxiv extraction."""
+        from influx.extraction.pipeline import ArxivExtractionResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_textless_note()
+        # Strip the explicit source:* tag — simulate a degraded note.
+        note["tags"] = [t for t in note["tags"] if not t.startswith("source:")]
+
+        with patch("influx.repair_hooks.extract_arxiv_text") as mock_x:
+            mock_x.return_value = ArxivExtractionResult(
+                text="full body",
+                source_tag="text:html",
+            )
+            assert hooks.text_extraction is not None
+            tag = hooks.text_extraction(note)
+
+        assert tag == "text:html"
+        # Tag was backfilled in-place so the next pass starts clean.
+        assert "source:arxiv" in note["tags"]
+
+    def test_invalid_source_metadata_raised_when_inference_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for the staging incident: empty source AND no fallback.
+
+        Previously this path emitted ``text_extraction retry: source ''
+        not supported`` every sweep (#150).  Now the hook short-
+        circuits with ``stage=invalid_source_metadata`` so the sweep
+        can flip the note terminal with ``influx:source-invalid``.
+        """
+        from influx.repair_counters import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        # Build a note whose source tag is empty AND has no fallback
+        # signals: blank source_url, blank path, blank id.
+        body = (
+            "---\n"
+            "source_url:\n"
+            "tags: []\n"
+            "---\n"
+            "# Paper\n\n"
+            "## Archive\n\n"
+            "## Summary\nSummary\n"
+        )
+        note = {
+            "id": "",
+            "title": "Paper",
+            "path": "",
+            "source_url": "",
+            "content": body,
+            "tags": ["profile:ai-robotics", "influx:repair-needed"],
+            "version": 1,
+        }
+
+        assert hooks.text_extraction is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.text_extraction(note)
+
+        assert exc_info.value.stage == "invalid_source_metadata"
+        # Distinct from unsupported_source — the per-source resolver
+        # extension can't repair this; only operator metadata-fix can.
+        assert "unsupported_source" not in str(exc_info.value)
+        # Classified as transient at the counter level (no counted
+        # cap), but the sweep handles it specially via the
+        # ``invalid_source_metadata`` discriminator.
+        assert classify_failure(exc_info.value) == "transient"
+
+    def test_logs_invalid_source_metadata_at_warning(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Logs must clearly distinguish invalid-state from extraction failures."""
+        import logging
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(config)
+        note = {
+            "id": "",
+            "title": "Paper",
+            "path": "",
+            "source_url": "",
+            "content": "---\ntags: []\n---\n",
+            "tags": ["profile:ai-robotics"],
+            "version": 1,
+        }
+
+        assert hooks.text_extraction is not None
+        with (
+            caplog.at_level(logging.WARNING, logger="influx.repair_hooks"),
+            pytest.raises(ExtractionError),
+        ):
+            hooks.text_extraction(note)
+
+        # Logs flag the invalid-state cause, not a generic
+        # extraction-failed message.
+        assert any(
+            "invalid source metadata" in record.message for record in caplog.records
+        )
+
+
 # ── archive policy registry threading (issue #149 follow-up) ──────────
 #
 # The repair archive download path must honour the same per-domain

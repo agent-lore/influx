@@ -11,7 +11,7 @@ advancement invariant, §5.4), and handles chronic
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1398,3 +1398,101 @@ class TestSweepTextExtractionRetry:
         assert "text:abstract-only" in rewritten["tags"]
         assert "influx:text-terminal" in rewritten["tags"]
         assert "influx:repair-needed" in rewritten["tags"]
+
+    async def test_invalid_source_metadata_flips_terminal_and_tags_source_invalid(
+        self,
+    ) -> None:
+        """Regression for the #150 staging incident.
+
+        A note with empty/garbled source metadata that the hook
+        cannot infer raises ``ExtractionError(stage=
+        invalid_source_metadata)``.  The sweep flips it terminal AND
+        tags it ``influx:source-invalid`` so the bad-state notes are
+        independently discoverable for operator cleanup, and removes
+        ``influx:repair-needed`` so the note exits the sweep entirely
+        instead of re-logging ``source '' not supported`` every pass.
+        """
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_textless("n1")
+
+        def hook(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                "text_extraction retry: note has no recoverable source metadata",
+                stage="invalid_source_metadata",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(text_extraction=hook),
+        )
+
+        rewritten = self._last_write_args(client)
+        assert "text:abstract-only" in rewritten["tags"]
+        assert "influx:text-terminal" in rewritten["tags"]
+        assert "influx:source-invalid" in rewritten["tags"]
+        assert "influx:repair-needed" not in rewritten["tags"]
+
+    async def test_invalid_source_metadata_does_not_retry_next_pass(
+        self,
+    ) -> None:
+        """Once terminal, the note carries ``influx:text-terminal`` and the
+        text-extraction stage is no longer selected (AC: 'repeated runs
+        do not re-log the same warning forever').
+        """
+        from influx.repair import select_stages
+
+        # Tags as they exist *after* the first sweep flipped the note
+        # terminal via _terminate_invalid_source_metadata.
+        post_terminal_tags = [
+            "profile:ai-robotics",
+            "text:abstract-only",
+            "influx:text-terminal",
+            "influx:source-invalid",
+        ]
+        sel = select_stages(
+            tags=post_terminal_tags,
+            archive_path="papers/arxiv/2026/04/x.pdf",
+            max_profile_score=5,
+            full_text_threshold=8,
+            deep_extract_threshold=9,
+        )
+        assert sel.text_extraction_retry is False
+        assert sel.abstract_only_reextraction is False
+        assert sel.tier2_retry is False
+        assert sel.tier3_retry is False
+
+    async def test_backfilled_source_tag_is_persisted_on_success(self) -> None:
+        """When inference backfills ``source:*`` mid-stage, the rewrite
+        persists the new tag so subsequent sweeps don't re-infer."""
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_textless("n1")
+
+        # Note that the textless fixture already lacks a source:* tag.
+        # Simulate a hook that backfills the tag (as the production
+        # hook does via infer_note_source) and then succeeds.
+        def hook(note: dict[str, object]) -> str:
+            tags = cast(list[str], note.get("tags") or [])
+            if not any(t.startswith("source:") for t in tags):
+                tags = [*tags, "source:arxiv"]
+                note["tags"] = tags
+            return "text:html"
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(text_extraction=hook),
+        )
+
+        rewritten = self._last_write_args(client)
+        assert "source:arxiv" in rewritten["tags"]
+        assert "text:html" in rewritten["tags"]
