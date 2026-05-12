@@ -67,9 +67,7 @@ class TestRegistryDefaults:
     def test_subdomain_inherits_parent_policy(self) -> None:
         # ``preview.science.org`` is not registered explicitly but
         # should inherit the parent suffix's policy.
-        policy = default_registry().policy_for(
-            "https://preview.science.org/draft/abc"
-        )
+        policy = default_registry().policy_for("https://preview.science.org/draft/abc")
         assert policy.mode == "blocked"
 
     def test_unrelated_domain_uses_default_attempt(self) -> None:
@@ -282,9 +280,7 @@ class TestRegistryFromConfig:
         registry = registry_from_config(cfg)
         # Without operator overrides and without defaults the registry
         # is empty — every URL falls through to ``attempt``.
-        assert (
-            registry.policy_for("https://www.science.org/x").mode == "attempt"
-        )
+        assert registry.policy_for("https://www.science.org/x").mode == "attempt"
         assert registry.domains() == ()
 
 

@@ -31,6 +31,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from influx import metrics
+from influx.archive_policy import (
+    registry_from_config as _archive_policy_registry_from_config,
+)
+from influx.archive_policy import (
+    tag_for_failure_kind as _tag_for_archive_failure_kind,
+)
 from influx.cascade import Acquired, Cascade, Tier2Result
 from influx.config import (
     AppConfig,
@@ -39,12 +45,6 @@ from influx.config import (
     ProfileThresholds,
     ResilienceConfig,
     StorageConfig,
-)
-from influx.archive_policy import (
-    tag_for_failure_kind as _tag_for_archive_failure_kind,
-)
-from influx.archive_policy import (
-    registry_from_config as _archive_policy_registry_from_config,
 )
 from influx.coordinator import RunKind
 from influx.errors import NetworkError

@@ -19,12 +19,10 @@ discriminator picks up the structural signal.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from influx.archive_policy import (
-    ArchiveFailureKind,
-    ArchivePolicy,
     ArchivePolicyRegistry,
     classify_failure_kind,
     default_registry,

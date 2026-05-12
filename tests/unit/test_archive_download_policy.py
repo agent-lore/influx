@@ -75,9 +75,7 @@ def _dl(
 class TestSkipModePolicy:
     """``skip`` mode short-circuits before the network call."""
 
-    def test_skip_returns_missing_by_policy_and_no_fetch(
-        self, tmp_path: Path
-    ) -> None:
+    def test_skip_returns_missing_by_policy_and_no_fetch(self, tmp_path: Path) -> None:
         registry = build_registry(
             skip={"blocked.example": "permanent skip"},
             include_defaults=False,
@@ -274,15 +272,11 @@ class TestDefaultRegistryRegression:
     ) -> None:
         with patch("influx.storage.guarded_fetch") as mock_fetch:
             mock_fetch.return_value = _make_fetch_result(status_code=403)
-            result = _dl(
-                tmp_path, "https://www.alignmentforum.org/posts/xyz"
-            )
+            result = _dl(tmp_path, "https://www.alignmentforum.org/posts/xyz")
         assert result.failure_kind == "blocked"
         assert result.policy_mode == "blocked"
 
-    def test_arxiv_pdf_does_not_match_default_blocked(
-        self, tmp_path: Path
-    ) -> None:
+    def test_arxiv_pdf_does_not_match_default_blocked(self, tmp_path: Path) -> None:
         # Regression: an unrelated domain (arxiv.org) must keep the
         # ``attempt`` no-op policy even when the staging defaults are
         # active.

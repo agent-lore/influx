@@ -44,6 +44,8 @@ from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from influx.config import ArchivePolicyConfig
 
 __all__ = [
@@ -306,11 +308,12 @@ def build_registry(
     # Operator overrides win.  ``skip`` then ``blocked`` then
     # ``rate_limited`` so that a later-declared mode beats an earlier
     # mode for the same suffix (last-write-wins discipline).
-    for table, mode in (
+    overrides: tuple[tuple[Mapping[str, str] | None, ArchivePolicyMode], ...] = (
         (rate_limited, "rate_limited"),
         (blocked, "blocked"),
         (skip, "skip"),
-    ):
+    )
+    for table, mode in overrides:
         if not table:
             continue
         for suffix, note in table.items():
@@ -321,9 +324,7 @@ def build_registry(
 
     # Sort longest-first so :meth:`policy_for`'s iteration order makes
     # the most specific suffix win.
-    entries = tuple(
-        sorted(merged.items(), key=lambda kv: (-len(kv[0]), kv[0]))
-    )
+    entries = tuple(sorted(merged.items(), key=lambda kv: (-len(kv[0]), kv[0])))
     return ArchivePolicyRegistry(_entries=entries)
 
 

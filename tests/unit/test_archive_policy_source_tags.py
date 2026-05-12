@@ -34,7 +34,6 @@ from influx.config import (
     ProfileThresholds,
     PromptEntryConfig,
     PromptsConfig,
-    RssSourceEntry,
     ScheduleConfig,
     SecurityConfig,
     StorageConfig,
@@ -48,9 +47,7 @@ def _profile() -> ProfileConfig:
     return ProfileConfig(
         name="ai-robotics",
         description="AI and robotics research",
-        thresholds=ProfileThresholds(
-            relevance=7, full_text=100, deep_extract=100
-        ),
+        thresholds=ProfileThresholds(relevance=7, full_text=100, deep_extract=100),
     )
 
 
@@ -104,9 +101,7 @@ class TestRssArchivePolicyTags:
     """``build_rss_note_item`` applies the policy tag for known domains."""
 
     @patch("influx.sources.rss.download_archive")
-    def test_skip_policy_emits_skipped_by_policy_tag(
-        self, mock_dl: object
-    ) -> None:
+    def test_skip_policy_emits_skipped_by_policy_tag(self, mock_dl: object) -> None:
         # The skip-mode policy short-circuits ``download_archive`` so
         # the mock must return the same shape the real function would.
         mock_dl.return_value = ArchiveResult(  # type: ignore[union-attr]
@@ -120,7 +115,9 @@ class TestRssArchivePolicyTags:
         config = _make_config(skip={"blocked.example": "skip outright"})
         item = _make_rss_item(url="https://blocked.example/article")
 
-        result = build_rss_note_item(item=item, profile_name="ai-robotics", config=config)
+        result = build_rss_note_item(
+            item=item, profile_name="ai-robotics", config=config
+        )
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-skipped-by-policy" in tags
@@ -142,7 +139,9 @@ class TestRssArchivePolicyTags:
         config = _make_config(blocked={"science.example": ""})
         item = _make_rss_item(url="https://science.example/article")
 
-        result = build_rss_note_item(item=item, profile_name="ai-robotics", config=config)
+        result = build_rss_note_item(
+            item=item, profile_name="ai-robotics", config=config
+        )
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-blocked" in tags
@@ -150,9 +149,7 @@ class TestRssArchivePolicyTags:
         assert "influx:archive-terminal" in tags
 
     @patch("influx.sources.rss.download_archive")
-    def test_rate_limited_policy_emits_rate_limited_tag(
-        self, mock_dl: object
-    ) -> None:
+    def test_rate_limited_policy_emits_rate_limited_tag(self, mock_dl: object) -> None:
         mock_dl.return_value = ArchiveResult(  # type: ignore[union-attr]
             ok=False,
             rel_posix_path=None,
@@ -164,7 +161,9 @@ class TestRssArchivePolicyTags:
         config = _make_config(rate_limited={"slow.example": ""})
         item = _make_rss_item(url="https://slow.example/article")
 
-        result = build_rss_note_item(item=item, profile_name="ai-robotics", config=config)
+        result = build_rss_note_item(
+            item=item, profile_name="ai-robotics", config=config
+        )
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-rate-limited" in tags
@@ -173,9 +172,7 @@ class TestRssArchivePolicyTags:
         assert "influx:archive-terminal" not in tags
 
     @patch("influx.sources.rss.download_archive")
-    def test_generic_failure_keeps_archive_missing_only(
-        self, mock_dl: object
-    ) -> None:
+    def test_generic_failure_keeps_archive_missing_only(self, mock_dl: object) -> None:
         mock_dl.return_value = ArchiveResult(  # type: ignore[union-attr]
             ok=False,
             rel_posix_path=None,
@@ -187,7 +184,9 @@ class TestRssArchivePolicyTags:
         config = _make_config()
         item = _make_rss_item(url="https://example.com/article")
 
-        result = build_rss_note_item(item=item, profile_name="ai-robotics", config=config)
+        result = build_rss_note_item(
+            item=item, profile_name="ai-robotics", config=config
+        )
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-missing" in tags
@@ -199,9 +198,7 @@ class TestRssArchivePolicyTags:
         assert "influx:archive-terminal" not in tags
 
     @patch("influx.sources.rss.download_archive")
-    def test_successful_archive_emits_no_policy_tag(
-        self, mock_dl: object
-    ) -> None:
+    def test_successful_archive_emits_no_policy_tag(self, mock_dl: object) -> None:
         mock_dl.return_value = ArchiveResult(  # type: ignore[union-attr]
             ok=True,
             rel_posix_path="rss/2026/04/example-feed-2026-04-25-abc.html",
@@ -213,7 +210,9 @@ class TestRssArchivePolicyTags:
         config = _make_config()
         item = _make_rss_item(url="https://example.com/article")
 
-        result = build_rss_note_item(item=item, profile_name="ai-robotics", config=config)
+        result = build_rss_note_item(
+            item=item, profile_name="ai-robotics", config=config
+        )
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-missing" not in tags
@@ -244,9 +243,7 @@ class TestArxivArchivePolicyTags:
     """
 
     @patch("influx.sources.arxiv.download_archive")
-    def test_blocked_policy_for_arxiv_marks_terminal(
-        self, mock_dl: object
-    ) -> None:
+    def test_blocked_policy_for_arxiv_marks_terminal(self, mock_dl: object) -> None:
         # Hypothetical operator override: pretend arxiv.org is blocked
         # in this profile.  Exercises that the arxiv adapter honours
         # the policy registry instead of treating every 403 as generic.
@@ -334,9 +331,7 @@ class TestArxivArchivePolicyTags:
         assert "influx:archive-terminal" not in tags
 
     @patch("influx.sources.arxiv.download_archive")
-    def test_arxiv_calls_through_with_policy_registry(
-        self, mock_dl: object
-    ) -> None:
+    def test_arxiv_calls_through_with_policy_registry(self, mock_dl: object) -> None:
         """Smoke: ``download_archive`` receives a ``policy_registry``
         argument so the call site honours operator overrides.
         """
