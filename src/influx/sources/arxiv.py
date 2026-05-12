@@ -103,6 +103,97 @@ _XML_CONTENT_TYPES: frozenset[str] = frozenset(
 _RETRY_AFTER_MAX_SECONDS = 300.0
 
 
+# ── 429 classification (issue #145) ────────────────────────────────
+#
+# arXiv staff (November 2025) clarified that ``429 Rate exceeded.``
+# responses today often reflect *shared* upstream capacity rather than
+# a single client's abuse.  The classifier inspects the response body
+# and headers to refine the generic ``rate_limit`` retry kind into one
+# of:
+#
+# * ``rate_limit_upstream_capacity`` — the response body contains the
+#   canonical arXiv ``Rate exceeded.`` marker (case-insensitive), which
+#   the staff guidance attributes to total user load on the public API
+#   rather than per-client throttling.  This is the strongest signal we
+#   have today; operators interpret it as "back off harder, this is not
+#   us".
+# * ``rate_limit_local`` — a 429 with a ``Retry-After`` header but
+#   without the shared-capacity body marker.  Conventional per-client
+#   throttling: the server told us exactly how long to wait, so we
+#   treat it as a local pacing issue (likely fixed by tighter
+#   ``arxiv_request_min_interval_seconds`` or fewer concurrent
+#   profiles).
+# * ``rate_limit_unknown`` — neither signal is present.  Behaviour is
+#   unchanged from the legacy ``rate_limit`` path; the label exists so
+#   operators can still see "we hit a 429 but couldn't tell why" in the
+#   ledger instead of having to inspect raw logs.
+#
+# The classification is what we record into telemetry / the run ledger.
+# The thrown ``NetworkError.kind`` remains the legacy ``"rate_limit"``
+# so any external consumer keyed on that kind continues to work — the
+# refined kind is additive context, not a breaking rename.
+_ARXIV_UPSTREAM_CAPACITY_MARKER = b"rate exceeded"
+
+
+_ARXIV_429_CLASSIFICATION_PREFIX = "classification="
+
+
+def _extract_arxiv_429_classification(error: NetworkError) -> str | None:
+    """Recover the refined 429 classification from a ``NetworkError`` reason.
+
+    ``_fetch_with_retry`` raises 429 failures with the legacy
+    ``kind="rate_limit"`` for backward-compatibility with downstream
+    consumers, but stashes the refined classification (e.g.
+    ``rate_limit_upstream_capacity``) at the head of the *reason*
+    string.  Returns ``None`` for non-429 errors so callers can fall
+    back to ``error.kind`` unchanged.
+    """
+    if error.kind != "rate_limit" or not error.reason:
+        return None
+    reason = error.reason
+    if not reason.startswith(_ARXIV_429_CLASSIFICATION_PREFIX):
+        return None
+    rest = reason[len(_ARXIV_429_CLASSIFICATION_PREFIX) :]
+    # ``classification=<kind> retry_after_present=<bool>``; split on the
+    # first whitespace so refined kinds with underscores survive intact.
+    return rest.split(" ", 1)[0] or None
+
+
+def _classify_arxiv_429(*, body: bytes, headers: dict[str, str]) -> tuple[str, bool]:
+    """Classify an arXiv 429 into a refined retry/error kind (issue #145).
+
+    Returns a ``(kind, retry_after_present)`` pair.  *kind* is one of:
+
+    * ``"rate_limit_upstream_capacity"`` — the response body carries the
+      known arXiv ``Rate exceeded.`` marker (case-insensitive); per
+      arXiv staff guidance this signals shared upstream capacity rather
+      than a per-client abuse event.
+    * ``"rate_limit_local"`` — a 429 with a ``Retry-After`` header but
+      no shared-capacity body marker; treated as classical per-client
+      throttling.
+    * ``"rate_limit_unknown"`` — neither signal is present.
+
+    *retry_after_present* is ``True`` exactly when a ``Retry-After``
+    header was supplied by the upstream — surfaced to log call sites
+    so operators can see at a glance whether the upstream nominated a
+    wait time.
+
+    The classification is intentionally tolerant of small variations:
+    a body of ``b"Rate exceeded."`` matches, and so does
+    ``b"<html>...Rate exceeded...</html>"`` or a body whose case differs
+    (``b"rate exceeded"``).  Empty bodies and non-decodable bodies fall
+    through to ``rate_limit_unknown`` / ``rate_limit_local`` based only
+    on the header signal.
+    """
+    retry_after_present = _header_value(headers, "Retry-After") is not None
+    body_marker = body is not None and _ARXIV_UPSTREAM_CAPACITY_MARKER in body.lower()
+    if body_marker:
+        return "rate_limit_upstream_capacity", retry_after_present
+    if retry_after_present:
+        return "rate_limit_local", retry_after_present
+    return "rate_limit_unknown", retry_after_present
+
+
 @dataclass(frozen=True, slots=True)
 class ArxivItem:
     """A single parsed arXiv entry from the Atom feed."""
@@ -626,20 +717,40 @@ def _fetch_with_retry(
             raise
 
         if result.status_code == 429:
+            # Issue #145: classify the 429 into a more specific kind so
+            # operators can tell shared-capacity upstream events apart
+            # from local per-client throttling.  The thrown
+            # ``NetworkError.kind`` keeps the legacy ``"rate_limit"``
+            # value so downstream consumers don't break; the refined
+            # kind flows into ``record_source_retry`` /
+            # ``record_source_acquisition_error`` (via ``reason``) so the
+            # run-ledger entry and telemetry counters carry the
+            # classification.
+            kind_refined, retry_after_present = _classify_arxiv_429(
+                body=result.body,
+                headers=result.headers,
+            )
             last_error = NetworkError(
                 f"HTTP 429 from arXiv API at {url}",
                 url=url,
                 kind="rate_limit",
+                reason=(
+                    f"classification={kind_refined} "
+                    f"retry_after_present={str(retry_after_present).lower()}"
+                ),
             )
             if attempt < rate_limit_max_retries:
                 delay = _arxiv_429_delay(result.headers, resilience, attempt=attempt)
                 _log.warning(
-                    "arXiv 429 on attempt %d/%d, backing off %.1fs (FR-RES-2)",
+                    "arXiv 429 on attempt %d/%d, backing off %.1fs "
+                    "(FR-RES-2 classification=%s retry_after_present=%s)",
                     attempt + 1,
                     rate_limit_max_retries + 1,
                     delay,
+                    kind_refined,
+                    retry_after_present,
                 )
-                record_source_retry(source="arxiv", kind="rate_limit")
+                record_source_retry(source="arxiv", kind=kind_refined)
                 _sleep(delay)
                 continue
             raise last_error
@@ -1031,14 +1142,24 @@ class ArxivSource:
                 else:
                     items = await _do_fetch()
             except NetworkError as exc:
+                # Issue #145: prefer the refined 429 classification
+                # stashed on the reason field so the run-ledger and
+                # metric counters surface "shared-capacity upstream"
+                # vs "local pacing" vs "unknown 429" instead of a
+                # generic ``rate_limit``.  Non-429 errors fall back
+                # to ``exc.kind`` unchanged.
+                ledger_kind = (
+                    _extract_arxiv_429_classification(exc) or exc.kind or "unknown"
+                )
                 _log.warning(
-                    "arxiv fetch failed for profile %r; yielding zero items",
+                    "arxiv fetch failed for profile %r kind=%s; yielding zero items",
                     profile,
+                    ledger_kind,
                     exc_info=True,
                 )
                 record_source_acquisition_error(
                     source="arxiv",
-                    kind=exc.kind or "unknown",
+                    kind=ledger_kind,
                     detail=str(exc),
                 )
                 metrics.source_acquisition_errors().add(
@@ -1046,7 +1167,7 @@ class ArxivSource:
                     {
                         "profile": profile,
                         "source": "arxiv",
-                        "kind": exc.kind or "unknown",
+                        "kind": ledger_kind,
                     },
                 )
                 return []
