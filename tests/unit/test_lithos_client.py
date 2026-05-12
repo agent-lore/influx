@@ -236,6 +236,64 @@ class TestClassifySquatter:
         )
         assert result.kind == "duplicate"
 
+    def test_canonical_url_match_classifies_as_duplicate(self) -> None:
+        """Issue #148: squatter and incoming URLs differ only in shape
+        (scheme case, trailing slash, tracking params) — canonical
+        equality must still classify as duplicate.
+        """
+        from influx.lithos_client import _classify_squatter
+
+        doc = self._make_doc(
+            tags=["source:rss"],
+            source_url="HTTPS://Example.com/Article-X/?utm_source=feedreader",
+            content="real body",
+        )
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://example.com/Article-X",
+        )
+        assert result.kind == "duplicate"
+        assert "canonical match" in result.reason
+
+    def test_arxiv_id_extracted_from_squatter_source_url(self) -> None:
+        """Issue #148: squatter has no ``arxiv-id:`` tag but its
+        ``source_url`` names the same arxiv id — treat as duplicate.
+        """
+        from influx.lithos_client import _classify_squatter
+
+        doc = self._make_doc(
+            tags=["source:arxiv"],
+            source_url="https://arxiv.org/abs/2604.28197",
+            content="body without arxiv-id tag",
+        )
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://arxiv.org/abs/2604.28197",
+        )
+        assert result.kind == "duplicate"
+        assert "arxiv-id:2604.28197" in result.reason
+
+    def test_malformed_url_falls_back_safely(self) -> None:
+        """Malformed URLs must not crash the classifier; fall back to
+        the exact-equality check.
+        """
+        from influx.lithos_client import _classify_squatter
+
+        doc = self._make_doc(
+            tags=["source:rss"],
+            source_url="not a url at all",
+            content="real",
+        )
+        result = _classify_squatter(
+            doc,
+            squatter_id="doc-x",
+            incoming_source_url="https://example.com/article-x",
+        )
+        # Not exact, not canonical (different shapes) → distinct.
+        assert result.kind == "distinct"
+
 
 class TestExistingIdParsing:
     """``_existing_id_from_detail`` extracts the squatter id from PR-#30 detail."""

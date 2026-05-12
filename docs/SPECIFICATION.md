@@ -245,6 +245,8 @@ The arXiv provider:
 
 Archive failures do not abort note creation. The note is tagged `influx:archive-missing` and `influx:repair-needed`, and the Archive section is left empty.
 
+Issue #149: archive acquisition consults a per-domain policy registry built from `[storage.archive_policy]`. Domains classified as `blocked` (HTTP 403 / WAF challenge), `rate_limited` (HTTP 429 under normal cadence), or `skip` (no attempt made at all) produce distinct note tags — `influx:archive-blocked`, `influx:archive-rate-limited`, or `influx:archive-skipped-by-policy` — alongside the generic `influx:archive-missing`. `blocked` and `skip` notes additionally carry `influx:archive-terminal` so the repair sweep stops re-attempting the doomed path. The defaults set covers staging hot offenders (`science.org`, `alignmentforum.org`, `therobotreport.com`, …).
+
 ### 6.2 RSS and Atom Feeds
 
 The RSS provider:
@@ -468,6 +470,10 @@ Common tags include:
 - `full-text`
 - `influx:deep-extracted`
 - `influx:archive-missing`
+- `influx:archive-blocked` (issue #149 — domain policy `blocked`)
+- `influx:archive-rate-limited` (issue #149 — domain policy `rate_limited`)
+- `influx:archive-skipped-by-policy` (issue #149 — domain policy `skip`)
+- `influx:archive-terminal`
 - `influx:repair-needed`
 - `influx:text-terminal`
 - `influx:tier2-terminal`

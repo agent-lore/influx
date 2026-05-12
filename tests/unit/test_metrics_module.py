@@ -60,6 +60,7 @@ HELPERS: dict[str, str] = {
     "llm_validation_failures": "influx_llm_validation_failures_total",
     "archive_missing": "influx_archive_missing_total",
     "source_acquisition_errors": "influx_source_acquisition_errors_total",
+    "slug_collision_url_recovery": "influx_slug_collision_url_recovery_total",
 }
 
 

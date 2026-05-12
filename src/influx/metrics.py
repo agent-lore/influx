@@ -35,6 +35,7 @@ from influx.telemetry import get_meter
 __all__ = [
     "active_runs",
     "archive_missing",
+    "archive_policy_failures",
     "articles_filtered",
     "articles_inspected",
     "cache_hits",
@@ -52,6 +53,7 @@ __all__ = [
     "slug_collision_dedup_recovery",
     "slug_collision_reclaimed",
     "slug_collision_unresolved",
+    "slug_collision_url_recovery",
     "source_acquisition_errors",
 ]
 
@@ -237,6 +239,35 @@ def archive_missing() -> Any:
     )
 
 
+def archive_policy_failures() -> Any:
+    """Counter of archive failures classified by domain-aware policy (#149).
+
+    Increments alongside :func:`archive_missing` whenever
+    :class:`~influx.archive_policy.ArchivePolicy` reclassifies an
+    archive failure into a structural shape (``blocked`` /
+    ``rate_limited`` / ``missing_by_policy``).  ``kind="generic"`` is
+    reserved for the (large, expected) baseline of unclassified
+    failures so dashboards can compute the ratio without subtracting
+    series.
+
+    Labels: ``profile``, ``source``, ``kind``
+    (``"blocked"`` | ``"rate_limited"`` | ``"missing_by_policy"`` |
+    ``"http_403"`` | ``"http_429"`` | ``"http_404"`` | ``"http_4xx"`` |
+    ``"http_5xx"`` | ``"oversize"`` | ``"timeout"`` | ``"ssrf"`` |
+    ``"dns"`` | ``"network"`` | ``"content_type_mismatch"`` |
+    ``"write"`` | ``"unknown"``).
+    """
+    return get_meter().counter(
+        "influx_archive_policy_failures_total",
+        description=(
+            "Archive download failures classified by domain-aware policy; "
+            "the ``kind`` label distinguishes blocked / rate-limited / "
+            "missing-by-policy from generic HTTP / network shapes (issue "
+            "#149)."
+        ),
+    )
+
+
 def ingestion_stalls() -> Any:
     """Counter of runs flagged with a stall ``degraded_reasons`` value.
 
@@ -364,6 +395,32 @@ def slug_collision_reclaimed() -> Any:
         description=(
             "slug_collision events resolved by deleting an empty stale "
             "squatter and re-issuing the write"
+        ),
+    )
+
+
+def slug_collision_url_recovery() -> Any:
+    """Counter of slug collisions short-circuited via source-URL identity (#148).
+
+    Increments when the pre-suffix-retry source-URL ``cache_lookup`` hits,
+    proving Lithos already owns a note for the incoming write's URL.
+    Influx treats the write as a duplicate without descending into the
+    squatter-shape dispatch (squatter inspection, suffix retry,
+    unresolved-collision backlog).
+
+    A steadily non-zero value indicates Lithos's URL/cache dedup is
+    missing items that source-URL equality would catch — file a Lithos
+    issue if the rate is significant.
+
+    No labels: low-volume signal that mostly tracks the quality of
+    upstream URL dedup.
+    """
+    return get_meter().counter(
+        "influx_slug_collision_url_recovery_total",
+        description=(
+            "slug_collision events short-circuited via source-URL identity "
+            "lookup (Lithos already had the URL; no squatter inspection "
+            "needed)"
         ),
     )
 

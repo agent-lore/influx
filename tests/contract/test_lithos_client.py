@@ -1616,6 +1616,208 @@ class TestWriteSlugCollisionRecovery:
         assert "retry_slug='OmniRobotHome [arXiv 2604.28197]'" in result.detail
 
 
+class TestSlugCollisionUrlIdentityRecovery:
+    """Issue #148: source-URL identity pre-check short-circuits slug_collision.
+
+    When ``lithos_cache_lookup`` (keyed on the incoming ``source_url``)
+    reports a hit before suffix-retry, the recovery path treats the
+    write as a duplicate without descending into squatter inspection
+    or suffix retry.  Converts repeated-run noise into a clean dedupe.
+    """
+
+    async def test_url_hit_short_circuits_to_duplicate(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """A source-URL cache hit during slug_collision recovery means
+        Lithos already owns the URL; surface as duplicate, no suffix
+        retry, no squatter read.
+        """
+        fake_lithos_server.write_responses.append(
+            '{"status": "slug_collision", "existing_id": "doc-other",'
+            ' "message": "Slug already in use", "warnings": []}'
+        )
+        fake_lithos_server.cache_lookup_responses.append(
+            '{"hit": true, "id": "note-existing-99", "stale_exists": false}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Some Paper",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2604.28197",
+                tags=["profile:staging-robotics"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == "duplicate"
+        assert "source_url already in lithos" in result.detail
+        assert "note-existing-99" in result.detail
+        assert result.note_id == "note-existing-99"
+        # Only the initial write should have run — no suffix retry.
+        write_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1
+        # The squatter must NOT have been read; the pre-check obviates it.
+        read_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_read"]
+        assert len(read_calls) == 0
+        # And the cache_lookup was keyed on the source URL only (issue #128 shape).
+        cache_calls = [
+            c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
+        ]
+        assert len(cache_calls) == 1
+        assert cache_calls[0][1]["source_url"] == "https://arxiv.org/abs/2604.28197"
+        assert cache_calls[0][1]["query"] == "https://arxiv.org/abs/2604.28197"
+
+    async def test_url_miss_falls_through_to_squatter_inspection(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """When the URL pre-check misses, the chain continues into the
+        existing squatter-shape dispatch (#31).
+        """
+        fake_lithos_server.write_responses.extend(
+            [
+                # First attempt collides.
+                '{"status": "slug_collision", "existing_id": "doc-dup-1",'
+                ' "message": "Slug already in use", "warnings": []}',
+            ]
+        )
+        # cache_lookup returns no hit — the pre-check is a noop.
+        fake_lithos_server.cache_lookup_responses.append(
+            '{"hit": false, "stale_exists": false}'
+        )
+        # Squatter carries the same arxiv-id, so classification still
+        # returns duplicate via the #31 path.
+        fake_lithos_server.read_responses.append(
+            '{"id": "doc-dup-1", "title": "Different Title",'
+            ' "content": "real content",'
+            ' "tags": ["arxiv-id:2604.28197", "source:arxiv"]}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="OmniRobotHome",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2604.28197",
+                tags=["profile:staging-robotics"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        # Still recovered as duplicate, just via the squatter-shape path.
+        assert result.status == "duplicate"
+        assert "arxiv-id:2604.28197" in result.detail
+        # And the squatter WAS read this time.
+        read_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_read"]
+        assert len(read_calls) == 1
+
+    async def test_url_precheck_failure_falls_through(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A malformed ``cache_lookup`` response must not crash recovery;
+        the chain still runs and the squatter is inspected normally.
+        """
+        import logging
+
+        fake_lithos_server.write_responses.append(
+            '{"status": "slug_collision", "existing_id": "doc-dup-1",'
+            ' "message": "Slug already in use", "warnings": []}'
+        )
+        # Malformed JSON → LithosError("malformed_tool_response")
+        fake_lithos_server.cache_lookup_responses.append("{not-json")
+        # Squatter is the same paper by arxiv-id.
+        fake_lithos_server.read_responses.append(
+            '{"id": "doc-dup-1", "title": "x",'
+            ' "content": "real", "tags": ["arxiv-id:2604.28197"]}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with caplog.at_level(logging.WARNING):
+                result = await client.write_note(
+                    title="Paper",
+                    content="# Summary\nContent.",
+                    path="papers/arxiv/2026/04",
+                    source_url="https://arxiv.org/abs/2604.28197",
+                    tags=["profile:staging-robotics"],
+                    confidence=0.8,
+                )
+        finally:
+            await client.close()
+
+        # Pre-check failure is logged but the squatter-shape recovery
+        # still classifies the write as duplicate.
+        assert result.status == "duplicate"
+        assert any(
+            "url-identity pre-check failed" in r.getMessage() for r in caplog.records
+        )
+
+    async def test_idempotent_repeated_runs_no_unresolved_noise(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A second scheduled run that re-encounters an existing note
+        must NOT log ``slug_collision unresolved after recovery``.
+
+        Regression coverage for the AC: "Ingestion path remains
+        idempotent for repeated scheduled runs."
+        """
+        import logging
+
+        # Both runs hit slug_collision (squatter exists under a
+        # different slug), but URL identity recovers both.
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "slug_collision", "existing_id": "doc-x",'
+                ' "message": "Slug in use", "warnings": []}',
+                '{"status": "slug_collision", "existing_id": "doc-x",'
+                ' "message": "Slug in use", "warnings": []}',
+            ]
+        )
+        fake_lithos_server.cache_lookup_responses.extend(
+            [
+                '{"hit": true, "id": "note-already", "stale_exists": false}',
+                '{"hit": true, "id": "note-already", "stale_exists": false}',
+            ]
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with caplog.at_level(logging.WARNING):
+                for _ in range(2):
+                    result = await client.write_note(
+                        title="Idempotent Paper",
+                        content="# Summary\n",
+                        path="papers/arxiv/2026/04",
+                        source_url="https://arxiv.org/abs/2604.99999",
+                        tags=["profile:staging-robotics"],
+                        confidence=0.8,
+                    )
+                    assert result.status == "duplicate"
+        finally:
+            await client.close()
+
+        # No unresolved-collision warning emitted on either pass.
+        assert not any(
+            "slug_collision unresolved after recovery" in r.getMessage()
+            for r in caplog.records
+        )
+
+
 # ── Write envelopes — version_conflict (FR-MCP-7, AC-05-E) ────────
 
 

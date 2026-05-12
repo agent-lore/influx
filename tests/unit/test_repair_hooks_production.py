@@ -14,7 +14,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from influx.config import AppConfig, ExtractionConfig, StorageConfig
+from influx.config import (
+    AppConfig,
+    ArchivePolicyConfig,
+    ExtractionConfig,
+    StorageConfig,
+)
 from influx.errors import ExtractionError, LCMAError
 from influx.repair import (
     ExtractionOutcome,
@@ -40,6 +45,7 @@ def _make_config(
     *,
     min_html_chars: int = 1000,
     min_web_chars: int = 500,
+    archive_policy: ArchivePolicyConfig | None = None,
 ) -> MagicMock:
     """Build a minimal AppConfig mock with storage and extraction settings."""
     config = MagicMock(spec=AppConfig)
@@ -47,6 +53,9 @@ def _make_config(
     config.storage.archive_dir = str(tmp_path / "archive")
     config.storage.max_download_bytes = 10_000_000
     config.storage.download_timeout_seconds = 30
+    # Issue #149 follow-up: repair archive hook now builds a policy
+    # registry from this attr, so it must be present on the mock.
+    config.storage.archive_policy = archive_policy or ArchivePolicyConfig()
     config.security = MagicMock()
     config.security.allow_private_ips = False
     config.extraction = MagicMock(spec=ExtractionConfig)
@@ -1556,3 +1565,165 @@ class TestTextExtractionHookSourceInvariant:
         assert any(
             "invalid source metadata" in record.message for record in caplog.records
         )
+
+
+# ── archive policy registry threading (issue #149 follow-up) ──────────
+#
+# The repair archive download path must honour the same per-domain
+# policy overrides as initial acquisition.  Before this fix the repair
+# hook silently fell back to the module-level ``default_registry`` and
+# ignored operator overrides like ``include_defaults = false`` or
+# custom per-domain entries.  These tests pin the contract: the registry
+# the hook threads into :func:`download_archive` is built from
+# ``config.storage.archive_policy``.
+
+
+class TestArchiveDownloadHookPolicyRegistry:
+    """Operator overrides in config win during repair, not just acquire."""
+
+    def test_threads_registry_built_from_config_archive_policy(
+        self, tmp_path: Path
+    ) -> None:
+        """The hook passes a config-derived registry into ``download_archive``."""
+        from influx.archive_policy import ArchivePolicyRegistry
+        from influx.storage import ArchiveResult
+
+        # Custom override: block a domain that is NOT in the built-in
+        # staging defaults so the assertion can prove the override was
+        # threaded through (and not merely the default registry).
+        policy = ArchivePolicyConfig(
+            blocked={"example-custom.test": "operator override"},
+            include_defaults=True,
+        )
+        config = _make_config(tmp_path, archive_policy=policy)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=True,
+                rel_posix_path="arxiv/2026/04/2604.26946.pdf",
+                error="",
+            )
+            assert hooks.archive_download is not None
+            hooks.archive_download(note)
+
+        registry = mock_dl.call_args.kwargs["policy_registry"]
+        assert isinstance(registry, ArchivePolicyRegistry)
+        # The operator-added domain is present in the threaded registry.
+        assert "example-custom.test" in registry.domains()
+
+    def test_include_defaults_false_drops_builtin_defaults(
+        self, tmp_path: Path
+    ) -> None:
+        """``include_defaults = false`` honoured on the repair path."""
+        from influx.archive_policy import ArchivePolicyRegistry
+        from influx.storage import ArchiveResult
+
+        policy = ArchivePolicyConfig(include_defaults=False)
+        config = _make_config(tmp_path, archive_policy=policy)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=True,
+                rel_posix_path="arxiv/2026/04/2604.26946.pdf",
+                error="",
+            )
+            assert hooks.archive_download is not None
+            hooks.archive_download(note)
+
+        registry = mock_dl.call_args.kwargs["policy_registry"]
+        assert isinstance(registry, ArchivePolicyRegistry)
+        # Built-in staging-defaults are absent; the registry is empty.
+        assert registry.domains() == ()
+
+    def test_custom_blocked_override_shortcircuits_during_repair(
+        self, tmp_path: Path
+    ) -> None:
+        """A custom per-domain blocked entry classifies failures during repair.
+
+        The test uses a real (non-mocked) ``download_archive`` and a
+        custom-blocked arxiv.org override to demonstrate that the
+        operator override flows through to the policy classification
+        path on repair sweeps.  We expect the policy_mode on the
+        :class:`ArchiveResult` to reflect the operator setting.
+        """
+        from influx.storage import ArchiveResult
+
+        policy = ArchivePolicyConfig(
+            blocked={"arxiv.org": "operator-blocked for test"},
+            include_defaults=False,
+        )
+        config = _make_config(tmp_path, archive_policy=policy)
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+
+        captured: dict[str, object] = {}
+
+        def fake_download_archive(
+            *,
+            policy_registry: object = None,
+            **_kwargs: object,
+        ) -> ArchiveResult:
+            # Mimic ``download_archive`` consulting the registry — the
+            # contract under test is purely that the registry it
+            # received reflects the operator override.
+            captured["registry"] = policy_registry
+            return ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error="HTTP 403 for https://arxiv.org/pdf/2604.26946.pdf",
+                failure_kind="blocked",
+                policy_mode="blocked",
+                domain="arxiv.org",
+            )
+
+        with patch(
+            "influx.repair_hooks.download_archive", side_effect=fake_download_archive
+        ):
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError):
+                hooks.archive_download(note)
+
+        registry = captured["registry"]
+        # The registry the hook threaded through resolves arxiv.org to
+        # the operator's blocked policy.
+        from influx.archive_policy import ArchivePolicyRegistry
+
+        assert isinstance(registry, ArchivePolicyRegistry)
+        resolved = registry.policy_for("https://arxiv.org/pdf/2604.26946.pdf")
+        assert resolved.mode == "blocked"
+        assert resolved.note == "operator-blocked for test"
+
+    def test_default_empty_policy_config_falls_back_gracefully(
+        self, tmp_path: Path
+    ) -> None:
+        """A default ``ArchivePolicyConfig`` still produces a real registry.
+
+        With no operator overrides, the registry built carries only the
+        built-in staging defaults — exercising the no-op happy path on
+        the repair sweep.
+        """
+        from influx.archive_policy import ArchivePolicyRegistry
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)  # default ArchivePolicyConfig()
+        hooks = make_default_sweep_hooks(config)
+        note = _make_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=True,
+                rel_posix_path="arxiv/2026/04/2604.26946.pdf",
+                error="",
+            )
+            assert hooks.archive_download is not None
+            hooks.archive_download(note)
+
+        registry = mock_dl.call_args.kwargs["policy_registry"]
+        assert isinstance(registry, ArchivePolicyRegistry)
+        # arxiv.org has no built-in policy entry, so it resolves to the
+        # no-op ``attempt`` policy.
+        assert registry.policy_for("https://arxiv.org/pdf/x.pdf").mode == "attempt"

@@ -16,6 +16,8 @@ from influx.sources.arxiv import (
     ArxivItem,
     BackfillRange,
     _apply_min_interval,
+    _classify_arxiv_429,
+    _extract_arxiv_429_classification,
     _extract_arxiv_id,
     _filter_by_lookback,
     _parse_atom,
@@ -910,6 +912,10 @@ class TestArxivHardening:
         """Each retry — 429 or network — calls ``record_source_retry``
         with the correct kind so the run-ledger entry can surface
         recovered-retry counts (#129).
+
+        Issue #145: the 429 retry kind is now the refined classification
+        (``rate_limit_unknown`` here because the mock 429 has neither
+        the upstream-capacity body marker nor a ``Retry-After`` header).
         """
         del mock_sleep
         body = _load_fixture("empty_feed.atom")
@@ -931,7 +937,7 @@ class TestArxivHardening:
             fetch_arxiv(arxiv_config=cfg, resilience=resilience)
         kinds = [c.kwargs["kind"] for c in mock_record.call_args_list]
         sources = [c.kwargs["source"] for c in mock_record.call_args_list]
-        assert kinds == ["timeout", "rate_limit"]
+        assert kinds == ["timeout", "rate_limit_unknown"]
         assert sources == ["arxiv", "arxiv"]
 
 
@@ -1006,3 +1012,329 @@ class TestApplyMinInterval:
         mock_sleep.reset_mock()
         _apply_min_interval(3.0)
         mock_sleep.assert_not_called()
+
+
+class TestClassifyArxiv429:
+    """Issue #145 — refine arXiv 429 into a more specific kind.
+
+    The classifier inspects the response body and headers and returns
+    one of ``rate_limit_upstream_capacity``, ``rate_limit_local``, or
+    ``rate_limit_unknown`` so operators can distinguish shared-capacity
+    upstream events from local per-client throttling without trawling
+    raw logs.
+    """
+
+    def test_body_marker_wins_even_with_retry_after(self) -> None:
+        """The canonical ``Rate exceeded.`` body is the strongest signal.
+        Even when a ``Retry-After`` header is present, the body marker
+        wins — arXiv staff (Nov 2025) said this body indicates total
+        load on the public API, not a per-client abuse event.
+        """
+        kind, retry_after_present = _classify_arxiv_429(
+            body=b"Rate exceeded.",
+            headers={"Retry-After": "30"},
+        )
+        assert kind == "rate_limit_upstream_capacity"
+        assert retry_after_present is True
+
+    def test_body_marker_case_insensitive(self) -> None:
+        kind, _present = _classify_arxiv_429(
+            body=b"<html><body>RATE EXCEEDED</body></html>",
+            headers={},
+        )
+        assert kind == "rate_limit_upstream_capacity"
+
+    def test_body_marker_embedded_in_larger_body(self) -> None:
+        kind, _present = _classify_arxiv_429(
+            body=b"<html><h1>Whoops</h1><p>Rate exceeded. Try later.</p></html>",
+            headers={},
+        )
+        assert kind == "rate_limit_upstream_capacity"
+
+    def test_retry_after_without_body_marker_is_local(self) -> None:
+        """A ``Retry-After`` header without the shared-capacity body
+        marker is classical per-client throttling.
+        """
+        kind, retry_after_present = _classify_arxiv_429(
+            body=b"Too many requests",
+            headers={"Retry-After": "30"},
+        )
+        assert kind == "rate_limit_local"
+        assert retry_after_present is True
+
+    def test_retry_after_lookup_is_case_insensitive(self) -> None:
+        kind, retry_after_present = _classify_arxiv_429(
+            body=b"",
+            headers={"retry-after": "60"},
+        )
+        assert kind == "rate_limit_local"
+        assert retry_after_present is True
+
+    def test_no_signal_is_unknown(self) -> None:
+        kind, retry_after_present = _classify_arxiv_429(
+            body=b"",
+            headers={},
+        )
+        assert kind == "rate_limit_unknown"
+        assert retry_after_present is False
+
+    def test_unrelated_body_is_unknown(self) -> None:
+        kind, _present = _classify_arxiv_429(
+            body=b"Something else entirely",
+            headers={},
+        )
+        assert kind == "rate_limit_unknown"
+
+
+class TestArxiv429ClassificationIntegration:
+    """Issue #145 — the refined kind reaches telemetry and the ledger.
+
+    These tests drive the full ``_fetch_with_retry`` loop with mocked
+    HTTP, then assert that ``record_source_retry`` (recovered-retry
+    counts) and the ``NetworkError`` raised on budget exhaustion carry
+    the refined classification.
+    """
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_upstream_capacity_body_recorded_on_retry(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """A 429 whose body matches ``Rate exceeded.`` records the
+        recovered retry under the ``rate_limit_upstream_capacity`` kind.
+        """
+        del mock_sleep
+        body = _load_fixture("recent_two.atom")
+        mock_fetch.side_effect = [
+            _make_fetch_result(b"Rate exceeded.", status_code=429),
+            _make_fetch_result(body),
+        ]
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=1,
+            arxiv_429_backoff_max_seconds=2,
+            max_retries=2,
+            arxiv_429_max_retries=2,
+            arxiv_request_min_interval_seconds=0,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=365)
+        with patch("influx.sources.arxiv.record_source_retry") as mock_record:
+            fetch_arxiv(arxiv_config=cfg, resilience=resilience)
+        kinds = [c.kwargs["kind"] for c in mock_record.call_args_list]
+        assert kinds == ["rate_limit_upstream_capacity"]
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_local_pacing_kind_recorded_on_retry(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """A 429 with a ``Retry-After`` header but no shared-capacity
+        body marker records the recovered retry under
+        ``rate_limit_local``.
+        """
+        del mock_sleep
+        body = _load_fixture("recent_two.atom")
+        mock_fetch.side_effect = [
+            _make_fetch_result(
+                b"Too many requests",
+                status_code=429,
+                headers={"Retry-After": "5"},
+            ),
+            _make_fetch_result(body),
+        ]
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=1,
+            arxiv_429_backoff_max_seconds=10,
+            max_retries=2,
+            arxiv_429_max_retries=2,
+            arxiv_request_min_interval_seconds=0,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=365)
+        with patch("influx.sources.arxiv.record_source_retry") as mock_record:
+            fetch_arxiv(arxiv_config=cfg, resilience=resilience)
+        kinds = [c.kwargs["kind"] for c in mock_record.call_args_list]
+        assert kinds == ["rate_limit_local"]
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_unknown_kind_recorded_on_retry(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """A 429 with neither the shared-capacity body marker nor a
+        ``Retry-After`` header records the recovered retry under
+        ``rate_limit_unknown``.
+        """
+        del mock_sleep
+        body = _load_fixture("recent_two.atom")
+        mock_fetch.side_effect = [
+            _make_fetch_result(b"", status_code=429),
+            _make_fetch_result(body),
+        ]
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=1,
+            arxiv_429_backoff_max_seconds=10,
+            max_retries=2,
+            arxiv_429_max_retries=2,
+            arxiv_request_min_interval_seconds=0,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"], lookback_days=365)
+        with patch("influx.sources.arxiv.record_source_retry") as mock_record:
+            fetch_arxiv(arxiv_config=cfg, resilience=resilience)
+        kinds = [c.kwargs["kind"] for c in mock_record.call_args_list]
+        assert kinds == ["rate_limit_unknown"]
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_exhausted_budget_carries_classification_on_exception(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """When the 429 retry budget exhausts, the raised ``NetworkError``
+        keeps ``kind='rate_limit'`` (legacy contract) but the refined
+        classification is recoverable from its ``reason``.
+        """
+        del mock_sleep
+        mock_fetch.side_effect = [
+            _make_fetch_result(b"Rate exceeded.", status_code=429),
+            _make_fetch_result(b"Rate exceeded.", status_code=429),
+            _make_fetch_result(b"Rate exceeded.", status_code=429),
+        ]
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=1,
+            arxiv_429_backoff_max_seconds=2,
+            max_retries=2,
+            arxiv_429_max_retries=2,
+            arxiv_request_min_interval_seconds=0,
+        )
+        cfg = ArxivSourceConfig(categories=["cs.AI"])
+        with pytest.raises(NetworkError) as exc_info:
+            fetch_arxiv(arxiv_config=cfg, resilience=resilience)
+        err = exc_info.value
+        # Legacy ``kind`` is preserved for any downstream consumer that
+        # keyed on it before #145 landed.
+        assert err.kind == "rate_limit"
+        # Refined classification survives on ``reason`` so
+        # ``ArxivSource.fetch_candidates`` can surface it to the ledger.
+        assert _extract_arxiv_429_classification(err) == (
+            "rate_limit_upstream_capacity"
+        )
+
+    def test_extract_classification_returns_none_for_non_429(self) -> None:
+        """The reason-recovery helper returns ``None`` for non-429 errors
+        so callers fall back to ``error.kind`` unchanged.
+        """
+        err = NetworkError(
+            "boom", url="http://x", kind="timeout", reason="connect timeout"
+        )
+        assert _extract_arxiv_429_classification(err) is None
+
+    def test_extract_classification_returns_none_when_reason_unstructured(
+        self,
+    ) -> None:
+        """A legacy 429 ``NetworkError`` without the structured
+        ``classification=...`` prefix falls through to ``None``.
+        """
+        err = NetworkError("oops", url="http://x", kind="rate_limit", reason="")
+        assert _extract_arxiv_429_classification(err) is None
+
+
+class TestArxiv429ClassificationLedger:
+    """Issue #145 — refined classification reaches the run ledger via
+    ``ArxivSource.fetch_candidates``.
+
+    The 429 retry budget is exhausted so the source-acquisition path
+    runs, then we assert that the recorded error / metric carry the
+    refined classification rather than the generic ``rate_limit``.
+    """
+
+    @patch("influx.sources.arxiv._sleep")
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_swallowed_error_records_refined_kind(
+        self,
+        mock_fetch: MagicMock,
+        mock_sleep: MagicMock,
+    ) -> None:
+        """When the 429 budget exhausts and ``ArxivSource.fetch_candidates``
+        swallows the error, the run-ledger entry recorded via
+        :func:`record_source_acquisition_error` carries
+        ``rate_limit_upstream_capacity`` (or ``_local`` / ``_unknown``)
+        rather than the legacy ``rate_limit``.
+        """
+        import asyncio
+
+        from influx.config import (
+            AppConfig,
+            ProfileConfig,
+            ProfileSources,
+            PromptEntryConfig,
+            PromptsConfig,
+            ResilienceConfig,
+            ScheduleConfig,
+        )
+        from influx.coordinator import RunKind
+        from influx.sources.arxiv import ArxivSource
+        from influx.telemetry import current_source_acquisition_errors
+
+        del mock_sleep
+        mock_fetch.side_effect = [
+            _make_fetch_result(b"Rate exceeded.", status_code=429),
+            _make_fetch_result(b"Rate exceeded.", status_code=429),
+            _make_fetch_result(b"Rate exceeded.", status_code=429),
+        ]
+
+        resilience = ResilienceConfig(
+            arxiv_429_backoff_seconds=1,
+            arxiv_429_backoff_max_seconds=2,
+            max_retries=2,
+            arxiv_429_max_retries=2,
+            arxiv_request_min_interval_seconds=0,
+        )
+
+        profile_cfg = ProfileConfig(
+            name="ai",
+            description="test",
+            sources=ProfileSources(
+                arxiv=ArxivSourceConfig(
+                    enabled=True,
+                    categories=["cs.AI"],
+                    max_results_per_category=10,
+                    lookback_days=7,
+                )
+            ),
+        )
+        cfg = AppConfig(
+            schedule=ScheduleConfig(cron="0 6 * * *", timezone="UTC"),
+            profiles=[profile_cfg],
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="x"),
+                tier1_enrich=PromptEntryConfig(text="x"),
+                tier3_extract=PromptEntryConfig(text="x"),
+            ),
+            resilience=resilience,
+        )
+
+        source = ArxivSource(cfg)
+
+        errors: list[dict[str, str]] = []
+        token = current_source_acquisition_errors.set(errors)
+        try:
+            result = asyncio.run(
+                source.fetch_candidates(
+                    profile_cfg=profile_cfg,
+                    kind=RunKind.SCHEDULED,
+                    run_range=None,
+                )
+            )
+        finally:
+            current_source_acquisition_errors.reset(token)
+
+        assert result == []
+        assert len(errors) == 1
+        assert errors[0]["source"] == "arxiv"
+        assert errors[0]["kind"] == "rate_limit_upstream_capacity"

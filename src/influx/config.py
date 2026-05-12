@@ -25,6 +25,7 @@ from influx.slugs import slugify_feed_name
 __all__ = [
     # v0.7 pydantic schema models
     "AppConfig",
+    "ArchivePolicyConfig",
     "ArxivSourceConfig",
     "ExtractionConfig",
     "FeedbackConfig",
@@ -98,6 +99,38 @@ class ScheduleConfig(BaseModel):
         return v
 
 
+class ArchivePolicyConfig(BaseModel):
+    """``[storage.archive_policy]`` domain-aware archive policy overrides (#149).
+
+    Maps domain (host suffix) → operator-facing diagnostic note for
+    each policy mode.  Built-in defaults already cover staging hot
+    offenders (``science.org``, ``alignmentforum.org``, …); these
+    operator-supplied entries are *merged on top* so a domain can be
+    promoted from ``blocked`` to ``skip``, or a new domain added
+    without code changes.
+
+    Modes:
+
+    * ``blocked``: attempt the download but expect HTTP 403 / WAF
+      challenge.  Failures are tagged ``influx:archive-blocked`` so
+      the repair sweep can stop re-attempting the same doomed path.
+    * ``rate_limited``: attempt but expect HTTP 429.  Failures are
+      tagged ``influx:archive-rate-limited``; the repair sweep applies
+      a bounded cool-down on this kind.
+    * ``skip``: do not attempt the download.  The note is tagged
+      ``influx:archive-skipped-by-policy`` and never produces a
+      network call.
+
+    ``include_defaults = false`` opts out of the built-in
+    staging-defaults set — primarily a test-injection lever.
+    """
+
+    blocked: dict[str, str] = Field(default_factory=dict)
+    rate_limited: dict[str, str] = Field(default_factory=dict)
+    skip: dict[str, str] = Field(default_factory=dict)
+    include_defaults: bool = True
+
+
 class StorageConfig(BaseModel):
     """``[storage]`` archive storage settings."""
 
@@ -106,6 +139,10 @@ class StorageConfig(BaseModel):
     retain_days: int = 3650
     max_download_bytes: int = 52_428_800
     download_timeout_seconds: int = 30
+    # Issue #149: per-domain archive acquisition policy overrides.
+    # Defaults to an empty override set plus the built-in staging
+    # offender list; see :class:`ArchivePolicyConfig` for the shape.
+    archive_policy: ArchivePolicyConfig = Field(default_factory=ArchivePolicyConfig)
 
 
 class NotificationsConfig(BaseModel):

@@ -19,6 +19,9 @@ from pathlib import Path
 
 import trafilatura
 
+from influx.archive_policy import (
+    registry_from_config as _archive_policy_registry_from_config,
+)
 from influx.config import AppConfig
 from influx.enrich import tier3_extract as _tier3_extract
 from influx.errors import ExtractionError, LCMAError, NetworkError
@@ -620,11 +623,26 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
     ``ExtractionError(stage="unsupported_source")`` which classifies as
     transient — the note re-enters the sweep next pass and is fixed
     automatically once a per-source resolver is added.
+
+    Issue #149 follow-up: the per-domain archive policy registry is
+    built once from ``config.storage.archive_policy`` and threaded into
+    :func:`download_archive` so operator overrides (``blocked`` /
+    ``rate_limited`` / ``skip`` and ``include_defaults = false``) apply
+    identically during repair sweeps and initial acquisition.  Without
+    this the repair path silently fell back to
+    :func:`~influx.archive_policy.default_registry`, ignoring per-run
+    config and re-attempting doomed domains.
     """
+    policy_registry = _archive_policy_registry_from_config(
+        config.storage.archive_policy
+    )
 
     def hook(note: dict[str, object]) -> str:
         kwargs = _resolve_archive_download_args(note, config)
-        result = download_archive(**kwargs)  # type: ignore[arg-type]
+        result = download_archive(
+            policy_registry=policy_registry,
+            **kwargs,  # type: ignore[arg-type]
+        )
         if result.ok and result.rel_posix_path:
             _log.info(
                 "archive_download retry succeeded for %s path=%s",

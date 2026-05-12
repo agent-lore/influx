@@ -186,12 +186,24 @@ async def ledger_lifecycle(
         sources_checked = outcome.sources_checked if outcome is not None else None
         ingested = outcome.ingested if outcome is not None else None
         archive_failures_total = 0
+        # Issue #149: per-policy-kind breakdown of archive failures so
+        # run summaries distinguish blocked / rate-limited / skip
+        # diagnostic shapes from generic failures.  Computed alongside
+        # the existing ``archive_failures_total`` so the ledger /
+        # degraded-reasons logic is unchanged for downstream callers.
+        archive_blocked_total = 0
+        archive_rate_limited_total = 0
+        archive_skipped_by_policy_total = 0
         if outcome is not None and outcome.profile_run_result is not None:
-            archive_failures_total = sum(
-                1
-                for item in outcome.profile_run_result.items
-                if "influx:archive-missing" in item.tags
-            )
+            for item in outcome.profile_run_result.items:
+                if "influx:archive-missing" in item.tags:
+                    archive_failures_total += 1
+                if "influx:archive-blocked" in item.tags:
+                    archive_blocked_total += 1
+                if "influx:archive-rate-limited" in item.tags:
+                    archive_rate_limited_total += 1
+                if "influx:archive-skipped-by-policy" in item.tags:
+                    archive_skipped_by_policy_total += 1
         # #85: pull the pre-filter fetched-count from the contextvar
         # bucket the source layer accumulated into.  ``outcome`` may be
         # ``None`` on the early-skip / abort paths; in that case we
@@ -298,13 +310,19 @@ async def ledger_lifecycle(
                 run_outcome = "degraded"
             logger.warning(
                 "run flagged archive_acquisition profile=%s kind=%s run_id=%s "
-                "archive_failures=%d "
+                "archive_failures=%d blocked=%d rate_limited=%d "
+                "skipped_by_policy=%d "
                 "(accepted items were ingested with influx:archive-missing "
-                "after archive download failed)",
+                "after archive download failed; issue #149: blocked / "
+                "rate_limited / skipped_by_policy break down the structural "
+                "domain-policy failure shapes)",
                 profile,
                 plan.kind.value,
                 run_id,
                 archive_failures_total,
+                archive_blocked_total,
+                archive_rate_limited_total,
+                archive_skipped_by_policy_total,
             )
         if "invalid_url_stall" in degraded_reasons:
             # #131 review concern 2: feed returned items but every URL
