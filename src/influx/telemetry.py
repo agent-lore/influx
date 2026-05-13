@@ -32,6 +32,7 @@ __all__ = [
     "SourceCooldownSkip",
     "SourceRetryCounts",
     "SpanWrapper",
+    "Tier3FallbackCounts",
     "WriteOutcomeCounts",
     "current_archive_terminal_arxiv_ids",
     "current_cache_hits",
@@ -42,6 +43,7 @@ __all__ = [
     "current_source_acquisition_errors",
     "current_source_cooldown_skips",
     "current_source_retry_counts",
+    "current_tier3_fallback_counts",
     "current_write_outcomes",
     "get_meter",
     "get_tracer",
@@ -52,6 +54,7 @@ __all__ = [
     "record_source_acquisition_error",
     "record_source_cooldown_skip",
     "record_source_retry",
+    "record_tier3_fallback",
     "record_write_outcome",
 ]
 
@@ -299,6 +302,48 @@ def record_invalid_url_rejection(count: int = 1) -> None:
     if counter is None:
         return
     counter[0] += count
+
+
+# Per-run counters of Tier 3 enrichment fallbacks, split by classification
+# (#151).  Shape: ``{"harmless": N, "degraded": M}``.
+#
+# Surfaced on the run-ledger entry as ``tier3_fallbacks`` so run summaries
+# and ``/runs/recent`` can distinguish "Tier 3 failed but Tier 1 + Tier 2
+# content covered for it" (harmless — log-level noise only) from "Tier 3
+# failed AND Tier 1 was also missing" (degraded — the note is materially
+# incomplete).  Operators previously could not tell these apart from the
+# ledger; now they can without scraping logs.
+#
+# A shared mutable dict so :func:`record_tier3_fallback` can update it
+# in-place via ``setdefault`` without ContextVar.set semantics, mirroring
+# :data:`current_source_retry_counts`.
+Tier3FallbackCounts = dict[str, int]
+
+
+current_tier3_fallback_counts: ContextVar[Tier3FallbackCounts | None] = ContextVar(
+    "current_tier3_fallback_counts",
+    default=None,
+)
+
+
+def record_tier3_fallback(*, kind: str) -> None:
+    """Increment the current run's Tier 3 fallback counter for *kind* (#151).
+
+    *kind* is the same ``fallback_kind`` label the cascade attaches to
+    its log line + ``tier3_fallbacks`` metric: ``"harmless"`` when Tier
+    1 + Tier 2 both produced acceptable content, ``"degraded"`` when
+    Tier 1 was missing.
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_tier3_fallback_counts` is unset.  The Cascade calls
+    this from :meth:`Cascade._log_tier3_failure`, the single spot that
+    already emits the per-failure log + metric, so the two records stay
+    in lock-step.
+    """
+    counts = current_tier3_fallback_counts.get()
+    if counts is None:
+        return
+    counts[kind] = counts.get(kind, 0) + 1
 
 
 # Per-run counter of items that matched in the Lithos cache lookup

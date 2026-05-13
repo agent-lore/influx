@@ -35,11 +35,12 @@ from influx.enrich import tier1_enrich, tier3_extract
 from influx.errors import ExtractionError, LCMAError
 from influx.repair_counters import REPAIR_COUNTED_CAP, RepairCounters
 from influx.schemas import Tier1Enrichment, Tier3Extraction
-from influx.telemetry import current_run_id, get_tracer
+from influx.telemetry import current_run_id, get_tracer, record_tier3_fallback
 
 __all__ = [
     "Acquired",
     "Cascade",
+    "EffectiveExtractionTier",
     "EnrichedSections",
     "TextFlavour",
     "Tier2Extractor",
@@ -109,6 +110,15 @@ Tier2Extractor = Callable[[Acquired], Tier2Result]
 # ── EnrichedSections ──────────────────────────────────────────────
 
 
+EffectiveExtractionTier = Literal[
+    "abstract-only",
+    "tier1",
+    "tier2",
+    "tier1+tier2",
+    "tier3",
+]
+
+
 @dataclass(frozen=True, slots=True)
 class EnrichedSections:
     """The Cascade's output for one Acquired (CONTEXT.md).
@@ -116,6 +126,19 @@ class EnrichedSections:
     All tier results are optional — absent when the gate did not fire,
     when the cascade short-circuited on a terminal flag, or when the
     underlying call raised a counted-class failure.
+
+    Observability fields (#151):
+
+    - ``effective_extraction_tier`` — the highest tier that produced
+      content used by the renderer.  Drives log-level selection when a
+      higher tier subsequently fails: if the effective tier already
+      covers ``tier1+tier2`` (a summary plus full text), a Tier 3
+      failure is harmless fallback noise rather than material
+      degradation.
+    - ``fallback_used`` — true when at least one tier was attempted and
+      failed *and* a lower tier still produced acceptable content.  The
+      renderer / metrics layer can use this to distinguish "we fell
+      back gracefully" from "the note is genuinely degraded".
     """
 
     tier1: Tier1Enrichment | None = None
@@ -126,6 +149,8 @@ class EnrichedSections:
     tier3: Tier3Extraction | None = None
     repair_flags: tuple[str, ...] = field(default_factory=tuple)
     terminal_flags: tuple[str, ...] = field(default_factory=tuple)
+    effective_extraction_tier: EffectiveExtractionTier = "abstract-only"
+    fallback_used: bool = False
 
 
 # ── Cascade ───────────────────────────────────────────────────────
@@ -177,6 +202,8 @@ class Cascade:
         counters = counters or RepairCounters()
         repair_flags: list[str] = []
         terminal_flags: list[str] = []
+        tier2_failed = False
+        tier3_failed = False
 
         # ── Tier 2 (full-text gate) ────────────────────────────────
         extracted_text = acquired.extracted_text
@@ -198,6 +225,7 @@ class Cascade:
                     text_tag = tier2.text_tag
                 else:
                     repair_flags.append("influx:repair-needed")
+                    tier2_failed = True
 
         # ``full_text`` for the renderer only when extraction succeeded
         # AND the score crosses the gate (FR-ENR-6, US-011).
@@ -217,13 +245,43 @@ class Cascade:
 
         # ── Tier 3 (deep-extract gate, requires extracted text) ─────
         tier3: Tier3Extraction | None = None
+        tier3_attempted = False
         if score >= self.thresholds.deep_extract and full_text is not None:
             if counters.tier3_attempts >= REPAIR_COUNTED_CAP:
                 terminal_flags.append("influx:tier3-terminal")
             else:
-                tier3 = self._run_tier3(acquired.title, full_text)
+                tier3_attempted = True
+                # Decide harmless-fallback vs. materially-degraded
+                # log level *before* the call so the dispatcher can
+                # emit the right classification at the failure site
+                # (#151).  Lower-tier content is "acceptable" when
+                # Tier 1 produced a summary AND Tier 2 produced full
+                # text — the note still has every section except the
+                # Tier 3 deep-extract ones.
+                lower_tier_acceptable = tier1 is not None
+                tier3 = self._run_tier3(
+                    acquired.item_id,
+                    acquired.title,
+                    full_text,
+                    lower_tier_acceptable=lower_tier_acceptable,
+                )
                 if tier3 is None:
                     repair_flags.append("influx:repair-needed")
+                    tier3_failed = True
+
+        effective_tier = _classify_effective_tier(
+            tier1=tier1,
+            full_text=full_text,
+            tier3=tier3,
+        )
+        fallback_used = _classify_fallback_used(
+            tier1_attempted=tier1_attempted,
+            tier1=tier1,
+            tier2_failed=tier2_failed,
+            tier3_attempted=tier3_attempted,
+            tier3_failed=tier3_failed,
+            effective_tier=effective_tier,
+        )
 
         return EnrichedSections(
             tier1=tier1,
@@ -234,6 +292,8 @@ class Cascade:
             tier3=tier3,
             repair_flags=tuple(dict.fromkeys(repair_flags)),
             terminal_flags=tuple(dict.fromkeys(terminal_flags)),
+            effective_extraction_tier=effective_tier,
+            fallback_used=fallback_used,
         )
 
     # ── Tier dispatchers ──────────────────────────────────────────
@@ -257,7 +317,16 @@ class Cascade:
                     config=self.config,
                 )
             except LCMAError:
-                logger.warning("Tier 1 enrichment failed for %s", acquired.item_id)
+                logger.warning(
+                    "Tier 1 enrichment failed for %s",
+                    acquired.item_id,
+                    extra={
+                        "profile": self.profile_name,
+                        "item_id": acquired.item_id,
+                        "tier": "1",
+                        "tier1_failure_kind": "lcma_error",
+                    },
+                )
                 metrics.llm_validation_failures().add(
                     1, {"profile": self.profile_name, "tier": "1"}
                 )
@@ -271,6 +340,12 @@ class Cascade:
                 logger.warning(
                     "Tier 1 enrichment crashed unexpectedly for %s",
                     acquired.item_id,
+                    extra={
+                        "profile": self.profile_name,
+                        "item_id": acquired.item_id,
+                        "tier": "1",
+                        "tier1_failure_kind": "unexpected_exception",
+                    },
                     exc_info=True,
                 )
                 metrics.llm_validation_failures().add(
@@ -298,8 +373,35 @@ class Cascade:
                 # abstract-only + repair-needed.
                 return None
 
-    def _run_tier3(self, title: str, full_text: str) -> Tier3Extraction | None:
-        """Dispatch Tier 3 with telemetry + degrade-on-failure semantics."""
+    def _run_tier3(
+        self,
+        item_id: str,
+        title: str,
+        full_text: str,
+        *,
+        lower_tier_acceptable: bool,
+    ) -> Tier3Extraction | None:
+        """Dispatch Tier 3 with telemetry + degrade-on-failure semantics.
+
+        ``lower_tier_acceptable`` controls log-level classification of a
+        Tier 3 failure (#151):
+
+        - ``True`` (Tier 1 summary + full text already in place) — the
+          failure is harmless fallback noise: log at ``INFO`` with
+          ``fallback_used=True`` and ``effective_extraction_tier=
+          "tier1+tier2"`` so dashboards can filter it out from
+          materially-degraded extractions.
+        - ``False`` (Tier 1 or Tier 2 also produced no content) — the
+          note is materially degraded: keep the ``WARNING`` so
+          operators still see the actionable signal.
+
+        The ``llm_validation_failures`` metric continues to tick on
+        every failure (no behaviour change for repair counters or the
+        ``influx:repair-needed`` flag); the new
+        ``tier3_fallbacks`` metric tags each failure with
+        ``fallback_kind=harmless|degraded`` so run summaries can
+        distinguish them.
+        """
         tracer = get_tracer()
         with tracer.span(
             "influx.enrich.tier3",
@@ -316,9 +418,12 @@ class Cascade:
                     config=self.config,
                 )
             except LCMAError:
-                logger.warning("Tier 3 extraction failed for %s", title)
-                metrics.llm_validation_failures().add(
-                    1, {"profile": self.profile_name, "tier": "3"}
+                self._log_tier3_failure(
+                    item_id=item_id,
+                    title=title,
+                    lower_tier_acceptable=lower_tier_acceptable,
+                    failure_kind="lcma_error",
+                    exc_info=False,
                 )
                 return None
             except Exception:
@@ -326,15 +431,93 @@ class Cascade:
                 # validator bug or unforeseen response shape must not
                 # turn a single bad paper into a run-level abort
                 # (staging incident 2026-05-01).
-                logger.warning(
-                    "Tier 3 extraction crashed unexpectedly for %s",
-                    title,
+                self._log_tier3_failure(
+                    item_id=item_id,
+                    title=title,
+                    lower_tier_acceptable=lower_tier_acceptable,
+                    failure_kind="unexpected_exception",
                     exc_info=True,
                 )
-                metrics.llm_validation_failures().add(
-                    1, {"profile": self.profile_name, "tier": "3"}
-                )
                 return None
+
+    def _log_tier3_failure(
+        self,
+        *,
+        item_id: str,
+        title: str,
+        lower_tier_acceptable: bool,
+        failure_kind: str,
+        exc_info: bool,
+    ) -> None:
+        """Emit the Tier 3 failure log + metrics with #151 classification.
+
+        Centralises log-level selection and the structured ``extra`` fields
+        so the LCMA-error path and the unexpected-exception path stay in
+        lock-step.
+
+        Tier 3 only runs when Tier 2 produced full text (the deep-extract
+        gate requires ``full_text is not None``).  So every Tier 3 failure
+        is a fallback to lower-tier content — what differs is how much
+        lower-tier content exists:
+
+        - ``lower_tier_acceptable=True`` (Tier 1 summary + Tier 2 full
+          text) — harmless fallback: the note has every section except
+          the Tier 3 deep-extract ones.  Effective tier is
+          ``tier1+tier2``; log at INFO.
+        - ``lower_tier_acceptable=False`` (Tier 1 missing, Tier 2 full
+          text present) — degraded fallback: the note is missing its
+          summary section.  Effective tier is ``tier2``; log at WARNING.
+
+        Both branches set ``fallback_used=True`` because the cascade did
+        in fact fall back from Tier 3 to whatever lower-tier content
+        existed; what changes is the *completeness* of that lower-tier
+        content, not whether a fallback happened.
+        """
+        fallback_kind = "harmless" if lower_tier_acceptable else "degraded"
+        effective_tier = "tier1+tier2" if lower_tier_acceptable else "tier2"
+        extra = {
+            "profile": self.profile_name,
+            "item_id": item_id,
+            "tier": "3",
+            "fallback_used": True,
+            "fallback_kind": fallback_kind,
+            "effective_extraction_tier": effective_tier,
+            "tier3_failure_kind": failure_kind,
+        }
+        if lower_tier_acceptable:
+            # Harmless fallback noise — earlier tiers already produced
+            # acceptable note content.  Downgrade to INFO so operators
+            # can still see the event when debugging without it
+            # polluting the staging warning stream (#151).
+            logger.info(
+                "Tier 3 extraction failed for %s; lower tiers produced "
+                "acceptable content, falling back",
+                title,
+                extra=extra,
+                exc_info=exc_info,
+            )
+        else:
+            logger.warning(
+                "Tier 3 extraction failed for %s; note content materially "
+                "degraded (no Tier 1 summary available)",
+                title,
+                extra=extra,
+                exc_info=exc_info,
+            )
+        metrics.llm_validation_failures().add(
+            1, {"profile": self.profile_name, "tier": "3"}
+        )
+        metrics.tier3_fallbacks().add(
+            1,
+            {"profile": self.profile_name, "fallback_kind": fallback_kind},
+        )
+        # Propagate the classification to the current run's ledger entry
+        # (#151 gap 2): increment a per-run counter so run summaries /
+        # ``/runs/recent`` can distinguish harmless Tier 3 fallback from
+        # genuinely degraded extractions without scraping logs.  Safe
+        # outside a run context — the helper no-ops when the contextvar
+        # bucket is unset.
+        record_tier3_fallback(kind=fallback_kind)
 
 
 def _text_tag_for(flavour: TextFlavour | None) -> str:
@@ -344,3 +527,48 @@ def _text_tag_for(flavour: TextFlavour | None) -> str:
     if flavour == "pdf":
         return "text:pdf"
     return "text:abstract-only"
+
+
+def _classify_effective_tier(
+    *,
+    tier1: Tier1Enrichment | None,
+    full_text: str | None,
+    tier3: Tier3Extraction | None,
+) -> EffectiveExtractionTier:
+    """Pick the highest tier label that reflects what made it into the note (#151).
+
+    Used by :class:`EnrichedSections` consumers (renderer, run
+    summaries, metrics) to tell at a glance whether a tier failure
+    materially degraded the output or was a harmless fallback.
+    """
+    if tier3 is not None:
+        return "tier3"
+    if tier1 is not None and full_text is not None:
+        return "tier1+tier2"
+    if tier1 is not None:
+        return "tier1"
+    if full_text is not None:
+        return "tier2"
+    return "abstract-only"
+
+
+def _classify_fallback_used(
+    *,
+    tier1_attempted: bool,
+    tier1: Tier1Enrichment | None,
+    tier2_failed: bool,
+    tier3_attempted: bool,
+    tier3_failed: bool,
+    effective_tier: EffectiveExtractionTier,
+) -> bool:
+    """Return whether any tier fell back to a lower one with usable output (#151).
+
+    A run is "in fallback" when at least one attempted tier produced no
+    output *and* the cascade still produced an effective tier above
+    abstract-only.  Repair flags continue to be the source of truth for
+    "this needs a repair sweep"; this flag is the operator-facing
+    "harmless vs material" classifier for logs and metrics.
+    """
+    tier1_failed = tier1_attempted and tier1 is None
+    any_tier_failed = tier1_failed or tier2_failed or (tier3_attempted and tier3_failed)
+    return any_tier_failed and effective_tier != "abstract-only"

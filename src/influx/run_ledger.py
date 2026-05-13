@@ -436,6 +436,15 @@ class RunLedger:
             # dict at start; populated from the per-run contextvar at
             # ``complete`` time.
             "source_retry_counts": {},
+            # #151: per-run counts of Tier 3 enrichment fallbacks,
+            # split by classification.  Shape:
+            # ``{"harmless": int, "degraded": int}``.  Empty dict at
+            # start; populated from the per-run contextvar at
+            # ``complete`` time so run summaries / ``/runs/recent``
+            # can distinguish "Tier 3 noise that didn't break notes"
+            # from "Tier 3 + Tier 1 both failed — note materially
+            # incomplete".
+            "tier3_fallbacks": {},
             # #152: bounded, top-N degradation summary aggregated at
             # ``complete`` time.  Stays ``None`` while the run is in
             # flight; populated by ``complete`` with archive +
@@ -463,6 +472,7 @@ class RunLedger:
         source_acquisition_errors: list[dict[str, str]] | None = None,
         source_cooldown_skips: list[dict[str, str]] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
+        tier3_fallbacks: dict[str, int] | None = None,
         archive_failures: list[ArchiveFailureRecord] | None = None,
         cache_hits_total: int | None = None,
         write_outcomes: WriteOutcomeCounts | None = None,
@@ -728,6 +738,7 @@ class RunLedger:
             source_cooldown_skips=cooldown_skips,
             degraded_reasons=reasons,
             source_retry_counts=source_retry_counts,
+            tier3_fallbacks=tier3_fallbacks,
             degradation_summary=degradation_summary,
         )
         return reasons
@@ -1063,6 +1074,7 @@ class RunLedger:
         source_cooldown_skips: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
+        tier3_fallbacks: dict[str, int] | None = None,
         degradation_summary: dict[str, Any] | None = None,
     ) -> None:
         try:
@@ -1109,6 +1121,12 @@ class RunLedger:
                         source: dict(by_kind)
                         for source, by_kind in (source_retry_counts or {}).items()
                     },
+                    # #151: shallow-copy the Tier 3 fallback counts so
+                    # later mutations of the contextvar bucket do not
+                    # leak into the persisted ledger entry.  ``int``
+                    # values are already immutable, so a flat ``dict()``
+                    # is sufficient.
+                    "tier3_fallbacks": dict(tier3_fallbacks or {}),
                     # #152: persist the precomputed degradation summary
                     # so downstream consumers (``/runs/recent``) see the
                     # top-N breakdowns without re-aggregating.  ``None``
