@@ -693,3 +693,197 @@ async def test_filter_error_does_not_collide_with_filter_stall(
     assert "filter_error" in entry["degraded_reasons"]
     assert "filter_stall" not in entry["degraded_reasons"]
     assert "fetch_stall" not in entry["degraded_reasons"]
+
+
+# ── #152: degradation summary flows from RunService into the ledger ─
+
+
+async def test_degradation_summary_aggregates_archive_failures_by_domain(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: the RunService passes per-item archive failures into
+    the ledger so the persisted ``degradation_summary.archive.by_domain``
+    spotlights the dominant host (#152)."""
+    from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    body_outcome = RunOutcome(
+        sources_checked=4,
+        ingested=3,
+        profile_run_result=ProfileRunResult(
+            run_date="2026-05-12",
+            profile="alpha",
+            stats=RunStats(sources_checked=4, ingested=3),
+            items=[
+                HighlightItem(
+                    id="note-1",
+                    title="A",
+                    score=8,
+                    tags=["profile:alpha", "influx:archive-missing"],
+                    reason="x",
+                    url="https://ieee.org/a",
+                ),
+                HighlightItem(
+                    id="note-2",
+                    title="B",
+                    score=8,
+                    tags=[
+                        "profile:alpha",
+                        "influx:archive-missing",
+                        "influx:archive-blocked",
+                    ],
+                    reason="x",
+                    url="https://ieee.org/b",
+                ),
+                HighlightItem(
+                    id="note-3",
+                    title="C",
+                    score=8,
+                    tags=["profile:alpha", "influx:archive-missing"],
+                    reason="x",
+                    url="https://acm.org/c",
+                ),
+            ],
+        ),
+    )
+    with patch(
+        "influx.run.Run.execute",
+        new_callable=AsyncMock,
+        return_value=body_outcome,
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    summary = entry["degradation_summary"]
+    assert summary is not None
+    by_domain = {row["domain"]: row["count"] for row in summary["archive"]["by_domain"]}
+    assert by_domain == {"ieee.org": 2, "acm.org": 1}
+    by_kind = {row["kind"]: row["count"] for row in summary["archive"]["by_kind"]}
+    # 1 item carries the ``influx:archive-blocked`` policy tag, 2 do not
+    # → bucketed as "unspecified".
+    assert by_kind == {"unspecified": 2, "blocked": 1}
+
+
+async def test_degradation_summary_cache_hits_do_not_inflate_breakdowns(
+    tmp_path: Path,
+) -> None:
+    """Backfill regression: a run whose only "issue" is duplicate/dedupe
+    cache hits must NOT show degradation breakdowns dominated by cache
+    activity.  The ledger's ``degraded`` flag stays false and the
+    degradation breakdowns stay empty (#152 acceptance criteria —
+    "duplicate/dedupe outcomes don't dominate the degradation summary").
+    """
+    from influx.telemetry import current_cache_hits
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    async def body_with_only_cache_hits(self: Any) -> RunOutcome:
+        # Simulate 25 cache hits in the Ingest stage (typical
+        # backfill shape where every candidate already exists).
+        cache_hits_counter = current_cache_hits.get()
+        assert cache_hits_counter is not None
+        cache_hits_counter[0] = 25
+        return RunOutcome(sources_checked=0, ingested=0)
+
+    with patch("influx.run.Run.execute", new=body_with_only_cache_hits):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    summary = entry["degradation_summary"]
+    # Run is NOT degraded — cache hits are expected behaviour.
+    assert entry["degraded"] is False
+    # The dedupe volume is visible to operators...
+    assert summary["totals"]["cache_hits"] == 25
+    # ...but it does NOT pollute the degradation breakdowns.
+    assert summary["totals"]["archive_failures"] == 0
+    assert summary["totals"]["source_acquisition_errors"] == 0
+    assert summary["archive"]["by_domain"] == []
+    assert summary["archive"]["by_kind"] == []
+    assert summary["source_acquisition"]["by_kind"] == []
+
+
+async def test_degradation_summary_log_tail_includes_top_drivers(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The ``run completed`` log line carries a compact ``top_drivers=``
+    tail when the run is degraded so single-log triage is possible
+    without fetching the ledger (#152)."""
+    from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    body_outcome = RunOutcome(
+        sources_checked=2,
+        ingested=1,
+        profile_run_result=ProfileRunResult(
+            run_date="2026-05-12",
+            profile="alpha",
+            stats=RunStats(sources_checked=2, ingested=1),
+            items=[
+                HighlightItem(
+                    id="note-1",
+                    title="t",
+                    score=8,
+                    tags=["profile:alpha", "influx:archive-missing"],
+                    reason="x",
+                    url="https://ieee.org/a",
+                ),
+            ],
+        ),
+    )
+
+    async def body(self: Any) -> RunOutcome:
+        errors = current_source_acquisition_errors.get()
+        assert errors is not None
+        errors.append(
+            {
+                "source": "arxiv",
+                "kind": "rate_limit_upstream_capacity",
+                "detail": "429",
+            }
+        )
+        return body_outcome
+
+    with (
+        caplog.at_level(logging.INFO, logger="influx.run_service"),
+        patch("influx.run.Run.execute", new=body),
+    ):
+        await service.execute(_scheduled_plan())
+
+    record = _extract_run_completed_record(caplog)
+    assert "top_drivers=" in record.message
+    assert "ieee.org=1" in record.message
+    assert "arxiv/rate_limit_upstream_capacity=1" in record.message
+
+
+async def test_degradation_summary_log_tail_absent_on_clean_run(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No ``top_drivers=`` tail on clean runs — keeps the log line lean
+    when there's nothing to triage (#152)."""
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    body_outcome = RunOutcome(sources_checked=2, ingested=1)
+    with (
+        caplog.at_level(logging.INFO, logger="influx.run_service"),
+        patch(
+            "influx.run.Run.execute",
+            new_callable=AsyncMock,
+            return_value=body_outcome,
+        ),
+    ):
+        await service.execute(_scheduled_plan())
+
+    record = _extract_run_completed_record(caplog)
+    assert "top_drivers=" not in record.message

@@ -32,6 +32,7 @@ __all__ = [
     "SourceRetryCounts",
     "SpanWrapper",
     "current_archive_terminal_arxiv_ids",
+    "current_cache_hits",
     "current_fetched_total",
     "current_filter_errors",
     "current_invalid_url_rejections",
@@ -40,6 +41,7 @@ __all__ = [
     "current_source_retry_counts",
     "get_meter",
     "get_tracer",
+    "record_cache_hit",
     "record_fetched_items",
     "record_filter_error",
     "record_invalid_url_rejection",
@@ -243,6 +245,40 @@ def record_invalid_url_rejection(count: int = 1) -> None:
     if count <= 0:
         return
     counter = current_invalid_url_rejections.get()
+    if counter is None:
+        return
+    counter[0] += count
+
+
+# Per-run counter of items that matched in the Lithos cache lookup
+# (primary or ``source_url`` fallback) — issue #152.  Set to ``[0]`` at
+# run start by ``run_service.ledger_lifecycle``; incremented by the
+# Ingest stage on every cache hit (skip or multi-profile merge).
+#
+# Surfaced on the run-ledger entry as
+# ``degradation_summary.totals.cache_hits`` so a backfill that
+# legitimately skipped 90% of candidates is visibly distinct from a
+# fresh fetch run.  Deliberately NOT folded into degraded_reasons:
+# cache hits are expected behaviour, not degradation (#152 acceptance
+# criteria — dedupe must not dominate the degradation summary).
+current_cache_hits: ContextVar[list[int] | None] = ContextVar(
+    "current_cache_hits",
+    default=None,
+)
+
+
+def record_cache_hit(count: int = 1) -> None:
+    """Add *count* to the current run's ``cache_hits`` counter (#152).
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_cache_hits` is unset.  Ingest-stage callers
+    increment on every cache lookup that returned ``hit=true``
+    (primary or ``source_url`` fallback); multi-profile merges count
+    once each because each merge consumes one lookup.
+    """
+    if count <= 0:
+        return
+    counter = current_cache_hits.get()
     if counter is None:
         return
     counter[0] += count

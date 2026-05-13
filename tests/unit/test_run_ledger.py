@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from influx.run_ledger import RunLedger
 
@@ -1286,3 +1287,354 @@ def test_invalid_url_stall_fires_on_first_run(tmp_path: Path) -> None:
         invalid_url_rejections_total=2,
     )
     assert "invalid_url_stall" in reasons
+
+
+# ── #152: degradation summary ────────────────────────────────────────
+
+
+def test_degradation_summary_present_on_clean_run(tmp_path: Path) -> None:
+    """Clean runs still carry a ``degradation_summary`` so consumers
+    never need to defend against a missing field (#152)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    ledger.complete(run_id="r-1", sources_checked=5, ingested=3)
+
+    entry = ledger.recent()[0]
+    summary = entry["degradation_summary"]
+    assert summary is not None
+    assert summary["totals"]["archive_failures"] == 0
+    assert summary["totals"]["source_acquisition_errors"] == 0
+    assert summary["totals"]["cache_hits"] == 0
+    assert summary["archive"]["by_kind"] == []
+    assert summary["archive"]["by_domain"] == []
+    assert summary["source_acquisition"]["by_kind"] == []
+    assert summary["source_acquisition"]["by_source"] == []
+    assert summary["retries_recovered"]["by_kind"] == []
+
+
+def test_degradation_summary_top_archive_by_domain(tmp_path: Path) -> None:
+    """Archive failures group by URL domain so operators see WHICH
+    domain dominates, not just the total (#152)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    archive = [
+        {"url": "https://ieee.org/a", "tags": ["influx:archive-missing"]},
+        {"url": "https://ieee.org/b", "tags": ["influx:archive-missing"]},
+        {"url": "https://ieee.org/c", "tags": ["influx:archive-missing"]},
+        {"url": "https://acm.org/x", "tags": ["influx:archive-missing"]},
+        {"url": "https://acm.org/y", "tags": ["influx:archive-missing"]},
+        {"url": "https://other.example/z", "tags": ["influx:archive-missing"]},
+    ]
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=10,
+        ingested=4,
+        archive_failures_total=len(archive),
+        archive_failures=archive,
+    )
+
+    summary = ledger.recent()[0]["degradation_summary"]
+    domains = summary["archive"]["by_domain"]
+    assert domains[0] == {"domain": "ieee.org", "count": 3}
+    assert domains[1] == {"domain": "acm.org", "count": 2}
+    assert domains[2] == {"domain": "other.example", "count": 1}
+    assert summary["totals"]["archive_failures"] == 6
+
+
+def test_degradation_summary_archive_by_kind_uses_policy_tags(
+    tmp_path: Path,
+) -> None:
+    """Archive ``by_kind`` distinguishes blocked / rate_limited /
+    missing_by_policy / unspecified from the tag taxonomy (#152)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    archive = [
+        {
+            "url": "https://a.example/1",
+            "tags": ["influx:archive-missing", "influx:archive-blocked"],
+        },
+        {
+            "url": "https://a.example/2",
+            "tags": ["influx:archive-missing", "influx:archive-blocked"],
+        },
+        {
+            "url": "https://b.example/1",
+            "tags": ["influx:archive-missing", "influx:archive-rate-limited"],
+        },
+        {
+            "url": "https://c.example/1",
+            "tags": ["influx:archive-missing", "influx:archive-skipped-by-policy"],
+        },
+        {
+            # Generic upstream failure (no policy tag): bucketed as
+            # "unspecified" so the long tail stays visible.
+            "url": "https://d.example/1",
+            "tags": ["influx:archive-missing"],
+        },
+    ]
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=10,
+        ingested=5,
+        archive_failures_total=len(archive),
+        archive_failures=archive,
+    )
+
+    by_kind = ledger.recent()[0]["degradation_summary"]["archive"]["by_kind"]
+    kinds = {row["kind"]: row["count"] for row in by_kind}
+    assert kinds == {
+        "blocked": 2,
+        "rate_limited": 1,
+        "missing_by_policy": 1,
+        "unspecified": 1,
+    }
+
+
+def test_degradation_summary_source_acquisition_breakdown(tmp_path: Path) -> None:
+    """Source-acquisition failures break down by source AND by kind so
+    operators can distinguish "arXiv-only rate-limit storm" from
+    "every source is timing out" (#152)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    errors = [
+        {
+            "source": "arxiv",
+            "kind": "rate_limit_upstream_capacity",
+            "detail": "429",
+        },
+        {
+            "source": "arxiv",
+            "kind": "rate_limit_upstream_capacity",
+            "detail": "429",
+        },
+        {"source": "arxiv", "kind": "rate_limit_local", "detail": "429"},
+        {"source": "rss", "kind": "timeout", "detail": "slow"},
+    ]
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=2,
+        ingested=0,
+        source_acquisition_errors=errors,
+    )
+
+    summary = ledger.recent()[0]["degradation_summary"]
+    kinds = {
+        row["kind"]: row["count"] for row in summary["source_acquisition"]["by_kind"]
+    }
+    sources = {
+        row["source"]: row["count"]
+        for row in summary["source_acquisition"]["by_source"]
+    }
+    assert kinds == {
+        "rate_limit_upstream_capacity": 2,
+        "rate_limit_local": 1,
+        "timeout": 1,
+    }
+    assert sources == {"arxiv": 3, "rss": 1}
+
+
+def test_degradation_summary_caps_breakdowns_at_top_n(tmp_path: Path) -> None:
+    """Long tails get truncated — operators need top drivers, not every
+    one-off failure (#152)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    # 10 distinct domains, descending counts 10..1
+    archive: list[dict[str, Any]] = []
+    for i, count in enumerate(range(10, 0, -1)):
+        for _ in range(count):
+            archive.append(
+                {
+                    "url": f"https://host-{i:02d}.example/p",
+                    "tags": ["influx:archive-missing"],
+                }
+            )
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=20,
+        ingested=10,
+        archive_failures_total=len(archive),
+        archive_failures=archive,
+    )
+
+    domains = ledger.recent()[0]["degradation_summary"]["archive"]["by_domain"]
+    # Bounded to top 5; first entry is the heaviest hitter.
+    assert len(domains) == 5
+    assert domains[0]["count"] == 10
+    assert domains[-1]["count"] == 6
+
+
+def test_degradation_summary_does_not_count_cache_hits_as_degradation(
+    tmp_path: Path,
+) -> None:
+    """A run whose only "issue" is dedupe is NOT degraded — cache hits
+    must NOT inflate the archive or source-acquisition breakdowns
+    (#152 acceptance criteria)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="backfill", run_range=None)
+    reasons = ledger.complete(
+        run_id="r-1",
+        sources_checked=0,
+        ingested=0,
+        cache_hits_total=100,
+    )
+
+    entry = ledger.recent()[0]
+    assert reasons == []
+    assert entry["degraded"] is False
+    summary = entry["degradation_summary"]
+    assert summary["totals"]["cache_hits"] == 100
+    # Cache hits MUST NOT show up in archive / source-acquisition
+    # breakdowns — they are not failures.
+    assert summary["archive"]["by_domain"] == []
+    assert summary["archive"]["by_kind"] == []
+    assert summary["source_acquisition"]["by_kind"] == []
+
+
+def test_degradation_summary_includes_retries_recovered(tmp_path: Path) -> None:
+    """Recovered retries are surfaced so operators see "we burned the
+    retry budget" patterns even on otherwise-clean runs (#152 +
+    #129)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=4,
+        ingested=2,
+        source_retry_counts={
+            "arxiv": {"rate_limit_upstream_capacity": 3, "network": 1},
+            "rss": {"timeout": 2},
+        },
+    )
+
+    summary = ledger.recent()[0]["degradation_summary"]
+    assert summary["totals"]["retries_recovered"] == 6
+    by_kind = {
+        row["kind"]: row["count"] for row in summary["retries_recovered"]["by_kind"]
+    }
+    by_source = {
+        row["source"]: row["count"] for row in summary["retries_recovered"]["by_source"]
+    }
+    assert by_kind == {
+        "rate_limit_upstream_capacity": 3,
+        "timeout": 2,
+        "network": 1,
+    }
+    assert by_source == {"arxiv": 4, "rss": 2}
+
+
+def test_degradation_summary_distinguishes_all_failure_classes(
+    tmp_path: Path,
+) -> None:
+    """Run mixing archive / source-acquisition / timeouts / invalid-url
+    stay distinguishable in the totals block (#152 acceptance
+    criteria)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=3,
+        ingested=1,
+        filter_errors_total=2,
+        invalid_url_rejections_total=4,
+        archive_failures_total=2,
+        archive_failures=[
+            {"url": "https://x.example/1", "tags": ["influx:archive-missing"]},
+            {
+                "url": "https://x.example/2",
+                "tags": ["influx:archive-missing", "influx:archive-rate-limited"],
+            },
+        ],
+        source_acquisition_errors=[
+            {"source": "arxiv", "kind": "timeout", "detail": "slow"},
+        ],
+        cache_hits_total=7,
+    )
+
+    totals = ledger.recent()[0]["degradation_summary"]["totals"]
+    assert totals == {
+        "archive_failures": 2,
+        "source_acquisition_errors": 1,
+        "filter_errors": 2,
+        "invalid_url_rejections": 4,
+        "cache_hits": 7,
+        "retries_recovered": 0,
+    }
+
+
+def test_degradation_summary_top_n_is_deterministic_on_ties(
+    tmp_path: Path,
+) -> None:
+    """Ties in count break to the lower-keyed entry so two operators
+    inspecting the same run see the same ordering (#152)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    archive = [
+        {"url": "https://b.example/1", "tags": ["influx:archive-missing"]},
+        {"url": "https://a.example/1", "tags": ["influx:archive-missing"]},
+    ]
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=2,
+        ingested=0,
+        archive_failures_total=len(archive),
+        archive_failures=archive,
+    )
+
+    domains = [
+        row["domain"]
+        for row in ledger.recent()[0]["degradation_summary"]["archive"]["by_domain"]
+    ]
+    # Both at count=1; ``a.example`` sorts first because count is tied
+    # and we fall back to ascending key.
+    assert domains == ["a.example", "b.example"]
+
+
+# ── #152: build_degradation_summary unit coverage ───────────────────
+
+
+def test_build_degradation_summary_handles_all_none(tmp_path: Path) -> None:
+    """All-``None`` inputs produce a zero-shaped summary so the
+    ``ledger.complete`` happy path doesn't have to defend (#152)."""
+    from influx.run_ledger import build_degradation_summary
+
+    summary = build_degradation_summary(
+        source_acquisition_errors=None,
+        archive_failures=None,
+        source_retry_counts=None,
+        filter_errors_total=None,
+        invalid_url_rejections_total=None,
+        cache_hits_total=None,
+    )
+    assert summary["totals"]["archive_failures"] == 0
+    assert summary["totals"]["source_acquisition_errors"] == 0
+    assert summary["totals"]["retries_recovered"] == 0
+    assert summary["archive"]["by_domain"] == []
+    assert summary["source_acquisition"]["by_source"] == []
+    assert summary["retries_recovered"]["by_kind"] == []
+
+
+def test_build_degradation_summary_ignores_unparseable_archive_urls(
+    tmp_path: Path,
+) -> None:
+    """Items with empty / malformed URLs still show up in by_kind
+    (they're real failures) but do not pollute by_domain (#152)."""
+    from influx.run_ledger import build_degradation_summary
+
+    summary = build_degradation_summary(
+        source_acquisition_errors=None,
+        archive_failures=[
+            {"url": "", "tags": ["influx:archive-missing"]},
+            {"url": "not-a-url", "tags": ["influx:archive-missing"]},
+            {"url": "https://real.example/x", "tags": ["influx:archive-missing"]},
+        ],
+        source_retry_counts=None,
+        filter_errors_total=None,
+        invalid_url_rejections_total=None,
+        cache_hits_total=None,
+    )
+    assert summary["totals"]["archive_failures"] == 3
+    by_kind = {row["kind"]: row["count"] for row in summary["archive"]["by_kind"]}
+    assert by_kind == {"unspecified": 3}
+    # Only the one parseable URL contributes to ``by_domain``.
+    by_domain = {row["domain"]: row["count"] for row in summary["archive"]["by_domain"]}
+    assert by_domain == {"real.example": 1}
