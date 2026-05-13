@@ -55,6 +55,7 @@ __all__ = [
     "slug_collision_unresolved",
     "slug_collision_url_recovery",
     "source_acquisition_errors",
+    "source_cooldown_skips",
 ]
 
 
@@ -460,4 +461,22 @@ def source_acquisition_errors() -> Any:
     return get_meter().counter(
         "influx_source_acquisition_errors_total",
         description="Swallowed source-acquisition errors per run.",
+    )
+
+
+def source_cooldown_skips() -> Any:
+    """Counter of source fetches skipped by an adaptive cooldown (#146).
+
+    Mirrors the ledger's ``source_cooldown_skip`` degraded reason:
+    every increment corresponds to one entry written through
+    :func:`~influx.telemetry.record_source_cooldown_skip`.  Distinct
+    from :func:`source_acquisition_errors` because the run deliberately
+    chose not to call upstream, so the failure mode is operational
+    (we backed off) rather than upstream (they refused us).
+
+    Labels: ``profile``, ``source``.
+    """
+    return get_meter().counter(
+        "influx_source_cooldown_skips_total",
+        description="Source fetches skipped by an adaptive cooldown.",
     )
