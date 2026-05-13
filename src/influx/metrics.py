@@ -55,6 +55,7 @@ __all__ = [
     "slug_collision_unresolved",
     "slug_collision_url_recovery",
     "source_acquisition_errors",
+    "tier3_fallbacks",
 ]
 
 
@@ -225,6 +226,32 @@ def llm_validation_failures() -> Any:
     return get_meter().counter(
         "influx_llm_validation_failures_total",
         description="LLM enrichment failures (Tier 1 or Tier 3).",
+    )
+
+
+def tier3_fallbacks() -> Any:
+    """Counter of Tier 3 extraction failures classified by impact (#151).
+
+    Tier 3 sits at the top of the cascade and frequently fails on
+    long-tail papers; many of those failures are harmless when Tier 1
+    + Tier 2 already produced a usable note.  This instrument
+    separates those harmless fallbacks from materially-degraded
+    failures so dashboards and alerts can target the latter.
+
+    Increments alongside :func:`llm_validation_failures` (``tier="3"``)
+    on every Tier 3 failure; the ``fallback_kind`` label distinguishes
+    ``"harmless"`` (Tier 1 produced a summary AND Tier 2 produced full
+    text) from ``"degraded"`` (Tier 1 also failed).
+
+    Labels: ``profile``, ``fallback_kind`` (``"harmless"`` |
+    ``"degraded"``).
+    """
+    return get_meter().counter(
+        "influx_tier3_fallbacks_total",
+        description=(
+            "Tier 3 extraction failures split by whether lower tiers "
+            "produced acceptable note content (issue #151)."
+        ),
     )
 
 
