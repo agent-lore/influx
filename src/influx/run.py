@@ -59,6 +59,8 @@ from influx.telemetry import (
     current_run_id,
     current_source_acquisition_errors,
     get_tracer,
+    record_cache_hit,
+    record_write_outcome,
 )
 
 __all__ = [
@@ -531,9 +533,20 @@ async def _run_ingest_stage(
             cache_hit_reason: str | None = "primary" if cache_hit else None
             if cache_hit:
                 metrics.cache_hits().add(1, {"profile": profile, "source": item_source})
+                # #152: per-run cache-hit count for the degradation
+                # summary's ``totals.cache_hits``.  Mirrors the metrics
+                # tick so the ledger's dedupe-volume signal stays in
+                # sync with the metric.
+                record_cache_hit()
         else:
             cache_hit = bool(cache_hit_meta)
             cache_hit_reason = item.get("cache_hit_reason") if cache_hit else None
+            # #152: the Acquire-stage primary lookup short-circuits the
+            # legacy in-loop branch above, so its hits are counted here
+            # to keep the ledger total in lockstep with metrics.cache_hits
+            # which Acquire already ticked.
+            if cache_hit:
+                record_cache_hit()
 
         # #128: defensive source_url-only fallback when the primary
         # title+abstract dedup misses.  Catches notes whose source_url
@@ -549,6 +562,12 @@ async def _run_ingest_stage(
                 metrics.cache_hits_via_url_fallback().add(
                     1, {"profile": profile, "source": item_source}
                 )
+                # #152: count the source_url fallback as a cache hit
+                # for the ledger's degradation summary — it represents
+                # the same dedupe outcome (a write that would have
+                # been rejected as ``duplicate``) and must NOT inflate
+                # the degraded-event counts.
+                record_cache_hit()
 
         if cache_hit:
             logger.info(
@@ -596,6 +615,18 @@ async def _run_ingest_stage(
                 "status": write_result.status,
             },
         )
+        # #152 review: feed every write outcome (success, duplicate,
+        # and write-time failures) into the per-run write-outcome
+        # counter so the run ledger can surface the duplicate/dedupe
+        # volume AND the invalid-note-state failures
+        # (``invalid_input`` / ``version_conflict`` / ``slug_collision``
+        # / ``content_too_large*``) in the degradation summary without
+        # operators having to grep the lithos_writes log.  ``duplicate``
+        # is counted here BUT excluded from the invalid-note-state
+        # bucket downstream — it is expected behaviour on re-runs and
+        # must not inflate degradation counts (issue #152 acceptance
+        # criteria).
+        record_write_outcome(outcome=write_result.status, source=item_source)
 
         if write_result.status in ("created", "updated"):
             logger.info(

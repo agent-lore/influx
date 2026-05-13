@@ -45,19 +45,78 @@ from influx.run import (
 )
 from influx.run_ledger import RunLedger
 from influx.telemetry import (
+    current_cache_hits,
     current_fetched_total,
     current_filter_errors,
     current_invalid_url_rejections,
     current_run_id,
     current_source_acquisition_errors,
+    current_source_cooldown_skips,
     current_source_retry_counts,
     current_tier3_fallback_counts,
+    current_write_outcomes,
     get_tracer,
 )
 
 __all__ = ["RunService", "ledger_lifecycle"]
 
 logger = logging.getLogger(__name__)
+
+
+def _format_top_drivers_tail(
+    *,
+    archive_failures: list[dict[str, Any]],
+    source_acquisition_errors: list[dict[str, str]],
+    reasons: list[str],
+    top_n: int = 3,
+) -> str:
+    """Return a compact log tail summarising the top degradation drivers (#152).
+
+    Builds a short string like
+    ``"archive:ieee.org=4,arxiv.org=2;source:arxiv/rate_limit_upstream_capacity=1"``
+    so a single log line carries the dominant per-domain / per-kind
+    drivers without the operator having to fetch ``/runs/recent`` to
+    triage.  Returns ``""`` for non-degraded runs (``reasons`` empty).
+
+    Bounded to *top_n* entries per category to keep the line readable.
+    """
+    if not reasons:
+        return ""
+
+    # Build a tiny on-the-fly aggregation rather than re-running the
+    # full ``build_degradation_summary`` — the log line only needs the
+    # one-line top-N digest, not the full structured shape.
+    archive_by_domain: dict[str, int] = {}
+    for record in archive_failures:
+        url = str(record.get("url") or "")
+        if not url:
+            continue
+        try:
+            from urllib.parse import urlparse
+
+            host = (urlparse(url).hostname or "").lower()
+        except (TypeError, ValueError):
+            host = ""
+        if host:
+            archive_by_domain[host] = archive_by_domain.get(host, 0) + 1
+
+    source_by_pair: dict[str, int] = {}
+    for err in source_acquisition_errors:
+        source = str(err.get("source") or "unknown")
+        kind = str(err.get("kind") or "unknown")
+        key = f"{source}/{kind}"
+        source_by_pair[key] = source_by_pair.get(key, 0) + 1
+
+    parts: list[str] = []
+    if archive_by_domain:
+        items = sorted(archive_by_domain.items(), key=lambda kv: (-kv[1], kv[0]))[
+            :top_n
+        ]
+        parts.append("archive:" + ",".join(f"{k}={v}" for k, v in items))
+    if source_by_pair:
+        items = sorted(source_by_pair.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
+        parts.append("source:" + ",".join(f"{k}={v}" for k, v in items))
+    return ";".join(parts)
 
 
 # ── Outer ledger lifecycle (Q2 grilling — Option B, structural CM) ──
@@ -102,6 +161,12 @@ async def ledger_lifecycle(
     session = _LedgerSession(run_id=run_id, started_at=started_at)
     run_id_token = current_run_id.set(run_id)
     source_errors_token = current_source_acquisition_errors.set([])
+    # Issue #146: per-run list of cooldown-suppressed source fetches.
+    # Distinct from ``current_source_acquisition_errors`` because a
+    # cooldown skip is a deliberate operational decision, not an
+    # upstream failure — the run-ledger entry tags it as
+    # ``source_cooldown_skip`` so operators can tell the two apart.
+    source_cooldown_skips_token = current_source_cooldown_skips.set([])
     # #85: per-run pre-filter fetched-count.  A list-of-ints so source
     # adapters increment a shared mutable container; reads at run-end
     # land the value into the run-ledger entry for the
@@ -139,6 +204,23 @@ async def ledger_lifecycle(
     tier3_fallback_counts_token = current_tier3_fallback_counts.set(
         tier3_fallback_counts
     )
+    # #152: per-run cache-hit counter so the ledger's
+    # ``degradation_summary.totals.cache_hits`` carries the dedupe
+    # volume.  Deliberately segregated from the degradation-driving
+    # counters: cache hits are expected behaviour (especially on
+    # backfills) and must NOT show up in archive / source-acquisition
+    # breakdowns.
+    cache_hits_counter: list[int] = [0]
+    cache_hits_token = current_cache_hits.set(cache_hits_counter)
+    # #152 review: per-run write-outcome counter so the ledger's
+    # ``degradation_summary.writes.by_outcome`` /
+    # ``degradation_summary.invalid_note_state.by_kind`` carry the
+    # write-time breakdowns.  Shared mutable dict so the Ingest stage
+    # can increment via :func:`record_write_outcome` without re-setting
+    # the ContextVar — same pattern as
+    # ``current_source_acquisition_errors``.
+    write_outcomes_counter: dict[tuple[str, str], int] = {}
+    write_outcomes_token = current_write_outcomes.set(write_outcomes_counter)
     metric_attrs = {"profile": profile, "run_type": plan.kind.value}
 
     ledger.start(
@@ -175,6 +257,7 @@ async def ledger_lifecycle(
         # Telemetry span exited cleanly; finalise the ledger entry.
         elapsed = (datetime.now(UTC) - started_at).total_seconds()
         source_errors = current_source_acquisition_errors.get() or []
+        source_cooldown_skips = current_source_cooldown_skips.get() or []
 
         if session.skip_reason is not None:
             ledger.skip(run_id=run_id, reason=session.skip_reason)
@@ -204,10 +287,17 @@ async def ledger_lifecycle(
         archive_blocked_total = 0
         archive_rate_limited_total = 0
         archive_skipped_by_policy_total = 0
+        # #152: per-item archive-failure records (url + tags) so the
+        # ledger's degradation summary can compute the by-domain and
+        # by-kind top-N.  One entry per item that landed
+        # ``influx:archive-missing`` regardless of which (if any) more
+        # specific policy tag accompanies it.
+        archive_failures: list[dict[str, Any]] = []
         if outcome is not None and outcome.profile_run_result is not None:
             for item in outcome.profile_run_result.items:
                 if "influx:archive-missing" in item.tags:
                     archive_failures_total += 1
+                    archive_failures.append({"url": item.url, "tags": list(item.tags)})
                 if "influx:archive-blocked" in item.tags:
                     archive_blocked_total += 1
                 if "influx:archive-rate-limited" in item.tags:
@@ -224,6 +314,9 @@ async def ledger_lifecycle(
         filter_errors_total = filter_errors_counter[0]
         # #131: total per-run pre-acquire URL rejections.
         invalid_url_rejections_total = invalid_url_rejections_counter[0]
+        # #152: total cache hits this run, surfaced under the
+        # degradation summary's ``totals.cache_hits``.
+        cache_hits_total = cache_hits_counter[0]
         degraded_reasons = ledger.complete(
             run_id=run_id,
             sources_checked=sources_checked,
@@ -233,6 +326,10 @@ async def ledger_lifecycle(
             invalid_url_rejections_total=invalid_url_rejections_total,
             archive_failures_total=archive_failures_total,
             source_acquisition_errors=source_errors,
+            # Issue #146: cooldown skips are run-level state distinct
+            # from swallowed acquisition errors — the ledger fires the
+            # ``source_cooldown_skip`` reason on a non-empty list.
+            source_cooldown_skips=source_cooldown_skips,
             # #129: surface recovered retry counts so the ledger entry
             # carries "we hit arXiv 429 twice but recovered" alongside
             # the swallowed-error list, letting an operator distinguish
@@ -242,8 +339,23 @@ async def ledger_lifecycle(
             # so run summaries / ``/runs/recent`` can tell apart noise
             # from material degradation without scraping logs.
             tier3_fallbacks=tier3_fallback_counts,
+            # #152: feed per-item archive failures + cache-hit total
+            # into the bounded top-N degradation summary computed by
+            # ``ledger.complete``.
+            archive_failures=archive_failures,
+            cache_hits_total=cache_hits_total,
+            # #152 review: per-(outcome, source) write counts collected
+            # at the Ingest stage drive
+            # ``degradation_summary.writes.by_outcome`` (all outcomes
+            # including duplicate) and
+            # ``degradation_summary.invalid_note_state.by_kind`` (only
+            # materially-failed outcomes — feeds the
+            # ``invalid_note_state`` degraded reason when non-zero).
+            write_outcomes=write_outcomes_counter,
         )
-        run_outcome = "degraded" if source_errors else "success"
+        run_outcome = (
+            "degraded" if (source_errors or source_cooldown_skips) else "success"
+        )
         if "ingestion_stall" in degraded_reasons:
             metrics.ingestion_stalls().add(
                 1, {"profile": profile, "reason": "ingestion_stall"}
@@ -338,6 +450,27 @@ async def ledger_lifecycle(
                 archive_rate_limited_total,
                 archive_skipped_by_policy_total,
             )
+        if "source_cooldown_skip" in degraded_reasons:
+            # Issue #146: one or more source fetches were suppressed by
+            # the adaptive 429 cooldown.  Distinct from
+            # ``source_acquisition``: we deliberately chose not to call
+            # upstream, so the run-level outcome is "we backed off"
+            # rather than "we tried and lost".  Operators triaging this
+            # reason check the cooldown thresholds / cooldown duration
+            # and the recent 429 classification breakdown.
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged source_cooldown_skip profile=%s kind=%s "
+                "run_id=%s cooldown_skips=%d "
+                "(arxiv fetch was skipped after repeated 429 bursts — "
+                "see resilience.arxiv_429_cooldown_threshold / "
+                "arxiv_429_cooldown_seconds)",
+                profile,
+                plan.kind.value,
+                run_id,
+                len(source_cooldown_skips),
+            )
         if "invalid_url_stall" in degraded_reasons:
             # #131 review concern 2: feed returned items but every URL
             # was upstream-malformed.  Single-run signal — operators
@@ -360,6 +493,53 @@ async def ledger_lifecycle(
                 invalid_url_rejections_total,
                 fetched_total,
             )
+        if "invalid_note_state" in degraded_reasons:
+            # #152 review: at least one write-time outcome was a real
+            # write failure (``invalid_input`` / ``version_conflict`` /
+            # ``slug_collision`` / ``content_too_large*``).  Distinct
+            # from duplicates (the contract-expected outcome of
+            # scheduled re-runs, PR #153) — operators should look at
+            # schema drift, repair backlog, or id collisions, not
+            # the dedupe pipeline.
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            # Build the by-kind digest locally from the counter to
+            # avoid re-reading the ledger entry we just appended.
+            invalid_kind_counts: dict[str, int] = {}
+            for (
+                write_outcome_kind,
+                _write_outcome_source,
+            ), count in write_outcomes_counter.items():
+                if count <= 0:
+                    continue
+                if write_outcome_kind in (
+                    "invalid_input",
+                    "version_conflict",
+                    "slug_collision",
+                    "content_too_large",
+                    "content_too_large_skipped",
+                ):
+                    invalid_kind_counts[write_outcome_kind] = (
+                        invalid_kind_counts.get(write_outcome_kind, 0) + count
+                    )
+            invalid_note_state_summary = ",".join(
+                f"{kind}={count}"
+                for kind, count in sorted(
+                    invalid_kind_counts.items(), key=lambda kv: (-kv[1], kv[0])
+                )
+            )
+            logger.warning(
+                "run flagged invalid_note_state profile=%s kind=%s run_id=%s "
+                "by_kind=%s "
+                "(write-time failures landed in the materially-failed set "
+                "— check schema drift, repair backlog, or upstream id "
+                "collisions; duplicate outcomes are deliberately excluded "
+                "from this flag)",
+                profile,
+                plan.kind.value,
+                run_id,
+                invalid_note_state_summary or "<none>",
+            )
         metrics.run_duration().record(elapsed, metric_attrs)
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
 
@@ -369,9 +549,21 @@ async def ledger_lifecycle(
             # future stall-reason additions stay in sync without touching
             # this call site.  ``reasons=...`` is appended for the
             # ``influx-diagnose failures`` grep path.
+            #
+            # #152: when degraded, append a compact ``top_drivers=...``
+            # tail with the dominant archive-by-domain / source-by-kind
+            # entries so the log line itself answers "what's actually
+            # broken?" without requiring a ledger fetch.  Computed in
+            # one shot via :func:`build_degradation_summary` so the log
+            # tail and the persisted summary stay in lockstep.
+            top_drivers = _format_top_drivers_tail(
+                archive_failures=archive_failures,
+                source_acquisition_errors=source_errors,
+                reasons=degraded_reasons,
+            )
             logger.info(
                 "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
-                "sources_checked=%d ingested=%d degraded=%s reasons=%s",
+                "sources_checked=%d ingested=%d degraded=%s reasons=%s%s",
                 profile,
                 plan.kind.value,
                 run_id,
@@ -380,6 +572,7 @@ async def ledger_lifecycle(
                 outcome.ingested,
                 run_outcome == "degraded",
                 ",".join(degraded_reasons) if degraded_reasons else "",
+                f" top_drivers={top_drivers}" if top_drivers else "",
             )
         else:
             logger.info(
@@ -411,11 +604,14 @@ async def ledger_lifecycle(
         metrics.active_runs().add(-1, {"profile": profile})
         current_run_id.reset(run_id_token)
         current_source_acquisition_errors.reset(source_errors_token)
+        current_source_cooldown_skips.reset(source_cooldown_skips_token)
         current_fetched_total.reset(fetched_total_token)
         current_filter_errors.reset(filter_errors_token)
         current_invalid_url_rejections.reset(invalid_url_rejections_token)
         current_source_retry_counts.reset(source_retry_counts_token)
         current_tier3_fallback_counts.reset(tier3_fallback_counts_token)
+        current_cache_hits.reset(cache_hits_token)
+        current_write_outcomes.reset(write_outcomes_token)
 
 
 # ── RunService ──────────────────────────────────────────────────────
