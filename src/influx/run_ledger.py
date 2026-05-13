@@ -110,6 +110,60 @@ def _domain_from_url(url: str) -> str:
 ArchiveFailureRecord = dict[str, Any]
 
 
+# Write-outcome strings that represent a materially-failed write that
+# the run continued past — issue #152 review.  These count toward the
+# ``invalid_note_state.by_kind`` breakdown AND the ``invalid_note_state``
+# degraded reason.  Anything else (``created``, ``updated``,
+# ``duplicate`` …) is recorded under ``writes.by_outcome`` for
+# operational visibility but does NOT count as degradation.
+#
+# Membership rationale:
+#
+# - ``invalid_input`` — Lithos rejected the payload as malformed
+#   (missing required field / bad schema); the item was skipped.
+# - ``version_conflict`` — both retries exhausted; the write was
+#   skipped.
+# - ``slug_collision`` — the slug-collision recovery chain
+#   (#31 / #148) gave up; the item was skipped and a backlog entry
+#   was appended.
+# - ``content_too_large`` — the Tier-2 trim retry was not invoked or
+#   bubbled out of the trimming retry path; the item was skipped.
+# - ``content_too_large_skipped`` — the Tier-2 trim retry also
+#   produced ``content_too_large``; the item was skipped.
+#
+# ``duplicate`` is deliberately NOT in this set: PR #153 / issue #148
+# formalised that duplicate writes are the expected outcome of
+# scheduled re-runs and must not be treated as degradation.
+_INVALID_NOTE_STATE_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "invalid_input",
+        "version_conflict",
+        "slug_collision",
+        "content_too_large",
+        "content_too_large_skipped",
+    }
+)
+
+
+def _is_invalid_note_state_outcome(outcome: str) -> bool:
+    """Return ``True`` when *outcome* counts as a real write failure (#152).
+
+    Used by :func:`build_degradation_summary` to gate the
+    ``invalid_note_state`` bucket so duplicate / created / updated
+    outcomes do not inflate degradation counts.
+    """
+    return outcome in _INVALID_NOTE_STATE_OUTCOMES
+
+
+# Per-run write-outcome counter shape consumed by
+# :func:`build_degradation_summary`.  Keyed by ``(outcome, source)``
+# tuples to keep the per-source attribution (an arXiv ``duplicate`` is
+# operationally different from an RSS ``duplicate`` even though the
+# outcome string is the same).  Mirrors
+# :data:`influx.telemetry.WriteOutcomeCounts`.
+WriteOutcomeCounts = dict[tuple[str, str], int]
+
+
 def build_degradation_summary(
     *,
     source_acquisition_errors: list[dict[str, str]] | None,
@@ -118,6 +172,7 @@ def build_degradation_summary(
     filter_errors_total: int | None,
     invalid_url_rejections_total: int | None,
     cache_hits_total: int | None,
+    write_outcomes: WriteOutcomeCounts | None = None,
     top_n: int = _DEGRADATION_SUMMARY_TOP_N,
 ) -> dict[str, Any]:
     """Build the bounded ``degradation_summary`` block for one run (#152).
@@ -140,6 +195,8 @@ def build_degradation_summary(
                 "invalid_url_rejections": int,
                 "cache_hits": int,
                 "retries_recovered": int,
+                "writes": int,
+                "invalid_note_state": int,
             },
             "archive": {
                 "by_kind":   [{"kind": "...", "count": N}, ...],
@@ -153,6 +210,14 @@ def build_degradation_summary(
                 "by_kind":   [{"kind": "...", "count": N}, ...],
                 "by_source": [{"source": "...", "count": N}, ...],
             },
+            "writes": {
+                "by_outcome": [{"outcome": "...", "count": N}, ...],
+                "by_source":  [{"source":  "...", "count": N}, ...],
+            },
+            "invalid_note_state": {
+                "by_kind":   [{"kind":   "...", "count": N}, ...],
+                "by_source": [{"source": "...", "count": N}, ...],
+            },
         }
 
     Design notes:
@@ -162,6 +227,16 @@ def build_degradation_summary(
       deliberately segregated from the archive / source-acquisition
       breakdowns.  A run whose only "issue" is cache hits is not a
       degraded run (#152 acceptance criteria).
+    - **Write-time duplicate outcomes are not degradation either.**
+      Every write outcome — including ``created`` / ``updated`` /
+      ``duplicate`` — is surfaced under ``writes.by_outcome`` so the
+      dedupe volume is visible to operators, but only the
+      invalid-note-state outcomes (``invalid_input``,
+      ``version_conflict``, ``slug_collision``,
+      ``content_too_large*``) feed into the ``invalid_note_state``
+      bucket.  PR #153 / issue #148 formalised the duplicate-is-OK
+      contract: a scheduled re-run whose every write returns
+      ``duplicate`` is steady-state, not a regression (#152 review).
     - **Top-N bounded.**  Each breakdown is truncated to *top_n* entries
       sorted descending by count.  The long tail is intentionally
       dropped — operators inspecting recent runs need to see the
@@ -179,6 +254,7 @@ def build_degradation_summary(
     errors = source_acquisition_errors or []
     archive = archive_failures or []
     retries = source_retry_counts or {}
+    writes = write_outcomes or {}
 
     archive_by_kind: dict[str, int] = {}
     archive_by_domain: dict[str, int] = {}
@@ -206,6 +282,35 @@ def build_degradation_summary(
             retries_by_source[source] = retries_by_source.get(source, 0) + count
             retries_total += count
 
+    # #152 review: aggregate per-(outcome, source) write counts into the
+    # two parallel views the ledger surfaces.  ``writes.*`` carries
+    # every outcome — including the benign ``created`` / ``updated`` /
+    # ``duplicate`` cases — so operators see the dedupe volume at the
+    # write layer alongside the cache-hit total.  ``invalid_note_state.*``
+    # filters down to the materially-failed outcomes
+    # (:data:`_INVALID_NOTE_STATE_OUTCOMES`) so a duplicate-heavy run
+    # doesn't inflate the degradation reason list.
+    writes_by_outcome: dict[str, int] = {}
+    writes_by_source: dict[str, int] = {}
+    writes_total = 0
+    invalid_note_state_by_kind: dict[str, int] = {}
+    invalid_note_state_by_source: dict[str, int] = {}
+    invalid_note_state_total = 0
+    for (outcome, source), count in writes.items():
+        if count <= 0:
+            continue
+        writes_by_outcome[outcome] = writes_by_outcome.get(outcome, 0) + count
+        writes_by_source[source] = writes_by_source.get(source, 0) + count
+        writes_total += count
+        if _is_invalid_note_state_outcome(outcome):
+            invalid_note_state_by_kind[outcome] = (
+                invalid_note_state_by_kind.get(outcome, 0) + count
+            )
+            invalid_note_state_by_source[source] = (
+                invalid_note_state_by_source.get(source, 0) + count
+            )
+            invalid_note_state_total += count
+
     def _renamed(rows: list[dict[str, Any]], key_name: str) -> list[dict[str, Any]]:
         """Rename the helper's neutral ``"key"`` field to the caller's label."""
         return [{key_name: row["key"], "count": row["count"]} for row in rows]
@@ -218,6 +323,12 @@ def build_degradation_summary(
             "invalid_url_rejections": int(invalid_url_rejections_total or 0),
             "cache_hits": int(cache_hits_total or 0),
             "retries_recovered": retries_total,
+            # #152 review: write-layer totals.  ``writes`` covers every
+            # outcome (including duplicate / created / updated);
+            # ``invalid_note_state`` is the strict subset that feeds the
+            # degraded-reasons list.
+            "writes": writes_total,
+            "invalid_note_state": invalid_note_state_total,
         },
         "archive": {
             "by_kind": _renamed(_top_n_by_count(archive_by_kind, n=top_n), "kind"),
@@ -233,6 +344,28 @@ def build_degradation_summary(
             "by_kind": _renamed(_top_n_by_count(retries_by_kind, n=top_n), "kind"),
             "by_source": _renamed(
                 _top_n_by_count(retries_by_source, n=top_n), "source"
+            ),
+        },
+        # #152 review: all write outcomes including duplicate / dedupe.
+        # NOT a degradation driver — operators consult this to see the
+        # dedupe volume at the write layer (complementing
+        # ``totals.cache_hits`` which counts the pre-write cache).
+        "writes": {
+            "by_outcome": _renamed(
+                _top_n_by_count(writes_by_outcome, n=top_n), "outcome"
+            ),
+            "by_source": _renamed(_top_n_by_count(writes_by_source, n=top_n), "source"),
+        },
+        # #152 review: degrading write-time outcomes only
+        # (``invalid_input`` / ``version_conflict`` / ``slug_collision``
+        # / ``content_too_large*``).  When the total is non-zero, the
+        # caller appends ``invalid_note_state`` to the degraded reasons.
+        "invalid_note_state": {
+            "by_kind": _renamed(
+                _top_n_by_count(invalid_note_state_by_kind, n=top_n), "kind"
+            ),
+            "by_source": _renamed(
+                _top_n_by_count(invalid_note_state_by_source, n=top_n), "source"
             ),
         },
     }
@@ -327,6 +460,7 @@ class RunLedger:
         source_retry_counts: dict[str, dict[str, int]] | None = None,
         archive_failures: list[ArchiveFailureRecord] | None = None,
         cache_hits_total: int | None = None,
+        write_outcomes: WriteOutcomeCounts | None = None,
     ) -> list[str]:
         """Mark an active run as completed and append it to history.
 
@@ -374,6 +508,17 @@ class RunLedger:
           disallowed-scheme), so nothing reached the LLM filter.
           Single-run signal — like ``filter_error`` — because URL
           malformation is an immediately actionable upstream bug.
+        - ``"invalid_note_state"`` (issue #152 review) — at least one
+          write-time outcome landed in the materially-failed set
+          (``invalid_input``, ``version_conflict``, ``slug_collision``,
+          or ``content_too_large*``) so an accepted item was dropped at
+          the write layer.  Distinct from ``duplicate``, which is the
+          expected steady-state outcome of scheduled re-runs and
+          deliberately does NOT count toward degradation (PR #153 /
+          issue #148 contract).  Single-run signal — these failure
+          shapes are immediately actionable (schema drift / repair
+          backlog / upstream id collision) and do not need a
+          consecutive-runs ratchet.
 
         ``fetch_stall`` and ``filter_stall`` partition the
         ``sources_checked == 0`` space by ``fetched_total``: they are
@@ -407,6 +552,22 @@ class RunLedger:
             reasons.append("filter_error")
         if isinstance(archive_failures_total, int) and archive_failures_total > 0:
             reasons.append("archive_acquisition")
+
+        # #152 review: ``invalid_note_state`` fires when any write-time
+        # outcome lands in the materially-failed set (see
+        # :data:`_INVALID_NOTE_STATE_OUTCOMES`).  ``duplicate`` outcomes
+        # are deliberately excluded — they are the contract-expected
+        # outcome of scheduled re-runs (PR #153 / issue #148).
+        # Single-run signal because the underlying shapes (schema
+        # drift, repair backlog, version conflict) are immediately
+        # actionable, not noisy/transient.
+        invalid_note_state_total = sum(
+            count
+            for (outcome, _source), count in (write_outcomes or {}).items()
+            if _is_invalid_note_state_outcome(outcome) and count > 0
+        )
+        if invalid_note_state_total > 0:
+            reasons.append("invalid_note_state")
 
         # #131 review concern 2: ``invalid_url_stall`` fires when the
         # feed returned items but every URL was upstream-malformed
@@ -529,6 +690,7 @@ class RunLedger:
             filter_errors_total=filter_errors_total,
             invalid_url_rejections_total=invalid_url_rejections_total,
             cache_hits_total=cache_hits_total,
+            write_outcomes=write_outcomes,
         )
 
         self._finish(

@@ -1558,6 +1558,11 @@ def test_degradation_summary_distinguishes_all_failure_classes(
         "invalid_url_rejections": 4,
         "cache_hits": 7,
         "retries_recovered": 0,
+        # #152 review: write-layer totals.  This run passed no
+        # write_outcomes so both stay zero — but the keys are present so
+        # downstream consumers don't need to defend against absence.
+        "writes": 0,
+        "invalid_note_state": 0,
     }
 
 
@@ -1638,3 +1643,155 @@ def test_build_degradation_summary_ignores_unparseable_archive_urls(
     # Only the one parseable URL contributes to ``by_domain``.
     by_domain = {row["domain"]: row["count"] for row in summary["archive"]["by_domain"]}
     assert by_domain == {"real.example": 1}
+
+
+# ── #152 review: write-outcome + invalid-note-state breakdowns ──────
+
+
+def test_degradation_summary_aggregates_writes_by_outcome(tmp_path: Path) -> None:
+    """``writes.by_outcome`` surfaces every write outcome (including
+    duplicates and successes) so operators see the dedupe volume and
+    write-time failures in one place (#152 review)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=4,
+        ingested=2,
+        write_outcomes={
+            ("created", "arxiv"): 2,
+            ("duplicate", "arxiv"): 3,
+            ("duplicate", "rss"): 1,
+            ("invalid_input", "rss"): 1,
+        },
+    )
+
+    summary = ledger.recent()[0]["degradation_summary"]
+    by_outcome = {
+        row["outcome"]: row["count"] for row in summary["writes"]["by_outcome"]
+    }
+    assert by_outcome == {
+        "created": 2,
+        "duplicate": 4,
+        "invalid_input": 1,
+    }
+    by_source = {row["source"]: row["count"] for row in summary["writes"]["by_source"]}
+    assert by_source == {"arxiv": 5, "rss": 2}
+    assert summary["totals"]["writes"] == 7
+
+
+def test_degradation_summary_duplicate_only_run_is_not_degraded(
+    tmp_path: Path,
+) -> None:
+    """Regression (#152 review): a run whose every write is a
+    ``duplicate`` is the contract-expected outcome of scheduled re-runs
+    (PR #153 / issue #148) and MUST NOT be flagged as degraded.
+
+    Duplicate counts must appear under ``writes.by_outcome`` for
+    visibility but stay out of every degradation driver — including
+    the new ``invalid_note_state`` bucket — so the dedupe contract is
+    not silently re-broken by the write-outcome plumbing."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    reasons = ledger.complete(
+        run_id="r-1",
+        sources_checked=5,
+        ingested=0,
+        write_outcomes={
+            ("duplicate", "arxiv"): 4,
+            ("duplicate", "rss"): 1,
+        },
+    )
+
+    entry = ledger.recent()[0]
+    # Not degraded — duplicates are expected steady state.
+    assert reasons == []
+    assert entry["degraded"] is False
+    assert entry["degraded_reasons"] == []
+
+    summary = entry["degradation_summary"]
+    # Duplicates are visible to operators under writes.by_outcome ...
+    by_outcome = {
+        row["outcome"]: row["count"] for row in summary["writes"]["by_outcome"]
+    }
+    assert by_outcome == {"duplicate": 5}
+    assert summary["totals"]["writes"] == 5
+    # ... but they do NOT inflate any degradation driver, including
+    # the new invalid_note_state bucket and the existing archive /
+    # source-acquisition counters.
+    assert summary["totals"]["invalid_note_state"] == 0
+    assert summary["totals"]["archive_failures"] == 0
+    assert summary["totals"]["source_acquisition_errors"] == 0
+    assert summary["invalid_note_state"]["by_kind"] == []
+    assert summary["invalid_note_state"]["by_source"] == []
+    assert summary["archive"]["by_kind"] == []
+    assert summary["source_acquisition"]["by_kind"] == []
+
+
+def test_degradation_summary_invalid_note_state_drives_degradation(
+    tmp_path: Path,
+) -> None:
+    """Invalid-note-state outcomes (``invalid_input`` /
+    ``version_conflict`` / ``slug_collision`` / ``content_too_large*``)
+    are degrading write failures and must show up in
+    ``degraded_reasons`` (#152 review acceptance criteria)."""
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    reasons = ledger.complete(
+        run_id="r-1",
+        sources_checked=5,
+        ingested=2,
+        write_outcomes={
+            ("created", "arxiv"): 2,
+            ("duplicate", "arxiv"): 1,  # NOT degrading
+            ("invalid_input", "rss"): 1,
+            ("version_conflict", "arxiv"): 1,
+            ("slug_collision", "arxiv"): 1,
+            ("content_too_large_skipped", "rss"): 1,
+        },
+    )
+
+    entry = ledger.recent()[0]
+    assert "invalid_note_state" in reasons
+    assert entry["degraded"] is True
+
+    summary = entry["degradation_summary"]
+    by_kind = {
+        row["kind"]: row["count"] for row in summary["invalid_note_state"]["by_kind"]
+    }
+    # Only the materially-failed outcomes are bucketed — created /
+    # duplicate stay out.
+    assert by_kind == {
+        "invalid_input": 1,
+        "version_conflict": 1,
+        "slug_collision": 1,
+        "content_too_large_skipped": 1,
+    }
+    assert summary["totals"]["invalid_note_state"] == 4
+    by_source = {
+        row["source"]: row["count"]
+        for row in summary["invalid_note_state"]["by_source"]
+    }
+    assert by_source == {"arxiv": 2, "rss": 2}
+
+
+def test_build_degradation_summary_accepts_no_write_outcomes(tmp_path: Path) -> None:
+    """``write_outcomes=None`` produces a zero-shaped writes /
+    invalid_note_state block so legacy callers (and the ``fail`` /
+    ``skip`` paths) don't break (#152 review)."""
+    from influx.run_ledger import build_degradation_summary
+
+    summary = build_degradation_summary(
+        source_acquisition_errors=None,
+        archive_failures=None,
+        source_retry_counts=None,
+        filter_errors_total=None,
+        invalid_url_rejections_total=None,
+        cache_hits_total=None,
+    )
+    assert summary["totals"]["writes"] == 0
+    assert summary["totals"]["invalid_note_state"] == 0
+    assert summary["writes"]["by_outcome"] == []
+    assert summary["writes"]["by_source"] == []
+    assert summary["invalid_note_state"]["by_kind"] == []
+    assert summary["invalid_note_state"]["by_source"] == []

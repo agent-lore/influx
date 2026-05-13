@@ -31,6 +31,7 @@ __all__ = [
     "SourceAcquisitionError",
     "SourceRetryCounts",
     "SpanWrapper",
+    "WriteOutcomeCounts",
     "current_archive_terminal_arxiv_ids",
     "current_cache_hits",
     "current_fetched_total",
@@ -39,6 +40,7 @@ __all__ = [
     "current_run_id",
     "current_source_acquisition_errors",
     "current_source_retry_counts",
+    "current_write_outcomes",
     "get_meter",
     "get_tracer",
     "record_cache_hit",
@@ -47,6 +49,7 @@ __all__ = [
     "record_invalid_url_rejection",
     "record_source_acquisition_error",
     "record_source_retry",
+    "record_write_outcome",
 ]
 
 # Context variable for the current run ID — set by ``run_profile()`` so
@@ -282,6 +285,57 @@ def record_cache_hit(count: int = 1) -> None:
     if counter is None:
         return
     counter[0] += count
+
+
+# Per-run counter of ``lithos_write`` outcomes keyed by ``(outcome, source)``
+# — issue #152 review.  Set to an empty dict at run start by
+# :func:`run_service.ledger_lifecycle`; the Ingest stage of
+# :mod:`influx.run` increments via :func:`record_write_outcome` after each
+# ``LithosClient.write_note`` call.
+#
+# Surfaced on the run-ledger entry as
+# ``degradation_summary.writes.by_outcome`` (the full top-N including
+# ``created`` / ``updated`` / ``duplicate`` so operators see the dedupe
+# volume) and ``degradation_summary.invalid_note_state.by_kind`` (only
+# the degrading outcomes — ``invalid_input``, ``version_conflict``,
+# ``slug_collision``, ``content_too_large*``).  Duplicate / dedupe
+# outcomes are deliberately segregated from the invalid-note-state
+# bucket: they are expected behaviour on scheduled re-runs and must NOT
+# inflate the degradation reason list (issue #152 acceptance criteria —
+# mirrors :data:`current_cache_hits` discipline).
+#
+# Plain ``dict[(outcome, source) -> count]`` so source / outcome pairs
+# stay distinct in the ledger entry (e.g. ``duplicate`` from arXiv
+# differs operationally from ``duplicate`` from RSS).
+WriteOutcomeCounts = dict[tuple[str, str], int]
+
+
+current_write_outcomes: ContextVar[WriteOutcomeCounts | None] = ContextVar(
+    "current_write_outcomes",
+    default=None,
+)
+
+
+def record_write_outcome(*, outcome: str, source: str) -> None:
+    """Increment the current run's write-outcome counter for *outcome*/*source*.
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_write_outcomes` is unset.  Callers invoke this once
+    per :meth:`LithosClient.write_note` return, regardless of whether
+    the outcome was a success (``created`` / ``updated``), a benign
+    dedupe (``duplicate``), or a write failure (``invalid_input`` /
+    ``version_conflict`` / ``slug_collision`` / ``content_too_large*``).
+
+    ``outcome`` is the :class:`WriteResult.status` string.  ``source``
+    is the per-item source bucket (``arxiv`` / ``rss`` / ...) so the
+    ledger entry can attribute write failures back to the upstream
+    feed.
+    """
+    counts = current_write_outcomes.get()
+    if counts is None:
+        return
+    key = (outcome, source)
+    counts[key] = counts.get(key, 0) + 1
 
 
 logger = logging.getLogger(__name__)

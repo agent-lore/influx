@@ -52,6 +52,7 @@ from influx.telemetry import (
     current_run_id,
     current_source_acquisition_errors,
     current_source_retry_counts,
+    current_write_outcomes,
     get_tracer,
 )
 
@@ -194,6 +195,15 @@ async def ledger_lifecycle(
     # breakdowns.
     cache_hits_counter: list[int] = [0]
     cache_hits_token = current_cache_hits.set(cache_hits_counter)
+    # #152 review: per-run write-outcome counter so the ledger's
+    # ``degradation_summary.writes.by_outcome`` /
+    # ``degradation_summary.invalid_note_state.by_kind`` carry the
+    # write-time breakdowns.  Shared mutable dict so the Ingest stage
+    # can increment via :func:`record_write_outcome` without re-setting
+    # the ContextVar — same pattern as
+    # ``current_source_acquisition_errors``.
+    write_outcomes_counter: dict[tuple[str, str], int] = {}
+    write_outcomes_token = current_write_outcomes.set(write_outcomes_counter)
     metric_attrs = {"profile": profile, "run_type": plan.kind.value}
 
     ledger.start(
@@ -308,6 +318,14 @@ async def ledger_lifecycle(
             # ``ledger.complete``.
             archive_failures=archive_failures,
             cache_hits_total=cache_hits_total,
+            # #152 review: per-(outcome, source) write counts collected
+            # at the Ingest stage drive
+            # ``degradation_summary.writes.by_outcome`` (all outcomes
+            # including duplicate) and
+            # ``degradation_summary.invalid_note_state.by_kind`` (only
+            # materially-failed outcomes — feeds the
+            # ``invalid_note_state`` degraded reason when non-zero).
+            write_outcomes=write_outcomes_counter,
         )
         run_outcome = "degraded" if source_errors else "success"
         if "ingestion_stall" in degraded_reasons:
@@ -426,6 +444,53 @@ async def ledger_lifecycle(
                 invalid_url_rejections_total,
                 fetched_total,
             )
+        if "invalid_note_state" in degraded_reasons:
+            # #152 review: at least one write-time outcome was a real
+            # write failure (``invalid_input`` / ``version_conflict`` /
+            # ``slug_collision`` / ``content_too_large*``).  Distinct
+            # from duplicates (the contract-expected outcome of
+            # scheduled re-runs, PR #153) — operators should look at
+            # schema drift, repair backlog, or id collisions, not
+            # the dedupe pipeline.
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            # Build the by-kind digest locally from the counter to
+            # avoid re-reading the ledger entry we just appended.
+            invalid_kind_counts: dict[str, int] = {}
+            for (
+                write_outcome_kind,
+                _write_outcome_source,
+            ), count in write_outcomes_counter.items():
+                if count <= 0:
+                    continue
+                if write_outcome_kind in (
+                    "invalid_input",
+                    "version_conflict",
+                    "slug_collision",
+                    "content_too_large",
+                    "content_too_large_skipped",
+                ):
+                    invalid_kind_counts[write_outcome_kind] = (
+                        invalid_kind_counts.get(write_outcome_kind, 0) + count
+                    )
+            invalid_note_state_summary = ",".join(
+                f"{kind}={count}"
+                for kind, count in sorted(
+                    invalid_kind_counts.items(), key=lambda kv: (-kv[1], kv[0])
+                )
+            )
+            logger.warning(
+                "run flagged invalid_note_state profile=%s kind=%s run_id=%s "
+                "by_kind=%s "
+                "(write-time failures landed in the materially-failed set "
+                "— check schema drift, repair backlog, or upstream id "
+                "collisions; duplicate outcomes are deliberately excluded "
+                "from this flag)",
+                profile,
+                plan.kind.value,
+                run_id,
+                invalid_note_state_summary or "<none>",
+            )
         metrics.run_duration().record(elapsed, metric_attrs)
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
 
@@ -495,6 +560,7 @@ async def ledger_lifecycle(
         current_invalid_url_rejections.reset(invalid_url_rejections_token)
         current_source_retry_counts.reset(source_retry_counts_token)
         current_cache_hits.reset(cache_hits_token)
+        current_write_outcomes.reset(write_outcomes_token)
 
 
 # ── RunService ──────────────────────────────────────────────────────

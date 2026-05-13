@@ -887,3 +887,120 @@ async def test_degradation_summary_log_tail_absent_on_clean_run(
 
     record = _extract_run_completed_record(caplog)
     assert "top_drivers=" not in record.message
+
+
+# ── #152 review: write-outcome end-to-end plumbing ──────────────────
+
+
+async def test_write_outcomes_recorded_during_run_flow_into_ledger(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: the Ingest stage's :func:`record_write_outcome` calls
+    accumulate into the per-run ContextVar and the ledger entry's
+    ``degradation_summary`` surfaces both the duplicate volume and the
+    invalid-note-state failures (#152 review)."""
+    from influx.telemetry import current_write_outcomes, record_write_outcome
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    async def body(self: Any) -> RunOutcome:
+        # The CM set the counter to an empty dict — record a mix of
+        # success / duplicate / invalid_input outcomes.
+        assert current_write_outcomes.get() is not None
+        record_write_outcome(outcome="created", source="arxiv")
+        record_write_outcome(outcome="duplicate", source="arxiv")
+        record_write_outcome(outcome="duplicate", source="rss")
+        record_write_outcome(outcome="invalid_input", source="rss")
+        return RunOutcome(sources_checked=4, ingested=1)
+
+    with patch("influx.run.Run.execute", new=body):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    summary = entry["degradation_summary"]
+    by_outcome = {
+        row["outcome"]: row["count"] for row in summary["writes"]["by_outcome"]
+    }
+    assert by_outcome == {"created": 1, "duplicate": 2, "invalid_input": 1}
+    invalid_by_kind = {
+        row["kind"]: row["count"] for row in summary["invalid_note_state"]["by_kind"]
+    }
+    assert invalid_by_kind == {"invalid_input": 1}
+    # Single invalid_input is degrading; duplicates are not.
+    assert "invalid_note_state" in entry["degraded_reasons"]
+    assert entry["degraded"] is True
+
+
+async def test_duplicate_only_run_via_service_not_degraded(
+    tmp_path: Path,
+) -> None:
+    """End-to-end regression (#152 review / PR #153 contract): a
+    scheduled re-run whose every write is ``duplicate`` is NOT
+    degraded and the duplicate volume does not bleed into archive /
+    source-acquisition / invalid-note-state counters."""
+    from influx.telemetry import record_write_outcome
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    async def body(self: Any) -> RunOutcome:
+        # Simulate the backfill / scheduled re-run shape: every
+        # candidate already exists in Lithos.
+        for _ in range(7):
+            record_write_outcome(outcome="duplicate", source="arxiv")
+        return RunOutcome(sources_checked=7, ingested=0)
+
+    with patch("influx.run.Run.execute", new=body):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert entry["degraded"] is False
+    assert entry["degraded_reasons"] == []
+
+    summary = entry["degradation_summary"]
+    # Visible to operators: 7 duplicates surfaced under writes.
+    by_outcome = {
+        row["outcome"]: row["count"] for row in summary["writes"]["by_outcome"]
+    }
+    assert by_outcome == {"duplicate": 7}
+    # NOT visible (= zero) in any degradation driver.
+    assert summary["totals"]["invalid_note_state"] == 0
+    assert summary["totals"]["archive_failures"] == 0
+    assert summary["totals"]["source_acquisition_errors"] == 0
+    assert summary["invalid_note_state"]["by_kind"] == []
+    assert summary["invalid_note_state"]["by_source"] == []
+
+
+async def test_invalid_note_state_emits_warning_log(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the run is flagged ``invalid_note_state``, the log tail
+    carries the by-kind digest so single-log triage is possible
+    without fetching the ledger (#152 review)."""
+    from influx.telemetry import record_write_outcome
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    async def body(self: Any) -> RunOutcome:
+        record_write_outcome(outcome="version_conflict", source="arxiv")
+        record_write_outcome(outcome="version_conflict", source="arxiv")
+        record_write_outcome(outcome="slug_collision", source="rss")
+        return RunOutcome(sources_checked=3, ingested=0)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="influx.run_service"),
+        patch("influx.run.Run.execute", new=body),
+    ):
+        await service.execute(_scheduled_plan())
+
+    matches = [r for r in caplog.records if "invalid_note_state" in r.getMessage()]
+    assert matches, "expected an invalid_note_state warning to be emitted"
+    message = matches[-1].getMessage()
+    assert "version_conflict=2" in message
+    assert "slug_collision=1" in message

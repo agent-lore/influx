@@ -60,6 +60,7 @@ from influx.telemetry import (
     current_source_acquisition_errors,
     get_tracer,
     record_cache_hit,
+    record_write_outcome,
 )
 
 __all__ = [
@@ -614,6 +615,18 @@ async def _run_ingest_stage(
                 "status": write_result.status,
             },
         )
+        # #152 review: feed every write outcome (success, duplicate,
+        # and write-time failures) into the per-run write-outcome
+        # counter so the run ledger can surface the duplicate/dedupe
+        # volume AND the invalid-note-state failures
+        # (``invalid_input`` / ``version_conflict`` / ``slug_collision``
+        # / ``content_too_large*``) in the degradation summary without
+        # operators having to grep the lithos_writes log.  ``duplicate``
+        # is counted here BUT excluded from the invalid-note-state
+        # bucket downstream — it is expected behaviour on re-runs and
+        # must not inflate degradation counts (issue #152 acceptance
+        # criteria).
+        record_write_outcome(outcome=write_result.status, source=item_source)
 
         if write_result.status in ("created", "updated"):
             logger.info(
