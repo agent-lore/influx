@@ -426,6 +426,86 @@ class TestRecentRuns:
 
         assert [run["run_id"] for run in body["runs"]] == ["run-web"]
 
+    def test_recent_runs_exposes_degradation_summary(
+        self, client: TestClient, app_with_state: FastAPI
+    ) -> None:
+        """``/runs/recent`` carries the bounded ``degradation_summary``
+        so operators can identify drivers without raw event logs (#152).
+        """
+        ledger: RunLedger = app_with_state.state.run_ledger
+        ledger.start(
+            run_id="run-degraded",
+            profile="ai-robotics",
+            kind="scheduled",
+            run_range=None,
+        )
+        ledger.complete(
+            run_id="run-degraded",
+            sources_checked=4,
+            ingested=2,
+            archive_failures_total=2,
+            archive_failures=[
+                {
+                    "url": "https://ieee.org/a",
+                    "tags": ["influx:archive-missing", "influx:archive-blocked"],
+                },
+                {
+                    "url": "https://ieee.org/b",
+                    "tags": ["influx:archive-missing", "influx:archive-blocked"],
+                },
+            ],
+            source_acquisition_errors=[
+                {
+                    "source": "arxiv",
+                    "kind": "rate_limit_upstream_capacity",
+                    "detail": "429",
+                }
+            ],
+            cache_hits_total=12,
+        )
+
+        body = client.get("/runs/recent").json()
+        entry = body["runs"][0]
+        assert entry["run_id"] == "run-degraded"
+        summary = entry["degradation_summary"]
+        assert summary["totals"]["archive_failures"] == 2
+        assert summary["totals"]["cache_hits"] == 12
+        assert summary["archive"]["by_domain"][0] == {
+            "domain": "ieee.org",
+            "count": 2,
+        }
+        # Cache-hit total must NOT be folded into the archive or
+        # source-acquisition breakdowns (#152 acceptance criteria).
+        kinds = {row["kind"]: row["count"] for row in summary["archive"]["by_kind"]}
+        assert kinds == {"blocked": 2}
+        assert summary["source_acquisition"]["by_kind"][0] == {
+            "kind": "rate_limit_upstream_capacity",
+            "count": 1,
+        }
+
+    def test_recent_runs_degradation_summary_on_clean_run(
+        self, client: TestClient, app_with_state: FastAPI
+    ) -> None:
+        """Even clean runs expose a zero-shaped ``degradation_summary``
+        so API consumers never have to defend against ``None`` (#152).
+        """
+        ledger: RunLedger = app_with_state.state.run_ledger
+        ledger.start(
+            run_id="run-clean",
+            profile="ai-robotics",
+            kind="scheduled",
+            run_range=None,
+        )
+        ledger.complete(run_id="run-clean", sources_checked=3, ingested=2)
+
+        body = client.get("/runs/recent").json()
+        entry = body["runs"][0]
+        summary = entry["degradation_summary"]
+        assert summary is not None
+        assert summary["totals"]["archive_failures"] == 0
+        assert summary["totals"]["source_acquisition_errors"] == 0
+        assert summary["archive"]["by_domain"] == []
+
 
 class TestPostRunsSchedulerOverlap:
     """AC-03-A: scheduled fire + POST /runs for same profile → exactly one accepted."""

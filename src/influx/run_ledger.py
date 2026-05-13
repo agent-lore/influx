@@ -32,6 +32,345 @@ RunEntry = dict[str, Any]
 _STALL_HISTORY_LIMIT = 20
 
 
+# How many entries to surface in each top-N breakdown inside the
+# ``degradation_summary`` (#152).  Five is enough to spotlight the main
+# drivers (typically a single domain or kind dominates) without dumping
+# the long tail of one-off failures into the ledger and the
+# ``/runs/recent`` payload.  Tied to a constant so the bound is
+# discoverable from one place.
+_DEGRADATION_SUMMARY_TOP_N = 5
+
+
+def _top_n_by_count(counts: dict[str, int], *, n: int) -> list[dict[str, Any]]:
+    """Return *counts* as a bounded, sorted ``[{"key": ..., "count": ...}, ...]`` list.
+
+    Sorted descending by count then ascending by key so the top-N is
+    deterministic across runs with the same shape.  Only positive
+    counts are surfaced (zero-count keys are noise).  Caller supplies
+    the wrapping key name (``"kind"`` / ``"domain"`` / ``"source"``)
+    by mapping the result; this helper keeps the sort + truncate
+    discipline in one place.
+    """
+    filtered = [(k, v) for k, v in counts.items() if v > 0]
+    filtered.sort(key=lambda kv: (-kv[1], kv[0]))
+    return [{"key": k, "count": v} for k, v in filtered[:n]]
+
+
+def _archive_failure_kind_from_tags(tags: list[str]) -> str:
+    """Classify a degraded item's archive failure kind from its note tags.
+
+    Returns one of: ``"blocked"``, ``"rate_limited"``,
+    ``"missing_by_policy"``, or ``"unspecified"``.  The classification
+    is structural (it mirrors the tag taxonomy from
+    :mod:`influx.archive_policy`) rather than parsing free-form error
+    detail strings, so future taxonomy refinements only need to add
+    cases here.
+
+    ``"unspecified"`` is the default for items that landed
+    ``influx:archive-missing`` without a more specific policy tag —
+    these are generic upstream failures (HTTP 5xx, timeouts, content
+    type mismatches) that the archive policy did not classify into a
+    structural bucket.
+    """
+    tag_set = set(tags)
+    if "influx:archive-skipped-by-policy" in tag_set:
+        return "missing_by_policy"
+    if "influx:archive-blocked" in tag_set:
+        return "blocked"
+    if "influx:archive-rate-limited" in tag_set:
+        return "rate_limited"
+    return "unspecified"
+
+
+def _domain_from_url(url: str) -> str:
+    """Return the lowercase host of *url* or ``""`` when unparseable.
+
+    Duplicated locally so :mod:`influx.run_ledger` does not depend on
+    :mod:`influx.archive_policy` (and indirectly :mod:`re`/parsers it
+    pulls).  Mirror of
+    :func:`influx.archive_policy.extract_domain`.
+    """
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(url).hostname or ""
+    except (TypeError, ValueError):
+        return ""
+    return host.lower()
+
+
+# Concrete archive-failure record consumed by
+# :func:`build_degradation_summary` — one entry per item the run ingested
+# with ``influx:archive-missing``.  ``url`` is used to derive the domain;
+# ``tags`` are scanned for the per-policy archive tags so the summary
+# can split blocked / rate-limited / skipped-by-policy from the long
+# tail of generic ``unspecified`` failures.
+ArchiveFailureRecord = dict[str, Any]
+
+
+# Write-outcome strings that represent a materially-failed write that
+# the run continued past — issue #152 review.  These count toward the
+# ``invalid_note_state.by_kind`` breakdown AND the ``invalid_note_state``
+# degraded reason.  Anything else (``created``, ``updated``,
+# ``duplicate`` …) is recorded under ``writes.by_outcome`` for
+# operational visibility but does NOT count as degradation.
+#
+# Membership rationale:
+#
+# - ``invalid_input`` — Lithos rejected the payload as malformed
+#   (missing required field / bad schema); the item was skipped.
+# - ``version_conflict`` — both retries exhausted; the write was
+#   skipped.
+# - ``slug_collision`` — the slug-collision recovery chain
+#   (#31 / #148) gave up; the item was skipped and a backlog entry
+#   was appended.
+# - ``content_too_large`` — the Tier-2 trim retry was not invoked or
+#   bubbled out of the trimming retry path; the item was skipped.
+# - ``content_too_large_skipped`` — the Tier-2 trim retry also
+#   produced ``content_too_large``; the item was skipped.
+#
+# ``duplicate`` is deliberately NOT in this set: PR #153 / issue #148
+# formalised that duplicate writes are the expected outcome of
+# scheduled re-runs and must not be treated as degradation.
+_INVALID_NOTE_STATE_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "invalid_input",
+        "version_conflict",
+        "slug_collision",
+        "content_too_large",
+        "content_too_large_skipped",
+    }
+)
+
+
+def _is_invalid_note_state_outcome(outcome: str) -> bool:
+    """Return ``True`` when *outcome* counts as a real write failure (#152).
+
+    Used by :func:`build_degradation_summary` to gate the
+    ``invalid_note_state`` bucket so duplicate / created / updated
+    outcomes do not inflate degradation counts.
+    """
+    return outcome in _INVALID_NOTE_STATE_OUTCOMES
+
+
+# Per-run write-outcome counter shape consumed by
+# :func:`build_degradation_summary`.  Keyed by ``(outcome, source)``
+# tuples to keep the per-source attribution (an arXiv ``duplicate`` is
+# operationally different from an RSS ``duplicate`` even though the
+# outcome string is the same).  Mirrors
+# :data:`influx.telemetry.WriteOutcomeCounts`.
+WriteOutcomeCounts = dict[tuple[str, str], int]
+
+
+def build_degradation_summary(
+    *,
+    source_acquisition_errors: list[dict[str, str]] | None,
+    archive_failures: list[ArchiveFailureRecord] | None,
+    source_retry_counts: dict[str, dict[str, int]] | None,
+    filter_errors_total: int | None,
+    invalid_url_rejections_total: int | None,
+    cache_hits_total: int | None,
+    write_outcomes: WriteOutcomeCounts | None = None,
+    top_n: int = _DEGRADATION_SUMMARY_TOP_N,
+) -> dict[str, Any]:
+    """Build the bounded ``degradation_summary`` block for one run (#152).
+
+    The summary is additive over the existing per-reason totals on the
+    ledger entry: it does not replace ``degraded`` /
+    ``degraded_reasons`` / ``source_acquisition_errors`` /
+    ``archive_failures_total`` — it provides the per-source / per-domain
+    / per-failure-class top-N breakdowns operators need to identify
+    drivers (arXiv 429s, IEEE 403s, slow timeouts) without grepping
+    raw event logs.
+
+    Shape::
+
+        {
+            "totals": {
+                "source_acquisition_errors": int,
+                "archive_failures": int,
+                "filter_errors": int,
+                "invalid_url_rejections": int,
+                "cache_hits": int,
+                "retries_recovered": int,
+                "writes": int,
+                "invalid_note_state": int,
+            },
+            "archive": {
+                "by_kind":   [{"kind": "...", "count": N}, ...],
+                "by_domain": [{"domain": "...", "count": N}, ...],
+            },
+            "source_acquisition": {
+                "by_kind":   [{"kind": "...", "count": N}, ...],
+                "by_source": [{"source": "...", "count": N}, ...],
+            },
+            "retries_recovered": {
+                "by_kind":   [{"kind": "...", "count": N}, ...],
+                "by_source": [{"source": "...", "count": N}, ...],
+            },
+            "writes": {
+                "by_outcome": [{"outcome": "...", "count": N}, ...],
+                "by_source":  [{"source":  "...", "count": N}, ...],
+            },
+            "invalid_note_state": {
+                "by_kind":   [{"kind":   "...", "count": N}, ...],
+                "by_source": [{"source": "...", "count": N}, ...],
+            },
+        }
+
+    Design notes:
+
+    - **Dedupe is not degradation.**  ``cache_hits`` is reported under
+      ``totals`` so operators can see the dedupe volume, but it is
+      deliberately segregated from the archive / source-acquisition
+      breakdowns.  A run whose only "issue" is cache hits is not a
+      degraded run (#152 acceptance criteria).
+    - **Write-time duplicate outcomes are not degradation either.**
+      Every write outcome — including ``created`` / ``updated`` /
+      ``duplicate`` — is surfaced under ``writes.by_outcome`` so the
+      dedupe volume is visible to operators, but only the
+      invalid-note-state outcomes (``invalid_input``,
+      ``version_conflict``, ``slug_collision``,
+      ``content_too_large*``) feed into the ``invalid_note_state``
+      bucket.  PR #153 / issue #148 formalised the duplicate-is-OK
+      contract: a scheduled re-run whose every write returns
+      ``duplicate`` is steady-state, not a regression (#152 review).
+    - **Top-N bounded.**  Each breakdown is truncated to *top_n* entries
+      sorted descending by count.  The long tail is intentionally
+      dropped — operators inspecting recent runs need to see the
+      dominant drivers, not the every-warning histogram.
+    - **Failure-class taxonomy is shallow.**  Archive failures are
+      bucketed by ``blocked`` / ``rate_limited`` / ``missing_by_policy``
+      / ``unspecified``; source-acquisition failures use the refined
+      ``kind`` already attached by the source adapter (``rate_limit``,
+      ``rate_limit_upstream_capacity``, ``rate_limit_local``,
+      ``rate_limit_unknown``, ``timeout``, ``network``, ``ssrf``,
+      ``oversize``, etc.).  New refinements (e.g. issue #145's
+      arXiv 429 split) flow through automatically because the
+      classification is captured at error-record time, not here.
+    """
+    errors = source_acquisition_errors or []
+    archive = archive_failures or []
+    retries = source_retry_counts or {}
+    writes = write_outcomes or {}
+
+    archive_by_kind: dict[str, int] = {}
+    archive_by_domain: dict[str, int] = {}
+    for record in archive:
+        kind = _archive_failure_kind_from_tags(list(record.get("tags") or []))
+        archive_by_kind[kind] = archive_by_kind.get(kind, 0) + 1
+        domain = _domain_from_url(str(record.get("url") or ""))
+        if domain:
+            archive_by_domain[domain] = archive_by_domain.get(domain, 0) + 1
+
+    source_by_kind: dict[str, int] = {}
+    source_by_source: dict[str, int] = {}
+    for err in errors:
+        kind = str(err.get("kind") or "unknown")
+        source_by_kind[kind] = source_by_kind.get(kind, 0) + 1
+        source = str(err.get("source") or "unknown")
+        source_by_source[source] = source_by_source.get(source, 0) + 1
+
+    retries_by_kind: dict[str, int] = {}
+    retries_by_source: dict[str, int] = {}
+    retries_total = 0
+    for source, by_kind in retries.items():
+        for kind, count in by_kind.items():
+            retries_by_kind[kind] = retries_by_kind.get(kind, 0) + count
+            retries_by_source[source] = retries_by_source.get(source, 0) + count
+            retries_total += count
+
+    # #152 review: aggregate per-(outcome, source) write counts into the
+    # two parallel views the ledger surfaces.  ``writes.*`` carries
+    # every outcome — including the benign ``created`` / ``updated`` /
+    # ``duplicate`` cases — so operators see the dedupe volume at the
+    # write layer alongside the cache-hit total.  ``invalid_note_state.*``
+    # filters down to the materially-failed outcomes
+    # (:data:`_INVALID_NOTE_STATE_OUTCOMES`) so a duplicate-heavy run
+    # doesn't inflate the degradation reason list.
+    writes_by_outcome: dict[str, int] = {}
+    writes_by_source: dict[str, int] = {}
+    writes_total = 0
+    invalid_note_state_by_kind: dict[str, int] = {}
+    invalid_note_state_by_source: dict[str, int] = {}
+    invalid_note_state_total = 0
+    for (outcome, source), count in writes.items():
+        if count <= 0:
+            continue
+        writes_by_outcome[outcome] = writes_by_outcome.get(outcome, 0) + count
+        writes_by_source[source] = writes_by_source.get(source, 0) + count
+        writes_total += count
+        if _is_invalid_note_state_outcome(outcome):
+            invalid_note_state_by_kind[outcome] = (
+                invalid_note_state_by_kind.get(outcome, 0) + count
+            )
+            invalid_note_state_by_source[source] = (
+                invalid_note_state_by_source.get(source, 0) + count
+            )
+            invalid_note_state_total += count
+
+    def _renamed(rows: list[dict[str, Any]], key_name: str) -> list[dict[str, Any]]:
+        """Rename the helper's neutral ``"key"`` field to the caller's label."""
+        return [{key_name: row["key"], "count": row["count"]} for row in rows]
+
+    return {
+        "totals": {
+            "source_acquisition_errors": len(errors),
+            "archive_failures": len(archive),
+            "filter_errors": int(filter_errors_total or 0),
+            "invalid_url_rejections": int(invalid_url_rejections_total or 0),
+            "cache_hits": int(cache_hits_total or 0),
+            "retries_recovered": retries_total,
+            # #152 review: write-layer totals.  ``writes`` covers every
+            # outcome (including duplicate / created / updated);
+            # ``invalid_note_state`` is the strict subset that feeds the
+            # degraded-reasons list.
+            "writes": writes_total,
+            "invalid_note_state": invalid_note_state_total,
+        },
+        "archive": {
+            "by_kind": _renamed(_top_n_by_count(archive_by_kind, n=top_n), "kind"),
+            "by_domain": _renamed(
+                _top_n_by_count(archive_by_domain, n=top_n), "domain"
+            ),
+        },
+        "source_acquisition": {
+            "by_kind": _renamed(_top_n_by_count(source_by_kind, n=top_n), "kind"),
+            "by_source": _renamed(_top_n_by_count(source_by_source, n=top_n), "source"),
+        },
+        "retries_recovered": {
+            "by_kind": _renamed(_top_n_by_count(retries_by_kind, n=top_n), "kind"),
+            "by_source": _renamed(
+                _top_n_by_count(retries_by_source, n=top_n), "source"
+            ),
+        },
+        # #152 review: all write outcomes including duplicate / dedupe.
+        # NOT a degradation driver — operators consult this to see the
+        # dedupe volume at the write layer (complementing
+        # ``totals.cache_hits`` which counts the pre-write cache).
+        "writes": {
+            "by_outcome": _renamed(
+                _top_n_by_count(writes_by_outcome, n=top_n), "outcome"
+            ),
+            "by_source": _renamed(_top_n_by_count(writes_by_source, n=top_n), "source"),
+        },
+        # #152 review: degrading write-time outcomes only
+        # (``invalid_input`` / ``version_conflict`` / ``slug_collision``
+        # / ``content_too_large*``).  When the total is non-zero, the
+        # caller appends ``invalid_note_state`` to the degraded reasons.
+        "invalid_note_state": {
+            "by_kind": _renamed(
+                _top_n_by_count(invalid_note_state_by_kind, n=top_n), "kind"
+            ),
+            "by_source": _renamed(
+                _top_n_by_count(invalid_note_state_by_source, n=top_n), "source"
+            ),
+        },
+    }
+
+
 @dataclass(frozen=True)
 class RunLedger:
     """Append-only local run ledger backed by JSON files."""
@@ -97,6 +436,12 @@ class RunLedger:
             # dict at start; populated from the per-run contextvar at
             # ``complete`` time.
             "source_retry_counts": {},
+            # #152: bounded, top-N degradation summary aggregated at
+            # ``complete`` time.  Stays ``None`` while the run is in
+            # flight; populated by ``complete`` with archive +
+            # source-acquisition + retry breakdowns.  See
+            # :func:`build_degradation_summary` for the full shape.
+            "degradation_summary": None,
         }
         try:
             active = self._read_active()
@@ -118,6 +463,9 @@ class RunLedger:
         source_acquisition_errors: list[dict[str, str]] | None = None,
         source_cooldown_skips: list[dict[str, str]] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
+        archive_failures: list[ArchiveFailureRecord] | None = None,
+        cache_hits_total: int | None = None,
+        write_outcomes: WriteOutcomeCounts | None = None,
     ) -> list[str]:
         """Mark an active run as completed and append it to history.
 
@@ -172,6 +520,17 @@ class RunLedger:
           disallowed-scheme), so nothing reached the LLM filter.
           Single-run signal — like ``filter_error`` — because URL
           malformation is an immediately actionable upstream bug.
+        - ``"invalid_note_state"`` (issue #152 review) — at least one
+          write-time outcome landed in the materially-failed set
+          (``invalid_input``, ``version_conflict``, ``slug_collision``,
+          or ``content_too_large*``) so an accepted item was dropped at
+          the write layer.  Distinct from ``duplicate``, which is the
+          expected steady-state outcome of scheduled re-runs and
+          deliberately does NOT count toward degradation (PR #153 /
+          issue #148 contract).  Single-run signal — these failure
+          shapes are immediately actionable (schema drift / repair
+          backlog / upstream id collision) and do not need a
+          consecutive-runs ratchet.
 
         ``fetch_stall`` and ``filter_stall`` partition the
         ``sources_checked == 0`` space by ``fetched_total``: they are
@@ -213,6 +572,22 @@ class RunLedger:
             reasons.append("filter_error")
         if isinstance(archive_failures_total, int) and archive_failures_total > 0:
             reasons.append("archive_acquisition")
+
+        # #152 review: ``invalid_note_state`` fires when any write-time
+        # outcome lands in the materially-failed set (see
+        # :data:`_INVALID_NOTE_STATE_OUTCOMES`).  ``duplicate`` outcomes
+        # are deliberately excluded — they are the contract-expected
+        # outcome of scheduled re-runs (PR #153 / issue #148).
+        # Single-run signal because the underlying shapes (schema
+        # drift, repair backlog, version conflict) are immediately
+        # actionable, not noisy/transient.
+        invalid_note_state_total = sum(
+            count
+            for (outcome, _source), count in (write_outcomes or {}).items()
+            if _is_invalid_note_state_outcome(outcome) and count > 0
+        )
+        if invalid_note_state_total > 0:
+            reasons.append("invalid_note_state")
 
         # #131 review concern 2: ``invalid_url_stall`` fires when the
         # feed returned items but every URL was upstream-malformed
@@ -319,6 +694,25 @@ class RunLedger:
                 ):
                     reasons.append("fetch_stall")
 
+        # #152: build the bounded degradation summary alongside the
+        # existing per-reason totals.  Computed at ``complete`` time so
+        # the persisted entry carries a stable snapshot — downstream
+        # consumers (``/runs/recent``) don't need to re-derive it from
+        # raw event logs.  Dedupe cache-hits are surfaced under
+        # ``totals.cache_hits`` but deliberately NOT folded into the
+        # archive / source-acquisition breakdowns (#152 acceptance
+        # criteria: a run whose only "issue" is cache hits is not
+        # degraded).
+        degradation_summary = build_degradation_summary(
+            source_acquisition_errors=errors,
+            archive_failures=archive_failures,
+            source_retry_counts=source_retry_counts,
+            filter_errors_total=filter_errors_total,
+            invalid_url_rejections_total=invalid_url_rejections_total,
+            cache_hits_total=cache_hits_total,
+            write_outcomes=write_outcomes,
+        )
+
         self._finish(
             run_id=run_id,
             status="completed",
@@ -334,6 +728,7 @@ class RunLedger:
             source_cooldown_skips=cooldown_skips,
             degraded_reasons=reasons,
             source_retry_counts=source_retry_counts,
+            degradation_summary=degradation_summary,
         )
         return reasons
 
@@ -599,6 +994,12 @@ class RunLedger:
                                 entry.get("source_retry_counts") or {}
                             ).items()
                         },
+                        # #152: preserve any in-flight degradation
+                        # summary on abandon (typically ``None`` since
+                        # the summary is only populated by ``complete``,
+                        # but allow restart hand-offs to keep partial
+                        # data).
+                        "degradation_summary": entry.get("degradation_summary"),
                     }
                 )
                 self._append(entry)
@@ -662,6 +1063,7 @@ class RunLedger:
         source_cooldown_skips: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
+        degradation_summary: dict[str, Any] | None = None,
     ) -> None:
         try:
             active = self._read_active()
@@ -707,6 +1109,12 @@ class RunLedger:
                         source: dict(by_kind)
                         for source, by_kind in (source_retry_counts or {}).items()
                     },
+                    # #152: persist the precomputed degradation summary
+                    # so downstream consumers (``/runs/recent``) see the
+                    # top-N breakdowns without re-aggregating.  ``None``
+                    # on the fail / skip / abandon paths — those use
+                    # the legacy zero-data shape.
+                    "degradation_summary": degradation_summary,
                 }
             )
             self._append(entry)
