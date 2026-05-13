@@ -41,6 +41,7 @@ from influx.telemetry import (
     current_fetched_total,
     current_filter_errors,
     current_source_acquisition_errors,
+    record_tier3_fallback,
 )
 
 
@@ -144,6 +145,65 @@ async def test_happy_path_runs_body_and_completes_ledger(tmp_path: Any) -> None:
     assert entry["status"] == "completed"
     assert entry["sources_checked"] == 3
     assert entry["ingested"] == 2
+
+
+async def test_tier3_fallback_counts_propagate_to_ledger_entry(
+    tmp_path: Any,
+) -> None:
+    """A run body that records Tier 3 fallbacks lands them on the ledger
+    entry as ``tier3_fallbacks`` (#151).
+
+    Uses :func:`record_tier3_fallback` from inside the patched body so
+    we exercise the real contextvar wiring inside ``ledger_lifecycle``
+    rather than mocking the bucket directly.
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    async def body_with_tier3_noise(*args: Any, **kwargs: Any) -> RunOutcome:
+        # Three harmless fallbacks (Tier 1+2 present, Tier 3 failed) and
+        # one degraded (Tier 1 missing) — the shape the Cascade emits
+        # via ``Cascade._log_tier3_failure``.
+        record_tier3_fallback(kind="harmless")
+        record_tier3_fallback(kind="harmless")
+        record_tier3_fallback(kind="harmless")
+        record_tier3_fallback(kind="degraded")
+        return RunOutcome(sources_checked=4, ingested=4)
+
+    with patch("influx.run.Run.execute", new=body_with_tier3_noise):
+        await service.execute(_scheduled_plan())
+
+    entry = ledger.recent()[0]
+    assert entry["tier3_fallbacks"] == {"harmless": 3, "degraded": 1}
+    # Tier 3 fallback counts on their own don't flip the run into
+    # ``degraded`` — the dedicated stall / acquisition / archive
+    # reasons own that field.  Operators read the counters as a
+    # diagnostic split, like ``source_retry_counts``.
+    assert entry["degraded"] is False
+    assert entry["degraded_reasons"] == []
+
+
+async def test_tier3_fallback_counts_default_to_empty_dict(
+    tmp_path: Any,
+) -> None:
+    """A clean run with no Tier 3 fallback recording lands
+    ``tier3_fallbacks={}`` so downstream consumers always see the field
+    (#151).
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    with patch(
+        "influx.run.Run.execute",
+        new_callable=AsyncMock,
+        return_value=RunOutcome(sources_checked=2, ingested=2),
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = ledger.recent()[0]
+    assert entry["tier3_fallbacks"] == {}
 
 
 async def test_body_exception_marks_ledger_failed_and_propagates(

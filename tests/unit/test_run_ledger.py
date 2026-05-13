@@ -200,6 +200,64 @@ def test_complete_records_source_retry_counts(tmp_path: Path) -> None:
     }
 
 
+def test_complete_without_tier3_fallbacks_persists_empty_dict(
+    tmp_path: Path,
+) -> None:
+    """A clean run with no Tier 3 fallback input lands
+    ``tier3_fallbacks={}`` (#151) so downstream consumers always see the
+    field, never KeyError.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="ai-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    ledger.complete(run_id="run-1", sources_checked=3, ingested=2)
+    entry = ledger.recent()[0]
+    assert entry["tier3_fallbacks"] == {}
+
+
+def test_complete_records_tier3_fallbacks(tmp_path: Path) -> None:
+    """``tier3_fallbacks`` survives the ledger round-trip (#151).
+
+    Operators reading ``/runs/recent`` should see harmless vs degraded
+    counts at a glance instead of scraping logs.  Harmless-only fallback
+    is *not* a degraded-reasons trigger — those counters are pure
+    diagnostics, like ``source_retry_counts``.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(
+        run_id="run-1",
+        profile="ai-robotics",
+        kind="scheduled",
+        run_range=None,
+    )
+    fallbacks = {"harmless": 4, "degraded": 1}
+    ledger.complete(
+        run_id="run-1",
+        sources_checked=8,
+        ingested=5,
+        tier3_fallbacks=fallbacks,
+    )
+    entry = ledger.recent()[0]
+    assert entry["tier3_fallbacks"] == {"harmless": 4, "degraded": 1}
+    # Tier 3 fallback counts on their own do not flag the run as
+    # degraded — the dedicated degraded-reasons set is for stall /
+    # acquisition / archive shapes.  This keeps the counter additive
+    # without inflating the existing `degraded` boolean.
+    assert entry["degraded"] is False
+    assert entry["degraded_reasons"] == []
+
+    # Mutating the caller's dict after ``complete`` must not leak into
+    # the persisted entry (shallow-copy invariant — values are ints).
+    fallbacks["harmless"] = 99
+    fallbacks["new_kind"] = 7
+    re_read = ledger.recent()[0]
+    assert re_read["tier3_fallbacks"] == {"harmless": 4, "degraded": 1}
+
+
 def test_failed_run_has_degraded_false(tmp_path: Path) -> None:
     """``fail`` always lands ``degraded=false`` so the field's semantics
     stay narrow: it means *partial source-fetch failure on an otherwise

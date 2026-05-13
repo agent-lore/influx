@@ -426,6 +426,59 @@ class TestRecentRuns:
 
         assert [run["run_id"] for run in body["runs"]] == ["run-web"]
 
+    def test_recent_runs_surfaces_tier3_fallback_breakdown(
+        self, client: TestClient, app_with_state: FastAPI
+    ) -> None:
+        """``/runs/recent`` exposes ``tier3_fallbacks`` so operators can
+        distinguish harmless Tier 3 noise from materially-degraded
+        extractions without scraping logs (#151).
+
+        Two runs are recorded: one with mixed fallback counts (the
+        ``noisy`` run) and one clean.  The endpoint must surface the
+        counts on the noisy entry and a zero-shaped ``{}`` on the
+        clean entry, never omit the field.
+        """
+        ledger: RunLedger = app_with_state.state.run_ledger
+        ledger.start(
+            run_id="run-noisy",
+            profile="ai-robotics",
+            kind="scheduled",
+            run_range=None,
+        )
+        ledger.complete(
+            run_id="run-noisy",
+            sources_checked=10,
+            ingested=10,
+            tier3_fallbacks={"harmless": 7, "degraded": 2},
+        )
+        ledger.start(
+            run_id="run-clean",
+            profile="ai-robotics",
+            kind="scheduled",
+            run_range=None,
+        )
+        ledger.complete(
+            run_id="run-clean",
+            sources_checked=4,
+            ingested=4,
+        )
+
+        body = client.get("/runs/recent").json()
+        by_id = {run["run_id"]: run for run in body["runs"]}
+
+        noisy = by_id["run-noisy"]
+        assert noisy["tier3_fallbacks"] == {"harmless": 7, "degraded": 2}
+        # Harmless-only Tier 3 fallback does not flag the run as
+        # degraded — the counter is diagnostic, not a stall reason.
+        # The presence of two ``degraded`` Tier 3 fallbacks is still
+        # surfaced for operator inspection, but ``degraded_reasons``
+        # only covers stall / acquisition / archive shapes.
+        assert noisy["degraded"] is False
+        assert noisy["degraded_reasons"] == []
+
+        clean = by_id["run-clean"]
+        assert clean["tier3_fallbacks"] == {}
+
 
 class TestPostRunsSchedulerOverlap:
     """AC-03-A: scheduled fire + POST /runs for same profile → exactly one accepted."""

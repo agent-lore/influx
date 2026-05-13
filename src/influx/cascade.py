@@ -35,7 +35,7 @@ from influx.enrich import tier1_enrich, tier3_extract
 from influx.errors import ExtractionError, LCMAError
 from influx.repair_counters import REPAIR_COUNTED_CAP, RepairCounters
 from influx.schemas import Tier1Enrichment, Tier3Extraction
-from influx.telemetry import current_run_id, get_tracer
+from influx.telemetry import current_run_id, get_tracer, record_tier3_fallback
 
 __all__ = [
     "Acquired",
@@ -454,14 +454,32 @@ class Cascade:
         Centralises log-level selection and the structured ``extra`` fields
         so the LCMA-error path and the unexpected-exception path stay in
         lock-step.
+
+        Tier 3 only runs when Tier 2 produced full text (the deep-extract
+        gate requires ``full_text is not None``).  So every Tier 3 failure
+        is a fallback to lower-tier content — what differs is how much
+        lower-tier content exists:
+
+        - ``lower_tier_acceptable=True`` (Tier 1 summary + Tier 2 full
+          text) — harmless fallback: the note has every section except
+          the Tier 3 deep-extract ones.  Effective tier is
+          ``tier1+tier2``; log at INFO.
+        - ``lower_tier_acceptable=False`` (Tier 1 missing, Tier 2 full
+          text present) — degraded fallback: the note is missing its
+          summary section.  Effective tier is ``tier2``; log at WARNING.
+
+        Both branches set ``fallback_used=True`` because the cascade did
+        in fact fall back from Tier 3 to whatever lower-tier content
+        existed; what changes is the *completeness* of that lower-tier
+        content, not whether a fallback happened.
         """
         fallback_kind = "harmless" if lower_tier_acceptable else "degraded"
-        effective_tier = "tier1+tier2" if lower_tier_acceptable else "tier1"
+        effective_tier = "tier1+tier2" if lower_tier_acceptable else "tier2"
         extra = {
             "profile": self.profile_name,
             "item_id": item_id,
             "tier": "3",
-            "fallback_used": lower_tier_acceptable,
+            "fallback_used": True,
             "fallback_kind": fallback_kind,
             "effective_extraction_tier": effective_tier,
             "tier3_failure_kind": failure_kind,
@@ -493,6 +511,13 @@ class Cascade:
             1,
             {"profile": self.profile_name, "fallback_kind": fallback_kind},
         )
+        # Propagate the classification to the current run's ledger entry
+        # (#151 gap 2): increment a per-run counter so run summaries /
+        # ``/runs/recent`` can distinguish harmless Tier 3 fallback from
+        # genuinely degraded extractions without scraping logs.  Safe
+        # outside a run context — the helper no-ops when the contextvar
+        # bucket is unset.
+        record_tier3_fallback(kind=fallback_kind)
 
 
 def _text_tag_for(flavour: TextFlavour | None) -> str:

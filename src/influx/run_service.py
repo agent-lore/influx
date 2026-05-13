@@ -51,6 +51,7 @@ from influx.telemetry import (
     current_run_id,
     current_source_acquisition_errors,
     current_source_retry_counts,
+    current_tier3_fallback_counts,
     get_tracer,
 )
 
@@ -129,6 +130,15 @@ async def ledger_lifecycle(
     # ``current_source_acquisition_errors``.
     source_retry_counts: dict[str, dict[str, int]] = {}
     source_retry_counts_token = current_source_retry_counts.set(source_retry_counts)
+    # #151: per-run counts of Tier 3 enrichment fallbacks split by
+    # classification (``harmless`` vs ``degraded``).  Surfaced on the
+    # run-ledger entry as ``tier3_fallbacks`` so ``/runs/recent`` can
+    # distinguish "Tier 3 noise that didn't break notes" from "Tier 3
+    # failed AND Tier 1 was also missing — note materially incomplete".
+    tier3_fallback_counts: dict[str, int] = {}
+    tier3_fallback_counts_token = current_tier3_fallback_counts.set(
+        tier3_fallback_counts
+    )
     metric_attrs = {"profile": profile, "run_type": plan.kind.value}
 
     ledger.start(
@@ -228,6 +238,10 @@ async def ledger_lifecycle(
             # the swallowed-error list, letting an operator distinguish
             # transient retry success from a burned retry budget.
             source_retry_counts=source_retry_counts,
+            # #151: surface harmless-vs-degraded Tier 3 fallback counts
+            # so run summaries / ``/runs/recent`` can tell apart noise
+            # from material degradation without scraping logs.
+            tier3_fallbacks=tier3_fallback_counts,
         )
         run_outcome = "degraded" if source_errors else "success"
         if "ingestion_stall" in degraded_reasons:
@@ -401,6 +415,7 @@ async def ledger_lifecycle(
         current_filter_errors.reset(filter_errors_token)
         current_invalid_url_rejections.reset(invalid_url_rejections_token)
         current_source_retry_counts.reset(source_retry_counts_token)
+        current_tier3_fallback_counts.reset(tier3_fallback_counts_token)
 
 
 # ── RunService ──────────────────────────────────────────────────────

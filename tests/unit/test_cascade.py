@@ -539,9 +539,15 @@ class TestTier3FallbackClassification:
         assert record.levelno == logging.WARNING, (
             f"expected WARNING for materially-degraded failure, got {record.levelname}"
         )
-        assert getattr(record, "fallback_used", None) is False
+        # Tier 3 only runs when Tier 2 produced full text, so a Tier 3
+        # failure is always a fallback to lower-tier content.  In the
+        # degraded case Tier 1 is missing, so the effective tier is
+        # ``tier2`` (Tier 2 full text without a summary section), not
+        # ``tier1``.  ``fallback_used`` is ``True`` because we did fall
+        # back from Tier 3 to Tier 2 content.
+        assert getattr(record, "fallback_used", None) is True
         assert getattr(record, "fallback_kind", None) == "degraded"
-        assert getattr(record, "effective_extraction_tier", None) == "tier1"
+        assert getattr(record, "effective_extraction_tier", None) == "tier2"
 
     def test_unexpected_tier3_exception_keeps_classification(
         self, caplog: pytest.LogCaptureFixture

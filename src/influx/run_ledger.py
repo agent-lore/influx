@@ -93,6 +93,15 @@ class RunLedger:
             # dict at start; populated from the per-run contextvar at
             # ``complete`` time.
             "source_retry_counts": {},
+            # #151: per-run counts of Tier 3 enrichment fallbacks,
+            # split by classification.  Shape:
+            # ``{"harmless": int, "degraded": int}``.  Empty dict at
+            # start; populated from the per-run contextvar at
+            # ``complete`` time so run summaries / ``/runs/recent``
+            # can distinguish "Tier 3 noise that didn't break notes"
+            # from "Tier 3 + Tier 1 both failed — note materially
+            # incomplete".
+            "tier3_fallbacks": {},
         }
         try:
             active = self._read_active()
@@ -113,6 +122,7 @@ class RunLedger:
         archive_failures_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
+        tier3_fallbacks: dict[str, int] | None = None,
     ) -> list[str]:
         """Mark an active run as completed and append it to history.
 
@@ -313,6 +323,7 @@ class RunLedger:
             source_acquisition_errors=errors,
             degraded_reasons=reasons,
             source_retry_counts=source_retry_counts,
+            tier3_fallbacks=tier3_fallbacks,
         )
         return reasons
 
@@ -637,6 +648,7 @@ class RunLedger:
         source_acquisition_errors: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
+        tier3_fallbacks: dict[str, int] | None = None,
     ) -> None:
         try:
             active = self._read_active()
@@ -678,6 +690,12 @@ class RunLedger:
                         source: dict(by_kind)
                         for source, by_kind in (source_retry_counts or {}).items()
                     },
+                    # #151: shallow-copy the Tier 3 fallback counts so
+                    # later mutations of the contextvar bucket do not
+                    # leak into the persisted ledger entry.  ``int``
+                    # values are already immutable, so a flat ``dict()``
+                    # is sufficient.
+                    "tier3_fallbacks": dict(tier3_fallbacks or {}),
                 }
             )
             self._append(entry)
