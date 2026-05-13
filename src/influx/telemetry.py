@@ -29,6 +29,7 @@ __all__ = [
     "InfluxMeter",
     "InfluxTracer",
     "SourceAcquisitionError",
+    "SourceCooldownSkip",
     "SourceRetryCounts",
     "SpanWrapper",
     "current_archive_terminal_arxiv_ids",
@@ -37,6 +38,7 @@ __all__ = [
     "current_invalid_url_rejections",
     "current_run_id",
     "current_source_acquisition_errors",
+    "current_source_cooldown_skips",
     "current_source_retry_counts",
     "get_meter",
     "get_tracer",
@@ -44,6 +46,7 @@ __all__ = [
     "record_filter_error",
     "record_invalid_url_rejection",
     "record_source_acquisition_error",
+    "record_source_cooldown_skip",
     "record_source_retry",
 ]
 
@@ -104,6 +107,51 @@ def record_source_acquisition_error(
         return
     errors.append(
         SourceAcquisitionError(
+            {
+                "source": source,
+                "kind": kind,
+                "detail": detail[:300],
+            }
+        )
+    )
+
+
+# Issue #146: a cooldown-suppressed source fetch is recorded *separately*
+# from the swallowed-acquisition-error path so the run ledger can mark
+# the run degraded with ``source_cooldown_skip`` instead of
+# ``source_acquisition``.  Same shape as :data:`SourceAcquisitionError`
+# (source / kind / detail dicts) so existing JSONL consumers can scan a
+# uniform schema.
+SourceCooldownSkip = dict[str, str]
+
+
+current_source_cooldown_skips: ContextVar[list[SourceCooldownSkip] | None] = ContextVar(
+    "current_source_cooldown_skips",
+    default=None,
+)
+
+
+def record_source_cooldown_skip(
+    *,
+    source: str,
+    kind: str,
+    detail: str,
+) -> None:
+    """Append a cooldown-suppressed source fetch to the current run's record.
+
+    Distinct from :func:`record_source_acquisition_error`: a cooldown
+    skip means Influx *chose* not to call upstream because a recent
+    burst of 429s tripped the source-specific cooldown state machine
+    (issue #146).  Surfaced on the run-ledger entry as
+    ``source_cooldown_skip`` and as the dedicated degraded reason of
+    the same name.  Safe to call outside a run context — silently
+    no-ops when :data:`current_source_cooldown_skips` is unset.
+    """
+    skips = current_source_cooldown_skips.get()
+    if skips is None:
+        return
+    skips.append(
+        SourceCooldownSkip(
             {
                 "source": source,
                 "kind": kind,

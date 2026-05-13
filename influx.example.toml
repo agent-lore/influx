@@ -340,6 +340,15 @@ arxiv_request_min_interval_seconds = 3
 arxiv_429_backoff_seconds = 30
 arxiv_429_backoff_max_seconds = 120
 arxiv_429_max_retries = 5
+# Issue #146: adaptive cooldown for repeated arXiv 429 bursts.
+# After N (= arxiv_429_cooldown_threshold) consecutive *final* 429
+# failures (i.e. the in-fetch retry budget was exhausted), subsequent
+# arXiv fetches are skipped quickly for arxiv_429_cooldown_seconds
+# instead of replaying the same retry storm.  The first successful
+# fetch (or the duration elapsing) clears the cooldown.  Set
+# arxiv_429_cooldown_threshold = 0 to disable wholesale.
+arxiv_429_cooldown_threshold = 3
+arxiv_429_cooldown_seconds = 900
 lithos_write_conflict_max_retries = 1
 
 # ---------------------------------------------------------------------------

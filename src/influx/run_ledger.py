@@ -87,6 +87,10 @@ class RunLedger:
             "degraded": False,
             "degraded_reasons": [],
             "source_acquisition_errors": [],
+            # Issue #146: cooldown skips are surfaced in the entry
+            # alongside ``source_acquisition_errors`` so the active
+            # snapshot has the same shape as a completed entry.
+            "source_cooldown_skips": [],
             # #129: per-source counter of *recovered* retries (i.e.
             # retries that did not produce a swallowed error).  Shape:
             # ``{"arxiv": {"rate_limit": 2, "timeout": 1}}``.  Empty
@@ -112,6 +116,7 @@ class RunLedger:
         invalid_url_rejections_total: int | None = None,
         archive_failures_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
+        source_cooldown_skips: list[dict[str, str]] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
     ) -> list[str]:
         """Mark an active run as completed and append it to history.
@@ -121,6 +126,13 @@ class RunLedger:
 
         - ``"source_acquisition"`` (issue #20) — at least one
           source-fetch failure was swallowed.
+        - ``"source_cooldown_skip"`` (issue #146) — at least one
+          source fetch was deliberately skipped because the
+          source-specific adaptive 429 cooldown was active.  Distinct
+          from ``source_acquisition`` because the run *chose* not to
+          call upstream rather than tried and lost.  Single-run
+          signal — like ``filter_error`` — so operators see the skip
+          immediately even on the first cooldown-suppressed run.
         - ``"filter_error"`` (issue #85 review) — the LLM filter
           scorer raised :class:`FilterScorerError` (transport, parse,
           or provider failure) at least once during this run.  Single-
@@ -176,9 +188,17 @@ class RunLedger:
         per-reason metrics without re-deriving the logic.
         """
         errors = list(source_acquisition_errors or [])
+        cooldown_skips = list(source_cooldown_skips or [])
         reasons: list[str] = []
         if errors:
             reasons.append("source_acquisition")
+        # Issue #146: cooldown skips are reported as a *separate*
+        # degraded reason so operator dashboards can distinguish
+        # "we backed off on purpose" from "we tried and lost".  Both
+        # may co-occur within a single run (e.g. arXiv cooldown, RSS
+        # network failure) — the run-level summary surfaces both.
+        if cooldown_skips:
+            reasons.append("source_cooldown_skip")
 
         # #85 review: filter_error fires immediately on any
         # FilterScorerError catch, regardless of run kind.  Operators
@@ -311,6 +331,7 @@ class RunLedger:
             error=None,
             degraded=bool(reasons),
             source_acquisition_errors=errors,
+            source_cooldown_skips=cooldown_skips,
             degraded_reasons=reasons,
             source_retry_counts=source_retry_counts,
         )
@@ -569,6 +590,9 @@ class RunLedger:
                         "source_acquisition_errors": list(
                             entry.get("source_acquisition_errors") or []
                         ),
+                        "source_cooldown_skips": list(
+                            entry.get("source_cooldown_skips") or []
+                        ),
                         "source_retry_counts": {
                             source: dict(by_kind)
                             for source, by_kind in (
@@ -635,6 +659,7 @@ class RunLedger:
         archive_failures_total: int | None = None,
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
+        source_cooldown_skips: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
     ) -> None:
@@ -671,6 +696,10 @@ class RunLedger:
                     "degraded": degraded,
                     "degraded_reasons": list(degraded_reasons or []),
                     "source_acquisition_errors": list(source_acquisition_errors or []),
+                    # Issue #146: persist cooldown skips alongside
+                    # ``source_acquisition_errors`` so the same JSONL
+                    # consumers can read both lists with the same shape.
+                    "source_cooldown_skips": list(source_cooldown_skips or []),
                     # #129: deep-copy the per-source retry-count dict so
                     # later mutations of the contextvar bucket do not
                     # leak into the persisted ledger entry.

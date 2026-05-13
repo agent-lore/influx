@@ -536,6 +536,34 @@ class ResilienceConfig(BaseModel):
     # rate-limit signal that warrants more patience than a hard network
     # failure — the API is healthy, it's just asking us to slow down.
     arxiv_429_max_retries: int = 5
+    # Issue #146: adaptive cooldown for repeated arXiv 429 bursts.
+    #
+    # The in-fetch retry budget above absorbs individual 429s but does
+    # nothing about a *scheduled* burst of 429-dominated runs back to
+    # back — each run starts cold, immediately tries arXiv again, and
+    # eats its full 429 budget before giving up.  The cooldown adds a
+    # process-local state machine on top of the existing retry path:
+    #
+    # * Each *exhausted* 429 final failure (the retry loop gave up)
+    #   increments a streak counter.
+    # * When the streak reaches ``arxiv_429_cooldown_threshold`` the
+    #   source enters COOLDOWN: subsequent fetches are skipped quickly
+    #   for ``arxiv_429_cooldown_seconds`` and surfaced as a *separate*
+    #   degraded reason (``source_cooldown_skip``) so operators can tell
+    #   "we backed off on purpose" apart from "we tried and failed".
+    # * Cooldown clears on either ``arxiv_429_cooldown_seconds`` elapse
+    #   *or* the next successful arXiv fetch (whichever comes first).
+    #   A successful fetch also resets the streak counter.
+    # * Setting ``arxiv_429_cooldown_threshold`` to 0 disables the
+    #   feature entirely without touching the rest of the retry path.
+    #
+    # The cooldown is *process-local* — distinct deployments and
+    # restarts do not share the streak counter or the active deadline.
+    # This is documented as a caveat: a freshly restarted process will
+    # try arXiv once on first request even if the cooldown was active
+    # right before the restart.
+    arxiv_429_cooldown_threshold: int = 3
+    arxiv_429_cooldown_seconds: int = 900
     lithos_write_conflict_max_retries: int = 1
 
     @field_validator(
@@ -545,6 +573,8 @@ class ResilienceConfig(BaseModel):
         "arxiv_429_backoff_seconds",
         "arxiv_429_backoff_max_seconds",
         "arxiv_429_max_retries",
+        "arxiv_429_cooldown_threshold",
+        "arxiv_429_cooldown_seconds",
         "lithos_write_conflict_max_retries",
     )
     @classmethod

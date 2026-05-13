@@ -50,6 +50,7 @@ from influx.telemetry import (
     current_invalid_url_rejections,
     current_run_id,
     current_source_acquisition_errors,
+    current_source_cooldown_skips,
     current_source_retry_counts,
     get_tracer,
 )
@@ -101,6 +102,12 @@ async def ledger_lifecycle(
     session = _LedgerSession(run_id=run_id, started_at=started_at)
     run_id_token = current_run_id.set(run_id)
     source_errors_token = current_source_acquisition_errors.set([])
+    # Issue #146: per-run list of cooldown-suppressed source fetches.
+    # Distinct from ``current_source_acquisition_errors`` because a
+    # cooldown skip is a deliberate operational decision, not an
+    # upstream failure — the run-ledger entry tags it as
+    # ``source_cooldown_skip`` so operators can tell the two apart.
+    source_cooldown_skips_token = current_source_cooldown_skips.set([])
     # #85: per-run pre-filter fetched-count.  A list-of-ints so source
     # adapters increment a shared mutable container; reads at run-end
     # land the value into the run-ledger entry for the
@@ -165,6 +172,7 @@ async def ledger_lifecycle(
         # Telemetry span exited cleanly; finalise the ledger entry.
         elapsed = (datetime.now(UTC) - started_at).total_seconds()
         source_errors = current_source_acquisition_errors.get() or []
+        source_cooldown_skips = current_source_cooldown_skips.get() or []
 
         if session.skip_reason is not None:
             ledger.skip(run_id=run_id, reason=session.skip_reason)
@@ -223,13 +231,19 @@ async def ledger_lifecycle(
             invalid_url_rejections_total=invalid_url_rejections_total,
             archive_failures_total=archive_failures_total,
             source_acquisition_errors=source_errors,
+            # Issue #146: cooldown skips are run-level state distinct
+            # from swallowed acquisition errors — the ledger fires the
+            # ``source_cooldown_skip`` reason on a non-empty list.
+            source_cooldown_skips=source_cooldown_skips,
             # #129: surface recovered retry counts so the ledger entry
             # carries "we hit arXiv 429 twice but recovered" alongside
             # the swallowed-error list, letting an operator distinguish
             # transient retry success from a burned retry budget.
             source_retry_counts=source_retry_counts,
         )
-        run_outcome = "degraded" if source_errors else "success"
+        run_outcome = (
+            "degraded" if (source_errors or source_cooldown_skips) else "success"
+        )
         if "ingestion_stall" in degraded_reasons:
             metrics.ingestion_stalls().add(
                 1, {"profile": profile, "reason": "ingestion_stall"}
@@ -324,6 +338,27 @@ async def ledger_lifecycle(
                 archive_rate_limited_total,
                 archive_skipped_by_policy_total,
             )
+        if "source_cooldown_skip" in degraded_reasons:
+            # Issue #146: one or more source fetches were suppressed by
+            # the adaptive 429 cooldown.  Distinct from
+            # ``source_acquisition``: we deliberately chose not to call
+            # upstream, so the run-level outcome is "we backed off"
+            # rather than "we tried and lost".  Operators triaging this
+            # reason check the cooldown thresholds / cooldown duration
+            # and the recent 429 classification breakdown.
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged source_cooldown_skip profile=%s kind=%s "
+                "run_id=%s cooldown_skips=%d "
+                "(arxiv fetch was skipped after repeated 429 bursts — "
+                "see resilience.arxiv_429_cooldown_threshold / "
+                "arxiv_429_cooldown_seconds)",
+                profile,
+                plan.kind.value,
+                run_id,
+                len(source_cooldown_skips),
+            )
         if "invalid_url_stall" in degraded_reasons:
             # #131 review concern 2: feed returned items but every URL
             # was upstream-malformed.  Single-run signal — operators
@@ -397,6 +432,7 @@ async def ledger_lifecycle(
         metrics.active_runs().add(-1, {"profile": profile})
         current_run_id.reset(run_id_token)
         current_source_acquisition_errors.reset(source_errors_token)
+        current_source_cooldown_skips.reset(source_cooldown_skips_token)
         current_fetched_total.reset(fetched_total_token)
         current_filter_errors.reset(filter_errors_token)
         current_invalid_url_rejections.reset(invalid_url_rejections_token)

@@ -61,6 +61,7 @@ from influx.telemetry import (
     record_fetched_items,
     record_filter_error,
     record_source_acquisition_error,
+    record_source_cooldown_skip,
     record_source_retry,
 )
 
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
     from influx.sources import FetchCache
 
 __all__ = [
+    "ArxivCooldownError",
     "ArxivFilterScorer",
     "ArxivItem",
     "ArxivScorer",
@@ -554,6 +556,173 @@ def _apply_min_interval(min_interval: float) -> None:
         _sleep(wait)
 
 
+# ── Adaptive 429 cooldown (issue #146) ─────────────────────────────
+#
+# Influx's per-fetch retry budget already absorbs individual 429s but
+# cannot dampen a *burst* across scheduled runs: each new run begins
+# cold and immediately retries with the same pacing, so staging logs
+# show degraded run after degraded run with zero ingested candidates
+# until upstream calms down.  The cooldown is a small process-local
+# state machine layered on top of the existing retry loop:
+#
+#   NORMAL  ─── failure_streak >= threshold ──► COOLDOWN
+#   COOLDOWN ── cooldown_deadline_elapsed ─► NORMAL  (lazy clear)
+#   COOLDOWN ── successful fetch ─────────► NORMAL  (eager clear)
+#
+# Counted events are only *final* 429 failures — failures the in-fetch
+# retry loop already gave up on.  Transient 429s that the loop
+# recovered from never tick the streak; they continue to surface
+# through ``record_source_retry``.  Other final failure kinds
+# (network, content_type_mismatch, …) do not enter the cooldown path
+# at all so a single transport hiccup cannot suppress arXiv.
+#
+# Setting ``arxiv_429_cooldown_threshold`` to 0 disables the feature
+# wholesale: ``_should_skip_for_cooldown`` becomes a no-op, the streak
+# stays at 0, and behaviour is identical to the pre-#146 path.
+#
+# State is *process-local* (caveat noted in PR / config docstring):
+# distinct deployments do not share streak counters and a restart
+# resets the deadline.  A future cross-restart variant would persist
+# the state under ``storage.state_dir`` alongside the run ledger.
+_COOLDOWN_LOCK = threading.Lock()
+_COOLDOWN_FAILURE_STREAK: int = 0
+_COOLDOWN_DEADLINE_MONOTONIC: float | None = None
+# Last refined 429 classification observed by ``_record_429_final_failure``.
+# Surfaced into the cooldown-skip ``NetworkError.reason`` so operators
+# can tell at a glance whether the cooldown was driven by
+# upstream-capacity events ("not us, back off harder") or local
+# pacing ("we are the problem").
+_COOLDOWN_LAST_CLASSIFICATION: str | None = None
+
+
+def _reset_arxiv_cooldown_for_tests() -> None:
+    """Reset the module-level cooldown state — test seam only.
+
+    Unit and integration tests need a clean baseline between cases;
+    production code never calls this.
+    """
+    global _COOLDOWN_FAILURE_STREAK  # noqa: PLW0603
+    global _COOLDOWN_DEADLINE_MONOTONIC  # noqa: PLW0603
+    global _COOLDOWN_LAST_CLASSIFICATION  # noqa: PLW0603
+    with _COOLDOWN_LOCK:
+        _COOLDOWN_FAILURE_STREAK = 0
+        _COOLDOWN_DEADLINE_MONOTONIC = None
+        _COOLDOWN_LAST_CLASSIFICATION = None
+
+
+def _arxiv_cooldown_snapshot() -> tuple[int, float | None, str | None]:
+    """Return ``(streak, deadline_monotonic, last_classification)`` snapshot.
+
+    Test seam only — production code reads the state via
+    :func:`_should_skip_for_cooldown` and the recorder helpers.
+    """
+    with _COOLDOWN_LOCK:
+        return (
+            _COOLDOWN_FAILURE_STREAK,
+            _COOLDOWN_DEADLINE_MONOTONIC,
+            _COOLDOWN_LAST_CLASSIFICATION,
+        )
+
+
+def _should_skip_for_cooldown(
+    resilience: ResilienceConfig,
+) -> tuple[bool, float | None, str | None]:
+    """Inspect the cooldown state machine before a fetch.
+
+    Returns ``(skip, remaining_seconds, classification)``.  When the
+    threshold is ``0`` (feature disabled) or no deadline is set the
+    helper returns ``(False, None, classification)`` and the caller
+    proceeds with the normal fetch path.
+
+    When an active deadline has elapsed, the state machine
+    transitions back to NORMAL *lazily* — that is, the deadline and
+    streak are both cleared as part of this call so the next 429
+    burst starts a fresh streak.  This keeps the state machine
+    self-healing without requiring a background thread.
+    """
+    global _COOLDOWN_FAILURE_STREAK  # noqa: PLW0603
+    global _COOLDOWN_DEADLINE_MONOTONIC  # noqa: PLW0603
+    threshold = int(resilience.arxiv_429_cooldown_threshold)
+    if threshold <= 0:
+        # Feature disabled — never skip; do not consult or mutate state.
+        return False, None, None
+    now = time.monotonic()
+    with _COOLDOWN_LOCK:
+        deadline = _COOLDOWN_DEADLINE_MONOTONIC
+        classification = _COOLDOWN_LAST_CLASSIFICATION
+        if deadline is None:
+            return False, None, classification
+        remaining = deadline - now
+        if remaining <= 0:
+            # Deadline elapsed — clear state and proceed normally.
+            _COOLDOWN_DEADLINE_MONOTONIC = None
+            _COOLDOWN_FAILURE_STREAK = 0
+            return False, None, classification
+        return True, remaining, classification
+
+
+def _record_429_final_failure(
+    resilience: ResilienceConfig, *, classification: str
+) -> tuple[int, bool]:
+    """Tick the failure streak after the retry loop gave up on a 429.
+
+    Returns ``(streak, entered_cooldown)``.  When the resulting streak
+    reaches ``arxiv_429_cooldown_threshold`` the state machine
+    transitions NORMAL → COOLDOWN by setting a fresh deadline; the
+    caller receives ``entered_cooldown=True`` so it can emit a single
+    distinctive log line.
+
+    When the feature is disabled (threshold ``0``) the function is a
+    no-op and returns ``(0, False)`` so callers do not have to gate
+    their own observability on the disable knob.
+    """
+    global _COOLDOWN_FAILURE_STREAK  # noqa: PLW0603
+    global _COOLDOWN_DEADLINE_MONOTONIC  # noqa: PLW0603
+    global _COOLDOWN_LAST_CLASSIFICATION  # noqa: PLW0603
+    threshold = int(resilience.arxiv_429_cooldown_threshold)
+    if threshold <= 0:
+        return 0, False
+    cooldown_seconds = float(resilience.arxiv_429_cooldown_seconds)
+    now = time.monotonic()
+    with _COOLDOWN_LOCK:
+        _COOLDOWN_LAST_CLASSIFICATION = classification
+        _COOLDOWN_FAILURE_STREAK += 1
+        streak = _COOLDOWN_FAILURE_STREAK
+        if streak >= threshold and cooldown_seconds > 0:
+            _COOLDOWN_DEADLINE_MONOTONIC = now + cooldown_seconds
+            return streak, True
+        return streak, False
+
+
+def _record_arxiv_fetch_success() -> None:
+    """Clear the cooldown state after a successful arXiv fetch.
+
+    A successful fetch is the strongest possible signal that the
+    upstream has recovered, so the cooldown deadline (if any) is
+    cleared *eagerly* — operators do not have to wait the rest of
+    ``arxiv_429_cooldown_seconds`` once arXiv is healthy again.  The
+    streak counter is also reset so an unrelated 429 later in the run
+    starts a fresh streak.
+    """
+    global _COOLDOWN_FAILURE_STREAK  # noqa: PLW0603
+    global _COOLDOWN_DEADLINE_MONOTONIC  # noqa: PLW0603
+    with _COOLDOWN_LOCK:
+        _COOLDOWN_FAILURE_STREAK = 0
+        _COOLDOWN_DEADLINE_MONOTONIC = None
+
+
+class ArxivCooldownError(NetworkError):
+    """Raised by ``_fetch_with_retry`` when cooldown suppresses a fetch.
+
+    Subclasses :class:`NetworkError` so existing ``except NetworkError``
+    branches continue to handle it without code changes; carries the
+    distinctive ``kind="cooldown_active"`` and a remaining-seconds
+    reason so the caller can route the failure into the dedicated
+    cooldown degraded-reason path instead of the generic
+    ``source_acquisition`` path.
+    """
+
+
 def fetch_arxiv(
     *,
     arxiv_config: ArxivSourceConfig,
@@ -675,6 +844,30 @@ def _fetch_with_retry(
     backoff_base = resilience.backoff_base_seconds
     rate_limit_max_retries = resilience.arxiv_429_max_retries
 
+    # Issue #146: short-circuit before pacing / HTTP when the cooldown
+    # state machine is active.  Raising before ``_apply_min_interval``
+    # means a suppressed fetch returns in milliseconds rather than
+    # blocking on the cross-fetch pacing window — operators see the
+    # "we skipped on purpose" signal immediately and the run stays
+    # responsive.
+    skip, remaining, classification = _should_skip_for_cooldown(resilience)
+    if skip:
+        remaining_str = f"{remaining:.1f}" if remaining is not None else "?"
+        cls_str = classification or "unknown"
+        _log.warning(
+            "arxiv fetch skipped (cooldown active) remaining=%ss "
+            "classification=%s url=%s",
+            remaining_str,
+            cls_str,
+            url,
+        )
+        raise ArxivCooldownError(
+            "arXiv fetch skipped: cooldown active after repeated 429 bursts",
+            url=url,
+            kind="cooldown_active",
+            reason=(f"remaining_seconds={remaining_str} classification={cls_str}"),
+        )
+
     # Pace this fetch against the previous in-process arXiv fetch.  A
     # zero / negative interval is treated as "no pacing" by the helper.
     _apply_min_interval(float(resilience.arxiv_request_min_interval_seconds))
@@ -753,6 +946,23 @@ def _fetch_with_retry(
                 record_source_retry(source="arxiv", kind=kind_refined)
                 _sleep(delay)
                 continue
+            # Issue #146: retry budget exhausted on 429 — tick the
+            # cooldown streak.  We pass the refined classification so
+            # the cooldown state remembers whether the burst was
+            # dominated by upstream-capacity vs local-pacing events;
+            # operators see that classification in the eventual
+            # cooldown-skip ledger entry.
+            streak, entered = _record_429_final_failure(
+                resilience, classification=kind_refined
+            )
+            if entered:
+                _log.warning(
+                    "arxiv cooldown engaged after %d consecutive 429 final "
+                    "failures (classification=%s, cooldown=%ds)",
+                    streak,
+                    kind_refined,
+                    int(resilience.arxiv_429_cooldown_seconds),
+                )
             raise last_error
 
         if result.status_code >= 500:
@@ -797,6 +1007,10 @@ def _fetch_with_retry(
                 ),
             )
 
+        # Issue #146: a clean fetch is the strongest "upstream is OK"
+        # signal we have.  Clear the cooldown state machine eagerly so
+        # the next request goes back to the normal path immediately.
+        _record_arxiv_fetch_success()
         return result.body
 
     # Should not reach here, but satisfy type checker
@@ -1142,6 +1356,28 @@ class ArxivSource:
                 else:
                     items = await _do_fetch()
             except NetworkError as exc:
+                # Issue #146: a cooldown-suppressed fetch is *not* a
+                # source-acquisition failure — we deliberately chose
+                # not to call upstream.  Surface it through the
+                # dedicated cooldown-skip path so the run-ledger entry
+                # carries ``source_cooldown_skip`` instead of
+                # ``source_acquisition`` and operators can tell
+                # "throttled on purpose" apart from "tried and lost".
+                if exc.kind == "cooldown_active":
+                    _log.info(
+                        "arxiv fetch skipped (cooldown active) profile=%r reason=%s",
+                        profile,
+                        exc.reason or "",
+                    )
+                    record_source_cooldown_skip(
+                        source="arxiv",
+                        kind=exc.kind,
+                        detail=str(exc),
+                    )
+                    metrics.source_cooldown_skips().add(
+                        1, {"profile": profile, "source": "arxiv"}
+                    )
+                    return []
                 # Issue #145: prefer the refined 429 classification
                 # stashed on the reason field so the run-ledger and
                 # metric counters surface "shared-capacity upstream"
