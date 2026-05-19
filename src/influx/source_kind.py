@@ -51,18 +51,28 @@ SourceKind = Literal["html", "xml", "pointer"]
 # ── Pattern rules ─────────────────────────────────────────────────────
 
 # Path patterns that indicate the URL points at an XML/RSS/Atom feed
-# rather than an HTML article.  Matched against the lowercased path:
+# rather than an HTML article.  Deliberately *narrow* (PR #167 review
+# feedback): a bare directory match like ``/feed/`` or ``/rss/`` would
+# false-positive on legitimate article URLs (e.g. ``/news/feed/breaking``
+# or WordPress posts under a ``/rss`` slug), and the resulting note
+# carries ``influx:archive-terminal`` so a false positive is permanent.
 #
-# * trailing ``.xml`` / ``.rss`` / ``.atom`` file extensions,
-# * a segment named ``rss`` / ``atom`` / ``feed`` (with or without a
-#   trailing extension like ``.php`` / ``.cgi`` / ``.aspx``),
-# * a trailing path segment ``rss`` / ``atom`` / ``feed`` (no extension).
+# We only match two unambiguous shapes:
 #
-# Anchored conservatively so an article path like ``/posts/feedback``
-# does not accidentally match ``feed``.
+# 1. The path ends with a feed file extension (``.rss``, ``.atom``,
+#    ``.xml``).  These are very strong signals — an article URL almost
+#    never ends with one of those literally.
+# 2. The path is a CGI-style feed endpoint: a directory named exactly
+#    ``rss``, ``atom``, or ``feed`` immediately followed by a script
+#    filename ending in ``.php`` / ``.cgi`` / ``.aspx`` / ``.jsp``.
+#    This matches the staging-observed CSDB shape
+#    (``/rss/upcomingevents.php``, ``/rss/latestadditions.php``) and
+#    similar self-served feed scripts, but does NOT match bare
+#    ``/feed/`` directory URLs or article URLs whose path happens to
+#    pass through one of those segments.
 _XML_PATH_RE = re.compile(
-    r"(?:^|/)(?:rss|atom|feed)(?:\.(?:php|cgi|aspx|xml|html?))?(?:/|$)"
-    r"|\.(?:xml|rss|atom)$"
+    r"\.(?:rss|atom|xml)$"
+    r"|/(?:rss|atom|feed)/[^/]+\.(?:php|cgi|aspx|jsp)$"
 )
 
 

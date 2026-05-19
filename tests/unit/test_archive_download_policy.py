@@ -339,8 +339,8 @@ class TestNonHtmlSourceShortCircuit:
         [
             "https://csdb.dk/rss/upcomingevents.php",
             "https://csdb.dk/rss/latestadditions.php?type=release",
-            "https://example.com/feed",
             "https://example.com/atom.xml",
+            "https://example.com/feed.rss",
         ],
     )
     def test_xml_feed_urls_short_circuit(self, tmp_path: Path, url: str) -> None:
@@ -379,7 +379,7 @@ class TestNonHtmlSourceShortCircuit:
             mock_fetch.return_value = _make_fetch_result()
             result = _dl(
                 tmp_path,
-                "https://example.com/feed",
+                "https://example.com/feed.rss",
                 source="arxiv",
                 item_id="2601.12345",
                 ext=".pdf",
