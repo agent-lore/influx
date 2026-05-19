@@ -27,6 +27,10 @@ Subcommands
                     ``influx:source-invalid`` (issue #162); default
                     read-only, ``--apply`` reconstructs recoverable
                     notes or tombstones unrecoverable ones
+    promotion-gate  Evaluate recent scheduled-run health against a
+                    configurable severity policy (issue #165); exits
+                    0 on PASS / 1 on FAIL so a CI promotion step can
+                    consume it directly
     cancel          Print the curl line for cancelling an in-flight run
                     (this script never sends destructive HTTP itself)
 
@@ -1386,6 +1390,38 @@ def cmd_invalid_source(args: argparse.Namespace) -> int:
     return 0 if refused == 0 else 1
 
 
+def cmd_promotion_gate(args: argparse.Namespace) -> int:
+    """Evaluate the promotion gate against recent ledger entries (issue #165).
+
+    Pure read of ``runs.jsonl`` plus the pure :mod:`influx.promotion_gate`
+    classifier — no Lithos connection, no docker logs, no admin HTTP.
+    Exits ``0`` on PASS, ``1`` on FAIL so the subcommand can drive a
+    staging-promotion CI step directly.
+    """
+    _ensure_project_runtime_or_reexec()
+    from influx.promotion_gate import (
+        PromotionGateConfig,
+        evaluate_promotion_gate,
+        format_gate_summary,
+    )
+
+    env = _load_env(args.env)
+    state = _state_dir(env)
+    runs = _read_runs_jsonl(state)
+    # ``_read_runs_jsonl`` returns oldest-first; the gate's window
+    # semantics need newest-first.
+    runs.reverse()
+
+    config = PromotionGateConfig(
+        window_runs=int(args.window),
+        max_expected_lossy_ratio=float(args.max_lossy_ratio),
+        min_runs_required=int(args.min_runs),
+    )
+    result = evaluate_promotion_gate(runs, config)
+    print(format_gate_summary(result, config))
+    return 0 if result.passed else 1
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     env = _load_env(args.env)
     host = env.get("INFLUX_ADMIN_BIND_HOST", "127.0.0.1")
@@ -1634,6 +1670,41 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_invalid.set_defaults(func=cmd_invalid_source)
+
+    p_gate = sub.add_parser(
+        "promotion-gate",
+        help=(
+            "evaluate recent runs against a configurable severity policy "
+            "(issue #165); exits 0 on PASS, 1 on FAIL"
+        ),
+    )
+    p_gate.add_argument(
+        "--window",
+        type=int,
+        default=20,
+        help=("number of recent scheduled completed runs to evaluate (default: 20)"),
+    )
+    p_gate.add_argument(
+        "--max-lossy-ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "fail the gate when the fraction of expected_lossy runs in "
+            "the window exceeds this value (inclusive at the boundary; "
+            "default: 0.5)"
+        ),
+    )
+    p_gate.add_argument(
+        "--min-runs",
+        type=int,
+        default=5,
+        help=(
+            "minimum scheduled completed runs required in the window to "
+            "evaluate at all (default: 5).  Below this the gate reports "
+            "'insufficient_runs' rather than a spurious pass / fail."
+        ),
+    )
+    p_gate.set_defaults(func=cmd_promotion_gate)
 
     p_cancel = sub.add_parser(
         "cancel",
