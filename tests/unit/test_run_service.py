@@ -673,6 +673,93 @@ async def test_archive_acquisition_degrades_run_and_logs_warning(
     assert "influx:archive-missing" in warning.message
 
 
+async def test_archive_unsupported_item_does_not_trigger_archive_acquisition(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #161: items from ``unsupported`` policy domains must NOT
+    contribute to ``archive_failures_total`` or fire the
+    ``archive_acquisition`` degraded reason.
+
+    The run-service derives ``archive_failures_total`` by counting
+    items tagged ``influx:archive-missing``.  A note ingested from a
+    domain on the ``unsupported`` policy list carries
+    ``influx:archive-unsupported`` plus ``influx:archive-terminal``
+    instead — the operator has already declared the domain has no
+    archive surface, so the run must not degrade purely because that
+    expected outcome was observed.  Pins the contract end-to-end so a
+    later tag-composition refactor cannot silently re-introduce the
+    spurious degradation that #161 fixes for ``openai.com``-style
+    domains.
+    """
+    from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    body_outcome = RunOutcome(
+        sources_checked=2,
+        ingested=1,
+        profile_run_result=ProfileRunResult(
+            run_date="2026-05-08",
+            profile="alpha",
+            stats=RunStats(sources_checked=2, ingested=1),
+            items=[
+                HighlightItem(
+                    id="note-1",
+                    title="OpenAI Blog Post",
+                    score=8,
+                    # Crucially: NO ``influx:archive-missing`` tag.
+                    # ``unsupported`` is an expected, terminal outcome
+                    # for declared-unsupported domains.
+                    tags=[
+                        "profile:alpha",
+                        "influx:archive-unsupported",
+                        "influx:archive-terminal",
+                    ],
+                    reason="domain policy unsupported",
+                    url="https://openai.com/index/some-post",
+                    related_in_lithos=[],
+                )
+            ],
+        ),
+    )
+    with (
+        caplog.at_level(logging.INFO, logger="influx.run_service"),
+        patch(
+            "influx.run.Run.execute",
+            new_callable=AsyncMock,
+            return_value=body_outcome,
+        ),
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert "archive_acquisition" not in entry["degraded_reasons"]
+    assert entry["archive_failures_total"] == 0
+
+    # No archive_acquisition WARNING should have been emitted.  The
+    # informational INFO line below mentions ``archive_acquisition`` in
+    # its explanatory tail; restrict the check to WARNING records so
+    # the explainer text doesn't false-positive.
+    assert not [
+        r
+        for r in caplog.records
+        if "archive_acquisition" in r.message and r.levelname == "WARNING"
+    ], "unsupported items must not emit the archive_acquisition warning"
+
+    # But the explicit INFO summary should fire so an operator sees
+    # the policy decision in the log stream (acceptance criterion #4).
+    info_logs = [
+        r
+        for r in caplog.records
+        if "archive_unsupported" in r.message and r.levelname == "INFO"
+    ]
+    assert info_logs, "expected an INFO archive_unsupported summary line"
+    assert "unsupported_items=1" in info_logs[0].message
+
+
 async def test_non_html_source_item_does_not_trigger_archive_acquisition(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

@@ -214,6 +214,14 @@ def download_archive(
     :func:`~influx.archive_policy.default_registry` is used so even
     untargeted callers (CLI smoke commands, repair sweep) honour the
     staging-defaults set.
+
+    Issue #161: ``unsupported``-mode policies also short-circuit
+    before any network call.  Distinct from ``skip`` because the
+    caller treats it as "this domain has no archive surface" —
+    callers do NOT tag ``influx:archive-missing`` on the resulting
+    note, so the item does not contribute to the run-level
+    ``archive_acquisition`` degraded reason.  The default registry
+    includes ``openai.com`` under this mode.
     """
     if max_download_bytes is None or timeout_seconds is None:
         _storage_defaults = StorageConfig()
@@ -273,6 +281,29 @@ def download_archive(
             rel_posix_path=None,
             error=f"missing_by_policy: {policy.note or 'archive disabled by policy'}",
             failure_kind="missing_by_policy",
+            policy_mode=policy.mode,
+            domain=domain,
+        )
+
+    # Issue #161: ``unsupported`` mode also short-circuits before any
+    # network call.  Distinct from ``skip``: the caller treats the
+    # result as "this domain has no archive surface, that's fine" — no
+    # ``influx:archive-missing`` tag, no contribution to the run-level
+    # ``archive_acquisition`` degraded reason.  Logged at INFO once per
+    # acquisition so an operator sees the policy decision was applied
+    # without producing the WARNING-level archive-failure noise.
+    if policy.mode == "unsupported":
+        _log.info(
+            "archive download skipped (policy=unsupported) url=%s domain=%s note=%s",
+            url,
+            domain,
+            policy.note,
+        )
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=f"unsupported: {policy.note or 'archive unsupported by policy'}",
+            failure_kind="unsupported",
             policy_mode=policy.mode,
             domain=domain,
         )

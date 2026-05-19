@@ -24,6 +24,7 @@ from influx.archive_policy import (
     ARCHIVE_NON_HTML_SOURCE_TAG,
     ARCHIVE_RATE_LIMITED_TAG,
     ARCHIVE_SKIPPED_BY_POLICY_TAG,
+    ARCHIVE_UNSUPPORTED_TAG,
     ArchivePolicy,
     ArchivePolicyRegistry,
     build_registry,
@@ -80,6 +81,15 @@ class TestRegistryDefaults:
         policy = default_registry().policy_for("https://www.alignmentforum.org/posts/x")
         assert policy.mode == "blocked"
 
+    def test_openai_is_unsupported(self) -> None:
+        # Issue #161: ``openai.com`` is in the staging-defaults
+        # ``unsupported`` list because its blog/index pages return
+        # HTTP 403 to every unauthenticated archive attempt.
+        policy = default_registry().policy_for("https://openai.com/index/x")
+        assert policy.mode == "unsupported"
+        assert policy.should_attempt is False
+        assert policy.note
+
 
 class TestRegistryMatching:
     """Suffix matching is longest-first and case-insensitive."""
@@ -123,7 +133,7 @@ class TestRegistryMatching:
 
 
 class TestArchivePolicyShouldAttempt:
-    """``should_attempt`` short-circuits for the skip mode only."""
+    """``should_attempt`` short-circuits for skip and unsupported modes."""
 
     @pytest.mark.parametrize(
         "mode, should_attempt",
@@ -132,6 +142,10 @@ class TestArchivePolicyShouldAttempt:
             ("rate_limited", True),
             ("blocked", True),
             ("skip", False),
+            # Issue #161: ``unsupported`` also short-circuits the
+            # download attempt, since the operator has declared the
+            # domain has no archive surface.
+            ("unsupported", False),
         ],
     )
     def test_should_attempt(self, mode: str, should_attempt: bool) -> None:
@@ -220,6 +234,7 @@ class TestTagForFailureKind:
             ("rate_limited", ARCHIVE_RATE_LIMITED_TAG),
             ("missing_by_policy", ARCHIVE_SKIPPED_BY_POLICY_TAG),
             ("non_html_source", ARCHIVE_NON_HTML_SOURCE_TAG),
+            ("unsupported", ARCHIVE_UNSUPPORTED_TAG),
         ],
     )
     def test_policy_kinds_map_to_dedicated_tags(
@@ -285,6 +300,33 @@ class TestRegistryFromConfig:
         assert registry.policy_for("https://www.science.org/x").mode == "attempt"
         assert registry.domains() == ()
 
+    def test_operator_unsupported_entry_round_trips(self) -> None:
+        # Issue #161: ``unsupported`` overrides land via TOML the same
+        # way the older ``skip`` overrides do.
+        cfg = ArchivePolicyConfig(
+            unsupported={"intranet.example": "no archive surface"},
+            include_defaults=False,
+        )
+        registry = registry_from_config(cfg)
+        policy = registry.policy_for("https://intranet.example/article")
+        assert policy.mode == "unsupported"
+        assert policy.should_attempt is False
+        assert policy.note == "no archive surface"
+
+    def test_unsupported_supersedes_skip_for_same_suffix(self) -> None:
+        # Issue #161: when both ``skip`` and ``unsupported`` declare
+        # the same suffix, the more-terminal ``unsupported`` mode wins
+        # (mirrors the existing skip-over-blocked precedence).
+        cfg = ArchivePolicyConfig(
+            skip={"example.com": "skip note"},
+            unsupported={"example.com": "unsupported note"},
+            include_defaults=False,
+        )
+        registry = registry_from_config(cfg)
+        policy = registry.policy_for("https://example.com/x")
+        assert policy.mode == "unsupported"
+        assert policy.note == "unsupported note"
+
 
 class TestRegistryDomainsListing:
     """``ArchivePolicyRegistry.domains`` exposes the registered suffix set."""
@@ -293,6 +335,9 @@ class TestRegistryDomainsListing:
         domains = default_registry().domains()
         assert "science.org" in domains
         assert "alignmentforum.org" in domains
+        # Issue #161: ``openai.com`` joins the staging-defaults set
+        # under the new ``unsupported`` mode.
+        assert "openai.com" in domains
 
     def test_no_duplicates_after_merge(self) -> None:
         # If an operator override re-declares a default suffix the

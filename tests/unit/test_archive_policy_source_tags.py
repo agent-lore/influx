@@ -56,6 +56,7 @@ def _make_config(
     blocked: dict[str, str] | None = None,
     rate_limited: dict[str, str] | None = None,
     skip: dict[str, str] | None = None,
+    unsupported: dict[str, str] | None = None,
     include_defaults: bool = False,
     archive_dir: str = "/archive",
 ) -> AppConfig:
@@ -68,6 +69,7 @@ def _make_config(
                 blocked=blocked or {},
                 rate_limited=rate_limited or {},
                 skip=skip or {},
+                unsupported=unsupported or {},
                 include_defaults=include_defaults,
             ),
         ),
@@ -196,6 +198,34 @@ class TestRssArchivePolicyTags:
         assert "influx:archive-skipped-by-policy" not in tags
         # Not flipped terminal.
         assert "influx:archive-terminal" not in tags
+
+    @patch("influx.sources.rss.download_archive")
+    def test_unsupported_emits_unsupported_tag_only(self, mock_dl: object) -> None:
+        # Issue #161: ``unsupported`` mode short-circuits without
+        # producing ``influx:archive-missing`` / ``influx:repair-needed``
+        # — the operator declared the domain has no archive surface,
+        # so the run is not degraded by it.  The note carries the
+        # dedicated ``influx:archive-unsupported`` + terminal flag.
+        mock_dl.return_value = ArchiveResult(  # type: ignore[union-attr]
+            ok=False,
+            rel_posix_path=None,
+            error="unsupported: archive unsupported by policy",
+            failure_kind="unsupported",
+            policy_mode="unsupported",
+            domain="openai.com",
+        )
+        config = _make_config(unsupported={"openai.com": "no archive"})
+        item = _make_rss_item(url="https://openai.com/index/article")
+
+        result = build_rss_note_item(
+            item=item, profile_name="ai-robotics", config=config
+        )
+
+        tags = cast(list[str], result["tags"])
+        assert "influx:archive-unsupported" in tags
+        assert "influx:archive-terminal" in tags
+        assert "influx:archive-missing" not in tags
+        assert "influx:repair-needed" not in tags
 
     @patch("influx.sources.rss.download_archive")
     def test_non_html_source_emits_non_html_tag_only(self, mock_dl: object) -> None:
