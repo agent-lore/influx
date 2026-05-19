@@ -226,6 +226,15 @@ def _note_source_tag(note: dict[str, object]) -> str:
     return _find_tag(_note_tags(note), _SOURCE_TAG_PREFIX) or ""
 
 
+# Public alias: cross-module callers (e.g. ``influx.audit_invalid_source``,
+# #162) should import :func:`note_source_tag` rather than the leading-
+# underscore variant so a future refactor inside this module does not
+# break them.  The bare function above is retained because it is
+# referenced from many internal helpers in this module and renaming
+# them all is needless churn.
+note_source_tag = _note_source_tag
+
+
 def _is_rss_source(source: str) -> bool:
     """Return whether *source* names an RSS feed source tag.
 

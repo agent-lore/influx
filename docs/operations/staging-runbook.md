@@ -361,6 +361,65 @@ the unsuffixed-slug squatter, which can be removed the same way.
 surfacing both squatters in a single WARNING so they can be cleaned
 in one pass.
 
+## 8b. Cleaning up invalid-source-metadata notes (issue #162)
+
+After an `invalid_source_metadata` repair incident (#150), notes whose
+`source:*` metadata was empty/garbled and whose URL/path/id provided no
+inference fallback were terminalised in-band — they carry
+`influx:source-invalid` + `influx:text-terminal`, and the sweep no
+longer loops on them.  The bad-state notes themselves still need
+operator cleanup; the `invalid-source` subcommand surfaces them and
+applies the recommended action.
+
+When to run it:
+- After a repair-related incident that mentioned `invalid_source_metadata`
+  in WARNINGs, the related notes will carry `influx:source-invalid`.
+- Periodically as a hygiene check (the tag has a clear semantic so a
+  zero-result scan is the expected steady state).
+
+```bash
+# 1. Read-only audit — list every note tagged influx:source-invalid
+#    along with the recommended action (RECONSTRUCT vs TOMBSTONE).
+./scripts/influx-diagnose.py invalid-source
+
+# 2. Inspect one specific note's classification without scanning the
+#    whole index.
+./scripts/influx-diagnose.py invalid-source --id <doc-id>
+
+# 3. Apply the recommended action to one note.
+./scripts/influx-diagnose.py invalid-source --apply --yes <doc-id>
+
+# 4. Apply to every note in the audit (use after reviewing output).
+./scripts/influx-diagnose.py invalid-source --apply --yes-to-all
+```
+
+Action semantics:
+- **RECONSTRUCT** (recoverable note: URL/path/id implies a source).
+  Backfills the `source:*` tag, drops `influx:source-invalid` and
+  `influx:text-terminal`, re-arms `influx:repair-needed`.  The next
+  scheduled sweep picks the note up and re-runs text extraction with
+  the repaired metadata.
+- **TOMBSTONE** (unrecoverable: no inference fallback exists).
+  Adds `influx:tombstone` on top of the existing terminal state and
+  drops `influx:repair-needed`.  The in-band terminal flags
+  (`influx:source-invalid`, `influx:text-terminal`) are preserved as
+  audit history.  Operators can later filter `influx:tombstone` in
+  dashboards / search to exclude operator-cleaned notes.
+
+Safety properties:
+- Default mode is read-only.
+- `--apply` requires either `--yes <doc-id>` (repeatable),
+  `--yes-to-all`, or `--id <doc-id>`.  Passing `--apply` alone aborts.
+- **`--apply` refuses any note that does not actually carry
+  `influx:source-invalid`** even when the operator names it via
+  `--id`.  This prevents an off-target id from rewriting an
+  unrelated note's tags.  The read-only audit flags such notes
+  upfront with an `INELIGIBLE` banner.
+- Each rewrite is recorded in Lithos with `agent=influx-diagnose`
+  (override with `--agent <name>`).
+- The subcommand never deletes notes — use the `squatters` subcommand
+  when actual removal is required.
+
 ## 9. Scheduling stagger (issue #87)
 
 Profiles share a single global `[schedule].cron` expression. Within
