@@ -214,6 +214,115 @@ class TestArxivThinSummaryNoDrop:
         assert _isolate_counter[0] == 0
 
 
+class TestMetricsDeferralPastSuppression:
+    """Issue #166 review: archive_missing / archive_policy_failures must
+    NOT bump for items the thin-summary rule drops, since those items
+    never receive the corresponding tags on a written note.
+    """
+
+    @patch("influx.sources.arxiv.metrics.archive_policy_failures")
+    @patch("influx.sources.arxiv.metrics.archive_missing")
+    @patch("influx.sources.arxiv.download_archive")
+    def test_thin_summary_drop_skips_archive_missing_bump_on_terminal(
+        self,
+        mock_dl: object,
+        mock_am: object,
+        mock_apf: object,
+        _isolate_counter: list[int],
+    ) -> None:
+        # Terminal-flipped path: archive_missing would have bumped
+        # eagerly under the original wiring.  Drop must skip the bump.
+        from influx.telemetry import current_archive_terminal_arxiv_ids
+
+        item = _make_item(abstract="Comments")
+        token = current_archive_terminal_arxiv_ids.set(frozenset({item.arxiv_id}))
+        try:
+            result = build_arxiv_note_item(
+                item=item,
+                score=4,
+                confidence=0.4,
+                reason="R",
+                profile_name="ai-robotics",
+                config=_make_config(min_summary_chars=0),
+            )
+        finally:
+            current_archive_terminal_arxiv_ids.reset(token)
+
+        assert result is None
+        assert _isolate_counter[0] == 1
+        # ``mock_am``/``mock_apf`` are the helper-getter mocks; their
+        # ``.return_value`` is the per-call counter mock — assert no
+        # ``.add`` invocation happened.
+        mock_am.return_value.add.assert_not_called()  # type: ignore[attr-defined]
+        mock_apf.return_value.add.assert_not_called()  # type: ignore[attr-defined]
+        # Sanity: download_archive was NOT called because terminal
+        # short-circuits download.
+        mock_dl.assert_not_called()  # type: ignore[attr-defined]
+
+    @patch("influx.sources.arxiv.metrics.archive_policy_failures")
+    @patch("influx.sources.arxiv.metrics.archive_missing")
+    @patch("influx.sources.arxiv.download_archive")
+    def test_thin_summary_drop_skips_archive_metrics_on_generic_failure(
+        self,
+        mock_dl: object,
+        mock_am: object,
+        mock_apf: object,
+        _isolate_counter: list[int],
+    ) -> None:
+        # Generic 404 path: both archive_missing AND
+        # archive_policy_failures would have bumped eagerly.  Drop must
+        # skip both.
+        mock_dl.return_value = _failed_archive("http_404")  # type: ignore[attr-defined]
+        item = _make_item(abstract="...")
+
+        result = build_arxiv_note_item(
+            item=item,
+            score=4,
+            confidence=0.4,
+            reason="R",
+            profile_name="ai-robotics",
+            config=_make_config(min_summary_chars=0),
+        )
+
+        assert result is None
+        assert _isolate_counter[0] == 1
+        mock_am.return_value.add.assert_not_called()  # type: ignore[attr-defined]
+        mock_apf.return_value.add.assert_not_called()  # type: ignore[attr-defined]
+
+    @patch("influx.sources.arxiv.metrics.archive_policy_failures")
+    @patch("influx.sources.arxiv.metrics.archive_missing")
+    @patch("influx.sources.arxiv.download_archive")
+    def test_non_thin_summary_still_bumps_archive_metrics(
+        self,
+        mock_dl: object,
+        mock_am: object,
+        mock_apf: object,
+        _isolate_counter: list[int],
+    ) -> None:
+        # Non-thin abstract + failed archive: item is written, so both
+        # counters must bump (deferred but still hit).
+        mock_dl.return_value = _failed_archive("http_404")  # type: ignore[attr-defined]
+        item = _make_item(abstract=_REAL_ABSTRACT)
+
+        with patch(
+            "influx.sources.arxiv.extract_arxiv_text",
+            side_effect=Exception("extraction not the focus"),
+        ):
+            result = build_arxiv_note_item(
+                item=item,
+                score=4,
+                confidence=0.4,
+                reason="R",
+                profile_name="ai-robotics",
+                config=_make_config(),
+            )
+
+        assert result is not None
+        assert _isolate_counter[0] == 0
+        mock_am.return_value.add.assert_called_once()  # type: ignore[attr-defined]
+        mock_apf.return_value.add.assert_called_once()  # type: ignore[attr-defined]
+
+
 class TestArxivUnsupportedScope:
     """The broader trigger scope decision also applies to arXiv."""
 

@@ -1064,8 +1064,9 @@ def build_arxiv_note_item(
     dict[str, Any] | None
         Ready-to-yield ``ProfileItem`` dict, or ``None`` when the
         thin-summary rule (#166) suppressed this item.  ``None`` is
-        the orchestrator's signal to skip the item (see
-        :mod:`influx.run` line 451).
+        the orchestrator's signal to skip the item; the consumer in
+        :mod:`influx.run` calls ``continue`` on ``None`` rather than
+        appending to the acquired-items list.
     """
     profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
     if thresholds is None:
@@ -1091,6 +1092,14 @@ def build_arxiv_note_item(
     # below.  ``None`` when the archive succeeded; a string like
     # ``"terminal"`` / ``"http_404"`` / ``"unsupported"`` otherwise.
     _archive_failure_kind_label: str | None = None
+    # Issue #166 review: deferred metric bumps so
+    # ``influx_archive_missing_total`` /
+    # ``influx_archive_policy_failures_total`` only increment for items
+    # that survive the thin-summary suppression check (i.e. items that
+    # actually get written with the corresponding tags).  The bumps
+    # happen in a single block below, after the suppression decision.
+    _archive_missing_bump_pending = False
+    _archive_policy_failure_kind: str | None = None
     if is_archive_terminal:
         # Issue #14: this paper's archive download has been terminal-flipped
         # by an earlier repair sweep (or hand-set by an operator).  Skip the
@@ -1098,7 +1107,7 @@ def build_arxiv_note_item(
         # be preserved by the canonical merge_tags path on rewrite.
         archive_missing = True
         _archive_failure_kind_label = "terminal"
-        metrics.archive_missing().add(1, {"profile": profile_name, "source": "arxiv"})
+        _archive_missing_bump_pending = True
         _log.info(
             "archive download skipped (terminal) profile=%s arxiv_id=%s",
             profile_name,
@@ -1155,22 +1164,11 @@ def build_arxiv_note_item(
                 archive_result.failure_kind  # type: ignore[arg-type]
             )
             if archive_missing:
-                metrics.archive_missing().add(
-                    1, {"profile": profile_name, "source": "arxiv"}
-                )
-                # Issue #149: reclassify the failure into a policy tag
-                # when the failure_kind is one of blocked / rate_limited /
-                # missing_by_policy.  Generic failures (http_404, oversize,
-                # timeout, …) keep the default ``influx:archive-missing``
-                # shape so repair-sweep behaviour is unchanged for them.
-                metrics.archive_policy_failures().add(
-                    1,
-                    {
-                        "profile": profile_name,
-                        "source": "arxiv",
-                        "kind": archive_result.failure_kind or "unknown",
-                    },
-                )
+                # Issue #166 review: deferred until after the thin-summary
+                # suppression check below so the metrics stay consistent
+                # with the tags actually applied to a written note.
+                _archive_missing_bump_pending = True
+                _archive_policy_failure_kind = archive_result.failure_kind or "unknown"
 
     # Issue #166: thin-summary suppression.  When the archive fetch did
     # NOT deliver a body (any failure kind: terminal / http_404 /
@@ -1208,6 +1206,28 @@ def build_arxiv_note_item(
                 thin_rule,
             )
             return None
+
+    # Issue #166 review: the item survived the thin-summary suppression
+    # check and will be written below.  Bump the archive-missing-side
+    # counters now so they stay consistent with the
+    # ``influx:archive-missing`` tag and the policy tag applied by the
+    # tag-composition block.  Deferred from the eager bumps that lived
+    # inside the if/else above before this review.
+    if _archive_missing_bump_pending:
+        metrics.archive_missing().add(1, {"profile": profile_name, "source": "arxiv"})
+        if _archive_policy_failure_kind is not None:
+            # Issue #149 + #166 review: the policy_failures counter is
+            # documented as "Increments alongside archive_missing" so
+            # the two move in lock-step — including when thin-summary
+            # suppression defers both.
+            metrics.archive_policy_failures().add(
+                1,
+                {
+                    "profile": profile_name,
+                    "source": "arxiv",
+                    "kind": _archive_policy_failure_kind,
+                },
+            )
 
     acquired = Acquired(
         item_id=item.arxiv_id,

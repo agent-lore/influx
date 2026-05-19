@@ -260,6 +260,12 @@ def tier3_fallbacks() -> Any:
 def archive_missing() -> Any:
     """Counter of items tagged ``influx:archive-missing`` during a run.
 
+    Bumped by the source adapters *after* the issue #166 thin-summary
+    suppression check returns the item — items that the suppression
+    rule drops never reach the write loop and so never receive the
+    tag, and are accounted for separately by
+    :func:`summary_thin_drops`.
+
     Labels: ``profile``, ``source``.
     """
     return get_meter().counter(
@@ -280,16 +286,34 @@ def summary_thin_drops() -> Any:
     :func:`archive_policy_failures` so dashboards can pivot
     suppressions independently of archive-failure counts — the dropped
     items never reach the Lithos write loop and so never receive an
-    ``influx:archive-missing`` tag, and they are deliberately excluded
-    from ``archive_failures_total`` / ``source_acquisition_errors`` /
-    ``archive_acquisition`` degraded reasons.
+    ``influx:archive-missing`` tag.  Per the issue #166 review,
+    ``archive_missing`` / ``archive_policy_failures`` are deferred past
+    the suppression decision in the source adapters so they only count
+    items that actually got written with the corresponding tag; this
+    counter and the archive-failure counters therefore partition the
+    set of archive-not-OK items rather than double-counting them.
+    Also deliberately excluded from ``archive_failures_total`` /
+    ``source_acquisition_errors`` / ``archive_acquisition`` degraded
+    reasons in the run ledger.
 
-    Labels: ``profile``, ``source`` (``rss`` / ``arxiv`` / …),
-    ``failure_kind`` (the archive failure_kind that triggered the
-    suppression — ``http_404`` / ``timeout`` / ``blocked`` /
-    ``non_html_source`` / ``unsupported`` / …), ``rule``
-    (``length`` | ``title_equality`` | ``boilerplate``) — the
-    thin-summary rule that fired first.
+    Labels:
+
+    - ``profile`` — profile name.
+    - ``source`` — the source-adapter identity, matching the existing
+      convention used by :func:`archive_policy_failures`: for arXiv
+      this is the literal ``"arxiv"``; for RSS this is the per-feed
+      ``source_tag`` configured under ``[[profiles.sources.rss]]``,
+      which defaults to ``"rss"`` but operators may override to
+      e.g. ``"blog"`` / ``"tech-news"`` for cardinality-friendly
+      per-feed-class dashboards.
+    - ``failure_kind`` — the archive failure_kind that triggered the
+      suppression: ``http_404`` / ``timeout`` / ``http_5xx`` /
+      ``blocked`` / ``rate_limited`` / ``missing_by_policy`` /
+      ``non_html_source`` / ``unsupported`` / ``oversize`` /
+      ``content_type_mismatch`` / ``write`` / ``ssrf`` / ``dns`` /
+      ``network`` / ``terminal`` (arXiv terminal-flipped) / ``unknown``.
+    - ``rule`` — ``length`` | ``title_equality`` | ``boilerplate``,
+      the thin-summary rule that fired first.
     """
     return get_meter().counter(
         "influx_summary_thin_drops_total",
@@ -311,6 +335,12 @@ def archive_policy_failures() -> Any:
     reserved for the (large, expected) baseline of unclassified
     failures so dashboards can compute the ratio without subtracting
     series.
+
+    Per the issue #166 review this counter is deferred past the
+    thin-summary suppression check (the source adapters bump it only
+    for items that actually get written with the policy tag), keeping
+    it in lock-step with :func:`archive_missing`.  Items dropped by the
+    suppression rule are accounted for by :func:`summary_thin_drops`.
 
     Labels: ``profile``, ``source``, ``kind``
     (``"blocked"`` | ``"rate_limited"`` | ``"missing_by_policy"`` |

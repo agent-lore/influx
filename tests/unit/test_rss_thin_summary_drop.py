@@ -363,6 +363,60 @@ class TestThinSummaryScopeBroaderFailureKinds:
         assert _isolate_counter[0] == 0
 
 
+class TestMetricsDeferralPastSuppression:
+    """Issue #166 review: ``archive_policy_failures`` must NOT bump for
+    items the thin-summary rule drops, since those items never receive
+    the archive-failure tag on a written note (the counter is
+    documented as moving in lock-step with ``archive_missing``).
+    """
+
+    @patch("influx.sources.rss.metrics.archive_policy_failures")
+    @patch("influx.sources.rss.download_archive")
+    def test_thin_summary_drop_skips_policy_failures_bump(
+        self,
+        mock_dl: object,
+        mock_apf: object,
+        _isolate_counter: list[int],
+    ) -> None:
+        mock_dl.return_value = _failed_archive(failure_kind="blocked")  # type: ignore[attr-defined]
+        item = _make_item(summary="Discussion (47 points)")
+
+        result = build_rss_note_item(
+            item=item,
+            profile_name="ai-robotics",
+            config=_make_config(),
+        )
+
+        assert result is None
+        assert _isolate_counter[0] == 1
+        # Helper-getter mock; ``.return_value.add`` is the per-call
+        # instrument mock that should never have been invoked.
+        mock_apf.return_value.add.assert_not_called()  # type: ignore[attr-defined]
+
+    @patch("influx.sources.rss.metrics.archive_policy_failures")
+    @patch("influx.sources.rss.download_archive")
+    def test_non_thin_summary_still_bumps_policy_failures(
+        self,
+        mock_dl: object,
+        mock_apf: object,
+        _isolate_counter: list[int],
+    ) -> None:
+        # Non-thin summary + failed archive: item is written so the
+        # counter bumps (deferred but still hit).
+        mock_dl.return_value = _failed_archive(failure_kind="blocked")  # type: ignore[attr-defined]
+        item = _make_item(summary=_LONG_SUMMARY)
+
+        result = build_rss_note_item(
+            item=item,
+            profile_name="ai-robotics",
+            config=_make_config(),
+        )
+
+        assert result is not None
+        assert _isolate_counter[0] == 0
+        mock_apf.return_value.add.assert_called_once()  # type: ignore[attr-defined]
+
+
 class TestConfigOverride:
     """``min_summary_chars`` propagates from the config."""
 

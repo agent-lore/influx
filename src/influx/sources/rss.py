@@ -377,8 +377,9 @@ def build_rss_note_item(
     dict[str, Any] | None
         Ready-to-yield ``ProfileItem`` dict, or ``None`` when the
         thin-summary rule (#166) suppressed this item.  ``None`` is
-        the orchestrator's signal to skip the item — see
-        :mod:`influx.run` line 451 for the consumer.
+        the orchestrator's signal to skip the item; the consumer in
+        :mod:`influx.run` calls ``continue`` on ``None`` rather than
+        appending to the acquired-items list.
     """
     feed_slug = slugify_feed_name(item.feed_name)
     hash_val = url_hash(item.url)
@@ -460,15 +461,16 @@ def build_rss_note_item(
         if archive_missing or archive_skipped_no_failure
         else None
     )
+    # Issue #166 review: deferred until after the thin-summary
+    # suppression check below so the metric stays consistent with the
+    # ``influx:archive-*`` tag actually applied to a written note.
+    # ``archive_policy_failures()`` is documented as "Increments
+    # alongside archive_missing" so it moves in lock-step with the
+    # archive-missing tag.  Eager bump here pollutes the counter for
+    # items the suppression rule drops.
+    _archive_policy_failure_kind: str | None = None
     if archive_missing:
-        metrics.archive_policy_failures().add(
-            1,
-            {
-                "profile": profile_name,
-                "source": item.source_tag,
-                "kind": archive_result.failure_kind or "unknown",
-            },
-        )
+        _archive_policy_failure_kind = archive_result.failure_kind or "unknown"
 
     # Article text extraction with summary fallback (FR-ENR-3): try web
     # article extraction; fall back to the feed item's ``<summary>``
@@ -538,6 +540,22 @@ def build_rss_note_item(
                 thin_rule,
             )
             return None
+
+    # Issue #166 review: the item survived the thin-summary suppression
+    # check and will be written below.  Bump the deferred
+    # ``archive_policy_failures`` counter now so it stays consistent
+    # with the archive-failure tag actually applied to the rendered
+    # note.  No bump on the suppression path above — the dropped item
+    # never produced a tag.
+    if _archive_policy_failure_kind is not None:
+        metrics.archive_policy_failures().add(
+            1,
+            {
+                "profile": profile_name,
+                "source": item.source_tag,
+                "kind": _archive_policy_failure_kind,
+            },
+        )
 
     acquired = Acquired(
         item_id=item_id,

@@ -51,11 +51,20 @@ ThinSummaryRule = Literal["length", "title_equality", "boilerplate"]
 
 
 # Module-level constant of (compiled-regex, operator-facing rationale)
-# pairs.  Listed in the staging runbook verbatim so operators can decide
-# whether to propose additions.  Each pattern is anchored / shaped to
-# fire on the *whole* summary string after whitespace trimming, so a
-# legitimate article body that happens to mention "continue reading"
-# inline is not affected — only summaries that *are* the boilerplate.
+# pairs.  Listed in the staging runbook verbatim so operators can
+# decide whether to propose additions.  Patterns are evaluated with
+# :meth:`re.Pattern.match`, which anchors at the *start* of the
+# trimmed summary; a few patterns also include an explicit end-anchor
+# (``$`` or terminating character class) for shapes that need
+# whole-string matching ("Discussion (47 points)" — strict), while
+# others ("Continue reading", "Read more", "Read … article at") are
+# deliberately prefix-anchored so they also catch the common case of a
+# pointer-boilerplate prefix followed by trailing URL / "on Medium…"
+# noise.  Real article bodies that happen to mention "continue
+# reading" *mid-sentence* are unaffected because of the start anchor;
+# a body that *starts* with one of these prefixes is rare in practice
+# but would trip the rule — operators can either rewrite the offending
+# pattern to add ``$`` or raise the issue for review.
 _BOILERPLATE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"^Discussion \(\d+ points?\)$", re.IGNORECASE),
