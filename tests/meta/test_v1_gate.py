@@ -509,13 +509,18 @@ class TestACX6LithosContractTests:
 # prompts, slug.  Mapped to one or more corresponding unit test files.
 # The "path" pure module is the archive-path logic in ``storage.py``
 # (``build_archive_path`` plus path-safety helpers); ``storage.py`` also
-# carries the thin ``download_archive`` IO wrapper, so coverage for that
-# module is driven by ``test_archive_path.py`` and
-# ``test_archive_download.py`` together.
+# carries the thin ``download_archive`` IO wrapper plus the per-domain
+# policy short-circuits (issues #149, #160, #161), so coverage for that
+# module is driven by ``test_archive_path.py``, ``test_archive_download.py``,
+# and ``test_archive_download_policy.py`` together.
 _PURE_MODULE_TESTS: dict[str, tuple[str, ...]] = {
     "config.py": ("test_config.py",),
     "urls.py": ("test_url_normalisation.py",),
-    "storage.py": ("test_archive_path.py", "test_archive_download.py"),
+    "storage.py": (
+        "test_archive_path.py",
+        "test_archive_download.py",
+        "test_archive_download_policy.py",
+    ),
     "slugs.py": ("test_slugs.py",),
     "schemas.py": ("test_schemas.py",),
     "prompts.py": ("test_prompts.py",),

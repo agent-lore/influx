@@ -1127,27 +1127,35 @@ def build_arxiv_note_item(
         if archive_result.ok:
             archive_path = archive_result.rel_posix_path
         else:
-            archive_missing = True
-            metrics.archive_missing().add(
-                1, {"profile": profile_name, "source": "arxiv"}
-            )
-            # Issue #149: reclassify the failure into a policy tag
-            # when the failure_kind is one of blocked / rate_limited /
-            # missing_by_policy.  Generic failures (http_404, oversize,
-            # timeout, …) keep the default ``influx:archive-missing``
-            # shape so repair-sweep behaviour is unchanged for them.
+            # Issue #161: ``unsupported`` is a deliberate "this domain
+            # has no archive surface" outcome — not a missing archive.
+            # Don't tag the note with ``influx:archive-missing``, and
+            # don't increment the archive-failure metric.  Still
+            # emit the dedicated tag below so an operator can see the
+            # policy fired.
+            archive_unsupported = archive_result.failure_kind == "unsupported"
+            archive_missing = not archive_unsupported
             archive_policy_tag = _tag_for_archive_failure_kind(
                 # ArchiveFailureKind is a Literal; mypy needs a cast.
                 archive_result.failure_kind  # type: ignore[arg-type]
             )
-            metrics.archive_policy_failures().add(
-                1,
-                {
-                    "profile": profile_name,
-                    "source": "arxiv",
-                    "kind": archive_result.failure_kind or "unknown",
-                },
-            )
+            if archive_missing:
+                metrics.archive_missing().add(
+                    1, {"profile": profile_name, "source": "arxiv"}
+                )
+                # Issue #149: reclassify the failure into a policy tag
+                # when the failure_kind is one of blocked / rate_limited /
+                # missing_by_policy.  Generic failures (http_404, oversize,
+                # timeout, …) keep the default ``influx:archive-missing``
+                # shape so repair-sweep behaviour is unchanged for them.
+                metrics.archive_policy_failures().add(
+                    1,
+                    {
+                        "profile": profile_name,
+                        "source": "arxiv",
+                        "kind": archive_result.failure_kind or "unknown",
+                    },
+                )
 
     acquired = Acquired(
         item_id=item.arxiv_id,
@@ -1196,7 +1204,11 @@ def build_arxiv_note_item(
         tags.append(archive_policy_tag)
     if (
         archive_policy_tag
-        in ("influx:archive-blocked", "influx:archive-skipped-by-policy")
+        in (
+            "influx:archive-blocked",
+            "influx:archive-skipped-by-policy",
+            "influx:archive-unsupported",
+        )
         and "influx:archive-terminal" not in tags
     ):
         tags.append("influx:archive-terminal")

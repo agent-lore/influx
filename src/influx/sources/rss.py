@@ -301,23 +301,33 @@ def build_rss_note_item(
     # than an acquisition failure so the run-level
     # ``archive_acquisition`` degraded reason does not fire on these
     # known non-article URLs.
-    non_html_source = archive_result.failure_kind == "non_html_source"
-    archive_missing = not archive_result.ok and not non_html_source
+    # Issue #161: ``unsupported`` is the same shape but the
+    # discriminator is the domain policy (``openai.com`` etc.) rather
+    # than the URL shape.  Both share the "not a missing archive"
+    # semantics — they get a dedicated tag + terminal flag, but no
+    # ``influx:archive-missing`` and no contribution to
+    # ``archive_failures_total``.
+    archive_skipped_no_failure = archive_result.failure_kind in (
+        "non_html_source",
+        "unsupported",
+    )
+    archive_missing = not archive_result.ok and not archive_skipped_no_failure
     # Issue #149: extract the policy-driven tag (if any) so the tag
     # composition below can apply ``influx:archive-blocked`` /
     # ``influx:archive-rate-limited`` /
     # ``influx:archive-skipped-by-policy`` alongside
     # ``influx:archive-missing``.  Returns ``None`` for generic
     # failures (http_404, oversize, timeout, …) so the existing
-    # ``influx:archive-missing`` shape is preserved.  Issue #160:
-    # ``non_html_source`` also returns its dedicated tag here so the
-    # informational ``influx:archive-non-html-source`` tag is applied
-    # below alongside the terminal flag.
+    # ``influx:archive-missing`` shape is preserved.  Issues #160/#161:
+    # ``non_html_source`` / ``unsupported`` also return their dedicated
+    # tags here so the informational ``influx:archive-non-html-source``
+    # / ``influx:archive-unsupported`` tag is applied below alongside
+    # the terminal flag.
     archive_policy_tag = (
         _tag_for_archive_failure_kind(
             archive_result.failure_kind  # type: ignore[arg-type]
         )
-        if archive_missing or non_html_source
+        if archive_missing or archive_skipped_no_failure
         else None
     )
     if archive_missing:
@@ -418,6 +428,9 @@ def build_rss_note_item(
     # Issue #160: ``non_html_source`` also lands its dedicated tag
     # (``influx:archive-non-html-source``) and the terminal flag — the
     # URL shape never pointed at HTML, so there is nothing to repair.
+    # Issue #161: ``unsupported`` lands its dedicated tag
+    # (``influx:archive-unsupported``) and the terminal flag — the
+    # domain has no archive surface.
     if archive_policy_tag is not None and archive_policy_tag not in tags:
         tags.append(archive_policy_tag)
     if (
@@ -426,6 +439,7 @@ def build_rss_note_item(
             "influx:archive-blocked",
             "influx:archive-skipped-by-policy",
             "influx:archive-non-html-source",
+            "influx:archive-unsupported",
         )
         and "influx:archive-terminal" not in tags
     ):

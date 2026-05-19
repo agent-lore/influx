@@ -53,6 +53,7 @@ __all__ = [
     "ARCHIVE_NON_HTML_SOURCE_TAG",
     "ARCHIVE_RATE_LIMITED_TAG",
     "ARCHIVE_SKIPPED_BY_POLICY_TAG",
+    "ARCHIVE_UNSUPPORTED_TAG",
     "ArchiveFailureKind",
     "ArchivePolicy",
     "ArchivePolicyMode",
@@ -81,6 +82,13 @@ ARCHIVE_SKIPPED_BY_POLICY_TAG = "influx:archive-skipped-by-policy"
 # from the domain-policy ``skip`` mode because the discriminator is the
 # URL shape itself, not an operator decision about a whole domain.
 ARCHIVE_NON_HTML_SOURCE_TAG = "influx:archive-non-html-source"
+# Issue #161: applied when a domain is declared archive-unsupported via
+# the ``unsupported`` policy mode.  Distinct from
+# ``ARCHIVE_SKIPPED_BY_POLICY_TAG``: the unsupported tag deliberately
+# does NOT accompany ``influx:archive-missing``, so a run with
+# otherwise-successful ingestion is not degraded solely because an
+# unsupported domain (``openai.com``) refused archive acquisition.
+ARCHIVE_UNSUPPORTED_TAG = "influx:archive-unsupported"
 
 
 # ── Failure-kind taxonomy ──────────────────────────────────────────────
@@ -104,6 +112,13 @@ ArchiveFailureKind = Literal[
     # call.  Distinct from ``missing_by_policy`` (which is per-domain
     # operator policy) — the discriminator is the URL shape itself.
     "non_html_source",
+    # Issue #161: the domain is declared archive-unsupported via the
+    # ``unsupported`` policy mode.  Like ``missing_by_policy`` in that
+    # no network call is made, but distinct because the run-level
+    # ``archive_acquisition`` degraded reason does NOT fire on
+    # unsupported items (the operator has already said "this domain
+    # has no archive surface").
+    "unsupported",
     "http_403",
     "http_404",
     "http_429",
@@ -131,7 +146,7 @@ _KIND_PREFIX_RE = re.compile(r"^([a-z_]+):")
 # ── Policy taxonomy ────────────────────────────────────────────────────
 
 
-# Three modes for an archive policy:
+# Modes for an archive policy:
 #
 # * ``attempt``: the default — try the download, classify failure
 #   generically.  Equivalent to "no policy registered".
@@ -147,10 +162,19 @@ _KIND_PREFIX_RE = re.compile(r"^([a-z_]+):")
 #   ``influx:archive-missing`` exactly once rather than re-attempting
 #   the same doomed path every sweep.
 # * ``skip``: do not attempt the download at all.  The note is
-#   tagged ``influx:archive-skipped-by-policy`` and never produces a
-#   network call.  Reserved for domains where every observed attempt
-#   over weeks of operation has produced 403 / 401 / WAF challenge.
-ArchivePolicyMode = Literal["attempt", "rate_limited", "blocked", "skip"]
+#   tagged ``influx:archive-skipped-by-policy`` + ``influx:archive-missing``
+#   and never produces a network call.  Contributes to the run-level
+#   ``archive_acquisition`` degraded reason — the operator declared
+#   the domain as "skip and surface as missing."
+# * ``unsupported``: (issue #161) treat the domain as having no
+#   archive surface at all.  No network call.  The note is tagged
+#   ``influx:archive-unsupported`` + ``influx:archive-terminal`` but
+#   NOT ``influx:archive-missing``, so it does NOT contribute to the
+#   run-level ``archive_acquisition`` degraded reason.  Use for
+#   domains where 403 is the expected permanent contract
+#   (``openai.com``) and the operator does not want quiet acquisitions
+#   on these domains polluting run health.
+ArchivePolicyMode = Literal["attempt", "rate_limited", "blocked", "skip", "unsupported"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,12 +199,12 @@ class ArchivePolicy:
     def should_attempt(self) -> bool:
         """Return ``True`` when the policy permits an archive download attempt.
 
-        ``skip`` mode is the only one that short-circuits before a
-        network call.  ``blocked`` and ``rate_limited`` still attempt
-        the download so a domain that lifts its restriction recovers
+        ``skip`` and ``unsupported`` short-circuit before a network
+        call.  ``blocked`` and ``rate_limited`` still attempt the
+        download so a domain that lifts its restriction recovers
         without an operator hand-edit.
         """
-        return self.mode != "skip"
+        return self.mode not in ("skip", "unsupported")
 
 
 # Single sentinel for the default "no specific policy, attempt the
@@ -227,6 +251,21 @@ _DEFAULT_RATE_LIMITED_DOMAINS: tuple[tuple[str, str], ...] = (
     # Reserved for sites observed to throttle archive downloads under
     # production cadence.  Empty for now; populated as staging logs
     # identify candidates.
+)
+
+
+# Issue #161: domains that systematically refuse archive acquisition
+# with HTTP 403 — the archive layer should treat them as having no
+# archive surface at all rather than repeatedly retrying and degrading
+# runs.  The observed offender is ``openai.com``, whose blog/index
+# pages return 403 to every unauthenticated archive request even
+# though the public pages render HTML when visited via a browser.
+_DEFAULT_UNSUPPORTED_DOMAINS: tuple[tuple[str, str], ...] = (
+    (
+        "openai.com",
+        "Archive download returns HTTP 403 to unauthenticated clients; "
+        "OpenAI publishes content via the website only, no archive surface.",
+    ),
 )
 
 
@@ -286,6 +325,7 @@ def build_registry(
     blocked: dict[str, str] | None = None,
     rate_limited: dict[str, str] | None = None,
     skip: dict[str, str] | None = None,
+    unsupported: dict[str, str] | None = None,
     include_defaults: bool = True,
 ) -> ArchivePolicyRegistry:
     """Construct an :class:`ArchivePolicyRegistry` from policy overrides.
@@ -304,9 +344,13 @@ def build_registry(
         Same shape, for ``"rate_limited"`` entries.
     skip:
         Same shape, for ``"skip"`` entries (no archive attempt at all).
+    unsupported:
+        Same shape, for ``"unsupported"`` entries (no archive attempt;
+        does not contribute to ``archive_acquisition`` degraded reason).
     include_defaults:
-        Include the built-in :data:`_DEFAULT_BLOCKED_DOMAINS` and
-        :data:`_DEFAULT_RATE_LIMITED_DOMAINS` (overridable per-suffix
+        Include the built-in :data:`_DEFAULT_BLOCKED_DOMAINS`,
+        :data:`_DEFAULT_RATE_LIMITED_DOMAINS`, and
+        :data:`_DEFAULT_UNSUPPORTED_DOMAINS` (overridable per-suffix
         by the explicit mappings).  Defaults to ``True`` so production
         behaviour is "ship with sensible defaults" out of the box.
     """
@@ -316,14 +360,18 @@ def build_registry(
             merged[suffix.lower()] = ArchivePolicy(mode="blocked", note=note)
         for suffix, note in _DEFAULT_RATE_LIMITED_DOMAINS:
             merged[suffix.lower()] = ArchivePolicy(mode="rate_limited", note=note)
+        for suffix, note in _DEFAULT_UNSUPPORTED_DOMAINS:
+            merged[suffix.lower()] = ArchivePolicy(mode="unsupported", note=note)
 
-    # Operator overrides win.  ``skip`` then ``blocked`` then
-    # ``rate_limited`` so that a later-declared mode beats an earlier
-    # mode for the same suffix (last-write-wins discipline).
+    # Operator overrides win.  Order matters: a later-declared mode
+    # beats an earlier mode for the same suffix (last-write-wins).
+    # ``unsupported`` is listed last so it beats ``skip`` when both
+    # are declared, mirroring the "more terminal" intent of the mode.
     overrides: tuple[tuple[Mapping[str, str] | None, ArchivePolicyMode], ...] = (
         (rate_limited, "rate_limited"),
         (blocked, "blocked"),
         (skip, "skip"),
+        (unsupported, "unsupported"),
     )
     for table, mode in overrides:
         if not table:
@@ -374,6 +422,7 @@ def registry_from_config(
         blocked=dict(archive_policy.blocked),
         rate_limited=dict(archive_policy.rate_limited),
         skip=dict(archive_policy.skip),
+        unsupported=dict(archive_policy.unsupported),
         include_defaults=archive_policy.include_defaults,
     )
 
@@ -477,7 +526,7 @@ def classify_failure_kind(
 def tag_for_failure_kind(kind: ArchiveFailureKind) -> str | None:
     """Return the policy-driven tag for *kind*, or ``None`` for generic kinds.
 
-    Four failure kinds carry a dedicated tag callers add to the note
+    Five failure kinds carry a dedicated tag callers add to the note
     alongside (or in place of) the generic ``influx:archive-missing``:
 
     * ``blocked`` → :data:`ARCHIVE_BLOCKED_TAG`
@@ -486,6 +535,10 @@ def tag_for_failure_kind(kind: ArchiveFailureKind) -> str | None:
     * ``non_html_source`` → :data:`ARCHIVE_NON_HTML_SOURCE_TAG` (issue
       #160; the URL shape never pointed at HTML so the archive layer
       short-circuited before the network call)
+    * ``unsupported`` → :data:`ARCHIVE_UNSUPPORTED_TAG` (issue #161;
+      the domain is declared archive-unsupported and does NOT
+      contribute to the run-level ``archive_acquisition`` degraded
+      reason)
 
     All other kinds (``http_404``, ``timeout``, ``oversize``, …) keep
     the generic missing-tag shape — they describe transient or
@@ -499,4 +552,6 @@ def tag_for_failure_kind(kind: ArchiveFailureKind) -> str | None:
         return ARCHIVE_SKIPPED_BY_POLICY_TAG
     if kind == "non_html_source":
         return ARCHIVE_NON_HTML_SOURCE_TAG
+    if kind == "unsupported":
+        return ARCHIVE_UNSUPPORTED_TAG
     return None

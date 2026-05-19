@@ -118,8 +118,20 @@ class ArchivePolicyConfig(BaseModel):
       tagged ``influx:archive-rate-limited``; the repair sweep applies
       a bounded cool-down on this kind.
     * ``skip``: do not attempt the download.  The note is tagged
-      ``influx:archive-skipped-by-policy`` and never produces a
-      network call.
+      ``influx:archive-skipped-by-policy`` and ``influx:archive-missing``
+      and never produces a network call.  Still contributes to the
+      run-level ``archive_acquisition`` degraded reason — the operator
+      explicitly declared the domain as "skip and surface as a missing
+      archive."
+    * ``unsupported``: (issue #161) do not attempt the download and
+      treat the domain as having no archive surface at all.  The note
+      is tagged ``influx:archive-unsupported`` (and
+      ``influx:archive-terminal``) but NOT ``influx:archive-missing``,
+      so the run is not degraded by domains that systematically refuse
+      archive acquisition (e.g. ``openai.com``).  Use this for domains
+      where 403 is the expected, permanent contract — distinct from
+      ``skip`` which still wants the operator to see "this acquisition
+      did not happen" as a flagged event.
 
     ``include_defaults = false`` opts out of the built-in
     staging-defaults set — primarily a test-injection lever.
@@ -128,6 +140,10 @@ class ArchivePolicyConfig(BaseModel):
     blocked: dict[str, str] = Field(default_factory=dict)
     rate_limited: dict[str, str] = Field(default_factory=dict)
     skip: dict[str, str] = Field(default_factory=dict)
+    # Issue #161: per-domain "this domain does not support archive
+    # acquisition" overrides — like ``skip`` but never contributes to
+    # the run-level ``archive_acquisition`` degraded reason.
+    unsupported: dict[str, str] = Field(default_factory=dict)
     include_defaults: bool = True
 
 

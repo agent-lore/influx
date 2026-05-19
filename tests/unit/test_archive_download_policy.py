@@ -322,6 +322,89 @@ class TestDefaultRegistryIdentity:
         assert default_registry() is default_registry()
 
 
+# ── Issue #161: ``unsupported`` mode short-circuits without degradation ──
+
+
+class TestUnsupportedModePolicy:
+    """``unsupported`` mode never reaches the network and emits its own kind.
+
+    The contract is the same shape as ``skip`` (no network call) but
+    the result carries ``failure_kind="unsupported"`` and ``policy_mode
+    == "unsupported"``, so callers can route around the
+    ``archive-missing`` tag composition that would otherwise contribute
+    to the run-level ``archive_acquisition`` degraded reason.
+    """
+
+    def test_unsupported_short_circuits_without_network(self, tmp_path: Path) -> None:
+        registry = build_registry(
+            unsupported={"openai.example": "no archive surface"},
+            include_defaults=False,
+        )
+        with patch("influx.storage.guarded_fetch") as mock_fetch:
+            result = _dl(
+                tmp_path,
+                "https://openai.example/index/article",
+                registry=registry,
+            )
+        mock_fetch.assert_not_called()
+        assert result.ok is False
+        assert result.failure_kind == "unsupported"
+        assert result.policy_mode == "unsupported"
+        assert result.domain == "openai.example"
+        assert result.rel_posix_path is None
+        assert "unsupported" in result.error
+
+    def test_unsupported_default_includes_openai_com(self, tmp_path: Path) -> None:
+        # Production default — openai.com is in the staging-defaults
+        # ``unsupported`` list and short-circuits without a network call.
+        with patch("influx.storage.guarded_fetch") as mock_fetch:
+            result = _dl(tmp_path, "https://openai.com/index/x")
+        mock_fetch.assert_not_called()
+        assert result.failure_kind == "unsupported"
+        assert result.policy_mode == "unsupported"
+
+    def test_unsupported_does_not_create_archive_file(self, tmp_path: Path) -> None:
+        registry = build_registry(
+            unsupported={"openai.example": ""},
+            include_defaults=False,
+        )
+        with patch("influx.storage.guarded_fetch"):
+            _dl(tmp_path, "https://openai.example/x", registry=registry)
+        # Like ``skip``, ``unsupported`` short-circuits before path
+        # construction.
+        assert not (tmp_path / "rss").exists()
+
+    def test_unsupported_logs_policy_decision(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Acceptance criterion #4: logs make the policy decision
+        # explicit.  An ``unsupported`` short-circuit emits an INFO
+        # log carrying ``policy=unsupported`` and the operator note
+        # so support triage can see why no archive was attempted.
+        import logging
+
+        registry = build_registry(
+            unsupported={"openai.example": "no archive surface"},
+            include_defaults=False,
+        )
+        with (
+            patch("influx.storage.guarded_fetch"),
+            caplog.at_level(logging.INFO, logger="influx.storage"),
+        ):
+            _dl(
+                tmp_path,
+                "https://openai.example/index/article",
+                registry=registry,
+            )
+
+        relevant = [r for r in caplog.records if "policy=unsupported" in r.message]
+        assert relevant, "expected an INFO log line marked policy=unsupported"
+        assert any("no archive surface" in r.message for r in relevant)
+        assert any("openai.example" in r.message for r in relevant)
+
+
 # ── Issue #160: URL-shape short-circuit for non-HTML sources ──────────
 
 

@@ -287,6 +287,13 @@ async def ledger_lifecycle(
         archive_blocked_total = 0
         archive_rate_limited_total = 0
         archive_skipped_by_policy_total = 0
+        # Issue #161: separate counter for ``unsupported`` policy items.
+        # These deliberately do NOT contribute to
+        # ``archive_failures_total`` (the operator declared the domain
+        # has no archive surface), but the per-run total still needs to
+        # surface so an operator sees "we hit N unsupported-policy
+        # items this run" in the INFO log line below.
+        archive_unsupported_total = 0
         # #152: per-item archive-failure records (url + tags) so the
         # ledger's degradation summary can compute the by-domain and
         # by-kind top-N.  One entry per item that landed
@@ -304,6 +311,8 @@ async def ledger_lifecycle(
                     archive_rate_limited_total += 1
                 if "influx:archive-skipped-by-policy" in item.tags:
                     archive_skipped_by_policy_total += 1
+                if "influx:archive-unsupported" in item.tags:
+                    archive_unsupported_total += 1
         # #85: pull the pre-filter fetched-count from the contextvar
         # bucket the source layer accumulated into.  ``outcome`` may be
         # ``None`` on the early-skip / abort paths; in that case we
@@ -540,6 +549,24 @@ async def ledger_lifecycle(
                 run_id,
                 invalid_note_state_summary or "<none>",
             )
+        # Issue #161: surface the unsupported-policy total at INFO so an
+        # operator can see "we hit N items on archive-unsupported
+        # domains this run" without the run being flagged as degraded.
+        # Distinct from the ``archive_acquisition`` WARNING above —
+        # ``unsupported`` is the expected, declared-terminal outcome,
+        # not a failure.
+        if archive_unsupported_total > 0:
+            logger.info(
+                "run archive_unsupported profile=%s kind=%s run_id=%s "
+                "unsupported_items=%d "
+                "(items on archive-unsupported policy domains — "
+                "expected, not counted toward archive_acquisition)",
+                profile,
+                plan.kind.value,
+                run_id,
+                archive_unsupported_total,
+            )
+
         metrics.run_duration().record(elapsed, metric_attrs)
         metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
 
