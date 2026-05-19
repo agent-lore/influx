@@ -21,6 +21,7 @@ import pytest
 
 from influx.archive_policy import (
     ARCHIVE_BLOCKED_TAG,
+    ARCHIVE_NON_HTML_SOURCE_TAG,
     ARCHIVE_RATE_LIMITED_TAG,
     ARCHIVE_SKIPPED_BY_POLICY_TAG,
     ArchivePolicy,
@@ -218,6 +219,7 @@ class TestTagForFailureKind:
             ("blocked", ARCHIVE_BLOCKED_TAG),
             ("rate_limited", ARCHIVE_RATE_LIMITED_TAG),
             ("missing_by_policy", ARCHIVE_SKIPPED_BY_POLICY_TAG),
+            ("non_html_source", ARCHIVE_NON_HTML_SOURCE_TAG),
         ],
     )
     def test_policy_kinds_map_to_dedicated_tags(

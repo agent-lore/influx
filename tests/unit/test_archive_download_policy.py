@@ -320,3 +320,70 @@ class TestDefaultRegistryIdentity:
 
     def test_singleton_identity(self) -> None:
         assert default_registry() is default_registry()
+
+
+# ── Issue #160: URL-shape short-circuit for non-HTML sources ──────────
+
+
+class TestNonHtmlSourceShortCircuit:
+    """``expected_content_type="html"`` short-circuits non-HTML URL shapes.
+
+    Pinning the contract guarantees that RSS/feed pointer URLs and HN
+    discussion links never reach the network — so they cannot inflate
+    the run's ``archive_failures_total`` (degraded-reasons feeder) with
+    ``content_type_mismatch`` failures.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://csdb.dk/rss/upcomingevents.php",
+            "https://csdb.dk/rss/latestadditions.php?type=release",
+            "https://example.com/feed",
+            "https://example.com/atom.xml",
+        ],
+    )
+    def test_xml_feed_urls_short_circuit(self, tmp_path: Path, url: str) -> None:
+        with patch("influx.storage.guarded_fetch") as mock_fetch:
+            result = _dl(tmp_path, url)
+        mock_fetch.assert_not_called()
+        assert result.ok is False
+        assert result.failure_kind == "non_html_source"
+        assert result.rel_posix_path is None
+        assert "non_html_source" in result.error
+
+    def test_hn_pointer_short_circuits(self, tmp_path: Path) -> None:
+        with patch("influx.storage.guarded_fetch") as mock_fetch:
+            result = _dl(tmp_path, "https://news.ycombinator.com/item?id=48081266")
+        mock_fetch.assert_not_called()
+        assert result.failure_kind == "non_html_source"
+        assert result.domain == "news.ycombinator.com"
+
+    def test_html_url_is_not_short_circuited(self, tmp_path: Path) -> None:
+        # A regular article URL still goes through the network — the
+        # short-circuit only fires on known non-HTML shapes.
+        with patch("influx.storage.guarded_fetch") as mock_fetch:
+            mock_fetch.return_value = _make_fetch_result(
+                body=b"<html>ok</html>", content_type="text/html"
+            )
+            result = _dl(tmp_path, "https://example.com/posts/article")
+        mock_fetch.assert_called_once()
+        assert result.ok is True
+        assert result.failure_kind == ""
+
+    def test_pdf_expected_type_skips_classifier(self, tmp_path: Path) -> None:
+        # The short-circuit only runs when the caller expects HTML —
+        # arXiv (PDF) callers must never be re-routed even if the URL
+        # happens to match an XML/pointer shape.
+        with patch("influx.storage.guarded_fetch") as mock_fetch:
+            mock_fetch.return_value = _make_fetch_result()
+            result = _dl(
+                tmp_path,
+                "https://example.com/feed",
+                source="arxiv",
+                item_id="2601.12345",
+                ext=".pdf",
+            )
+        mock_fetch.assert_called_once()
+        assert result.ok is True
+        assert result.failure_kind == ""
