@@ -621,6 +621,130 @@ async def test_run_completed_log_degraded_false_for_clean_run(
 
     record = _extract_run_completed_record(caplog)
     assert "degraded=False" in record.message
+    # Issue #164: clean runs carry the ``severity=success`` bucket so
+    # operator log greps can filter for non-trivial outcomes uniformly.
+    assert "severity=success" in record.message
+
+
+async def test_run_completed_log_carries_expected_lossy_severity(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #164: archive_acquisition alone → ``severity=expected_lossy``.
+
+    Tolerated upstream lossiness (the openai.com / lesswrong.com
+    staging shape) gets the ``expected_lossy`` bucket so dashboards
+    can separate release-noise from real breakage without parsing
+    the reason list.
+    """
+    from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    body_outcome = RunOutcome(
+        sources_checked=2,
+        ingested=1,
+        profile_run_result=ProfileRunResult(
+            run_date="2026-05-08",
+            profile="alpha",
+            stats=RunStats(sources_checked=2, ingested=1),
+            items=[
+                HighlightItem(
+                    id="note-1",
+                    title="Archive failed",
+                    score=8,
+                    tags=["profile:alpha", "influx:archive-missing"],
+                    reason="archive fetch failed",
+                    url="https://www.lesswrong.com/posts/x",
+                    related_in_lithos=[],
+                )
+            ],
+        ),
+    )
+    with (
+        caplog.at_level(logging.INFO, logger="influx.run_service"),
+        patch(
+            "influx.run.Run.execute",
+            new_callable=AsyncMock,
+            return_value=body_outcome,
+        ),
+    ):
+        await service.execute(_scheduled_plan())
+
+    record = _extract_run_completed_record(caplog)
+    assert "degraded=True" in record.message
+    assert "severity=expected_lossy" in record.message
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert entry["degradation_severity"] == "expected_lossy"
+
+
+async def test_run_completed_log_carries_unexpected_failure_severity(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #164: invalid_note_state escalates to ``unexpected_failure``.
+
+    Reproduces the staging shape
+    ``reasons=archive_acquisition,invalid_note_state`` — even though
+    archive_acquisition is expected-lossy on its own, the
+    invalid_note_state co-occurrence escalates the whole run.
+    """
+    from influx.notifications import HighlightItem, ProfileRunResult, RunStats
+    from influx.telemetry import current_write_outcomes
+
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    async def body_with_invalid_input(self: Any) -> RunOutcome:
+        # Stamp an ``invalid_input`` write outcome so the run-service
+        # surfaces ``invalid_note_state`` to the ledger.
+        counter = current_write_outcomes.get()
+        assert counter is not None
+        counter[("invalid_input", "arxiv")] = (
+            counter.get(("invalid_input", "arxiv"), 0) + 1
+        )
+        return RunOutcome(
+            sources_checked=2,
+            ingested=1,
+            profile_run_result=ProfileRunResult(
+                run_date="2026-05-08",
+                profile="alpha",
+                stats=RunStats(sources_checked=2, ingested=1),
+                items=[
+                    HighlightItem(
+                        id="note-1",
+                        title="Archive failed",
+                        score=8,
+                        tags=["profile:alpha", "influx:archive-missing"],
+                        reason="archive fetch failed",
+                        url="https://openai.com/index/x",
+                        related_in_lithos=[],
+                    )
+                ],
+            ),
+        )
+
+    with (
+        caplog.at_level(logging.INFO, logger="influx.run_service"),
+        patch("influx.run.Run.execute", new=body_with_invalid_input),
+    ):
+        await service.execute(_scheduled_plan())
+
+    record = _extract_run_completed_record(caplog)
+    assert "degraded=True" in record.message
+    assert "severity=unexpected_failure" in record.message
+    assert "invalid_note_state" in record.message
+
+    entry = next(e for e in ledger.recent() if e["status"] == "completed")
+    assert entry["degradation_severity"] == "unexpected_failure"
+    assert "invalid_note_state" in entry["degraded_reasons"]
+    # archive_acquisition is still present in the list — the
+    # severity bucket escalated, but the reason list preserves both.
+    assert "archive_acquisition" in entry["degraded_reasons"]
 
 
 async def test_archive_acquisition_degrades_run_and_logs_warning(

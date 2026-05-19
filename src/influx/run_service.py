@@ -567,8 +567,20 @@ async def ledger_lifecycle(
                 archive_unsupported_total,
             )
 
+        # Issue #164: classify the degraded reasons into the
+        # ``severity`` bucket the ledger entry stores so the metric
+        # label and the run-completed log line agree on the
+        # ``"expected_lossy"`` / ``"unexpected_failure"`` split.  The
+        # ledger has the authoritative computation; we mirror it
+        # here for the metric attribute.
+        from influx.run_ledger import classify_degradation_severity
+
+        severity = classify_degradation_severity(list(degraded_reasons))
+
         metrics.run_duration().record(elapsed, metric_attrs)
-        metrics.run_completions().add(1, {**metric_attrs, "outcome": run_outcome})
+        metrics.run_completions().add(
+            1, {**metric_attrs, "outcome": run_outcome, "severity": severity}
+        )
 
         if outcome is not None:
             # #79: tie ``degraded`` to ``run_outcome`` (the same source of
@@ -583,6 +595,11 @@ async def ledger_lifecycle(
             # broken?" without requiring a ledger fetch.  Computed in
             # one shot via :func:`build_degradation_summary` so the log
             # tail and the persisted summary stay in lockstep.
+            #
+            # #164: emit ``severity=...`` alongside ``degraded=...``
+            # so operators can immediately distinguish expected
+            # upstream lossiness from real pipeline regressions
+            # without re-deriving the bucket from the reason list.
             top_drivers = _format_top_drivers_tail(
                 archive_failures=archive_failures,
                 source_acquisition_errors=source_errors,
@@ -590,7 +607,8 @@ async def ledger_lifecycle(
             )
             logger.info(
                 "run completed profile=%s kind=%s run_id=%s duration=%.1fs "
-                "sources_checked=%d ingested=%d degraded=%s reasons=%s%s",
+                "sources_checked=%d ingested=%d degraded=%s severity=%s "
+                "reasons=%s%s",
                 profile,
                 plan.kind.value,
                 run_id,
@@ -598,6 +616,7 @@ async def ledger_lifecycle(
                 outcome.sources_checked,
                 outcome.ingested,
                 run_outcome == "degraded",
+                severity,
                 ",".join(degraded_reasons) if degraded_reasons else "",
                 f" top_drivers={top_drivers}" if top_drivers else "",
             )
