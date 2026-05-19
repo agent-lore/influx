@@ -169,6 +169,19 @@ class TestReconstructTags:
         reconstruct_tags(note, inferred_source="arxiv")
         assert note["tags"] == original_tags
 
+    def test_drops_existing_tombstone_tag(self) -> None:
+        # PR #170 Copilot review: a previously-tombstoned note that
+        # becomes recoverable (e.g. because inference paths expanded)
+        # must shed the tombstone tag during reconstruct — otherwise
+        # the note would still be filtered out by "operator-cleaned"
+        # dashboards / sweep selectors despite being re-armed for
+        # processing.
+        note = _make_invalid_note(extra_tags=[TOMBSTONE_TAG])
+        result = reconstruct_tags(note, inferred_source="arxiv")
+        assert TOMBSTONE_TAG not in result
+        # And the reconstruct still re-arms the note.
+        assert REPAIR_NEEDED_TAG in result
+
 
 class TestTombstoneTags:
     """``tombstone_tags`` adds the tombstone marker and drops repair-needed."""

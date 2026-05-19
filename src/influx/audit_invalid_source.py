@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from influx.repair_hooks import _note_source_tag, infer_note_source
+from influx.repair_hooks import infer_note_source, note_source_tag
 
 __all__ = [
     "INVALID_SOURCE_TAG",
@@ -114,7 +114,7 @@ def audit_one_note(note: dict[str, Any]) -> AuditFinding:
         title=str(note.get("title", "")),
         path=str(note.get("path", "")),
         source_url=str(note.get("source_url", "")),
-        existing_source_tag=_note_source_tag(note),
+        existing_source_tag=note_source_tag(note),
         inferred_source=infer_note_source(note),
         tags=tags,
     )
@@ -150,12 +150,18 @@ def reconstruct_tags(note: dict[str, Any], *, inferred_source: str) -> list[str]
     ``rewrite``).  Does NOT mutate the input note.
     """
     tags = [str(t) for t in note.get("tags", []) if isinstance(t, str)]
+    # ``TOMBSTONE_TAG`` is dropped here because a note that was
+    # previously tombstoned may become recoverable as new inference
+    # paths land — leaving the tombstone tag in place would conflict
+    # with the reconstruct semantics ("re-arm for the next sweep")
+    # and keep dashboards / filters treating the note as
+    # permanently excluded.
     rebuilt = [
         t
         for t in tags
         if not t.startswith("source:")
         and not t.startswith("text:")
-        and t not in {INVALID_SOURCE_TAG, TEXT_TERMINAL_TAG}
+        and t not in {INVALID_SOURCE_TAG, TEXT_TERMINAL_TAG, TOMBSTONE_TAG}
     ]
     rebuilt.append(f"source:{inferred_source}")
     if REPAIR_NEEDED_TAG not in rebuilt:
@@ -195,7 +201,7 @@ def format_audit_report(findings: list[AuditFinding]) -> str:
     to ``less``.
     """
     if not findings:
-        return "No notes carry influx:source-invalid — nothing to clean up."
+        return f"No notes carry {INVALID_SOURCE_TAG} — nothing to clean up."
 
     reconstructable = sum(1 for f in findings if f.recoverable)
     tombstoneable = len(findings) - reconstructable

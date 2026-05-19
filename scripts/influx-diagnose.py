@@ -1162,6 +1162,11 @@ async def _fetch_invalid_source_notes(
         for note_id in ids:
             try:
                 doc = await client.read_note(note_id=note_id)
+            except (KeyboardInterrupt, SystemExit):
+                # Operator-initiated cancellation must propagate so
+                # the script can stop cleanly instead of looping over
+                # remaining ids.
+                raise
             except BaseException as exc:  # noqa: BLE001
                 chain = _format_exception_chain(exc)
                 print(
@@ -1226,6 +1231,10 @@ async def _apply_invalid_source_action(
                 note_type=str(note.get("note_type") or "summary"),
                 namespace=str(note.get("namespace") or "influx"),
             )
+        except (KeyboardInterrupt, SystemExit):
+            # Operator cancellation must abort the apply pass cleanly
+            # rather than being demoted to a "refused" result.
+            raise
         except BaseException as exc:  # noqa: BLE001
             return "refused", f"write failed: {_format_exception_chain(exc)}"
         status = getattr(result, "status", "") or getattr(result, "outcome", "")
