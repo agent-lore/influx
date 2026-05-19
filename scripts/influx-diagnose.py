@@ -1690,8 +1690,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help=(
             "fail the gate when the fraction of expected_lossy runs in "
-            "the window exceeds this value (inclusive at the boundary; "
-            "default: 0.5)"
+            "the window is strictly greater than this value.  A ratio "
+            "exactly equal to the threshold passes (default: 0.5)."
         ),
     )
     p_gate.add_argument(

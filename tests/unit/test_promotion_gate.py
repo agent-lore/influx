@@ -7,8 +7,9 @@ verdict for a staging-promotion script.  Tests pin:
   runs count.
 * The three failure modes — ``insufficient_runs``,
   ``unexpected_failure_present``, ``expected_lossy_above_threshold``.
-* The success mode (``"ok"``) and that the ratio threshold is
-  inclusive (a ratio exactly equal to the configured max passes).
+* The success mode (``"ok"``) and that the ratio comparison is
+  strict ``>`` rather than ``>=`` — a ratio exactly equal to the
+  configured max passes; only ratios strictly above it fail.
 * The top-driver / unexpected-failure summary surfaces.
 * Backward-compat: entries written before #164 land in the ledger
   without ``degradation_severity``; the gate falls back to
@@ -19,11 +20,87 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from influx.promotion_gate import (
     PromotionGateConfig,
     evaluate_promotion_gate,
     format_gate_summary,
 )
+
+# ── Config validation (Copilot review on PR #172) ─────────────────────
+
+
+class TestPromotionGateConfigValidation:
+    """``PromotionGateConfig.__post_init__`` rejects bogus knob values.
+
+    Without validation, a CI misconfiguration like ``min_runs_required=0``
+    silently makes the insufficient-runs check unreachable and the gate
+    can pass on an empty window.  Pinning the contract here keeps the
+    knobs from drifting back into the wild west.
+    """
+
+    def test_window_runs_below_one_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="window_runs"):
+            PromotionGateConfig(window_runs=0)
+        with pytest.raises(ValueError, match="window_runs"):
+            PromotionGateConfig(window_runs=-1)
+
+    def test_min_runs_required_below_one_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="min_runs_required"):
+            PromotionGateConfig(min_runs_required=0)
+        with pytest.raises(ValueError, match="min_runs_required"):
+            PromotionGateConfig(min_runs_required=-1)
+
+    def test_max_expected_lossy_ratio_out_of_range_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="max_expected_lossy_ratio"):
+            PromotionGateConfig(max_expected_lossy_ratio=-0.01)
+        with pytest.raises(ValueError, match="max_expected_lossy_ratio"):
+            PromotionGateConfig(max_expected_lossy_ratio=1.01)
+
+    def test_ratio_at_zero_and_one_are_accepted(self) -> None:
+        # 0.0 = "any expected_lossy fails" — a tightening operator may
+        # want this.  1.0 = "no observable ratio can exceed 1.0", so
+        # the lossy-ratio check is effectively disabled.
+        PromotionGateConfig(max_expected_lossy_ratio=0.0)
+        PromotionGateConfig(max_expected_lossy_ratio=1.0)
+
+
+# ── Formatter contract: no trailing newline ───────────────────────────
+
+
+class TestFormatGateSummaryNewlines:
+    """``format_gate_summary`` returns text WITHOUT a trailing newline.
+
+    Caller decides how to emit (default ``print(...)`` adds the single
+    final newline).  Copilot review on PR #172: a function-side
+    trailing newline plus ``print`` produced extra blank lines in CI
+    logs.
+    """
+
+    def test_no_trailing_newline(self) -> None:
+        entries = [
+            {
+                "run_id": "r-1",
+                "profile": "alpha",
+                "kind": "scheduled",
+                "status": "completed",
+                "degraded_reasons": [],
+                "degradation_severity": "success",
+            }
+        ]
+        result = evaluate_promotion_gate(
+            entries, PromotionGateConfig(min_runs_required=1)
+        )
+        text = format_gate_summary(result, PromotionGateConfig(min_runs_required=1))
+        assert not text.endswith("\n"), (
+            "format_gate_summary must not return a trailing newline; the "
+            "caller decides how to emit"
+        )
+        # Still ends with the substantive last line.
+        assert text.endswith("success=1 expected_lossy=0 unexpected_failure=0") or (
+            "success=1" in text
+        )
 
 
 def _entry(
@@ -171,9 +248,10 @@ class TestPromotionGateOutcomes:
         assert result.expected_lossy_ratio == 0.4
 
     def test_ratio_exactly_at_threshold_passes(self) -> None:
-        # 5 lossy + 5 success = exactly 0.5 → inclusive at the
-        # boundary so an operator setting ``max=0.5`` does not see
-        # gate flap from a 50/50 split.
+        # 5 lossy + 5 success = exactly 0.5 → passes because the
+        # comparison is strict ``>`` (only ratios strictly above the
+        # threshold fail), so an operator setting ``max=0.5`` does
+        # not see gate flap from a clean 50/50 split.
         entries = [
             _entry(
                 run_id=f"lossy-{i}",

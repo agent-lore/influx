@@ -47,10 +47,13 @@ class PromotionGateConfig:
         20 — a roughly-day-long window at the typical hourly cadence.
     max_expected_lossy_ratio:
         Hard ceiling on the ratio of ``expected_lossy`` runs in the
-        window.  Above this the gate fails with reason
-        ``"expected_lossy_above_threshold"`` even when every run is
-        below ``unexpected_failure``.  Defaults to 0.5 (half the
-        window).  Set to 1.0 to disable the ratio check entirely.
+        window.  The gate fails with reason
+        ``"expected_lossy_above_threshold"`` when the observed ratio
+        is **strictly greater than** this value; a ratio exactly
+        equal to the threshold passes (so an operator setting ``0.5``
+        does not see the gate flap on a clean 50/50 split).  Defaults
+        to 0.5 (half the window).  Set to 1.0 to disable the ratio
+        check entirely (no observable ratio can exceed 1.0).
     min_runs_required:
         Refuse to evaluate when fewer than this many scheduled
         completed runs are present in the window.  Prevents
@@ -61,6 +64,28 @@ class PromotionGateConfig:
     window_runs: int = 20
     max_expected_lossy_ratio: float = 0.5
     min_runs_required: int = 5
+
+    def __post_init__(self) -> None:
+        """Validate config values at construction time (Copilot review on PR #172).
+
+        Reject obviously-bogus values up front so a CI misconfiguration
+        (e.g. ``min_runs_required = 0`` making the insufficient-runs
+        check unreachable, or a negative ratio that no real run can
+        satisfy) cannot silently promote.  Raised as ``ValueError`` so
+        the operator sees the specific bad knob rather than a vague
+        downstream failure.
+        """
+        if self.window_runs < 1:
+            raise ValueError(f"window_runs must be >= 1, got {self.window_runs}")
+        if self.min_runs_required < 1:
+            raise ValueError(
+                f"min_runs_required must be >= 1, got {self.min_runs_required}"
+            )
+        if not 0.0 <= self.max_expected_lossy_ratio <= 1.0:
+            raise ValueError(
+                "max_expected_lossy_ratio must be in [0.0, 1.0], got "
+                f"{self.max_expected_lossy_ratio}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,4 +298,7 @@ def format_gate_summary(
             reasons_str = ",".join(str(r) for r in reasons_list) or "<none>"
             lines.append(f"  run_id={run_id} profile={profile} reasons={reasons_str}")
 
-    return "\n".join(lines) + "\n"
+    # No trailing newline — caller decides how to emit (Copilot review
+    # on PR #172: wrapping in ``print(...)`` previously added a second
+    # newline and produced extra blank lines in CI logs).
+    return "\n".join(lines)

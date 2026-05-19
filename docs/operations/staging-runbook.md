@@ -460,9 +460,12 @@ Policy:
   scorer failures).  The acceptance criterion is "fail immediately"
   — even one such run trips the gate.
 - **Soft fail** when the fraction of `expected_lossy` runs in the
-  window exceeds `--max-lossy-ratio` (default `0.5`, inclusive at
-  the boundary).  Tolerated upstream noise is fine in small doses
-  but becomes a quality signal if it dominates.
+  window is **strictly greater than** `--max-lossy-ratio` (default
+  `0.5`).  A ratio exactly equal to the threshold passes — only
+  ratios above it fail — so an operator setting `0.5` does not see
+  the gate flap on a clean 50/50 split.  Tolerated upstream noise
+  is fine in small doses but becomes a quality signal if it
+  dominates.
 - **Insufficient runs** when fewer than `--min-runs` (default 5)
   scheduled completed runs are present — prevents spurious
   PASS/FAIL on a freshly-started deployment.
