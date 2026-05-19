@@ -23,6 +23,8 @@ import calendar
 import json
 import logging
 import os
+import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -55,11 +57,12 @@ from influx.telemetry import (
     record_filter_error,
     record_invalid_url_rejection,
     record_source_acquisition_error,
+    record_source_cooldown_skip,
 )
 from influx.urls import classify_article_url, normalise_url, url_hash
 
 if TYPE_CHECKING:
-    from influx.config import AppConfig, ProfileConfig, RssSourceEntry
+    from influx.config import AppConfig, ProfileConfig, ResilienceConfig, RssSourceEntry
     from influx.sources import FetchCache
 
 __all__ = [
@@ -71,6 +74,128 @@ __all__ = [
 ]
 
 _log = logging.getLogger(__name__)
+
+
+# ── Per-feed timeout cooldown (issue #163) ─────────────────────────────
+#
+# A single flaky RSS feed (e.g. the staging-observed "Two Stop Bits"
+# aggregator emitting ``httpx.ReadTimeout``) degrades every scheduled
+# run with ``source_acquisition``.  The cooldown is a per-feed-URL
+# state machine layered on top of the existing fetch path:
+#
+#   NORMAL  ── timeout_streak >= threshold ──► COOLDOWN
+#   COOLDOWN ── deadline elapsed ─────────► NORMAL  (lazy clear)
+#   COOLDOWN ── successful fetch ─────────► NORMAL  (eager clear)
+#
+# Only ``timeout`` failures count — other kinds (DNS, network,
+# content_type_mismatch, …) do not enter the cooldown path, so a one-off
+# transport hiccup cannot quarantine a healthy feed.
+#
+# State is per-feed-URL so distinct feeds in the same profile do not
+# share counters: one slow feed never suppresses the rest.  The state
+# map is process-local — a restart resets every deadline (documented as
+# a caveat mirroring the arXiv 429 cooldown in :mod:`influx.sources.arxiv`).
+
+
+@dataclass
+class _RssFeedCooldownState:
+    """Per-feed-URL cooldown bookkeeping (issue #163)."""
+
+    streak: int = 0
+    deadline_monotonic: float | None = None
+
+
+_RSS_COOLDOWN_LOCK = threading.Lock()
+_RSS_COOLDOWN_STATE: dict[str, _RssFeedCooldownState] = {}
+
+
+def _reset_rss_cooldown_for_tests() -> None:
+    """Reset the per-feed cooldown state — test seam only (issue #163).
+
+    Unit and integration tests need a clean baseline between cases;
+    production code never calls this.
+    """
+    with _RSS_COOLDOWN_LOCK:
+        _RSS_COOLDOWN_STATE.clear()
+
+
+def _rss_cooldown_snapshot(url: str) -> tuple[int, float | None]:
+    """Return ``(streak, deadline_monotonic)`` for *url* — test seam only."""
+    with _RSS_COOLDOWN_LOCK:
+        state = _RSS_COOLDOWN_STATE.get(url)
+        if state is None:
+            return 0, None
+        return state.streak, state.deadline_monotonic
+
+
+def _should_skip_rss_for_cooldown(
+    url: str, resilience: ResilienceConfig
+) -> tuple[bool, float | None]:
+    """Inspect the per-feed cooldown state machine before a fetch.
+
+    Returns ``(skip, remaining_seconds)``.  When the threshold is ``0``
+    (feature disabled) or no deadline is set for *url* the helper
+    returns ``(False, None)`` and the caller proceeds normally.
+
+    When an active deadline has elapsed, the state machine transitions
+    back to NORMAL *lazily* — the deadline and streak are both cleared
+    as part of this call so the next timeout starts a fresh streak.
+    """
+    threshold = int(resilience.rss_timeout_cooldown_threshold)
+    if threshold <= 0:
+        return False, None
+    now = time.monotonic()
+    with _RSS_COOLDOWN_LOCK:
+        state = _RSS_COOLDOWN_STATE.get(url)
+        if state is None or state.deadline_monotonic is None:
+            return False, None
+        remaining = state.deadline_monotonic - now
+        if remaining <= 0:
+            # Deadline elapsed — clear state and proceed normally.
+            state.deadline_monotonic = None
+            state.streak = 0
+            return False, None
+        return True, remaining
+
+
+def _record_rss_timeout(url: str, resilience: ResilienceConfig) -> tuple[int, bool]:
+    """Tick the per-feed timeout streak after a timeout fetch failure.
+
+    Returns ``(streak, entered_cooldown)``.  When the resulting streak
+    reaches ``rss_timeout_cooldown_threshold`` the state machine
+    transitions NORMAL → COOLDOWN by setting a fresh deadline; the
+    caller receives ``entered_cooldown=True`` so it can emit a single
+    distinctive WARNING line summarising the quarantine.
+    """
+    threshold = int(resilience.rss_timeout_cooldown_threshold)
+    if threshold <= 0:
+        return 0, False
+    cooldown_seconds = float(resilience.rss_timeout_cooldown_seconds)
+    now = time.monotonic()
+    with _RSS_COOLDOWN_LOCK:
+        state = _RSS_COOLDOWN_STATE.setdefault(url, _RssFeedCooldownState())
+        state.streak += 1
+        streak = state.streak
+        if streak >= threshold and cooldown_seconds > 0:
+            state.deadline_monotonic = now + cooldown_seconds
+            return streak, True
+        return streak, False
+
+
+def _record_rss_fetch_success(url: str) -> None:
+    """Clear the per-feed cooldown state after a successful fetch.
+
+    A successful fetch is the strongest signal that the feed has
+    recovered, so the deadline (if any) is cleared *eagerly* — the
+    streak counter is also reset so an unrelated timeout later starts
+    a fresh streak.
+    """
+    with _RSS_COOLDOWN_LOCK:
+        state = _RSS_COOLDOWN_STATE.get(url)
+        if state is None:
+            return
+        state.streak = 0
+        state.deadline_monotonic = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -636,6 +761,7 @@ class RssSource:
                 max_download_bytes=config.storage.max_download_bytes,
                 timeout_seconds=config.storage.download_timeout_seconds,
                 profile=profile_cfg.name,
+                resilience=config.resilience,
             )
             metrics.candidates_fetched().add(
                 len(items), {"profile": profile_cfg.name, "source": "rss"}
@@ -745,6 +871,7 @@ def make_rss_item_provider(
                     max_download_bytes=config.storage.max_download_bytes,
                     timeout_seconds=config.storage.download_timeout_seconds,
                     profile=profile,
+                    resilience=config.resilience,
                 )
                 metrics.candidates_fetched().add(
                     len(items), {"profile": profile, "source": "rss"}
@@ -899,6 +1026,7 @@ async def _fetch_rss_feed(
     max_download_bytes: int | None = None,
     timeout_seconds: int | None = None,
     profile: str = "",
+    resilience: ResilienceConfig | None = None,
 ) -> list[RssFeedItem]:
     """Fetch raw feed bytes, then parse-and-stamp per *feed_entry*.
 
@@ -911,8 +1039,44 @@ async def _fetch_rss_feed(
     bucket / archive path (review finding 3).  Re-parsing per call keeps
     the network savings of dedup while preserving the FR-SRC-4 rule that
     each item inherits its feed's configured ``source_tag`` verbatim.
+
+    Issue #163: when *resilience* is provided, the helper consults the
+    per-feed timeout cooldown state machine before each fetch.  A feed
+    in active cooldown short-circuits with ``source_cooldown_skip``
+    instead of repeating the upstream timeout and degrading the run
+    with ``source_acquisition``.
     """
     cache_key = f"rss-bytes:{feed_entry.url}"
+
+    # Issue #163: short-circuit fetch when the feed is in active
+    # cooldown.  Records ``source_cooldown_skip`` so the run-ledger
+    # entry distinguishes "throttled on purpose" from "tried and lost"
+    # — mirroring the arXiv 429 cooldown integration (#146).
+    if resilience is not None:
+        skip, remaining = _should_skip_rss_for_cooldown(feed_entry.url, resilience)
+        if skip:
+            remaining_str = f"{remaining:.0f}" if remaining is not None else "?"
+            _log.info(
+                "rss feed skipped (cooldown active) profile=%s feed=%r url=%s "
+                "remaining=%ss "
+                "(repeated ReadTimeout — quarantined until cooldown elapses)",
+                profile,
+                feed_entry.name,
+                feed_entry.url,
+                remaining_str,
+            )
+            record_source_cooldown_skip(
+                source="rss",
+                kind="timeout_cooldown",
+                detail=(
+                    f"{feed_entry.name}: cooldown active, "
+                    f"remaining_seconds={remaining_str}"
+                ),
+            )
+            metrics.source_cooldown_skips().add(
+                1, {"profile": profile, "source": "rss"}
+            )
+            return []
 
     async def _fetch_bytes() -> bytes | None:
         try:
@@ -922,11 +1086,37 @@ async def _fetch_rss_feed(
                 timeout_seconds=timeout_seconds,
             )
         except NetworkError as exc:
-            _log.warning(
-                "RSS feed fetch failed for %r; yielding zero items",
-                feed_entry.name,
-                exc_info=True,
-            )
+            # Issue #163: bump the per-feed timeout streak so repeated
+            # timeouts (the staging "Two Stop Bits" shape) eventually
+            # quarantine this feed.  Other failure kinds (DNS, network,
+            # content_type_mismatch, …) do NOT enter the cooldown
+            # path so a one-off transport hiccup cannot suppress a
+            # healthy feed.
+            entered_cooldown = False
+            cooldown_streak = 0
+            if resilience is not None and exc.kind == "timeout":
+                cooldown_streak, entered_cooldown = _record_rss_timeout(
+                    feed_entry.url, resilience
+                )
+            if entered_cooldown:
+                _log.warning(
+                    "rss feed cooldown engaged after %d consecutive timeouts "
+                    "profile=%s feed=%r url=%s cooldown=%ds "
+                    "(subsequent runs will skip with source_cooldown_skip)",
+                    cooldown_streak,
+                    profile,
+                    feed_entry.name,
+                    feed_entry.url,
+                    int(resilience.rss_timeout_cooldown_seconds)
+                    if resilience is not None
+                    else 0,
+                )
+            else:
+                _log.warning(
+                    "RSS feed fetch failed for %r; yielding zero items",
+                    feed_entry.name,
+                    exc_info=True,
+                )
             # Issue #20: surface to the run ledger so the degraded
             # outcome is distinguishable from a quiet feed.
             record_source_acquisition_error(
@@ -943,6 +1133,11 @@ async def _fetch_rss_feed(
                 },
             )
             return None
+        # Issue #163: a successful fetch clears any accumulated streak
+        # / deadline for this feed.  Cheap no-op when the feed has
+        # never timed out.
+        if resilience is not None:
+            _record_rss_fetch_success(feed_entry.url)
         return result.body
 
     if cache is not None:
