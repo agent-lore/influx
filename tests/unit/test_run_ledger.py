@@ -2,10 +2,183 @@
 
 from __future__ import annotations
 
+import inspect
+import re
 from pathlib import Path
 from typing import Any
 
-from influx.run_ledger import RunLedger
+from influx.run_ledger import (
+    _KNOWN_DEGRADED_REASONS,
+    RunLedger,
+    classify_degradation_severity,
+)
+
+# ── Issue #164: degradation severity classification ──────────────────
+
+
+class TestClassifyDegradationSeverity:
+    """``classify_degradation_severity`` separates lossy noise from real breakage.
+
+    Pinning the contract here keeps the mapping authoritative.  A
+    sibling meta-test (:class:`TestKnownDegradedReasonsCoverage`)
+    scans the source of ``RunLedger.complete`` and refuses to let a
+    new ``reasons.append("…")`` literal land without an explicit
+    severity classification, so the contract is enforced rather than
+    aspirational.
+    """
+
+    def test_no_reasons_is_success(self) -> None:
+        assert classify_degradation_severity([]) == "success"
+
+    def test_lossy_only_reasons_are_expected_lossy(self) -> None:
+        # source_acquisition + cooldown + archive_acquisition are all
+        # tolerated upstream noise; their presence alone keeps the
+        # severity at expected_lossy.
+        for reason in (
+            "source_acquisition",
+            "source_cooldown_skip",
+            "archive_acquisition",
+        ):
+            assert classify_degradation_severity([reason]) == "expected_lossy"
+        assert (
+            classify_degradation_severity(["source_acquisition", "archive_acquisition"])
+            == "expected_lossy"
+        )
+
+    def test_invalid_note_state_is_always_unexpected(self) -> None:
+        # Issue acceptance criterion: "Invalid note state or malformed
+        # persisted metadata is always treated as unexpected failure."
+        assert (
+            classify_degradation_severity(["invalid_note_state"])
+            == "unexpected_failure"
+        )
+
+    def test_invalid_note_state_escalates_when_mixed_with_lossy(self) -> None:
+        # The staging-evidence shape:
+        # ``reasons=archive_acquisition,invalid_note_state``.  Must
+        # escalate to unexpected_failure even though archive_acquisition
+        # is expected-lossy on its own.
+        assert (
+            classify_degradation_severity(["archive_acquisition", "invalid_note_state"])
+            == "unexpected_failure"
+        )
+
+    def test_stall_reasons_are_unexpected_failures(self) -> None:
+        # Stalls fire on a 2-run streak — by then the signal is
+        # operationally actionable, not noisy.
+        for reason in (
+            "ingestion_stall",
+            "fetch_stall",
+            "filter_stall",
+            "invalid_url_stall",
+        ):
+            assert classify_degradation_severity([reason]) == "unexpected_failure", (
+                reason
+            )
+
+    def test_filter_error_is_unexpected(self) -> None:
+        # filter_error fires on scorer execution failure — a config /
+        # availability / response-schema bug, not a soft rate limit.
+        assert classify_degradation_severity(["filter_error"]) == "unexpected_failure"
+
+
+class TestKnownDegradedReasonsCoverage:
+    """Every reason ``RunLedger.complete`` appends must be classified.
+
+    Scans the source of ``RunLedger.complete`` for the
+    ``reasons.append("…")`` literals and asserts each value lands in
+    :data:`_KNOWN_DEGRADED_REASONS`.  Catches the case where a new
+    degraded reason is added without simultaneously updating the
+    expected/unexpected mapping — the classifier would otherwise
+    silently default the unknown reason and the runbook contract
+    would silently drift.
+    """
+
+    _APPEND_RE = re.compile(r'reasons\.append\(\s*"([^"]+)"\s*\)')
+
+    def test_complete_only_appends_classified_reasons(self) -> None:
+        source = inspect.getsource(RunLedger.complete)
+        appended = set(self._APPEND_RE.findall(source))
+        # Sanity: the test would be a no-op if the regex caught nothing.
+        assert appended, "expected to find at least one reasons.append() literal"
+        unknown = appended - _KNOWN_DEGRADED_REASONS
+        assert not unknown, (
+            "RunLedger.complete appends degraded reasons that are not in "
+            "_KNOWN_DEGRADED_REASONS: "
+            + ", ".join(sorted(unknown))
+            + ".  Add each to either _UNEXPECTED_FAILURE_REASONS or "
+            "_EXPECTED_LOSSY_REASONS in src/influx/run_ledger.py."
+        )
+
+
+class TestLedgerEntrySeverityField:
+    """Completed ledger entries carry ``degradation_severity``."""
+
+    @staticmethod
+    def _complete(
+        ledger: RunLedger,
+        *,
+        run_id: str = "r-1",
+        profile: str = "p",
+        kind: str = "scheduled",
+        sources_checked: int = 5,
+        ingested: int = 2,
+        fetched_total: int | None = None,
+        archive_failures_total: int | None = None,
+        write_outcomes: dict[tuple[str, str], int] | None = None,
+    ) -> list[str]:
+        ledger.start(run_id=run_id, profile=profile, kind=kind, run_range=None)
+        return ledger.complete(
+            run_id=run_id,
+            sources_checked=sources_checked,
+            ingested=ingested,
+            fetched_total=fetched_total
+            if fetched_total is not None
+            else sources_checked,
+            archive_failures_total=archive_failures_total,
+            write_outcomes=write_outcomes,
+        )
+
+    def test_clean_run_carries_success_severity(self, tmp_path: Path) -> None:
+        ledger = RunLedger(tmp_path / "state")
+        self._complete(ledger, sources_checked=5, ingested=3)
+        entry = ledger.recent()[0]
+        assert entry["degradation_severity"] == "success"
+
+    def test_expected_lossy_run_carries_expected_lossy_severity(
+        self, tmp_path: Path
+    ) -> None:
+        ledger = RunLedger(tmp_path / "state")
+        self._complete(ledger, archive_failures_total=1)
+        entry = ledger.recent()[0]
+        assert entry["degraded_reasons"] == ["archive_acquisition"]
+        assert entry["degradation_severity"] == "expected_lossy"
+
+    def test_invalid_note_state_run_is_unexpected_failure(self, tmp_path: Path) -> None:
+        # Drive the ledger with the write-outcomes shape that produces
+        # invalid_note_state.
+        ledger = RunLedger(tmp_path / "state")
+        reasons = self._complete(
+            ledger,
+            write_outcomes={("invalid_input", "arxiv"): 1},
+        )
+        assert "invalid_note_state" in reasons
+        entry = ledger.recent()[0]
+        assert entry["degradation_severity"] == "unexpected_failure"
+
+    def test_mixed_reasons_escalate_to_unexpected_failure(self, tmp_path: Path) -> None:
+        # Staging evidence verbatim:
+        # reasons=archive_acquisition,invalid_note_state must collapse
+        # to unexpected_failure.
+        ledger = RunLedger(tmp_path / "state")
+        reasons = self._complete(
+            ledger,
+            archive_failures_total=1,
+            write_outcomes={("invalid_input", "arxiv"): 1},
+        )
+        assert set(reasons) >= {"archive_acquisition", "invalid_note_state"}
+        entry = ledger.recent()[0]
+        assert entry["degradation_severity"] == "unexpected_failure"
 
 
 def test_run_ledger_records_completed_run(tmp_path: Path) -> None:

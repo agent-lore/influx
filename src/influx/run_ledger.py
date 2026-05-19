@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,102 @@ _STALL_HISTORY_LIMIT = 20
 # ``/runs/recent`` payload.  Tied to a constant so the bound is
 # discoverable from one place.
 _DEGRADATION_SUMMARY_TOP_N = 5
+
+
+# Issue #164: severity classification of degraded reasons.  Splits the
+# existing flat ``degraded_reasons`` list into two operational
+# severities so dashboards / paging / triage can separate
+# release-noise (tolerated upstream lossiness) from real breakage
+# (data integrity / pipeline regressions).
+#
+# Reasons listed here ALWAYS escalate the run to
+# ``unexpected_failure`` even when expected-lossy reasons co-occur.
+# This matches the issue's acceptance criterion ("Invalid note state
+# or malformed persisted metadata is always treated as unexpected
+# failure").
+#
+# Reasons NOT in this set are classified as ``expected_lossy`` when
+# they are the only reasons present:
+#
+# * ``source_acquisition`` — transient upstream errors that the
+#   in-fetch retry loop already absorbed; the swallowed-error list
+#   is surfaced for operator awareness but does not warrant paging.
+# * ``source_cooldown_skip`` — we intentionally backed off; the
+#   operator's policy decision firing as designed.
+# * ``archive_acquisition`` — archive download failed for items that
+#   were still ingested (summary text / abstract preserved).  Policy
+#   modes (``unsupported`` / ``blocked``) are explicitly tolerated
+#   per #149 / #161; generic transient failures are also acceptable
+#   noise.
+#
+# Stalls and ``invalid_*`` shapes are unexpected because they
+# represent actionable regressions — a 2-run streak of "nothing
+# fetched / ingested / passed the filter" or an upstream feed
+# emitting only broken URLs.  ``filter_error`` is unexpected because
+# the in-fetch scorer execution failed (provider config / model
+# availability / response schema bug) — not a soft rate-limit.
+_UNEXPECTED_FAILURE_REASONS: frozenset[str] = frozenset(
+    {
+        "invalid_note_state",
+        "invalid_url_stall",
+        "ingestion_stall",
+        "fetch_stall",
+        "filter_stall",
+        "filter_error",
+    }
+)
+
+
+# Issue #164 review: the complement set of expected-lossy reasons.
+# Together with :data:`_UNEXPECTED_FAILURE_REASONS` this is the
+# exhaustive list of degraded reasons :meth:`RunLedger.complete` may
+# append.  A meta-test in ``tests/unit/test_run_ledger.py`` scans the
+# source of ``complete`` and asserts every ``reasons.append("…")``
+# literal lands in :data:`_KNOWN_DEGRADED_REASONS`, so a new reason
+# cannot be added without an explicit severity classification.
+_EXPECTED_LOSSY_REASONS: frozenset[str] = frozenset(
+    {
+        "source_acquisition",
+        "source_cooldown_skip",
+        "archive_acquisition",
+    }
+)
+
+
+# Union of the two classified sets.  Used by the meta-test only;
+# production callers consult the individual sets.
+_KNOWN_DEGRADED_REASONS: frozenset[str] = (
+    _UNEXPECTED_FAILURE_REASONS | _EXPECTED_LOSSY_REASONS
+)
+
+
+# Severity literal — surfaced on the ledger entry as
+# ``degradation_severity`` and as the ``severity`` label on the
+# ``run_completions`` metric.  Mutually exclusive across a single
+# run; a run with mixed reasons is escalated to the higher severity
+# (``unexpected_failure`` beats ``expected_lossy``).
+_SeverityLiteral = Literal["success", "expected_lossy", "unexpected_failure"]
+
+
+def classify_degradation_severity(degraded_reasons: list[str]) -> _SeverityLiteral:
+    """Return the severity classification for *degraded_reasons*.
+
+    * ``"success"`` when no reasons fired.
+    * ``"unexpected_failure"`` when any reason in
+      :data:`_UNEXPECTED_FAILURE_REASONS` is present.
+    * ``"expected_lossy"`` otherwise (only tolerated reasons fired).
+
+    Public — exposed for callers (run service, admin HTTP) that need
+    to surface severity without re-implementing the mapping.  The
+    classification is stable for a given reason list and does not
+    consult any ambient state.
+    """
+    if not degraded_reasons:
+        return "success"
+    for reason in degraded_reasons:
+        if reason in _UNEXPECTED_FAILURE_REASONS:
+            return "unexpected_failure"
+    return "expected_lossy"
 
 
 def _top_n_by_count(counts: dict[str, int], *, n: int) -> list[dict[str, Any]]:
@@ -425,6 +521,11 @@ class RunLedger:
             "error": None,
             "degraded": False,
             "degraded_reasons": [],
+            # Issue #164: severity bucket on top of the flat
+            # ``degraded_reasons`` list.  Starts at ``"success"`` while
+            # the run is in flight; finalised by ``_finish`` once
+            # ``degraded_reasons`` is known.
+            "degradation_severity": "success",
             "source_acquisition_errors": [],
             # Issue #146: cooldown skips are surfaced in the entry
             # alongside ``source_acquisition_errors`` so the active
@@ -1018,6 +1119,14 @@ class RunLedger:
                         "error": reason,
                         "degraded": entry.get("degraded", False),
                         "degraded_reasons": list(entry.get("degraded_reasons") or []),
+                        # Issue #164: preserve the in-flight severity
+                        # on abandon — typically ``"success"`` since
+                        # the field is only finalised by ``_finish``,
+                        # but a restart hand-off should not silently
+                        # downgrade an already-set value.
+                        "degradation_severity": entry.get(
+                            "degradation_severity", "success"
+                        ),
                         "source_acquisition_errors": list(
                             entry.get("source_acquisition_errors") or []
                         ),
@@ -1134,6 +1243,16 @@ class RunLedger:
                     "error": error,
                     "degraded": degraded,
                     "degraded_reasons": list(degraded_reasons or []),
+                    # Issue #164: precompute the severity bucket from
+                    # the reason list so downstream consumers
+                    # (``/runs/recent``, dashboards, paging) read a
+                    # stable classification without reimplementing the
+                    # mapping.  ``"unexpected_failure"`` wins when any
+                    # unexpected reason co-occurs with expected-lossy
+                    # ones.
+                    "degradation_severity": classify_degradation_severity(
+                        list(degraded_reasons or [])
+                    ),
                     "source_acquisition_errors": list(source_acquisition_errors or []),
                     # Issue #146: persist cooldown skips alongside
                     # ``source_acquisition_errors`` so the same JSONL
