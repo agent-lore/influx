@@ -520,6 +520,13 @@ class ExtractionConfig(BaseModel):
 
     min_html_chars: int = 1000
     min_web_chars: int = 500
+    # Issue #166: thin-summary suppression threshold.  When an item's
+    # archive fetch fails AND the (post-extraction-fallback) summary
+    # is shorter than this value, the source adapter drops the item
+    # entirely rather than writing a summary-only note.  Setting this
+    # to ``0`` disables the length rule only — title-equality and
+    # boilerplate-pattern suppression continue to fire.
+    min_summary_chars: int = 80
     strip_tags: list[str] = Field(
         default_factory=lambda: [
             "script",

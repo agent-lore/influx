@@ -168,6 +168,7 @@ class TestArxivPDFFallback:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "text:pdf" in result["tags"]
 
@@ -189,6 +190,7 @@ class TestArxivPDFFallback:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "full-text" in result["tags"]
 
@@ -208,6 +210,7 @@ class TestArxivPDFFallback:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "text:html" not in result["tags"]
 
@@ -229,6 +232,7 @@ class TestArxivPDFFallback:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Full Text" in result["content"]
         # The PDF fixture contains recognisable content about extraction testing.
@@ -277,5 +281,6 @@ class TestArxivPDFFallback:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" not in result["tags"]

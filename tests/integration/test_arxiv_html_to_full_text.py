@@ -182,6 +182,7 @@ class TestArxivHTMLToFullText:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "text:html" in result["tags"]
 
@@ -199,6 +200,7 @@ class TestArxivHTMLToFullText:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "full-text" in result["tags"]
 
@@ -216,6 +218,7 @@ class TestArxivHTMLToFullText:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Full Text" in result["content"]
         # The extracted text should contain recognisable content from the
@@ -237,6 +240,7 @@ class TestArxivHTMLToFullText:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         # Find the full-text section body.
         content = result["content"]
@@ -267,6 +271,7 @@ class TestArxivHTMLToFullText:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         # The full-text section should contain no HTML tags.
         content = result["content"]
@@ -297,6 +302,7 @@ class TestArxivHTMLToFullText:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" not in result["tags"]
 

@@ -57,18 +57,31 @@ from tests.contract.test_lithos_client import FakeLithosServer
 
 PROFILE = "ai-robotics"
 
+# Abstract lengths comfortably clear the issue #166 thin-summary
+# threshold so the suppression rule does not interfere with the
+# backfill ingest assertions.
 _FIXTURE_ARXIV_ITEMS = [
     ArxivItem(
         arxiv_id="2601.00010",
         title="Backfill Paper Alpha",
-        abstract="A historical paper about attention mechanisms.",
+        abstract=(
+            "A historical paper about attention mechanisms, with an "
+            "abstract long enough to clear the default thin-summary "
+            "threshold so the backfill ingest assertions are not "
+            "affected by the suppression rule."
+        ),
         published=datetime(2026, 4, 20, tzinfo=UTC),
         categories=["cs.AI"],
     ),
     ArxivItem(
         arxiv_id="2601.00011",
         title="Backfill Paper Beta",
-        abstract="A second historical paper about transformers.",
+        abstract=(
+            "A second historical paper about transformers, with an "
+            "abstract long enough to clear the default thin-summary "
+            "threshold so the backfill ingest assertions are not "
+            "affected by the suppression rule."
+        ),
         published=datetime(2026, 4, 21, tzinfo=UTC),
         categories=["cs.AI"],
     ),

@@ -53,6 +53,7 @@ from influx.telemetry import (
     current_source_acquisition_errors,
     current_source_cooldown_skips,
     current_source_retry_counts,
+    current_summary_thin_drops,
     current_tier3_fallback_counts,
     current_write_outcomes,
     get_tracer,
@@ -186,6 +187,16 @@ async def ledger_lifecycle(
     invalid_url_rejections_counter: list[int] = [0]
     invalid_url_rejections_token = current_invalid_url_rejections.set(
         invalid_url_rejections_counter
+    )
+    # #166: per-run count of items dropped by the thin-summary rule.
+    # Source adapters increment via :func:`record_summary_thin_drop`
+    # when the archive fetch failed and the feed summary was thin.
+    # Surfaced on the run-ledger entry as ``summary_thin_drops_total``
+    # so an operator can see "we suppressed N summary-only notes this
+    # run" distinct from archive failures and URL rejections.
+    summary_thin_drops_counter: list[int] = [0]
+    summary_thin_drops_token = current_summary_thin_drops.set(
+        summary_thin_drops_counter
     )
     # #129: per-run counter of recovered source-fetch retries (i.e.
     # retries followed by another attempt, distinct from the swallowed
@@ -334,6 +345,11 @@ async def ledger_lifecycle(
         filter_errors_total = filter_errors_counter[0]
         # #131: total per-run pre-acquire URL rejections.
         invalid_url_rejections_total = invalid_url_rejections_counter[0]
+        # #166: total per-run thin-summary suppressions (items dropped
+        # because archive fetch failed AND the feed summary was thin).
+        # Deliberately distinct from archive_failures_total — these
+        # items never reached the write loop.
+        summary_thin_drops_total = summary_thin_drops_counter[0]
         # #152: total cache hits this run, surfaced under the
         # degradation summary's ``totals.cache_hits``.
         cache_hits_total = cache_hits_counter[0]
@@ -345,6 +361,7 @@ async def ledger_lifecycle(
             filter_errors_total=filter_errors_total,
             invalid_url_rejections_total=invalid_url_rejections_total,
             archive_failures_total=archive_failures_total,
+            summary_thin_drops_total=summary_thin_drops_total,
             source_acquisition_errors=source_errors,
             # Issue #146: cooldown skips are run-level state distinct
             # from swallowed acquisition errors — the ledger fires the
@@ -577,6 +594,24 @@ async def ledger_lifecycle(
                 run_id,
                 archive_unsupported_total,
             )
+        # Issue #166: surface per-run thin-summary suppression total at
+        # INFO so an operator sees "we dropped N summary-only notes
+        # this run" alongside the unsupported total.  Distinct from
+        # ``archive_acquisition`` — these items never received the
+        # ``influx:archive-missing`` tag because they were dropped
+        # before the write loop.
+        if summary_thin_drops_total > 0:
+            logger.info(
+                "run summary_thin_drops profile=%s kind=%s run_id=%s "
+                "dropped_items=%d "
+                "(items suppressed by the thin-summary rule — archive "
+                "fetch failed AND feed summary was thin; not counted "
+                "toward archive_failures_total or archive_acquisition)",
+                profile,
+                plan.kind.value,
+                run_id,
+                summary_thin_drops_total,
+            )
 
         # Issue #164: classify the degraded reasons into the
         # ``severity`` bucket the ledger entry stores so the metric
@@ -677,6 +712,7 @@ async def ledger_lifecycle(
         current_fetched_total.reset(fetched_total_token)
         current_filter_errors.reset(filter_errors_token)
         current_invalid_url_rejections.reset(invalid_url_rejections_token)
+        current_summary_thin_drops.reset(summary_thin_drops_token)
         current_source_retry_counts.reset(source_retry_counts_token)
         current_tier3_fallback_counts.reset(tier3_fallback_counts_token)
         current_cache_hits.reset(cache_hits_token)

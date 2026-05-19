@@ -93,7 +93,14 @@ def _make_rss_item(url: str = "https://example.com/article") -> RssFeedItem:
         title="Test Article",
         url=url,
         published=datetime(2026, 4, 25, tzinfo=UTC),
-        summary="A summary of the article.",
+        # Long enough to clear the issue #166 thin-summary threshold so
+        # these archive-policy-tag tests exercise their intended path
+        # rather than the suppression drop.
+        summary=(
+            "A substantive summary that comfortably exceeds the default "
+            "thin-summary threshold so this test focuses on archive "
+            "policy tags rather than suppression."
+        ),
         source_tag="rss",
         feed_name="example-feed",
     )
@@ -120,6 +127,7 @@ class TestRssArchivePolicyTags:
         result = build_rss_note_item(
             item=item, profile_name="ai-robotics", config=config
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-skipped-by-policy" in tags
@@ -144,6 +152,7 @@ class TestRssArchivePolicyTags:
         result = build_rss_note_item(
             item=item, profile_name="ai-robotics", config=config
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-blocked" in tags
@@ -166,6 +175,7 @@ class TestRssArchivePolicyTags:
         result = build_rss_note_item(
             item=item, profile_name="ai-robotics", config=config
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-rate-limited" in tags
@@ -189,6 +199,7 @@ class TestRssArchivePolicyTags:
         result = build_rss_note_item(
             item=item, profile_name="ai-robotics", config=config
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-missing" in tags
@@ -220,6 +231,7 @@ class TestRssArchivePolicyTags:
         result = build_rss_note_item(
             item=item, profile_name="ai-robotics", config=config
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-unsupported" in tags
@@ -248,6 +260,7 @@ class TestRssArchivePolicyTags:
         result = build_rss_note_item(
             item=item, profile_name="ai-robotics", config=config
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-non-html-source" in tags
@@ -271,6 +284,7 @@ class TestRssArchivePolicyTags:
         result = build_rss_note_item(
             item=item, profile_name="ai-robotics", config=config
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-missing" not in tags
@@ -286,7 +300,13 @@ def _make_arxiv_item() -> ArxivItem:
     return ArxivItem(
         arxiv_id="2601.12345",
         title="Test Paper",
-        abstract="An abstract.",
+        # Long enough to clear the issue #166 thin-summary threshold so
+        # these archive-policy-tag tests exercise their intended path.
+        abstract=(
+            "A substantive abstract that comfortably exceeds the "
+            "default thin-summary threshold so this test focuses on "
+            "archive policy tags rather than suppression."
+        ),
         published=datetime(2026, 4, 25, tzinfo=UTC),
         categories=["cs.AI"],
     )
@@ -323,6 +343,7 @@ class TestArxivArchivePolicyTags:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-blocked" in tags
@@ -351,6 +372,7 @@ class TestArxivArchivePolicyTags:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-rate-limited" in tags
@@ -380,6 +402,7 @@ class TestArxivArchivePolicyTags:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         tags = cast(list[str], result["tags"])
         assert "influx:archive-missing" in tags
@@ -473,6 +496,7 @@ class TestPolicyModeTagCrossProduct:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
         tags = cast(list[str], result["tags"])
 
         assert expected_tag in tags

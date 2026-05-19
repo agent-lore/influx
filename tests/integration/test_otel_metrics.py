@@ -168,7 +168,12 @@ async def _run_arxiv_scenario(meter: InfluxMeter, config: Any) -> None:
         ArxivItem(
             arxiv_id="2601.12345",
             title="Test Paper",
-            abstract="Abstract text",
+            # Long enough to clear the issue #166 thin-summary threshold.
+            abstract=(
+                "Abstract text that comfortably exceeds the default "
+                "thin-summary threshold so this metrics test runs the "
+                "full ingest pipeline."
+            ),
             published=datetime(2026, 4, 25, tzinfo=UTC),
             categories=["cs.AI"],
         ),
@@ -346,7 +351,12 @@ class TestOtelDisabledZeroMetrics:
             ArxivItem(
                 arxiv_id="2601.12345",
                 title="Test Paper",
-                abstract="Abstract text",
+                # Long enough to clear the issue #166 thin-summary threshold.
+                abstract=(
+                    "Abstract text that comfortably exceeds the default "
+                    "thin-summary threshold so this metrics test runs "
+                    "the full ingest pipeline."
+                ),
                 published=datetime(2026, 4, 25, tzinfo=UTC),
                 categories=["cs.AI"],
             ),

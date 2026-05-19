@@ -502,6 +502,118 @@ Tuning the knobs:
 The gate is read-only: no Lithos connection, no docker exec, no
 ledger writes.  It only reads `${INFLUX_STATE_PATH}/runs.jsonl`.
 
+## 8d. Thin-summary suppression (issue #166)
+
+When an RSS or arXiv archive fetch fails for any reason, Influx
+previously wrote a Lithos note built from the feed-provided
+`<summary>` / arXiv `<abstract>` plus the title.  Many of those
+summary-only notes are operationally garbage — Hacker News pointers
+(`Discussion (47 points)`), title repetitions, generic teasers
+(`Read the full article at example.com…`) — accumulating in Lithos
+with no recovery path.
+
+Issue #166 adds a forward-only **thin-summary suppression** rule.
+When the archive fetch did not deliver a body **and** the feed
+summary is "thin" by a structural test, the source adapter drops the
+item entirely — no Lithos note, no `influx:archive-missing` tag, no
+repair-sweep entry.  Existing notes already in Lithos are not
+touched; only new items are affected.
+
+The rule fires on `not archive_result.ok` for **any** failure kind —
+including `non_html_source` (#160) and `unsupported` (#161) — so the
+trigger scope is broader than the `archive_missing` flag alone.
+
+### The rule (any-of)
+
+| Rule | Fires when |
+| ---- | ---------- |
+| `length` | The trimmed summary is shorter than `min_summary_chars` (default 80).  Setting `min_summary_chars = 0` disables this rule only. |
+| `title_equality` | The summary equals the title after normalisation (lowercase, strip Unicode punctuation, collapse whitespace). |
+| `boilerplate` | The trimmed summary matches one of the patterns below. |
+
+Order matters — the cheapest rule is evaluated first.  The rule that
+fires is logged so an operator can decide which knob to tune.
+
+### Boilerplate patterns
+
+The pattern list ships in
+`src/influx/thin_summary.py::BOILERPLATE_PATTERNS` as a single
+module-level constant of `(regex, rationale)` pairs.  Current entries:
+
+| Pattern | Rationale |
+| ------- | --------- |
+| `^Discussion \(\d+ points?\)$` (case-insensitive) | Hacker News pointer summary — the feed surfaces only the comment-thread points count, not the article body. |
+| `^Comments(\.|\s|$)` (case-insensitive) | HN / Reddit pointer summary — the feed item is just a link to the comment thread. |
+| `^Read (the |this )?(full |entire )?(article|post|story|entry) (at|on|via)\s` (case-insensitive) | Generic teaser — the feed publisher truncates the body to a "read the full article at…" pointer with no real content. |
+| `^Continue reading\b` (case-insensitive) | WordPress / Substack-style truncation marker with no extra content beyond the title. |
+| `^Read more\b` (case-insensitive) | Generic "Read more" truncation marker — the feed body is effectively empty. |
+| `^[…\.\s\[\]]*$` | Empty-ish marker — the summary is only ellipsis / bracket characters / whitespace, no real text at all. |
+
+To propose a new pattern: confirm the boilerplate shape on a real feed
+sample, add the regex + rationale to the tuple, write a parametrised
+case in `tests/unit/test_thin_summary.py::TestBoilerplateRule`, and
+open a PR.  Patterns are deliberately anchored to the *start* of the
+trimmed summary so an article that mentions "continue reading"
+mid-body is not affected — only summaries that *are* the boilerplate.
+
+### Tuning
+
+Set in `influx.toml`:
+
+```toml
+[extraction]
+min_summary_chars = 80   # default; raise to suppress more aggressively
+```
+
+Reasonable values:
+
+- **0** — disables the length rule only.  Title-equality and
+  boilerplate-match continue to fire.  Use this when an operator
+  has audited a specific feed and wants to keep its terse-but-real
+  summaries; tag-shape and pointer-style drops are still on.
+- **80** (default) — drops the obvious pointer-shape garbage without
+  affecting realistic feed summaries.
+- **200+** — aggressive; will drop many feeds whose summaries are
+  genuine first-sentence teasers.  Only tighten when an operator has
+  measured the suppression impact on the run logs (see telemetry
+  below).
+
+### Telemetry
+
+| Surface | Where | Notes |
+| ------- | ----- | ----- |
+| Per-drop INFO log | `influx.sources.rss` / `influx.sources.arxiv` | One line per dropped item: `thin-summary drop source=… profile=… url=… failure_kind=… rule=…`.  `rule` names the first rule that fired (`length` / `title_equality` / `boilerplate`). |
+| Per-run INFO summary | `influx.run_service` | `run summary_thin_drops profile=… kind=… run_id=… dropped_items=N` when N > 0.  Distinct from the unsupported-policy summary above it. |
+| OTel counter | `influx_summary_thin_drops_total` | Labels: `profile`, `source`, `failure_kind`, `rule`.  Distinct from `influx_archive_missing_total` and `influx_archive_policy_failures_total` so dashboards can pivot the suppression rate independently. |
+| Ledger entry field | `summary_thin_drops_total` on each `runs.jsonl` entry | Per-run total; `None` on legacy entries written before #166 landed. |
+
+The drop is deliberately **excluded** from:
+
+- `archive_failures_total` (the item never received `influx:archive-missing`).
+- The `archive_acquisition` degraded reason.
+- `source_acquisition_errors`.
+- The `degradation_severity` classification (a drop is a quality
+  choice, not a degradation).
+
+So a run whose only "issue" is thin-summary suppression remains
+classified `success` with no degraded reasons, even if `dropped_items`
+is large.  An operator sees the suppression in the dedicated INFO
+line and the dedicated counter; the run-completion verdict is
+unaffected.
+
+### Out of scope
+
+- **No retrospective pruning.**  Existing summary-only notes already
+  in Lithos keep their current state.  A separate cleanup pass
+  against Lithos would be needed to remove them and is intentionally
+  out of scope here.
+- **No per-profile threshold.**  A single global `min_summary_chars`
+  applies to every profile; per-profile overrides can be added later
+  if operator need emerges.
+- **No repair-sweep re-evaluation.**  The thin-summary rule fires
+  at write-time only.  A note tagged `influx:archive-missing` before
+  #166 landed is not retroactively dropped on a later sweep.
+
 ## 9. Scheduling stagger (issue #87)
 
 Profiles share a single global `[schedule].cron` expression. Within

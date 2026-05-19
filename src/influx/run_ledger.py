@@ -518,6 +518,13 @@ class RunLedger:
             "filter_errors_total": None,
             "invalid_url_rejections_total": None,
             "archive_failures_total": None,
+            # Issue #166: per-run total of items the source adapters
+            # suppressed via the thin-summary rule.  Distinct from
+            # ``archive_failures_total`` — these items never reached the
+            # write loop and so never received ``influx:archive-missing``.
+            # Stays ``None`` while the run is in flight; populated from
+            # the per-run contextvar at ``complete`` time.
+            "summary_thin_drops_total": None,
             "error": None,
             "degraded": False,
             "degraded_reasons": [],
@@ -570,6 +577,7 @@ class RunLedger:
         filter_errors_total: int | None = None,
         invalid_url_rejections_total: int | None = None,
         archive_failures_total: int | None = None,
+        summary_thin_drops_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         source_cooldown_skips: list[dict[str, str]] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
@@ -846,6 +854,7 @@ class RunLedger:
             filter_errors_total=filter_errors_total,
             invalid_url_rejections_total=invalid_url_rejections_total,
             archive_failures_total=archive_failures_total,
+            summary_thin_drops_total=summary_thin_drops_total,
             error=None,
             degraded=bool(reasons),
             source_acquisition_errors=errors,
@@ -1203,6 +1212,7 @@ class RunLedger:
         filter_errors_total: int | None = None,
         invalid_url_rejections_total: int | None = None,
         archive_failures_total: int | None = None,
+        summary_thin_drops_total: int | None = None,
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         source_cooldown_skips: list[dict[str, str]] | None = None,
@@ -1240,6 +1250,10 @@ class RunLedger:
                     "filter_errors_total": filter_errors_total,
                     "invalid_url_rejections_total": invalid_url_rejections_total,
                     "archive_failures_total": archive_failures_total,
+                    # Issue #166: persist per-run total of thin-summary
+                    # suppressions so operators can see how many items
+                    # the rule is dropping without scraping logs.
+                    "summary_thin_drops_total": summary_thin_drops_total,
                     "error": error,
                     "degraded": degraded,
                     "degraded_reasons": list(degraded_reasons or []),
