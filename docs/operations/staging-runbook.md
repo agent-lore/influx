@@ -443,6 +443,65 @@ Safety properties:
 - The subcommand never deletes notes — use the `squatters` subcommand
   when actual removal is required.
 
+## 8c. Promotion gate (issue #165)
+
+A configurable gate that consumes the `degradation_severity` split
+from #164 and produces a single PASS/FAIL verdict suitable for a
+staging-promotion CI step.
+
+```bash
+./scripts/influx-diagnose.py promotion-gate [--window N] [--max-lossy-ratio R] [--min-runs M]
+```
+
+Policy:
+
+- **Hard fail** on any `degradation_severity=unexpected_failure`
+  run in the window (write-time data integrity, stall ratchets,
+  scorer failures).  The acceptance criterion is "fail immediately"
+  — even one such run trips the gate.
+- **Soft fail** when the fraction of `expected_lossy` runs in the
+  window is **strictly greater than** `--max-lossy-ratio` (default
+  `0.5`).  A ratio exactly equal to the threshold passes — only
+  ratios above it fail — so an operator setting `0.5` does not see
+  the gate flap on a clean 50/50 split.  Tolerated upstream noise
+  is fine in small doses but becomes a quality signal if it
+  dominates.
+- **Insufficient runs** when fewer than `--min-runs` (default 5)
+  scheduled completed runs are present — prevents spurious
+  PASS/FAIL on a freshly-started deployment.
+- **PASS** otherwise.
+
+Output is a stable, line-oriented summary with:
+- the verdict + machine-readable `reason` code
+- runs evaluated vs. configured window/min
+- severity bucket counts
+- the expected-lossy ratio vs. threshold
+- top driver reasons / profiles (top 5 each)
+- on hard-fail, the specific failing `run_id`s with their reasons
+
+Exit codes: `0` on PASS, `1` on FAIL (any reason).  Suitable for
+direct use in a CI step:
+
+```bash
+./scripts/influx-diagnose.py --env staging promotion-gate \
+    --window 24 --max-lossy-ratio 0.4 \
+    || { echo "Staging quality gate failed"; exit 1; }
+```
+
+Tuning the knobs:
+
+- `--window`: roughly aligned with your scheduled cadence.  At one
+  run per hour, `24` = last day.  Higher values trade
+  responsiveness (a recent regression takes longer to clear) for
+  stability (one bad run does not dominate the verdict).
+- `--max-lossy-ratio`: depends on upstream noise floor.  Start
+  near `0.5` and tighten as you trust the steady-state.
+- `--min-runs`: bump to your usual daily run count if you only run
+  the gate after a 24h window has filled.
+
+The gate is read-only: no Lithos connection, no docker exec, no
+ledger writes.  It only reads `${INFLUX_STATE_PATH}/runs.jsonl`.
+
 ## 9. Scheduling stagger (issue #87)
 
 Profiles share a single global `[schedule].cron` expression. Within
