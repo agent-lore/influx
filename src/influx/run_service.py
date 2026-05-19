@@ -265,7 +265,18 @@ async def ledger_lifecycle(
                 1, {"profile": profile, "reason": session.skip_reason}
             )
             metrics.run_duration().record(elapsed, metric_attrs)
-            metrics.run_completions().add(1, {**metric_attrs, "outcome": "skipped"})
+            # Issue #164 review: every ``run_completions`` series carries
+            # the ``severity`` label so dashboard queries can filter
+            # uniformly.  ``skipped`` runs never ran the body and have
+            # no degraded-reasons list, so the value is ``not_applicable``.
+            metrics.run_completions().add(
+                1,
+                {
+                    **metric_attrs,
+                    "outcome": "skipped",
+                    "severity": "not_applicable",
+                },
+            )
             logger.warning(
                 "run skipped profile=%s kind=%s run_id=%s reason=%s",
                 profile,
@@ -644,7 +655,19 @@ async def ledger_lifecycle(
             error=f"{type(exc).__name__}: {exc}" if exc is not None else "unknown",
         )
         metrics.run_duration().record(elapsed, metric_attrs)
-        metrics.run_completions().add(1, {**metric_attrs, "outcome": "failure"})
+        # Issue #164 review: failure path also carries the ``severity``
+        # label so the ``run_completions`` series shape is uniform
+        # across outcomes.  ``failure`` runs raised before
+        # ``degraded_reasons`` was computed, so the value is
+        # ``not_applicable``.
+        metrics.run_completions().add(
+            1,
+            {
+                **metric_attrs,
+                "outcome": "failure",
+                "severity": "not_applicable",
+            },
+        )
         raise
     finally:
         metrics.active_runs().add(-1, {"profile": profile})

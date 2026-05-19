@@ -85,6 +85,29 @@ _UNEXPECTED_FAILURE_REASONS: frozenset[str] = frozenset(
 )
 
 
+# Issue #164 review: the complement set of expected-lossy reasons.
+# Together with :data:`_UNEXPECTED_FAILURE_REASONS` this is the
+# exhaustive list of degraded reasons :meth:`RunLedger.complete` may
+# append.  A meta-test in ``tests/unit/test_run_ledger.py`` scans the
+# source of ``complete`` and asserts every ``reasons.append("…")``
+# literal lands in :data:`_KNOWN_DEGRADED_REASONS`, so a new reason
+# cannot be added without an explicit severity classification.
+_EXPECTED_LOSSY_REASONS: frozenset[str] = frozenset(
+    {
+        "source_acquisition",
+        "source_cooldown_skip",
+        "archive_acquisition",
+    }
+)
+
+
+# Union of the two classified sets.  Used by the meta-test only;
+# production callers consult the individual sets.
+_KNOWN_DEGRADED_REASONS: frozenset[str] = (
+    _UNEXPECTED_FAILURE_REASONS | _EXPECTED_LOSSY_REASONS
+)
+
+
 # Severity literal — surfaced on the ledger entry as
 # ``degradation_severity`` and as the ``severity`` label on the
 # ``run_completions`` metric.  Mutually exclusive across a single

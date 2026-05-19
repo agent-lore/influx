@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import inspect
+import re
 from pathlib import Path
 from typing import Any
 
-from influx.run_ledger import RunLedger, classify_degradation_severity
+from influx.run_ledger import (
+    _KNOWN_DEGRADED_REASONS,
+    RunLedger,
+    classify_degradation_severity,
+)
 
 # ── Issue #164: degradation severity classification ──────────────────
 
@@ -13,10 +19,12 @@ from influx.run_ledger import RunLedger, classify_degradation_severity
 class TestClassifyDegradationSeverity:
     """``classify_degradation_severity`` separates lossy noise from real breakage.
 
-    Pinning the contract here keeps the mapping authoritative — every
-    new degraded reason added to ``RunLedger.complete`` MUST be
-    classified explicitly (either listed in
-    ``_UNEXPECTED_FAILURE_REASONS`` or accepted as expected-lossy).
+    Pinning the contract here keeps the mapping authoritative.  A
+    sibling meta-test (:class:`TestKnownDegradedReasonsCoverage`)
+    scans the source of ``RunLedger.complete`` and refuses to let a
+    new ``reasons.append("…")`` literal land without an explicit
+    severity classification, so the contract is enforced rather than
+    aspirational.
     """
 
     def test_no_reasons_is_success(self) -> None:
@@ -72,6 +80,35 @@ class TestClassifyDegradationSeverity:
         # filter_error fires on scorer execution failure — a config /
         # availability / response-schema bug, not a soft rate limit.
         assert classify_degradation_severity(["filter_error"]) == "unexpected_failure"
+
+
+class TestKnownDegradedReasonsCoverage:
+    """Every reason ``RunLedger.complete`` appends must be classified.
+
+    Scans the source of ``RunLedger.complete`` for the
+    ``reasons.append("…")`` literals and asserts each value lands in
+    :data:`_KNOWN_DEGRADED_REASONS`.  Catches the case where a new
+    degraded reason is added without simultaneously updating the
+    expected/unexpected mapping — the classifier would otherwise
+    silently default the unknown reason and the runbook contract
+    would silently drift.
+    """
+
+    _APPEND_RE = re.compile(r'reasons\.append\(\s*"([^"]+)"\s*\)')
+
+    def test_complete_only_appends_classified_reasons(self) -> None:
+        source = inspect.getsource(RunLedger.complete)
+        appended = set(self._APPEND_RE.findall(source))
+        # Sanity: the test would be a no-op if the regex caught nothing.
+        assert appended, "expected to find at least one reasons.append() literal"
+        unknown = appended - _KNOWN_DEGRADED_REASONS
+        assert not unknown, (
+            "RunLedger.complete appends degraded reasons that are not in "
+            "_KNOWN_DEGRADED_REASONS: "
+            + ", ".join(sorted(unknown))
+            + ".  Add each to either _UNEXPECTED_FAILURE_REASONS or "
+            "_EXPECTED_LOSSY_REASONS in src/influx/run_ledger.py."
+        )
 
 
 class TestLedgerEntrySeverityField:

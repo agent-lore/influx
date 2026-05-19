@@ -89,13 +89,15 @@ Three quick signals, all read-only:
   triage can separate release-noise from real breakage without
   parsing the reason list. The bucket also appears as `severity=` in
   the `run completed` log line and as the `severity` label on the
-  `run_completions` metric.
+  `run_completions` metric (always present, including on `skipped`
+  and `failure` outcomes — see below).
 
   | Severity | Triggers | Operator action |
   |----------|----------|-----------------|
   | `success` | `degraded_reasons` empty | None |
   | `expected_lossy` | only `source_acquisition`, `source_cooldown_skip`, `archive_acquisition` present | Glance; investigate only if frequency spikes. These are tolerated upstream / policy-driven outcomes. |
   | `unexpected_failure` | any of `invalid_note_state`, `invalid_url_stall`, `ingestion_stall`, `fetch_stall`, `filter_stall`, `filter_error` present | Triage — actionable regression signal. |
+  | `not_applicable` | `outcome=skipped` (circuit breaker fired) or `outcome=failure` (body raised before reasons were computed) | Read the existing `outcome` label — `severity` is set to a constant so the metric series shape stays uniform across all completions. |
 
   When unexpected and lossy reasons co-occur on the same run (the
   staging shape `reasons=archive_acquisition,invalid_note_state`),
