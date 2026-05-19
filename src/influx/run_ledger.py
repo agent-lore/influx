@@ -696,9 +696,22 @@ class RunLedger:
                 # ``fetched_total`` was explicitly 0 or the caller
                 # didn't supply one (legacy path) — both fall to
                 # fetch_stall to preserve pre-#85 semantics.
-                consecutive_zero_fetch = 1 + self._consecutive_zero_fetch_runs(
-                    profile=profile, exclude_run_id=run_id
-                )
+                #
+                # Issue #163 review: when the current run also has
+                # ``source_cooldown_skips`` non-empty, the zeros are
+                # fully explained by the cooldown — adding fetch_stall
+                # on top would mis-route the operator to "upstream
+                # drift / lookback problem" when the truth is "we
+                # deliberately did not fetch".  ``_consecutive_zero_fetch_runs``
+                # already skips prior cooldown-skipped runs (see
+                # :meth:`_is_zero_fetch_entry`) so the streak is not
+                # polluted by past cooldown runs either.
+                if cooldown_skips:
+                    consecutive_zero_fetch = 0
+                else:
+                    consecutive_zero_fetch = 1 + self._consecutive_zero_fetch_runs(
+                        profile=profile, exclude_run_id=run_id
+                    )
                 if consecutive_zero_fetch >= 2 and self._has_prior_non_zero_fetch(
                     profile=profile, exclude_run_id=run_id
                 ):
@@ -790,12 +803,24 @@ class RunLedger:
         by construction since the LLM-filter rejection was the only
         new way to land at ``sources_checked == 0`` despite a
         successful fetch).
+
+        Issue #163 review: prior runs whose zeros are explained by a
+        ``source_cooldown_skip`` (cooldown short-circuited the fetch)
+        are *skipped* — neither counted toward the streak nor used to
+        terminate it.  Continuing past these entries keeps the streak
+        meaningful for the genuine "fetch tried and got nothing"
+        pattern that ``fetch_stall`` exists to surface.
         """
         count = 0
         for prior in self.recent(limit=_STALL_HISTORY_LIMIT, profile=profile):
             if prior.get("run_id") == exclude_run_id:
                 continue
             if prior.get("kind") != "scheduled":
+                continue
+            # Issue #163: don't let cooldown-skipped runs pollute the
+            # zero-fetch streak.  Their zeros are deliberate, not a
+            # symptom of upstream silence.
+            if prior.get("source_cooldown_skips"):
                 continue
             if self._is_zero_fetch_entry(prior):
                 count += 1
