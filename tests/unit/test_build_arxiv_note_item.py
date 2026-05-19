@@ -113,6 +113,7 @@ class TestHTMLSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "text:html" in result["tags"]
 
@@ -132,6 +133,7 @@ class TestHTMLSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "full-text" in result["tags"]
 
@@ -151,6 +153,7 @@ class TestHTMLSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Full Text" in result["content"]
         assert "The full extracted article text" in result["content"]
@@ -171,6 +174,7 @@ class TestHTMLSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" not in result["tags"]
 
@@ -196,6 +200,7 @@ class TestPDFFallback:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "text:pdf" in result["tags"]
         assert "full-text" in result["tags"]
@@ -223,6 +228,7 @@ class TestBothFail:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "text:abstract-only" in result["tags"]
 
@@ -241,6 +247,7 @@ class TestBothFail:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" in result["tags"]
 
@@ -259,6 +266,7 @@ class TestBothFail:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Full Text" not in result["content"]
         assert "full-text" not in result["tags"]
@@ -279,6 +287,7 @@ class TestBothFail:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:text-terminal" not in result["tags"]
 
@@ -303,6 +312,7 @@ class TestBelowThreshold:
                 profile_name="ai-robotics",
                 config=config,
             )
+            assert result is not None
             mock_extract.assert_not_called()  # type: ignore[union-attr]
 
         assert "text:abstract-only" in result["tags"]
@@ -321,6 +331,7 @@ class TestBelowThreshold:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Full Text" not in result["content"]
 
@@ -343,6 +354,7 @@ class TestItemShape:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert result["title"] == "Test Paper Title"
         assert result["source_url"] == "https://arxiv.org/abs/2601.99999"
@@ -363,6 +375,7 @@ class TestItemShape:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "profile:ai-robotics" in result["tags"]
         assert "arxiv-id:2601.12345" in result["tags"]
@@ -382,6 +395,7 @@ class TestItemShape:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "cat:cs.AI" in result["tags"]
         assert "cat:cs.RO" in result["tags"]
@@ -398,6 +412,7 @@ class TestItemShape:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert result["path"] == "papers/arxiv/2026/04"
 
@@ -413,6 +428,7 @@ class TestItemShape:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "# Test Paper Title" in result["content"]
 
@@ -427,6 +443,7 @@ class TestItemShape:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Profile Relevance" in result["content"]
         assert "ai-robotics" in result["content"]
@@ -447,6 +464,7 @@ class TestItemShape:
                 config=config,
                 thresholds=custom_thresholds,
             )
+            assert result is not None
             mock_extract.assert_not_called()  # type: ignore[union-attr]
 
         # Score 9 < threshold 100, so no extraction
@@ -502,6 +520,7 @@ class TestTier1EnrichmentSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Summary" in result["content"]
         assert "### Contributions" in result["content"]
@@ -545,6 +564,7 @@ class TestTier1EnrichmentSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" not in result["tags"]
 
@@ -575,6 +595,7 @@ class TestTier1EnrichmentSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Summary" in result["content"]
         assert "This is the abstract of the test paper" in result["content"]
@@ -602,6 +623,7 @@ class TestTier1EnrichmentFailure:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Summary" not in result["content"]
 
@@ -620,6 +642,7 @@ class TestTier1EnrichmentFailure:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" in result["tags"]
 
@@ -639,6 +662,7 @@ class TestTier1EnrichmentFailure:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         # No summary placeholder, abstract not rendered as summary
         assert "## Summary" not in result["content"]
@@ -672,6 +696,7 @@ class TestTier3ExtractionSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Claims" in result["content"]
         assert "## Datasets & Benchmarks" in result["content"]
@@ -699,6 +724,7 @@ class TestTier3ExtractionSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:deep-extracted" in result["tags"]
 
@@ -723,6 +749,7 @@ class TestTier3ExtractionSuccess:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" not in result["tags"]
 
@@ -803,6 +830,7 @@ class TestTier3ExtractionFailure:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "## Claims" not in result["content"]
         assert "## Datasets & Benchmarks" not in result["content"]
@@ -832,6 +860,7 @@ class TestTier3ExtractionFailure:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:deep-extracted" not in result["tags"]
 
@@ -858,6 +887,7 @@ class TestTier3ExtractionFailure:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" in result["tags"]
 
@@ -890,6 +920,7 @@ class TestTier3ExtractionFailure:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" in result["tags"]
         assert "influx:deep-extracted" not in result["tags"]
@@ -917,6 +948,7 @@ class TestTier3ExtractionFailure:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:repair-needed" in result["tags"]
         assert "## Summary" not in result["content"]
@@ -952,6 +984,7 @@ class TestPerTierFailureIndependence:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         # Tier 1 succeeded → ## Summary present
         assert "## Summary" in result["content"]
@@ -986,6 +1019,7 @@ class TestPerTierFailureIndependence:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         # Tier 1 failed → no ## Summary
         assert "## Summary" not in result["content"]
@@ -1016,6 +1050,7 @@ class TestPerTierFailureIndependence:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         # Tier 1 succeeded
         assert "## Summary" in result["content"]
@@ -1057,6 +1092,7 @@ class TestTagDerivationInvariants:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         has_section = "## Full Text" in result["content"]
         has_tag = "full-text" in result["tags"]
@@ -1084,6 +1120,7 @@ class TestTagDerivationInvariants:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         has_sections = all(
             h in result["content"]
@@ -1118,6 +1155,7 @@ class TestTagDerivationInvariants:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert "influx:deep-extracted" not in result["tags"]
         assert "## Claims" not in result["content"]
@@ -1144,6 +1182,7 @@ class TestTagDerivationInvariants:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
 
         assert result["tags"].count("influx:repair-needed") == 1
 
@@ -1172,6 +1211,7 @@ class TestFilterTagsPropagation:
             config=config,
             filter_tags=["topic:robotics", "topic:ai"],
         )
+        assert result is not None
 
         assert result["filter_tags"] == ["topic:robotics", "topic:ai"]
         # Filter-result tags are not mixed into persisted note tags.
@@ -1187,6 +1227,7 @@ class TestFilterTagsPropagation:
             profile_name="ai-robotics",
             config=config,
         )
+        assert result is not None
         assert result["filter_tags"] == []
 
 
@@ -1216,6 +1257,7 @@ class TestInspectorArchiveTerminalSkip:
                 profile_name="ai-robotics",
                 config=config,
             )
+            assert result is not None
         finally:
             current_archive_terminal_arxiv_ids.reset(token)
 

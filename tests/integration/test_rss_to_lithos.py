@@ -400,6 +400,7 @@ class TestArchiveNotePathAgreement:
             profile_name="test-profile",
             config=config,
         )
+        assert result is not None
 
         # Tag agreement
         assert "source:rss" in result["tags"]
@@ -440,6 +441,7 @@ class TestArchiveNotePathAgreement:
             profile_name="test-profile",
             config=config,
         )
+        assert result is not None
 
         assert "source:blog" in result["tags"]
         assert result["path"] == "articles/blog/2026/04"
@@ -465,6 +467,7 @@ class TestArchiveNotePathAgreement:
             profile_name="test-profile",
             config=config,
         )
+        assert result is not None
 
         # File on disk
         archive_files = list(archive_dir.rglob("*.html"))
@@ -527,11 +530,13 @@ class TestCollision:
             profile_name="test-profile",
             config=config,
         )
+        assert result_a is not None
         result_b = build_rss_note_item(
             item=item_b,
             profile_name="test-profile",
             config=config,
         )
+        assert result_b is not None
 
         # Both archive files exist on disk
         archive_files = sorted(archive_dir.rglob("*.html"))
@@ -591,6 +596,7 @@ class TestCollision:
                 profile_name="test-profile",
                 config=config,
             )
+            assert result is not None
             results.append(result)
 
         # Two distinct archive files on disk
@@ -642,6 +648,7 @@ class TestDeterminism:
             profile_name="test-profile",
             config=config,
         )
+        assert result1 is not None
 
         # Verify single file
         files_after_first = list(archive_dir.rglob("*.html"))
@@ -654,6 +661,7 @@ class TestDeterminism:
             profile_name="test-profile",
             config=config,
         )
+        assert result2 is not None
 
         files_after_second = list(archive_dir.rglob("*.html"))
         assert len(files_after_second) == 1
@@ -714,6 +722,7 @@ class TestEndToEndFixtureFeed:
                 profile_name="test-profile",
                 config=config,
             )
+            assert result is not None
             results.append(result)
 
         # Two archive files on disk
@@ -764,6 +773,7 @@ class TestEndToEndFixtureFeed:
                 profile_name="test-profile",
                 config=config,
             )
+            assert result is not None
             results.append(result)
 
         archive_files = list(archive_dir.rglob("*.html"))
@@ -797,6 +807,7 @@ class TestEndToEndFixtureFeed:
             profile_name="test-profile",
             config=config,
         )
+        assert result is not None
         assert "influx:archive-missing" not in result["tags"]
 
         # Now test that without allow_private_ips the download fails
@@ -818,6 +829,7 @@ class TestEndToEndFixtureFeed:
             profile_name="test-profile",
             config=strict_config,
         )
+        assert result_strict is not None
         # Archive download failed due to SSRF guard
         assert "influx:archive-missing" in result_strict["tags"]
 
@@ -923,6 +935,7 @@ class TestExtractionFallbackToSummary:
             profile_name="test-profile",
             config=config,
         )
+        assert result is not None
 
         # Feed summary should be used, not the short extracted text
         assert result["abstract_or_summary"] == feed_summary
@@ -947,6 +960,7 @@ class TestExtractionFallbackToSummary:
             profile_name="test-profile",
             config=config,
         )
+        assert result is not None
 
         # Extracted text should be used, not the feed summary
         assert result["abstract_or_summary"] != feed_summary

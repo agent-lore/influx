@@ -1123,6 +1123,7 @@ class TestEnrichSpansDisabled:
                 profile_name="ai-robotics",
                 config=config,
             )
+            assert result is not None
 
         # Enrichment still runs — just no spans
         mock_tier1.assert_called_once()
