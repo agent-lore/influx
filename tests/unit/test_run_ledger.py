@@ -2109,6 +2109,76 @@ def test_degradation_summary_invalid_note_state_drives_degradation(
     assert by_source == {"arxiv": 2, "rss": 2}
 
 
+def test_summary_thin_drops_total_persists_on_ledger_entry(tmp_path: Path) -> None:
+    """Issue #166: ``summary_thin_drops_total`` round-trips through the ledger.
+
+    Confirms the new kwarg is plumbed through ``complete`` → ``_finish``
+    and surfaces on the persisted entry shape so downstream consumers
+    (``/runs/recent``, dashboards) can read it without scraping logs.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=3,
+        ingested=3,
+        fetched_total=10,
+        summary_thin_drops_total=7,
+    )
+    entry = ledger.recent()[0]
+    assert entry["summary_thin_drops_total"] == 7
+    # Distinct field — must NOT be conflated with the archive-failure
+    # total even when archive_failures_total is unset.
+    assert entry["archive_failures_total"] is None
+
+
+def test_summary_thin_drops_total_does_not_trigger_archive_acquisition(
+    tmp_path: Path,
+) -> None:
+    """Issue #166: thin-summary drops are deliberately NOT degraded reasons.
+
+    A run with 50 thin-summary drops and zero archive failures must not
+    surface the ``archive_acquisition`` reason — these items never
+    became ``influx:archive-missing`` notes; they were dropped before
+    the write loop.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    reasons = ledger.complete(
+        run_id="r-1",
+        sources_checked=3,
+        ingested=3,
+        fetched_total=53,
+        archive_failures_total=None,
+        summary_thin_drops_total=50,
+    )
+    assert reasons == []
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is False
+    assert entry["degraded_reasons"] == []
+    assert entry["degradation_severity"] == "success"
+    assert entry["summary_thin_drops_total"] == 50
+
+
+def test_summary_thin_drops_total_defaults_to_none(tmp_path: Path) -> None:
+    """A run that doesn't pass the kwarg gets ``None`` on the entry.
+
+    Backwards-compatibility canary: existing callers that don't pass
+    the new kwarg still produce valid entries (just with the field set
+    to ``None`` rather than ``0``).
+    """
+    ledger = RunLedger(tmp_path / "state")
+    ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+    ledger.complete(
+        run_id="r-1",
+        sources_checked=1,
+        ingested=1,
+        fetched_total=1,
+    )
+    entry = ledger.recent()[0]
+    assert entry["summary_thin_drops_total"] is None
+
+
 def test_build_degradation_summary_accepts_no_write_outcomes(tmp_path: Path) -> None:
     """``write_outcomes=None`` produces a zero-shaped writes /
     invalid_note_state block so legacy callers (and the ``fail`` /

@@ -841,7 +841,13 @@ def _make_test_arxiv_item() -> Any:
     return ArxivItem(
         arxiv_id="2601.12345",
         title="Test Paper Title",
-        abstract="This is the abstract.",
+        # Long enough to clear the issue #166 thin-summary threshold so
+        # these enrichment-span tests exercise the full build path.
+        abstract=(
+            "This is the abstract for the test paper, deliberately "
+            "long enough to clear the default thin-summary threshold "
+            "so the enrichment-span tests run their intended path."
+        ),
         published=datetime(2026, 4, 25, tzinfo=UTC),
         categories=["cs.AI"],
     )

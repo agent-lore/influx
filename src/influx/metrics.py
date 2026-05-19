@@ -56,6 +56,7 @@ __all__ = [
     "slug_collision_url_recovery",
     "source_acquisition_errors",
     "source_cooldown_skips",
+    "summary_thin_drops",
     "tier3_fallbacks",
 ]
 
@@ -264,6 +265,39 @@ def archive_missing() -> Any:
     return get_meter().counter(
         "influx_archive_missing_total",
         description="Items tagged influx:archive-missing during a run.",
+    )
+
+
+def summary_thin_drops() -> Any:
+    """Counter of items suppressed by the thin-summary rule (#166).
+
+    Increments once per item the source adapter drops because the
+    archive fetch did not produce a body AND the feed-provided
+    summary (after extraction fallback) was thin per
+    :func:`influx.thin_summary.is_thin_summary`.
+
+    Distinct from :func:`archive_missing` and
+    :func:`archive_policy_failures` so dashboards can pivot
+    suppressions independently of archive-failure counts — the dropped
+    items never reach the Lithos write loop and so never receive an
+    ``influx:archive-missing`` tag, and they are deliberately excluded
+    from ``archive_failures_total`` / ``source_acquisition_errors`` /
+    ``archive_acquisition`` degraded reasons.
+
+    Labels: ``profile``, ``source`` (``rss`` / ``arxiv`` / …),
+    ``failure_kind`` (the archive failure_kind that triggered the
+    suppression — ``http_404`` / ``timeout`` / ``blocked`` /
+    ``non_html_source`` / ``unsupported`` / …), ``rule``
+    (``length`` | ``title_equality`` | ``boilerplate``) — the
+    thin-summary rule that fired first.
+    """
+    return get_meter().counter(
+        "influx_summary_thin_drops_total",
+        description=(
+            "Items suppressed by the thin-summary rule because their "
+            "archive fetch failed and the feed-provided summary was "
+            "too thin to keep (issue #166)."
+        ),
     )
 
 

@@ -196,7 +196,12 @@ async def _run_arxiv_scenario(
         ArxivItem(
             arxiv_id="2601.12345",
             title="Test Paper",
-            abstract="Abstract text",
+            # Long enough to clear the issue #166 thin-summary threshold.
+            abstract=(
+                "Abstract text that comfortably exceeds the default "
+                "thin-summary threshold so this span test runs the "
+                "full ingest pipeline."
+            ),
             published=datetime(2026, 4, 25, tzinfo=UTC),
             categories=["cs.AI"],
         ),
@@ -281,7 +286,12 @@ async def _run_rss_scenario(
             title="Blog Post",
             url="https://example.com/post-1",
             published=datetime(2026, 4, 25, tzinfo=UTC),
-            summary="Post summary",
+            # Long enough to clear the issue #166 thin-summary threshold.
+            summary=(
+                "Post summary that comfortably exceeds the default "
+                "thin-summary threshold so this span test runs the "
+                "full ingest pipeline."
+            ),
             source_tag="blog",
             feed_name="Test Blog",
         ),
@@ -418,7 +428,12 @@ class TestOtelDisabledZeroSpans:
             ArxivItem(
                 arxiv_id="2601.12345",
                 title="Test Paper",
-                abstract="Abstract text",
+                # Long enough to clear the issue #166 thin-summary threshold.
+                abstract=(
+                    "Abstract text that comfortably exceeds the default "
+                    "thin-summary threshold so this span test runs the "
+                    "full ingest pipeline."
+                ),
                 published=datetime(2026, 4, 25, tzinfo=UTC),
                 categories=["cs.AI"],
             ),

@@ -56,11 +56,19 @@ PROFILE_A = "ai-robotics"
 PROFILE_B = "web-tech"
 
 # Fixture arXiv item (cs.AI category, shared by both profiles).
+# Abstract length comfortably clears the issue #166 thin-summary
+# threshold so the suppression rule does not interfere with the
+# dedup assertion.
 _FIXTURE_ARXIV_ITEMS = [
     ArxivItem(
         arxiv_id="2601.00001",
         title="Shared cs.AI Paper",
-        abstract="This paper covers attention mechanisms relevant to both profiles.",
+        abstract=(
+            "This paper covers attention mechanisms relevant to both "
+            "profiles, with a deliberately long abstract so the issue "
+            "#166 thin-summary rule does not interfere with the dedup "
+            "assertion."
+        ),
         published=datetime(2026, 4, 25, tzinfo=UTC),
         categories=["cs.AI"],
     ),
@@ -424,7 +432,9 @@ class TestRssFetchDedup:
         fetch_cache = FetchCache()
         http_fetch_count = 0
 
-        # Minimal RSS 2.0 feed fixture.
+        # Minimal RSS 2.0 feed fixture.  Description is long enough to
+        # clear the issue #166 thin-summary threshold so the suppression
+        # rule does not interfere with the dedup assertion.
         rss_xml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<rss version="2.0"><channel>'
@@ -432,7 +442,9 @@ class TestRssFetchDedup:
             "<item>"
             "<title>Shared Blog Post</title>"
             "<link>https://shared-blog.example/post-1</link>"
-            "<description>A shared blog post.</description>"
+            "<description>A shared blog post with a substantive "
+            "description that comfortably exceeds the default "
+            "thin-summary threshold for this dedup test.</description>"
             "<pubDate>Sat, 25 Apr 2026 00:00:00 GMT</pubDate>"
             "</item>"
             "</channel></rss>"

@@ -80,7 +80,12 @@ def _make_item(arxiv_id: str = "2601.12345") -> ArxivItem:
     return ArxivItem(
         arxiv_id=arxiv_id,
         title="Test Paper Title",
-        abstract="This is the abstract of the test paper.",
+        abstract=(
+            "This is the abstract of the test paper, deliberately long "
+            "enough to clear the issue #166 thin-summary threshold so "
+            "this fixture exercises the note-builder rather than the "
+            "suppression drop."
+        ),
         published=datetime(2026, 4, 25, tzinfo=UTC),
         categories=["cs.AI", "cs.RO"],
     )
@@ -522,7 +527,9 @@ class TestTier1EnrichmentSuccess:
         mock_t1.assert_called_once()  # type: ignore[union-attr]
         call_kwargs = mock_t1.call_args.kwargs  # type: ignore[union-attr]
         assert call_kwargs["title"] == "Test Paper Title"
-        assert call_kwargs["abstract"] == "This is the abstract of the test paper."
+        assert call_kwargs["abstract"].startswith(
+            "This is the abstract of the test paper"
+        )
         assert call_kwargs["profile_summary"] == "AI and robotics research"
 
     @patch("influx.cascade.tier1_enrich")
@@ -570,7 +577,7 @@ class TestTier1EnrichmentSuccess:
         )
 
         assert "## Summary" in result["content"]
-        assert "This is the abstract of the test paper." in result["content"]
+        assert "This is the abstract of the test paper" in result["content"]
 
 
 # ── Tier 1 enrichment failure ────────────────────────────────────

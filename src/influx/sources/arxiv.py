@@ -63,7 +63,9 @@ from influx.telemetry import (
     record_source_acquisition_error,
     record_source_cooldown_skip,
     record_source_retry,
+    record_summary_thin_drop,
 )
+from influx.thin_summary import is_thin_summary
 
 if TYPE_CHECKING:
     from influx.sources import FetchCache
@@ -1031,7 +1033,7 @@ def build_arxiv_note_item(
     config: AppConfig,
     thresholds: ProfileThresholds | None = None,
     filter_tags: Iterable[str] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Build a complete ``ProfileItem`` dict for the scheduler.
 
     Runs the HTML → PDF → abstract-only extraction cascade when the
@@ -1059,9 +1061,11 @@ def build_arxiv_note_item(
 
     Returns
     -------
-    dict[str, Any]
-        Ready-to-yield ``ProfileItem`` dict (title, source_url,
-        content, tags, score, confidence, path, abstract_or_summary).
+    dict[str, Any] | None
+        Ready-to-yield ``ProfileItem`` dict, or ``None`` when the
+        thin-summary rule (#166) suppressed this item.  ``None`` is
+        the orchestrator's signal to skip the item (see
+        :mod:`influx.run` line 451).
     """
     profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
     if thresholds is None:
@@ -1082,12 +1086,18 @@ def build_arxiv_note_item(
     pdf_url = f"https://arxiv.org/pdf/{item.arxiv_id}.pdf"
     tracer = get_tracer()
 
+    # Issue #166: label of the failure that caused the archive to NOT
+    # deliver a body — used by the thin-summary suppression check
+    # below.  ``None`` when the archive succeeded; a string like
+    # ``"terminal"`` / ``"http_404"`` / ``"unsupported"`` otherwise.
+    _archive_failure_kind_label: str | None = None
     if is_archive_terminal:
         # Issue #14: this paper's archive download has been terminal-flipped
         # by an earlier repair sweep (or hand-set by an operator).  Skip the
         # download attempt entirely; the existing Lithos note's tags will
         # be preserved by the canonical merge_tags path on rewrite.
         archive_missing = True
+        _archive_failure_kind_label = "terminal"
         metrics.archive_missing().add(1, {"profile": profile_name, "source": "arxiv"})
         _log.info(
             "archive download skipped (terminal) profile=%s arxiv_id=%s",
@@ -1135,6 +1145,11 @@ def build_arxiv_note_item(
             # policy fired.
             archive_unsupported = archive_result.failure_kind == "unsupported"
             archive_missing = not archive_unsupported
+            # Issue #166: capture the failure_kind label for the
+            # thin-summary suppression check below.  Includes
+            # ``unsupported`` because the user-decided trigger scope is
+            # broader than ``archive_missing == True``.
+            _archive_failure_kind_label = archive_result.failure_kind or "unknown"
             archive_policy_tag = _tag_for_archive_failure_kind(
                 # ArchiveFailureKind is a Literal; mypy needs a cast.
                 archive_result.failure_kind  # type: ignore[arg-type]
@@ -1156,6 +1171,43 @@ def build_arxiv_note_item(
                         "kind": archive_result.failure_kind or "unknown",
                     },
                 )
+
+    # Issue #166: thin-summary suppression.  When the archive fetch did
+    # NOT deliver a body (any failure kind: terminal / http_404 /
+    # timeout / blocked / unsupported / …) AND the feed-provided
+    # abstract is thin per :mod:`influx.thin_summary`, drop the item
+    # entirely rather than writing a low-value abstract-only note.
+    # arXiv abstracts are typically several hundred characters of real
+    # content so the default 80-char threshold rarely fires; the rule
+    # is here for uniformity with the RSS adapter (PR description
+    # acceptance criterion: "per-source consistency").
+    if _archive_failure_kind_label is not None:
+        thin, thin_rule = is_thin_summary(
+            summary=item.abstract,
+            title=item.title,
+            min_chars=config.extraction.min_summary_chars,
+        )
+        if thin:
+            metrics.summary_thin_drops().add(
+                1,
+                {
+                    "profile": profile_name,
+                    "source": "arxiv",
+                    "failure_kind": _archive_failure_kind_label,
+                    "rule": thin_rule or "unknown",
+                },
+            )
+            record_summary_thin_drop()
+            _log.info(
+                "thin-summary drop source=arxiv profile=%s arxiv_id=%s "
+                "url=%s failure_kind=%s rule=%s",
+                profile_name,
+                item.arxiv_id,
+                source_url,
+                _archive_failure_kind_label,
+                thin_rule,
+            )
+            return None
 
     acquired = Acquired(
         item_id=item.arxiv_id,
@@ -1454,12 +1506,15 @@ class ArxivSource:
         *,
         profile_cfg: ProfileConfig,
         config: AppConfig,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """Acquire stage: download archive + run cascade + render note.
 
         Delegates to :func:`build_arxiv_note_item`.  The legacy module
         binding is preserved so existing tests that patch
         ``influx.sources.arxiv.build_arxiv_note_item`` continue to work.
+
+        Returns ``None`` when the thin-summary rule (#166) suppressed
+        the item — the orchestrator skips ``None`` results.
         """
         item = scored.candidate.payload
         if not isinstance(item, ArxivItem):

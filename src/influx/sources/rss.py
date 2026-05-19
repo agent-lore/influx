@@ -58,7 +58,9 @@ from influx.telemetry import (
     record_invalid_url_rejection,
     record_source_acquisition_error,
     record_source_cooldown_skip,
+    record_summary_thin_drop,
 )
+from influx.thin_summary import is_thin_summary
 from influx.urls import classify_article_url, normalise_url, url_hash
 
 if TYPE_CHECKING:
@@ -353,7 +355,7 @@ def build_rss_note_item(
     confidence: float = 0.0,
     reason: str = "",
     filter_tags: Iterable[str] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Build a complete ``ProfileItem`` dict for an RSS feed item.
 
     Downloads the article HTML via the guarded HTTP client (FR-SRC-5),
@@ -372,8 +374,11 @@ def build_rss_note_item(
 
     Returns
     -------
-    dict[str, Any]
-        Ready-to-yield ``ProfileItem`` dict.
+    dict[str, Any] | None
+        Ready-to-yield ``ProfileItem`` dict, or ``None`` when the
+        thin-summary rule (#166) suppressed this item.  ``None`` is
+        the orchestrator's signal to skip the item — see
+        :mod:`influx.run` line 451 for the consumer.
     """
     feed_slug = slugify_feed_name(item.feed_name)
     hash_val = url_hash(item.url)
@@ -492,6 +497,47 @@ def build_rss_note_item(
 
     source_url = normalise_url(item.url)
     profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
+
+    # Issue #166: thin-summary suppression.  When the archive fetch did
+    # NOT deliver a body (any failure kind — http_404 / timeout /
+    # blocked / non_html_source / unsupported / …) AND the
+    # post-extraction-fallback summary is "thin" by the structural test
+    # in :mod:`influx.thin_summary`, drop the item entirely rather than
+    # writing a low-value summary-only note.  The check runs
+    # post-extraction so a successful ``extract_article`` that filled
+    # ``summary`` with real body text bypasses the suppression — only
+    # genuinely-no-body items end up here.  Deliberately broader than
+    # the ``archive_missing`` flag so ``non_html_source`` /
+    # ``unsupported`` short-circuits also benefit (a thin summary + a
+    # URL that never pointed at HTML is still a low-value note).
+    if not archive_result.ok:
+        thin, thin_rule = is_thin_summary(
+            summary=summary,
+            title=item.title,
+            min_chars=config.extraction.min_summary_chars,
+        )
+        if thin:
+            failure_kind_label = archive_result.failure_kind or "unknown"
+            metrics.summary_thin_drops().add(
+                1,
+                {
+                    "profile": profile_name,
+                    "source": item.source_tag,
+                    "failure_kind": failure_kind_label,
+                    "rule": thin_rule or "unknown",
+                },
+            )
+            record_summary_thin_drop()
+            _log.info(
+                "thin-summary drop source=rss profile=%s feed-slug=%s "
+                "url=%s failure_kind=%s rule=%s",
+                profile_name,
+                feed_slug,
+                source_url,
+                failure_kind_label,
+                thin_rule,
+            )
+            return None
 
     acquired = Acquired(
         item_id=item_id,
@@ -790,8 +836,12 @@ class RssSource:
         *,
         profile_cfg: ProfileConfig,
         config: AppConfig,
-    ) -> dict[str, Any]:
-        """Acquire stage: download archive + run cascade + render note."""
+    ) -> dict[str, Any] | None:
+        """Acquire stage: download archive + run cascade + render note.
+
+        Returns ``None`` when the thin-summary rule (#166) suppressed
+        the item — the orchestrator skips ``None`` results.
+        """
         item = scored.candidate.payload
         if not isinstance(item, RssFeedItem):
             raise TypeError(

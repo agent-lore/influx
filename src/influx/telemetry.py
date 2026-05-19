@@ -43,6 +43,7 @@ __all__ = [
     "current_source_acquisition_errors",
     "current_source_cooldown_skips",
     "current_source_retry_counts",
+    "current_summary_thin_drops",
     "current_tier3_fallback_counts",
     "current_write_outcomes",
     "get_meter",
@@ -54,6 +55,7 @@ __all__ = [
     "record_source_acquisition_error",
     "record_source_cooldown_skip",
     "record_source_retry",
+    "record_summary_thin_drop",
     "record_tier3_fallback",
     "record_write_outcome",
 ]
@@ -299,6 +301,44 @@ def record_invalid_url_rejection(count: int = 1) -> None:
     if count <= 0:
         return
     counter = current_invalid_url_rejections.get()
+    if counter is None:
+        return
+    counter[0] += count
+
+
+# Per-run counter of items suppressed by the thin-summary rule (#166).
+# Set to ``[0]`` at run start by ``run_service.ledger_lifecycle``; source
+# adapters increment via :func:`record_summary_thin_drop` when the
+# archive fetch failed and the feed-provided summary was thin per
+# :func:`influx.thin_summary.is_thin_summary`.
+#
+# Surfaced on the run-ledger entry as ``summary_thin_drops_total`` so
+# operators can see "we suppressed N summary-only notes this run"
+# distinct from archive failures and from upstream URL rejections.
+# Deliberately does NOT contribute to ``archive_failures_total``,
+# ``source_acquisition_errors``, or the ``archive_acquisition``
+# degraded reason — a thin-summary drop is a quality choice, not a
+# pipeline failure.
+current_summary_thin_drops: ContextVar[list[int] | None] = ContextVar(
+    "current_summary_thin_drops",
+    default=None,
+)
+
+
+def record_summary_thin_drop(count: int = 1) -> None:
+    """Add *count* to the current run's ``summary_thin_drops_total`` (#166).
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_summary_thin_drops` is unset.  Source adapters call
+    this once per dropped item, alongside the per-drop INFO log line
+    and the ``influx_summary_thin_drops_total`` metric bump, so the
+    ledger entry can carry the per-run total without re-scanning
+    written notes (the suppression deliberately means the item never
+    reaches the write loop).
+    """
+    if count <= 0:
+        return
+    counter = current_summary_thin_drops.get()
     if counter is None:
         return
     counter[0] += count

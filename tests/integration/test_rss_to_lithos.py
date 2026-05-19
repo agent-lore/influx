@@ -176,7 +176,15 @@ def _make_item(
     title: str = "Test Article",
     url: str,
     published_iso: str = "2026-04-23T10:00:00+00:00",
-    summary: str = "Test summary.",
+    # Long enough by default to clear the issue #166 thin-summary
+    # threshold so generic fixtures don't trip the rule.  Tests that
+    # specifically exercise short-summary behaviour pass a shorter
+    # string explicitly.
+    summary: str = (
+        "A substantive test summary that comfortably exceeds the "
+        "default thin-summary threshold so end-to-end tests are not "
+        "accidentally affected by the suppression rule."
+    ),
     source_tag: Literal["rss", "blog"] = "rss",
     feed_name: str = "AI Research Blog",
 ) -> RssFeedItem:
