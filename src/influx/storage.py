@@ -31,6 +31,7 @@ from influx.config import StorageConfig
 from influx.errors import InfluxError, NetworkError
 from influx.http_client import ContentTypeFamily, guarded_fetch
 from influx.slugs import is_valid_slug
+from influx.source_kind import classify_source_kind
 
 __all__ = [
     "ArchivePathError",
@@ -227,6 +228,34 @@ def download_archive(
     registry = policy_registry if policy_registry is not None else default_registry()
     policy = registry.policy_for(url)
     domain = _domain_from_url(url)
+
+    # Issue #160: short-circuit URLs whose shape already indicates a
+    # non-HTML source kind (RSS/Atom/feed pointer, HN discussion link,
+    # etc.) when the caller expects HTML.  These URLs would otherwise
+    # be sent through the HTML content-type guard and fail every
+    # acquisition with ``content_type_mismatch``, looking identical to
+    # a real archive failure even though the source-kind never pointed
+    # at HTML in the first place.  Distinct from the ``skip`` policy
+    # because the discriminator is the URL itself, not a per-domain
+    # operator decision.
+    if expected_content_type == "html":
+        source_kind = classify_source_kind(url)
+        if source_kind != "html":
+            _log.info(
+                "archive download skipped (non-html source) url=%s "
+                "domain=%s detected_kind=%s",
+                url,
+                domain,
+                source_kind,
+            )
+            return ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error=f"non_html_source: detected source kind {source_kind!r}",
+                failure_kind="non_html_source",
+                policy_mode=policy.mode,
+                domain=domain,
+            )
 
     # Skip-mode policies short-circuit before path construction so an
     # entire blocked domain pays zero IO cost (the staging issue: the

@@ -294,19 +294,30 @@ def build_rss_note_item(
         )
 
     archive_path = archive_result.rel_posix_path
-    archive_missing = not archive_result.ok
+    # Issue #160: ``non_html_source`` is a deliberate short-circuit at
+    # the URL-shape level, not a missing archive — the URL never
+    # pointed at HTML to begin with (RSS/feed pointer, HN discussion
+    # link, …).  Treat it as a terminal, informational outcome rather
+    # than an acquisition failure so the run-level
+    # ``archive_acquisition`` degraded reason does not fire on these
+    # known non-article URLs.
+    non_html_source = archive_result.failure_kind == "non_html_source"
+    archive_missing = not archive_result.ok and not non_html_source
     # Issue #149: extract the policy-driven tag (if any) so the tag
     # composition below can apply ``influx:archive-blocked`` /
     # ``influx:archive-rate-limited`` /
     # ``influx:archive-skipped-by-policy`` alongside
     # ``influx:archive-missing``.  Returns ``None`` for generic
     # failures (http_404, oversize, timeout, …) so the existing
-    # ``influx:archive-missing`` shape is preserved.
+    # ``influx:archive-missing`` shape is preserved.  Issue #160:
+    # ``non_html_source`` also returns its dedicated tag here so the
+    # informational ``influx:archive-non-html-source`` tag is applied
+    # below alongside the terminal flag.
     archive_policy_tag = (
         _tag_for_archive_failure_kind(
             archive_result.failure_kind  # type: ignore[arg-type]
         )
-        if archive_missing
+        if archive_missing or non_html_source
         else None
     )
     if archive_missing:
@@ -404,11 +415,18 @@ def build_rss_note_item(
     # tight-loop on a doomed path (this is the staging-log behaviour
     # we are fixing).  ``rate_limited`` retries on cool-down, so it
     # stays in the normal repair-needed loop.
+    # Issue #160: ``non_html_source`` also lands its dedicated tag
+    # (``influx:archive-non-html-source``) and the terminal flag — the
+    # URL shape never pointed at HTML, so there is nothing to repair.
     if archive_policy_tag is not None and archive_policy_tag not in tags:
         tags.append(archive_policy_tag)
     if (
         archive_policy_tag
-        in ("influx:archive-blocked", "influx:archive-skipped-by-policy")
+        in (
+            "influx:archive-blocked",
+            "influx:archive-skipped-by-policy",
+            "influx:archive-non-html-source",
+        )
         and "influx:archive-terminal" not in tags
     ):
         tags.append("influx:archive-terminal")

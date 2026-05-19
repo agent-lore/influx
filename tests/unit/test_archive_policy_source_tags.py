@@ -198,6 +198,34 @@ class TestRssArchivePolicyTags:
         assert "influx:archive-terminal" not in tags
 
     @patch("influx.sources.rss.download_archive")
+    def test_non_html_source_emits_non_html_tag_only(self, mock_dl: object) -> None:
+        # Issue #160: when ``download_archive`` short-circuits a non-HTML
+        # URL the note carries ``influx:archive-non-html-source`` and the
+        # terminal flag, but NOT ``influx:archive-missing`` or
+        # ``influx:repair-needed`` — the URL never pointed at HTML, so
+        # there is nothing to acquire and nothing to repair.
+        mock_dl.return_value = ArchiveResult(  # type: ignore[union-attr]
+            ok=False,
+            rel_posix_path=None,
+            error="non_html_source: detected source kind 'xml'",
+            failure_kind="non_html_source",
+            policy_mode="attempt",
+            domain="csdb.dk",
+        )
+        config = _make_config()
+        item = _make_rss_item(url="https://csdb.dk/rss/upcomingevents.php")
+
+        result = build_rss_note_item(
+            item=item, profile_name="ai-robotics", config=config
+        )
+
+        tags = cast(list[str], result["tags"])
+        assert "influx:archive-non-html-source" in tags
+        assert "influx:archive-terminal" in tags
+        assert "influx:archive-missing" not in tags
+        assert "influx:repair-needed" not in tags
+
+    @patch("influx.sources.rss.download_archive")
     def test_successful_archive_emits_no_policy_tag(self, mock_dl: object) -> None:
         mock_dl.return_value = ArchiveResult(  # type: ignore[union-attr]
             ok=True,

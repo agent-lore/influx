@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ARCHIVE_BLOCKED_TAG",
+    "ARCHIVE_NON_HTML_SOURCE_TAG",
     "ARCHIVE_RATE_LIMITED_TAG",
     "ARCHIVE_SKIPPED_BY_POLICY_TAG",
     "ArchiveFailureKind",
@@ -74,6 +75,12 @@ __all__ = [
 ARCHIVE_BLOCKED_TAG = "influx:archive-blocked"
 ARCHIVE_RATE_LIMITED_TAG = "influx:archive-rate-limited"
 ARCHIVE_SKIPPED_BY_POLICY_TAG = "influx:archive-skipped-by-policy"
+# Issue #160: applied when the archive layer short-circuits an HTML
+# acquisition because the URL classifies as a non-HTML source kind
+# (RSS/Atom/feed endpoint, HN discussion pointer, etc.).  Distinct
+# from the domain-policy ``skip`` mode because the discriminator is the
+# URL shape itself, not an operator decision about a whole domain.
+ARCHIVE_NON_HTML_SOURCE_TAG = "influx:archive-non-html-source"
 
 
 # ── Failure-kind taxonomy ──────────────────────────────────────────────
@@ -92,6 +99,11 @@ ArchiveFailureKind = Literal[
     "blocked",
     "rate_limited",
     "missing_by_policy",
+    # Issue #160: the URL was classified as a non-HTML source kind
+    # (RSS/feed pointer, HN discussion link, …) before any network
+    # call.  Distinct from ``missing_by_policy`` (which is per-domain
+    # operator policy) — the discriminator is the URL shape itself.
+    "non_html_source",
     "http_403",
     "http_404",
     "http_429",
@@ -465,13 +477,15 @@ def classify_failure_kind(
 def tag_for_failure_kind(kind: ArchiveFailureKind) -> str | None:
     """Return the policy-driven tag for *kind*, or ``None`` for generic kinds.
 
-    Three failure kinds carry a dedicated policy tag callers add to
-    the note alongside (or in place of) the generic
-    ``influx:archive-missing``:
+    Four failure kinds carry a dedicated tag callers add to the note
+    alongside (or in place of) the generic ``influx:archive-missing``:
 
     * ``blocked`` → :data:`ARCHIVE_BLOCKED_TAG`
     * ``rate_limited`` → :data:`ARCHIVE_RATE_LIMITED_TAG`
     * ``missing_by_policy`` → :data:`ARCHIVE_SKIPPED_BY_POLICY_TAG`
+    * ``non_html_source`` → :data:`ARCHIVE_NON_HTML_SOURCE_TAG` (issue
+      #160; the URL shape never pointed at HTML so the archive layer
+      short-circuited before the network call)
 
     All other kinds (``http_404``, ``timeout``, ``oversize``, …) keep
     the generic missing-tag shape — they describe transient or
@@ -483,4 +497,6 @@ def tag_for_failure_kind(kind: ArchiveFailureKind) -> str | None:
         return ARCHIVE_RATE_LIMITED_TAG
     if kind == "missing_by_policy":
         return ARCHIVE_SKIPPED_BY_POLICY_TAG
+    if kind == "non_html_source":
+        return ARCHIVE_NON_HTML_SOURCE_TAG
     return None
