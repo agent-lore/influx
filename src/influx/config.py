@@ -580,6 +580,36 @@ class ResilienceConfig(BaseModel):
     # right before the restart.
     arxiv_429_cooldown_threshold: int = 3
     arxiv_429_cooldown_seconds: int = 900
+    # Issue #163: per-feed cooldown for repeated RSS timeouts.
+    #
+    # A single flaky RSS feed (e.g. the staging-observed "Two Stop
+    # Bits" aggregator) emitting ``httpx.ReadTimeout`` on every fetch
+    # degrades every scheduled run with the same
+    # ``source_acquisition`` reason.  The cooldown adds a per-feed-URL
+    # state machine layered on the existing fetch path:
+    #
+    # * Each *timeout* (``NetworkError.kind == "timeout"``) on the
+    #   feed-bytes fetch increments a streak counter for that URL.
+    # * When the streak reaches ``rss_timeout_cooldown_threshold`` the
+    #   feed enters COOLDOWN: subsequent fetches are skipped quickly
+    #   for ``rss_timeout_cooldown_seconds`` and surfaced as a
+    #   ``source_cooldown_skip`` degraded reason rather than the noisy
+    #   per-run ``source_acquisition`` stack trace.
+    # * Cooldown clears on either ``rss_timeout_cooldown_seconds``
+    #   elapse *or* the next successful fetch.  Successful fetch also
+    #   resets the streak counter.
+    # * Setting ``rss_timeout_cooldown_threshold`` to 0 disables the
+    #   feature entirely.
+    # * Only ``timeout`` failures count.  Other failure kinds (DNS,
+    #   network, content_type_mismatch, …) do NOT enter the cooldown
+    #   path so a single transport hiccup cannot quarantine a healthy
+    #   feed.
+    #
+    # State is per-feed-URL and process-local — separate feeds in the
+    # same profile and on the same domain are tracked independently,
+    # and a restart resets every deadline.
+    rss_timeout_cooldown_threshold: int = 3
+    rss_timeout_cooldown_seconds: int = 1800
     lithos_write_conflict_max_retries: int = 1
 
     @field_validator(
@@ -591,6 +621,8 @@ class ResilienceConfig(BaseModel):
         "arxiv_429_max_retries",
         "arxiv_429_cooldown_threshold",
         "arxiv_429_cooldown_seconds",
+        "rss_timeout_cooldown_threshold",
+        "rss_timeout_cooldown_seconds",
         "lithos_write_conflict_max_retries",
     )
     @classmethod

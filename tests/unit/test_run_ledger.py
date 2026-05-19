@@ -356,6 +356,7 @@ def _start_complete(
     invalid_url_rejections_total: int | None = None,
     archive_failures_total: int | None = None,
     source_acquisition_errors: list[dict[str, str]] | None = None,
+    source_cooldown_skips: list[dict[str, str]] | None = None,
 ) -> list[str]:
     """Helper: start + complete a run, return the degraded_reasons list.
 
@@ -369,6 +370,8 @@ def _start_complete(
     ``filter_errors_total`` defaults to ``None`` (no scorer failures).
     ``invalid_url_rejections_total`` defaults to ``None`` (no
     pre-acquire URL rejections — issue #131).
+    ``source_cooldown_skips`` defaults to ``None`` (no cooldown
+    short-circuits this run — issues #146 / #163).
     """
     if fetched_total is None:
         fetched_total = sources_checked if isinstance(sources_checked, int) else 0
@@ -382,6 +385,7 @@ def _start_complete(
         invalid_url_rejections_total=invalid_url_rejections_total,
         archive_failures_total=archive_failures_total,
         source_acquisition_errors=source_acquisition_errors,
+        source_cooldown_skips=source_cooldown_skips,
     )
 
 
@@ -571,6 +575,105 @@ def test_two_consecutive_zero_fetch_runs_after_history_flag_fetch_stall(
     entry = ledger.recent()[0]
     assert entry["degraded"] is True
     assert entry["degraded_reasons"] == ["fetch_stall"]
+
+
+def test_cooldown_skipped_priors_are_skipped_in_fetch_stall_streak(
+    tmp_path: Path,
+) -> None:
+    """Issue #163 review: cooldown-skipped prior runs do not pollute the streak.
+
+    Once a cooldown ends, the next run might legitimately fetch zero
+    items (genuine upstream silence).  In that case ``fetch_stall``
+    should require TWO consecutive *genuine* zero-fetch runs, not be
+    short-circuited by past cooldown runs that simply chose not to
+    fetch.
+
+    Scenario:
+      r-0: healthy (seeds history)
+      r-1: cooldown-skipped     ← not a zero-fetch for streak purposes
+      r-2: cooldown-skipped     ← not a zero-fetch for streak purposes
+      r-3: cooldown ended, fetch returned zero items (genuine silence)
+           — only ONE real zero-fetch run; fetch_stall must NOT fire yet.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    cooldown_skip = [{"source": "rss", "kind": "timeout_cooldown", "detail": "feed"}]
+
+    _start_complete(ledger, run_id="r-0", profile="p", sources_checked=5, ingested=2)
+    _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        source_cooldown_skips=cooldown_skip,
+    )
+    _start_complete(
+        ledger,
+        run_id="r-2",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        source_cooldown_skips=cooldown_skip,
+    )
+    # r-3: genuine zero-fetch after cooldown ended.  Without the
+    # streak-skip, this would see r-1 and r-2 as priors and fire
+    # fetch_stall immediately.  With the skip, only r-3 itself counts
+    # — one zero-fetch is not yet a stall (needs the streak >= 2).
+    reasons = _start_complete(
+        ledger,
+        run_id="r-3",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+    )
+    assert "fetch_stall" not in reasons
+
+
+def test_zero_fetch_runs_with_cooldown_skips_do_not_ratchet_fetch_stall(
+    tmp_path: Path,
+) -> None:
+    """Issue #163 review: repeated cooldown-skipped runs must not flag fetch_stall.
+
+    Reproduces the exact scenario raised in PR #169 review:
+
+    1. ``r-0``: healthy fetch with ``sources_checked > 0`` seeds history.
+    2. ``r-1``: feed in cooldown → ``sources_checked == 0``,
+       ``fetched_total == 0``, ``source_cooldown_skips`` non-empty.
+    3. ``r-2``: feed still in cooldown → same shape as r-1.
+
+    Without the guard, r-2 ratchets into ``fetch_stall`` on top of
+    ``source_cooldown_skip``, telling the operator both "quarantined on
+    purpose" AND "nothing fetched, upstream drift?".  The latter is
+    misleading — the zeros are fully explained by the cooldown.
+    """
+    ledger = RunLedger(tmp_path / "state")
+    cooldown_skip = [{"source": "rss", "kind": "timeout_cooldown", "detail": "feed"}]
+
+    # Healthy run seeds history.
+    _start_complete(ledger, run_id="r-0", profile="p", sources_checked=5, ingested=2)
+    # First cooldown-skipped run.
+    _start_complete(
+        ledger,
+        run_id="r-1",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        source_cooldown_skips=cooldown_skip,
+    )
+    # Second cooldown-skipped run.
+    reasons = _start_complete(
+        ledger,
+        run_id="r-2",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        source_cooldown_skips=cooldown_skip,
+    )
+
+    # Cooldown skip stays; fetch_stall must NOT also fire (the zeros
+    # are fully explained by the cooldown).
+    assert "source_cooldown_skip" in reasons
+    assert "fetch_stall" not in reasons
 
 
 def test_two_consecutive_zero_fetch_with_no_history_does_not_flag(
