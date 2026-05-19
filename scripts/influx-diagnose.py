@@ -23,6 +23,10 @@ Subcommands
                     recovery chain (squatter-shape dispatch + suffix
                     retry); read from
                     ${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl
+    invalid-source  Audit / clean up notes tagged
+                    ``influx:source-invalid`` (issue #162); default
+                    read-only, ``--apply`` reconstructs recoverable
+                    notes or tombstones unrecoverable ones
     cancel          Print the curl line for cancelling an in-flight run
                     (this script never sends destructive HTTP itself)
 
@@ -1128,6 +1132,214 @@ def cmd_slug_collision_backlog(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _fetch_invalid_source_notes(
+    *,
+    lithos_url: str,
+    note_ids: list[str] | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch notes carrying ``influx:source-invalid`` (issue #162).
+
+    When *note_ids* is provided, fetches those specific notes via
+    ``lithos_read`` and skips the tag-based list scan.  Otherwise
+    lists every note tagged ``influx:source-invalid`` (across all
+    profiles — this is operator cleanup, not a per-profile sweep)
+    and reads each one to obtain the full body for inference.
+    """
+    client = _make_lithos_client(lithos_url)
+    try:
+        if note_ids:
+            ids = list(note_ids)
+        else:
+            body = await client.list_notes_body(
+                tags=["influx:source-invalid"],
+                limit=limit,
+            )
+            items = body.get("items", [])
+            ids = [str(item.get("id", "")) for item in items if item.get("id")]
+
+        notes: list[dict[str, Any]] = []
+        for note_id in ids:
+            try:
+                doc = await client.read_note(note_id=note_id)
+            except BaseException as exc:  # noqa: BLE001
+                chain = _format_exception_chain(exc)
+                print(
+                    f"warning: read failed for {note_id}: {chain} — skipping",
+                    file=sys.stderr,
+                )
+                continue
+            notes.append(doc)
+        return notes
+    finally:
+        await client.close()
+
+
+async def _apply_invalid_source_action(
+    *,
+    lithos_url: str,
+    note: dict[str, Any],
+    new_tags: list[str],
+    agent: str,
+) -> tuple[str, str]:
+    """Rewrite *note* with *new_tags* via ``lithos_write`` (issue #162).
+
+    Returns ``(outcome, reason)`` where ``outcome`` is one of
+    ``"applied"`` (rewrite succeeded), ``"already_clean"`` (the tag set
+    was already in the target shape — no rewrite needed), or
+    ``"refused"`` (write failed; ``reason`` carries the diagnostic).
+
+    Mirrors the per-id confirmation shape of :func:`_delete_squatter`
+    so the operator workflow is consistent across cleanup subcommands.
+    """
+    existing_tags = [t for t in (note.get("tags") or []) if isinstance(t, str)]
+    if sorted(existing_tags) == sorted(new_tags):
+        return "already_clean", "no tag change required"
+
+    client = _make_lithos_client(lithos_url)
+    try:
+        try:
+            result = await client.write_note(
+                title=str(note.get("title", "")),
+                content=str(note.get("content", "")),
+                agent=agent,
+                path=str(note.get("path", "")),
+                source_url=str(note.get("source_url", "")),
+                tags=list(new_tags),
+                confidence=float(note.get("confidence") or 0.0),
+                note_type=str(note.get("note_type") or "summary"),
+                namespace=str(note.get("namespace") or "influx"),
+            )
+        except BaseException as exc:  # noqa: BLE001
+            return "refused", f"write failed: {_format_exception_chain(exc)}"
+        status = getattr(result, "status", "") or getattr(result, "outcome", "")
+        if str(status) in {"created", "updated"}:
+            return "applied", str(status)
+        # Surface anything else (slug_collision survivor, invalid_input, …)
+        # so the operator can decide how to proceed.
+        return "refused", f"unexpected write status: {status!r} ({result!r})"
+    finally:
+        await client.close()
+
+
+def cmd_invalid_source(args: argparse.Namespace) -> int:
+    """Audit and clean up notes tagged ``influx:source-invalid`` (issue #162).
+
+    Default mode (no ``--apply``): scans Lithos for notes carrying the
+    invalid-source-metadata terminal tag and prints a per-note action
+    recommendation.  Read-only — no writes.
+
+    ``--apply`` enables the rewrite path:
+
+    * Recoverable notes (URL / path / id hints support inference) are
+      *reconstructed*: the ``source:*`` tag is backfilled, in-band
+      terminal flags are dropped, and ``influx:repair-needed`` is
+      re-armed so the next sweep retries text extraction cleanly.
+    * Unrecoverable notes are *tombstoned*: an ``influx:tombstone``
+      tag is added on top of the existing terminal state so the note
+      is filterable as "operator-cleaned".
+
+    ``--yes <doc-id>`` (repeatable) or ``--yes-to-all`` are required
+    alongside ``--apply``, mirroring the ``squatters`` subcommand's
+    confirmation discipline.
+    """
+    env = _load_env(args.env)
+    _ensure_project_runtime_or_reexec()
+    lithos_url = _read_lithos_url(args, env)
+
+    import asyncio
+
+    from influx.audit_invalid_source import (
+        audit_notes,
+        format_audit_report,
+        reconstruct_tags,
+        tombstone_tags,
+    )
+
+    notes = asyncio.run(
+        _fetch_invalid_source_notes(
+            lithos_url=lithos_url,
+            note_ids=list(args.id or []),
+            limit=args.limit,
+        )
+    )
+    findings = audit_notes(notes)
+
+    print(format_audit_report(findings))
+
+    if not args.apply:
+        print(
+            "Default mode is read-only.  To apply the recommended action, "
+            "re-run with:\n"
+            "    --apply --yes <doc-id>      (per-id confirmation, repeatable)\n"
+            "    --apply --id <doc-id>       (skip list scan; targets one note)\n"
+            "    --apply --yes-to-all        (apply to every note listed above)"
+        )
+        return 0
+
+    # ── Apply path ─────────────────────────────────────────────────
+    if args.id:
+        confirmed = {str(i) for i in args.id}
+    else:
+        confirmed = set(args.yes or [])
+        if args.yes_to_all:
+            confirmed.update(f.note_id for f in findings)
+        if not confirmed:
+            sys.exit(
+                "--apply requires at least one --yes <doc-id>, --yes-to-all, "
+                "or --id <doc-id>.  Aborted."
+            )
+
+    finding_by_id = {f.note_id: f for f in findings}
+    note_by_id = {str(n.get("id", "")): n for n in notes}
+
+    unknown = confirmed - finding_by_id.keys()
+    if unknown:
+        print(
+            "Warning: --yes ids not present in audit results: "
+            + ", ".join(sorted(unknown))
+        )
+        confirmed -= unknown
+    if not confirmed:
+        sys.exit("No matching ids; nothing to apply.")
+
+    applied = 0
+    already_clean = 0
+    refused = 0
+    for note_id in sorted(confirmed):
+        finding = finding_by_id[note_id]
+        note = note_by_id[note_id]
+        if finding.recoverable:
+            assert finding.inferred_source is not None  # narrowed
+            new_tags = reconstruct_tags(note, inferred_source=finding.inferred_source)
+            action_label = "RECONSTRUCT"
+        else:
+            new_tags = tombstone_tags(note)
+            action_label = "TOMBSTONE"
+
+        outcome, reason = asyncio.run(
+            _apply_invalid_source_action(
+                lithos_url=lithos_url,
+                note=note,
+                new_tags=new_tags,
+                agent=args.agent,
+            )
+        )
+        if outcome == "applied":
+            print(f"{action_label}  doc_id={note_id}  ({reason})")
+            applied += 1
+        elif outcome == "already_clean":
+            print(f"SKIPPED       doc_id={note_id}  ({reason})")
+            already_clean += 1
+        else:
+            print(f"REFUSED       doc_id={note_id}  reason={reason}")
+            refused += 1
+
+    print()
+    print(f"Summary: applied={applied} already_clean={already_clean} refused={refused}")
+    return 0 if refused == 0 else 1
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     env = _load_env(args.env)
     host = env.get("INFLUX_ADMIN_BIND_HOST", "127.0.0.1")
@@ -1306,6 +1518,76 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_backlog.set_defaults(func=cmd_slug_collision_backlog)
+
+    p_invalid = sub.add_parser(
+        "invalid-source",
+        help=(
+            "audit / clean up notes tagged 'influx:source-invalid' "
+            "(persisted notes with empty or garbled source metadata, "
+            "issue #162).  Default is read-only; --apply enables rewrite."
+        ),
+    )
+    p_invalid.add_argument(
+        "--id",
+        action="append",
+        metavar="DOC_ID",
+        help=(
+            "act on a known note-id directly, bypassing the lithos_list scan "
+            "(repeatable).  Without --apply, fetches each note and reports "
+            "the recommended action.  With --apply, applies that action "
+            "without an extra --yes."
+        ),
+    )
+    p_invalid.add_argument(
+        "--limit",
+        type=int,
+        help=(
+            "cap the number of notes returned by the lithos_list scan (default: no cap)"
+        ),
+    )
+    p_invalid.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "actually apply the recommended action (reconstruct for "
+            "recoverable notes, tombstone for unrecoverable ones).  "
+            "Default is read-only audit.  Must be combined with --yes "
+            "<doc-id>, --yes-to-all, or --id."
+        ),
+    )
+    p_invalid.add_argument(
+        "--yes",
+        action="append",
+        metavar="DOC_ID",
+        help=(
+            "with --apply, confirm a specific doc-id for rewrite "
+            "(repeatable).  Required unless --yes-to-all or --id is used."
+        ),
+    )
+    p_invalid.add_argument(
+        "--yes-to-all",
+        action="store_true",
+        help=(
+            "with --apply, apply the recommended action to every note "
+            "listed in the audit.  Use after reviewing the read-only output."
+        ),
+    )
+    p_invalid.add_argument(
+        "--agent",
+        default="influx-diagnose",
+        help=(
+            "agent name passed to lithos_write for the audit trail "
+            "(default: influx-diagnose)"
+        ),
+    )
+    p_invalid.add_argument(
+        "--lithos-url",
+        help=(
+            "override the Lithos MCP/SSE URL.  Default resolution: "
+            "$LITHOS_URL, then [lithos] url in $INFLUX_DATA_PATH/influx.toml."
+        ),
+    )
+    p_invalid.set_defaults(func=cmd_invalid_source)
 
     p_cancel = sub.add_parser(
         "cancel",
