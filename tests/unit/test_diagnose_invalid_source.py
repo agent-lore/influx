@@ -210,6 +210,44 @@ class TestApplyInvalidSourceAction:
         assert outcome == "already_clean"
         client.write_note.assert_not_awaited()
 
+    def test_refuses_note_without_source_invalid_tag(self) -> None:
+        # PR #170 review safety check: ``--id`` skips the tag-filtered
+        # ``lithos_list`` scan, so an operator could name a healthy
+        # note by id and have it rewritten.  The apply helper MUST
+        # refuse any note whose tags do not include
+        # ``influx:source-invalid`` — regardless of how it was fetched.
+        healthy_note = {
+            "id": "healthy",
+            "title": "Healthy Note",
+            "path": "papers/arxiv/2026/04",
+            "source_url": "https://arxiv.org/abs/2601.12345",
+            "content": "## Summary\nfoo\n",
+            "tags": [
+                "profile:retro-computing",
+                "source:arxiv",
+                "ingested-by:influx",
+            ],
+            "confidence": 0.5,
+            "note_type": "summary",
+            "namespace": "influx",
+        }
+        client = _make_client([healthy_note])
+
+        with patch.object(_DIAGNOSE, "_make_lithos_client", return_value=client):
+            outcome, reason = asyncio.run(
+                _DIAGNOSE._apply_invalid_source_action(
+                    lithos_url="http://example/sse",
+                    note=healthy_note,
+                    new_tags=list(healthy_note["tags"]) + ["influx:tombstone"],
+                    agent="influx-diagnose",
+                )
+            )
+
+        assert outcome == "refused"
+        assert "not tagged influx:source-invalid" in reason
+        # And no write was attempted.
+        client.write_note.assert_not_awaited()
+
     def test_unexpected_status_is_refused(self) -> None:
         note = _invalid_note(note_id="a")
         client = _make_client([note])
@@ -369,6 +407,52 @@ class TestCmdInvalidSourceApply:
         assert client.write_note.await_count == 1
         call_kwargs = client.write_note.await_args_list[0].kwargs
         assert "source:arxiv" in call_kwargs["tags"]
+
+    def test_apply_id_pointing_at_healthy_note_is_refused(self, capsys: Any) -> None:
+        # PR #170 review: even when an operator names a healthy note
+        # via ``--id``, the apply path must refuse to rewrite it.
+        # End-to-end check that the safety boundary in
+        # ``_apply_invalid_source_action`` fires from the CLI path.
+        healthy_note = {
+            "id": "healthy",
+            "title": "Healthy Note",
+            "path": "papers/arxiv/2026/04",
+            "source_url": "https://arxiv.org/abs/1",
+            "content": "## Summary\nfoo\n",
+            "tags": [
+                "profile:retro-computing",
+                "source:arxiv",
+                "ingested-by:influx",
+            ],
+            "confidence": 0.5,
+            "note_type": "summary",
+            "namespace": "influx",
+        }
+        client = _make_client([healthy_note])
+
+        with (
+            patch.object(_DIAGNOSE, "_make_lithos_client", return_value=client),
+            patch.object(_DIAGNOSE, "_load_env", return_value={}),
+            patch.object(_DIAGNOSE, "_read_lithos_url", return_value="http://x/sse"),
+            patch.object(_DIAGNOSE, "_ensure_project_runtime_or_reexec"),
+        ):
+            rc = _DIAGNOSE.cmd_invalid_source(_build_args(apply=True, id=["healthy"]))
+
+        # Exit non-zero because the apply was refused.
+        assert rc == 1
+        client.write_note.assert_not_awaited()
+
+        out = capsys.readouterr().out
+        # The ineligible-warning fires up-front so the operator sees
+        # the issue before the per-id REFUSED line.
+        assert "INELIGIBLE" in out
+        assert "healthy" in out
+        # And the apply path also prints a REFUSED line with the
+        # specific safety reason.
+        assert "REFUSED" in out
+        assert "not tagged influx:source-invalid" in out
+        # Summary reflects the refusal.
+        assert "refused=1" in out
 
     def test_apply_id_only_writes_that_note_no_list_scan(self) -> None:
         notes = [_invalid_note(note_id="r", source_url="https://arxiv.org/abs/1")]

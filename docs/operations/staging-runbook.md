@@ -410,6 +410,11 @@ Safety properties:
 - Default mode is read-only.
 - `--apply` requires either `--yes <doc-id>` (repeatable),
   `--yes-to-all`, or `--id <doc-id>`.  Passing `--apply` alone aborts.
+- **`--apply` refuses any note that does not actually carry
+  `influx:source-invalid`** even when the operator names it via
+  `--id`.  This prevents an off-target id from rewriting an
+  unrelated note's tags.  The read-only audit flags such notes
+  upfront with an `INELIGIBLE` banner.
 - Each rewrite is recorded in Lithos with `agent=influx-diagnose`
   (override with `--agent <name>`).
 - The subcommand never deletes notes — use the `squatters` subcommand

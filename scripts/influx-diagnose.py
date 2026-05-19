@@ -1191,8 +1191,24 @@ async def _apply_invalid_source_action(
 
     Mirrors the per-id confirmation shape of :func:`_delete_squatter`
     so the operator workflow is consistent across cleanup subcommands.
+
+    Safety boundary (PR #170 review)
+    --------------------------------
+    Refuses any note whose existing tag list does NOT contain
+    ``influx:source-invalid``.  The ``--id`` targeting shortcut
+    bypasses the tag-filtered ``lithos_list`` scan, so a healthy note
+    could otherwise be fetched, classified, and rewritten — for an
+    operator cleanup tool the blast radius is too large.  Refusing at
+    the write boundary makes the eligibility check unmissable from
+    every caller path.
     """
     existing_tags = [t for t in (note.get("tags") or []) if isinstance(t, str)]
+    if "influx:source-invalid" not in existing_tags:
+        return (
+            "refused",
+            "note is not tagged influx:source-invalid; apply refuses to rewrite "
+            "outside the invalid-source-metadata cleanup scope",
+        )
     if sorted(existing_tags) == sorted(new_tags):
         return "already_clean", "no tag change required"
 
@@ -1264,6 +1280,27 @@ def cmd_invalid_source(args: argparse.Namespace) -> int:
         )
     )
     findings = audit_notes(notes)
+
+    # PR #170 review: when ``--id`` is used, the helper bypasses the
+    # tag-filtered ``lithos_list`` scan.  Surface any fetched note that
+    # does not actually carry ``influx:source-invalid`` so the operator
+    # sees the ineligibility before reading the (possibly misleading)
+    # RECONSTRUCT / TOMBSTONE recommendation — and so it's clear why
+    # ``--apply`` will refuse below.
+    ineligible_ids = [
+        f.note_id for f in findings if "influx:source-invalid" not in f.tags
+    ]
+    if ineligible_ids:
+        print(
+            "WARNING: the following notes do not carry "
+            "'influx:source-invalid' and are INELIGIBLE for this workflow.  "
+            "--apply will refuse them.  Suspected cause: an --id targeting a "
+            "note that was never in the invalid-source-metadata terminal "
+            "state, or was already operator-cleaned.\n"
+        )
+        for nid in ineligible_ids:
+            print(f"  INELIGIBLE  {nid}")
+        print()
 
     print(format_audit_report(findings))
 
