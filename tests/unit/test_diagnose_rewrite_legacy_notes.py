@@ -549,9 +549,7 @@ class TestSelectLegacyDocIdsFromCorpus:
         ids = _DIAGNOSE._select_legacy_doc_ids_from_corpus(tmp_path)
         assert ids == ["dup-id"]
 
-    def test_fence_in_value_does_not_truncate_frontmatter(
-        self, tmp_path: Path
-    ) -> None:
+    def test_fence_in_value_does_not_truncate_frontmatter(self, tmp_path: Path) -> None:
         # Regression: a substring-style closing-fence search (``find("---", 4)``)
         # stops at the first ``---`` ANYWHERE in the file, including inside a
         # YAML value like ``title: 'Foo --- Bar'``.  yaml.safe_load on the
