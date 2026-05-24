@@ -549,6 +549,36 @@ class TestSelectLegacyDocIdsFromCorpus:
         ids = _DIAGNOSE._select_legacy_doc_ids_from_corpus(tmp_path)
         assert ids == ["dup-id"]
 
+    def test_fence_in_value_does_not_truncate_frontmatter(
+        self, tmp_path: Path
+    ) -> None:
+        # Regression: a substring-style closing-fence search (``find("---", 4)``)
+        # stops at the first ``---`` ANYWHERE in the file, including inside a
+        # YAML value like ``title: 'Foo --- Bar'``.  yaml.safe_load on the
+        # truncated payload then fails and the doc is silently skipped from
+        # the candidate set — a false negative that loses real broken docs.
+        # The fix is a line-anchored fence search; this test pins it.
+        path = tmp_path / "blog/2026/02/fence-in-value.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Write the file by hand — yaml.safe_dump would quote the ``---`` away
+        # so we wouldn't reproduce the substring-find bug shape.
+        path.write_text(
+            (
+                "---\n"
+                "author: influx\n"
+                "id: fence-in-value-doc\n"
+                "source_url:\n"
+                "tags: []\n"
+                "title: 'OmniRobot --- a multi-camera platform'\n"
+                "---\n"
+                "\n"
+                "body\n"
+            ),
+            encoding="utf-8",
+        )
+        ids = _DIAGNOSE._select_legacy_doc_ids_from_corpus(tmp_path)
+        assert ids == ["fence-in-value-doc"]
+
 
 class TestCorpusScanFlagWiring:
     """``--corpus-scan`` end-to-end behaviour in ``cmd_rewrite_legacy_notes``."""

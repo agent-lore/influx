@@ -1277,6 +1277,16 @@ def _select_legacy_doc_ids_from_corpus(articles_path: Path) -> list[str]:
     collided, while this catches every recoverable doc on disk
     regardless of collision history (#181).
 
+    The closing-fence parser delegates to
+    :func:`influx.notes._split_frontmatter`, which line-anchors the
+    fence match.  A naive ``text.find("---", 4)`` would stop at the
+    first ``---`` substring anywhere in the file, including inside a
+    frontmatter VALUE like ``title: Foo --- Bar`` — and yaml.safe_load
+    on the truncated payload would then fail, silently dropping a
+    legitimate legacy doc from the candidate set.  The canonical
+    splitter looks for ``\\n---`` followed by a CR/LF terminator so
+    fences embedded in values are correctly ignored.
+
     Files that don't start with a ``---`` fence, parse failures, and
     non-influx-authored docs are silently skipped — the per-doc
     rewrite path's own author / parseable-frontmatter guards are the
@@ -1285,6 +1295,8 @@ def _select_legacy_doc_ids_from_corpus(articles_path: Path) -> list[str]:
     output for the bulk of healthy docs.
     """
     import yaml
+
+    from influx.notes import NoteParseError, _split_frontmatter
 
     ids: list[str] = []
     seen: set[str] = set()
@@ -1295,13 +1307,12 @@ def _select_legacy_doc_ids_from_corpus(articles_path: Path) -> list[str]:
             text = md.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if not text.startswith("---"):
-            continue
-        end = text.find("---", 4)
-        if end < 0:
+        try:
+            frontmatter_raw, _rest = _split_frontmatter(text)
+        except NoteParseError:
             continue
         try:
-            meta = yaml.safe_load(text[3:end])
+            meta = yaml.safe_load(frontmatter_raw)
         except yaml.YAMLError:
             continue
         if not isinstance(meta, dict):
