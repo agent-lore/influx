@@ -77,9 +77,7 @@ class TestBodyOnlyOutput:
         # Tags belong on the API parameter; the body must not carry
         # them in a YAML block.  Catches any future re-introduction
         # of a frontmatter-style emission.
-        text = _render_minimal(
-            tags=["source:arxiv", "ingested-by:influx", "favourite"]
-        )
+        text = _render_minimal(tags=["source:arxiv", "ingested-by:influx", "favourite"])
         assert "tags:" not in text
         assert "  - favourite" not in text
 

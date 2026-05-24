@@ -109,9 +109,7 @@ class TestWriteNoteStrictMode:
         # returns rather than raising.
         client = LithosClient(url="http://localhost:1234/sse")
         client.call_tool = AsyncMock(  # type: ignore[method-assign]
-            return_value=_tool_result(
-                {"status": "created", "id": "note-1"}
-            )
+            return_value=_tool_result({"status": "created", "id": "note-1"})
         )
 
         result = await client.write_note(
