@@ -97,8 +97,31 @@ _EXPECTED_LOSSY_REASONS: frozenset[str] = frozenset(
         "source_acquisition",
         "source_cooldown_skip",
         "archive_acquisition",
+        # Issue #177: ``invalid_url_rejections`` fires when an upstream
+        # feed is shipping many bad URLs (loopback / private / scheme
+        # / malformed) per run but at least some good ones still
+        # reach the filter — distinct from ``invalid_url_stall``,
+        # which requires that EVERY URL be rejected.  The Sourcegraph
+        # 5174 leak (2026-05-09 → 2026-05-10) is the canonical
+        # incident: 30 URLs/run rejected silently for five days
+        # because the stall variant never tripped.  Classed as
+        # expected_lossy because the validator is doing its job; the
+        # signal is "go look at this feed" rather than a data
+        # integrity regression.
+        "invalid_url_rejections",
     }
 )
+
+
+# Issue #177: ``invalid_url_rejections`` burst threshold — fires when
+# ``invalid_url_rejections_total`` for a single run meets or exceeds
+# this value AND ``invalid_url_stall`` is not already firing (the
+# stall variant is the all-bad case; this is the many-bad case).  Set
+# above the noise floor of occasional typo'd entries in an otherwise
+# healthy feed (~1–3) and well below the Sourcegraph incident shape
+# (~30/run).  Operator tunable in a follow-up if the default rate
+# of false positives proves wrong.
+_INVALID_URL_REJECTIONS_BURST_THRESHOLD: int = 10
 
 
 # Union of the two classified sets.  Used by the meta-test only;
@@ -639,6 +662,17 @@ class RunLedger:
           disallowed-scheme), so nothing reached the LLM filter.
           Single-run signal — like ``filter_error`` — because URL
           malformation is an immediately actionable upstream bug.
+        - ``"invalid_url_rejections"`` (issue #177) — the feed
+          shipped many bad URLs per run but at least some good ones
+          still reached the filter.  Distinct from
+          ``invalid_url_stall``: this is the partial-bad case.
+          Fires when ``invalid_url_rejections_total`` meets or
+          exceeds :data:`_INVALID_URL_REJECTIONS_BURST_THRESHOLD`
+          (currently ``10``).  Slotted into ``expected_lossy``
+          because the validator is doing its job — the signal is
+          "operator should look at this feed" rather than a data
+          integrity regression.  Suppressed when
+          ``invalid_url_stall`` already fires.
         - ``"invalid_note_state"`` (issue #152 review) — at least one
           write-time outcome landed in the materially-failed set
           (``invalid_input``, ``version_conflict``, ``slug_collision``,
@@ -734,6 +768,21 @@ class RunLedger:
         )
         if has_invalid_url_stall:
             reasons.append("invalid_url_stall")
+
+        # Issue #177: ``invalid_url_rejections`` (burst).  Fires when
+        # a run's URL-rejection count meets or exceeds
+        # :data:`_INVALID_URL_REJECTIONS_BURST_THRESHOLD` while at
+        # least some items still reached the filter — the partial-bad
+        # case that the stall variant above misses.  Suppressed when
+        # ``invalid_url_stall`` already fires (the stall is the
+        # more-specific signal for the all-bad case).
+        has_invalid_url_burst = (
+            not has_invalid_url_stall
+            and isinstance(invalid_url_rejections_total, int)
+            and invalid_url_rejections_total >= _INVALID_URL_REJECTIONS_BURST_THRESHOLD
+        )
+        if has_invalid_url_burst:
+            reasons.append("invalid_url_rejections")
 
         # Resolve profile + kind once for the stall checks.  All three
         # stall flags only apply to scheduled runs (backfills
