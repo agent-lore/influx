@@ -170,13 +170,7 @@ class TestParseLegacyNoteFrontmatter:
         assert _DIAGNOSE.parse_legacy_note_frontmatter(no_tags) is None
 
     def test_returns_none_when_source_url_missing(self) -> None:
-        no_url = (
-            "---\n"
-            "tags: [a, b]\n"
-            "confidence: 1.0\n"
-            "---\n"
-            "# Title\n"
-        )
+        no_url = "---\ntags: [a, b]\nconfidence: 1.0\n---\n# Title\n"
         assert _DIAGNOSE.parse_legacy_note_frontmatter(no_url) is None
 
     def test_returns_none_when_tags_is_empty_list(self) -> None:
@@ -237,7 +231,8 @@ class TestRewriteLegacyNotesCommand:
         captured = capsys.readouterr()
         assert rc == 0
         assert doc["id"] in captured.out
-        assert "would_rewrite" in captured.out or "would rewrite" in captured.out.lower()
+        out = captured.out
+        assert "would_rewrite" in out or "would rewrite" in out.lower()
         client.call_tool.assert_not_called()
 
     def test_apply_yes_to_all_rewrites_doc(self) -> None:
@@ -298,7 +293,8 @@ class TestRewriteLegacyNotesCommand:
         captured = capsys.readouterr()
         assert rc == 0
         client.call_tool.assert_not_called()
-        assert "already_fixed" in captured.out or "already fixed" in captured.out.lower()
+        out = captured.out
+        assert "already_fixed" in out or "already fixed" in out.lower()
 
     def test_skips_unparseable_content(self, capsys: Any) -> None:
         doc = _legacy_doc()
@@ -353,7 +349,8 @@ class TestRewriteLegacyNotesCommand:
                             '{"status": "duplicate", '
                             '"duplicate_of": {"id": "partner-id-1", '
                             '"title": "Partner", '
-                            '"source_url": "https://openai.com/index/gpt-5-3-codex-system-card"}, '
+                            '"source_url": '
+                            '"https://openai.com/index/gpt-5-3-codex-system-card"}, '
                             '"message": "URL already exists"}'
                         )
                     )
@@ -378,6 +375,5 @@ class TestRewriteLegacyNotesCommand:
         # must be rejected — mirrors cmd_squatters's safety contract.
         args = _make_args(apply=True)
         client = MagicMock()
-        with _patch_runtime(client):
-            with pytest.raises(SystemExit):
-                _DIAGNOSE.cmd_rewrite_legacy_notes(args)
+        with _patch_runtime(client), pytest.raises(SystemExit):
+            _DIAGNOSE.cmd_rewrite_legacy_notes(args)
