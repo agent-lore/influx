@@ -335,6 +335,44 @@ class TestRewriteLegacyNotesCommand:
         out = captured.out.lower()
         assert "not influx-authored" in out or "refused" in out
 
+    def test_apply_handles_duplicate_partner_response(self, capsys: Any) -> None:
+        # When the colliding partner doc has already landed this source_url
+        # (typical during a batch apply where pair members are processed in
+        # close succession), Lithos returns status=duplicate.  This is the
+        # expected outcome, NOT a failure — the partner is the canonical
+        # source-of-truth for the URL and the slug-recovery chain will
+        # resolve future collisions against it.
+        doc = _legacy_doc()
+        client = MagicMock()
+        client.read_note = AsyncMock(return_value=doc)
+        client.call_tool = AsyncMock(
+            return_value=MagicMock(
+                content=[
+                    MagicMock(
+                        text=(
+                            '{"status": "duplicate", '
+                            '"duplicate_of": {"id": "partner-id-1", '
+                            '"title": "Partner", '
+                            '"source_url": "https://openai.com/index/gpt-5-3-codex-system-card"}, '
+                            '"message": "URL already exists"}'
+                        )
+                    )
+                ]
+            )
+        )
+        client.close = AsyncMock()
+
+        args = _make_args(apply=True, yes_to_all=True, id=[doc["id"]])
+        with _patch_runtime(client):
+            rc = _DIAGNOSE.cmd_rewrite_legacy_notes(args)
+
+        captured = capsys.readouterr()
+        # Exit code MUST be 0 — duplicate-partner is a success outcome.
+        assert rc == 0
+        # The outcome bucket must be its own label, not 'failed'.
+        assert "partner_owns_url" in captured.out
+        assert "failed" not in captured.out.split("Summary:")[1].lower()
+
     def test_apply_requires_yes_or_yes_to_all(self) -> None:
         # ``--apply`` alone without ``--yes`` / ``--yes-to-all`` / ``--id``
         # must be rejected — mirrors cmd_squatters's safety contract.

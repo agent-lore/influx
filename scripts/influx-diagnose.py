@@ -1229,6 +1229,11 @@ _LEGACY_OUTCOME_SKIPPED_ALREADY_FIXED = "skipped_already_fixed"
 _LEGACY_OUTCOME_SKIPPED_UNPARSEABLE = "skipped_unparseable"
 _LEGACY_OUTCOME_REFUSED_NON_INFLUX = "refused_non_influx_authored"
 _LEGACY_OUTCOME_REWROTE = "rewrote"
+# Lithos rejected the rewrite because the partner doc in a collision pair
+# already owns the source_url.  The doc stays a zombie but is harmless —
+# the partner is now the canonical source-of-truth for the URL and
+# ``_classify_squatter`` will resolve future collisions via that doc.
+_LEGACY_OUTCOME_REJECTED_PARTNER_OWNS_URL = "partner_owns_url"
 _LEGACY_OUTCOME_FAILED = "failed"
 
 
@@ -1362,6 +1367,18 @@ async def _process_one_legacy_doc(
     status = body.get("status", "")
     if status in {"updated", "created"}:
         return _LEGACY_OUTCOME_REWROTE, f"write status={status}", plan
+    if status == "duplicate":
+        # The partner doc in a collision pair owns this source_url now —
+        # it was rewritten earlier in this same run (or externally).  The
+        # partner is canonical; this doc remains an empty-metadata zombie
+        # but harmless: the slug-recovery chain matches via the partner,
+        # which carries the source_url at the doc level.
+        dup = body.get("duplicate_of") or {}
+        return (
+            _LEGACY_OUTCOME_REJECTED_PARTNER_OWNS_URL,
+            f"partner doc owns source_url (partner_id={dup.get('id', '?')!r})",
+            plan,
+        )
     return (
         _LEGACY_OUTCOME_FAILED,
         f"unexpected write status: {status!r} (body={body!r})",
