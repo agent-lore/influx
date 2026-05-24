@@ -111,6 +111,34 @@ def _fixed_doc(doc_id: str = "fixed-id-1") -> dict[str, Any]:
     }
 
 
+def _repair_swept_broken_doc(doc_id: str = "repair-swept-id") -> dict[str, Any]:
+    """Hybrid shape: tags populated by repair sweep, source_url still empty.
+
+    The repair sweep adds tags like ``text:abstract-only`` /
+    ``influx:source-invalid`` to broken docs without ever recovering the
+    source_url.  ``_classify_squatter`` matches incoming writes by
+    source_url, so this doc is still effectively broken from the
+    recovery chain's perspective and SHOULD be rewritten by this job.
+    """
+    return {
+        "id": doc_id,
+        "title": "Repair-swept legacy doc",
+        "content": LEGACY_CONTENT,
+        "path": "articles/blog/2026/02/repair-swept.md",
+        "metadata": {
+            "tags": [
+                "text:abstract-only",
+                "influx:text-terminal",
+                "influx:source-invalid",
+            ],
+            "source_url": None,
+            "confidence": 0.0,
+            "author": "influx",
+            "version": 5,
+        },
+    }
+
+
 def _make_args(**overrides: Any) -> argparse.Namespace:
     defaults: dict[str, Any] = {
         "env": "staging",
@@ -295,6 +323,32 @@ class TestRewriteLegacyNotesCommand:
         client.call_tool.assert_not_called()
         out = captured.out
         assert "already_fixed" in out or "already fixed" in out.lower()
+
+    def test_rewrites_repair_swept_doc_with_empty_source_url(self) -> None:
+        # Regression for the staging incident where docs touched by the
+        # repair sweep (tags=['text:abstract-only', 'influx:source-invalid', ...])
+        # but still missing source_url were treated as 'already fixed' by
+        # an over-aggressive idempotency guard.  The recovery chain matches
+        # on source_url, so source_url is the only authoritative signal.
+        doc = _repair_swept_broken_doc()
+        client = MagicMock()
+        client.read_note = AsyncMock(return_value=doc)
+        client.call_tool = AsyncMock(
+            return_value=MagicMock(content=[MagicMock(text='{"status": "updated"}')])
+        )
+        client.close = AsyncMock()
+
+        args = _make_args(apply=True, yes_to_all=True, id=[doc["id"]])
+        with _patch_runtime(client):
+            rc = _DIAGNOSE.cmd_rewrite_legacy_notes(args)
+
+        assert rc == 0
+        assert client.call_tool.await_count == 1
+        write_args = client.call_tool.await_args.args[1]
+        assert (
+            write_args["source_url"]
+            == "https://openai.com/index/gpt-5-3-codex-system-card"
+        )
 
     def test_skips_unparseable_content(self, capsys: Any) -> None:
         doc = _legacy_doc()

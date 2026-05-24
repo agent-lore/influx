@@ -1279,7 +1279,7 @@ async def _process_one_legacy_doc(
     delta) so the operator-facing line can surface it for both dry-run
     and apply modes.  ``plan`` is ``None`` for skip/refuse outcomes.
     """
-    from influx.lithos_client import _doc_source_url, _doc_tags
+    from influx.lithos_client import _doc_source_url
 
     try:
         doc = await client.read_note(note_id=doc_id)
@@ -1299,10 +1299,17 @@ async def _process_one_legacy_doc(
             None,
         )
 
-    if _doc_tags(doc) or _doc_source_url(doc):
+    # Idempotency: a doc is "fixed" once its doc-level source_url is populated.
+    # Tags alone are NOT a sufficient signal — the repair sweep adds tags
+    # like ``text:abstract-only`` / ``influx:source-invalid`` to broken docs
+    # without ever recovering the source_url, and ``_classify_squatter``
+    # matches incoming writes by source_url (Match #2), so a doc with tags
+    # but no source_url is still effectively broken from the recovery
+    # chain's perspective.
+    if _doc_source_url(doc) is not None:
         return (
             _LEGACY_OUTCOME_SKIPPED_ALREADY_FIXED,
-            "doc-level tags or source_url already populated — nothing to do",
+            "doc-level source_url already populated — nothing to do",
             None,
         )
 
