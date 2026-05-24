@@ -787,7 +787,27 @@ class LithosClient:
         user-notes preservation + retry once, AC-05-E).
         Returns a :class:`WriteResult` so callers can inspect the
         outcome and increment counters (e.g. ``dedup_skipped``).
+
+        Strict-mode contract (#178): ``content`` must be body-only
+        markdown — no leading ``---``-fenced YAML frontmatter block.
+        Lithos owns the outer frontmatter and persists ``tags`` /
+        ``source_url`` / ``confidence`` / ``note_type`` / ``namespace``
+        from the API parameters on this call (spec §5.1).  A
+        ``LithosError`` is raised if ``content`` starts with ``---\\n``
+        so a renderer regression that re-introduces the embedded
+        frontmatter shape fails loudly at the boundary instead of
+        silently doubling the on-disk state.
         """
+        if content.startswith("---\n") or content.startswith("---\r\n"):
+            raise LithosError(
+                "content begins with a '---' frontmatter fence — "
+                "the lithos_write contract requires body-only content; "
+                "tags / source_url / confidence / note_type / namespace "
+                "must be passed as API parameters, not inlined in content "
+                "(spec §5.1, issue #178)",
+                operation="write_note",
+                detail="embedded_frontmatter",
+            )
         args: dict[str, Any] = {
             "title": title,
             "content": content,

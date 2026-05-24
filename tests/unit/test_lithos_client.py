@@ -59,6 +59,73 @@ class TestLCMAStubsRemoved:
             )
 
 
+class TestWriteNoteStrictMode:
+    """``write_note`` enforces the body-only ``content`` contract (#178).
+
+    Lithos spec §5.1 defines ``content`` as markdown body WITHOUT
+    a frontmatter block — ``tags`` / ``source_url`` / ``confidence``
+    / ``note_type`` / ``namespace`` are first-class API parameters on
+    ``lithos_write``.  A historical renderer bug (resolved by 2026-05-08,
+    residue cleaned up in #176/#180) emitted an embedded ``---``-fenced
+    frontmatter block at the top of ``content``, which Lithos tolerated
+    but caused on-disk duplication and contaminated the lithos-enrich
+    entity extraction.  The strict-mode assertion catches a regression
+    that re-introduces that shape.
+    """
+
+    async def test_rejects_content_starting_with_lf_frontmatter_fence(self) -> None:
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock()  # type: ignore[method-assign]
+        with pytest.raises(LithosError, match="frontmatter fence"):
+            await client.write_note(
+                title="t",
+                content="---\nnote_type: summary\n---\n# Title\n",
+                path="articles/test/2026/05",
+                source_url="https://example.com/a",
+                tags=["ingested-by:influx"],
+                confidence=1.0,
+            )
+        # MCP boundary never reached.
+        client.call_tool.assert_not_called()
+
+    async def test_rejects_content_starting_with_crlf_frontmatter_fence(self) -> None:
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock()  # type: ignore[method-assign]
+        with pytest.raises(LithosError, match="frontmatter fence"):
+            await client.write_note(
+                title="t",
+                content="---\r\nnote_type: summary\r\n---\r\n# Title\r\n",
+                path="articles/test/2026/05",
+                source_url="https://example.com/a",
+                tags=["ingested-by:influx"],
+                confidence=1.0,
+            )
+        client.call_tool.assert_not_called()
+
+    async def test_accepts_body_only_content(self) -> None:
+        # The body-only shape produced by the post-#178 renderer must
+        # pass the strict-mode check.  Mock the MCP layer just enough
+        # to return a clean ``created`` envelope so ``write_note``
+        # returns rather than raising.
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=_tool_result(
+                {"status": "created", "id": "note-1"}
+            )
+        )
+
+        result = await client.write_note(
+            title="t",
+            content="# Title\n\n## Archive\n\n## Summary\nText.\n",
+            path="articles/test/2026/05",
+            source_url="https://example.com/a",
+            tags=["ingested-by:influx"],
+            confidence=1.0,
+        )
+        assert result.status == "created"
+        client.call_tool.assert_awaited_once()
+
+
 class TestListNotes:
     """LithosClient.list_notes adapts Influx call shape to current Lithos."""
 

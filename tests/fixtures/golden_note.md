@@ -1,18 +1,3 @@
----
-note_type: summary
-namespace: influx
-source_url: https://arxiv.org/abs/2601.12345
-tags:
-  - source:arxiv
-  - arxiv-id:2601.12345
-  - cat:cs.AI
-  - cat:cs.RO
-  - ingested-by:influx
-  - schema:1
-  - profile:research
-  - favourite
-confidence: 0.8
----
 # Attention Is All You Need (Redux)
 
 ## Archive

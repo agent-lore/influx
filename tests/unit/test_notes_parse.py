@@ -203,9 +203,13 @@ class TestUserNotesBytePreservation:
 class TestParseNoteErrors:
     """Error cases for malformed notes."""
 
-    def test_no_frontmatter_fence(self) -> None:
-        with pytest.raises(NoteParseError, match="frontmatter fence"):
-            parse_note("# Title\nContent\n")
+    def test_body_only_input_parses_with_empty_frontmatter(self) -> None:
+        # Post-#178: ``parse_note`` accepts body-only input (the canonical
+        # shape after Lithos's outer frontmatter and prepended ``# title``
+        # are stripped on read).  ``frontmatter_raw`` is empty in that case.
+        parsed = parse_note("# Title\n\n## Section\nContent\n")
+        assert parsed.frontmatter_raw == ""
+        assert parsed.title == "Title"
 
     def test_no_closing_fence(self) -> None:
         with pytest.raises(NoteParseError, match="closing frontmatter fence"):
