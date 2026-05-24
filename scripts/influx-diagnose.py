@@ -1237,6 +1237,101 @@ _LEGACY_OUTCOME_REJECTED_PARTNER_OWNS_URL = "partner_owns_url"
 _LEGACY_OUTCOME_FAILED = "failed"
 
 
+def _resolve_corpus_articles_path(env: dict[str, str]) -> Path:
+    """Resolve the on-disk path to the Lithos ``articles/`` subtree (#181).
+
+    Resolution order mirrors ``scripts/influx-report.py``:
+
+    1. ``$LITHOS_KNOWLEDGE_PATH`` — explicit override (lithos's
+       knowledge-root path; we append ``articles``).
+    2. ``$INFLUX_ARCHIVE_PATH`` — fall back to the staging convention
+       ``<staging_root>/lithos/knowledge/articles`` derived from the
+       archive path's parent.
+
+    Exits with a clear message when neither is available, so the
+    operator knows which env var to set.
+    """
+    explicit = env.get("LITHOS_KNOWLEDGE_PATH")
+    if explicit:
+        return Path(explicit) / "articles"
+
+    archive_path = env.get("INFLUX_ARCHIVE_PATH")
+    if not archive_path:
+        sys.exit(
+            "Cannot resolve Lithos articles path: set $LITHOS_KNOWLEDGE_PATH "
+            "in the env file (or ensure $INFLUX_ARCHIVE_PATH is set for the "
+            "staging-convention fallback)."
+        )
+    staging_root = Path(archive_path).parent
+    return staging_root / "lithos" / "knowledge" / "articles"
+
+
+def _select_legacy_doc_ids_from_corpus(articles_path: Path) -> list[str]:
+    """Scan the on-disk corpus for Influx-authored docs with empty source_url.
+
+    Walks ``articles_path`` recursively, parses each ``*.md`` file's
+    outer YAML frontmatter, and returns the ids of docs where
+    ``author == 'influx'`` AND ``source_url`` is missing/empty.  This
+    is the broader selector for the ``rewrite-legacy-notes`` job — the
+    backlog-derived selector only catches docs that have already
+    collided, while this catches every recoverable doc on disk
+    regardless of collision history (#181).
+
+    The closing-fence parser delegates to
+    :func:`influx.notes._split_frontmatter`, which line-anchors the
+    fence match.  A naive ``text.find("---", 4)`` would stop at the
+    first ``---`` substring anywhere in the file, including inside a
+    frontmatter VALUE like ``title: Foo --- Bar`` — and yaml.safe_load
+    on the truncated payload would then fail, silently dropping a
+    legitimate legacy doc from the candidate set.  The canonical
+    splitter looks for ``\\n---`` followed by a CR/LF terminator so
+    fences embedded in values are correctly ignored.
+
+    Files that don't start with a ``---`` fence, parse failures, and
+    non-influx-authored docs are silently skipped — the per-doc
+    rewrite path's own author / parseable-frontmatter guards are the
+    authoritative refusals.  This selector only short-circuits the
+    obvious mismatches so an operator doesn't see noise in dry-run
+    output for the bulk of healthy docs.
+    """
+    import yaml
+
+    from influx.notes import NoteParseError, _split_frontmatter
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    if not articles_path.exists():
+        return ids
+    for md in articles_path.rglob("*.md"):
+        try:
+            text = md.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        try:
+            frontmatter_raw, _rest = _split_frontmatter(text)
+        except NoteParseError:
+            continue
+        try:
+            meta = yaml.safe_load(frontmatter_raw)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("author") != "influx":
+            continue
+        # Empty/None source_url is the broken-doc shape we care about.
+        if meta.get("source_url"):
+            continue
+        doc_id = meta.get("id")
+        if not isinstance(doc_id, str) or not doc_id:
+            continue
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        ids.append(doc_id)
+    return ids
+
+
 def _select_legacy_doc_ids_from_backlog(state_dir: Path) -> list[str]:
     """Extract candidate doc ids from ``unresolved-slug-collisions.jsonl``.
 
@@ -1408,6 +1503,16 @@ def cmd_rewrite_legacy_notes(args: argparse.Namespace) -> int:
     env = _load_env(args.env)
 
     id_list = list(getattr(args, "id", None) or [])
+    corpus_scan = bool(getattr(args, "corpus_scan", False))
+
+    # ``--id`` and ``--corpus-scan`` are mutually exclusive at the
+    # argparse layer, but the runtime sanity check is cheap and
+    # documents the contract for anyone reading the body.
+    if id_list and corpus_scan:
+        sys.exit(
+            "--id and --corpus-scan are mutually exclusive — pass one or "
+            "the other, not both.  Aborted."
+        )
 
     # Early validation: --apply without any confirmation flag is rejected
     # before we read the backlog file (so the test surface stays clean
@@ -1426,15 +1531,25 @@ def cmd_rewrite_legacy_notes(args: argparse.Namespace) -> int:
             if doc_id not in seen:
                 seen.add(doc_id)
                 doc_ids.append(doc_id)
+    elif corpus_scan:
+        articles = _resolve_corpus_articles_path(env)
+        doc_ids = _select_legacy_doc_ids_from_corpus(articles)
     else:
         state = _state_dir(env)
         doc_ids = _select_legacy_doc_ids_from_backlog(state)
 
     if not doc_ids:
-        print(
-            "No candidate doc ids — pass --id <doc-id> (repeatable) or ensure "
-            "${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl is populated."
-        )
+        if corpus_scan:
+            print(
+                "No candidate doc ids — the corpus scan found no "
+                "Influx-authored docs with empty source_url."
+            )
+        else:
+            print(
+                "No candidate doc ids — pass --id <doc-id> (repeatable), "
+                "--corpus-scan, or ensure "
+                "${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl is populated."
+            )
         return 0
 
     # ── Apply-mode subset narrowing ──
@@ -2018,6 +2133,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "unresolved-slug-collisions.jsonl scan (repeatable).  Without "
             "--apply, fetches each doc and reports a planned rewrite line.  "
             "With --apply, rewrites without an extra --yes."
+        ),
+    )
+    p_rewrite.add_argument(
+        "--corpus-scan",
+        action="store_true",
+        dest="corpus_scan",
+        help=(
+            "select candidate docs by walking the on-disk Lithos articles "
+            "subtree (every Influx-authored doc with empty doc-level "
+            "source_url), instead of reading the slug-collision backlog "
+            "file.  Catches recoverable docs that haven't collided yet "
+            "(issue #181).  Mutually exclusive with --id."
         ),
     )
     p_rewrite.add_argument(

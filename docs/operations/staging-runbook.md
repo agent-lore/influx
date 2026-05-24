@@ -685,6 +685,46 @@ grep -v '"source_url": "http://<bad-host>/' \
   > ${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl
 ```
 
+## 8f. Rewriting legacy-shape notes (issues #176 / #181)
+
+A historical writer bug (resolved by 2026-05-08, residue identified
+during the #176 investigation) left some Influx-authored notes in
+Lithos with empty doc-level `tags` / `source_url` / `confidence`
+despite their `content` carrying the correct values inside an
+embedded YAML frontmatter block. The
+`./scripts/influx-diagnose.py rewrite-legacy-notes` subcommand
+recovers these docs by parsing the embedded frontmatter and
+re-issuing the write through `lithos_write` with the structured
+fields as proper API parameters.
+
+### Selector modes
+
+| Selector | When to use |
+| -------- | ----------- |
+| Default (no flags) | Reads `${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl` and dedupes the doc ids. Catches the docs actively blocking the slug-collision recovery chain — the operational triage shape. |
+| `--id <doc-id>` (repeatable) | Targets known doc ids directly. Useful for re-running against a specific pair after an incident, or for the post-mortem cleanup loop. With `--apply`, no extra `--yes` is needed for these ids. |
+| `--corpus-scan` (#181) | Walks the on-disk articles subtree (`$LITHOS_KNOWLEDGE_PATH/articles` or the staging-convention fallback at `$INFLUX_ARCHIVE_PATH/../lithos/knowledge/articles`) and surfaces every Influx-authored doc whose doc-level `source_url` is empty — including recoverable docs that haven't yet collided. The broader cleanup shape. Mutually exclusive with `--id`. |
+
+### Outcome buckets (printed in the per-doc summary line)
+
+| Bucket | Meaning |
+| ------ | ------- |
+| `would_rewrite` | Dry-run: parser found a recoverable doc; `--apply` would write it. |
+| `rewrote` | Apply: doc rewritten successfully (`lithos_write status=updated`). |
+| `partner_owns_url` | Apply: the colliding partner doc in a slug-collision pair already owns this `source_url`, so Lithos correctly rejected the duplicate URL. The current doc remains a zombie but is harmless — the partner is canonical and `_classify_squatter` will resolve future collisions against it. |
+| `skipped_already_fixed` | Doc-level `source_url` is already populated. |
+| `skipped_unparseable` | Content has no `---`-fenced inner frontmatter (typical for #162 source-invalid docs). Route those through `invalid-source` (see §8b) or `squatters --apply --no-require-influx-authored` (see §8). |
+| `refused_non_influx_authored` | Safety guard: `metadata.author != 'influx'`. Never auto-rewrite a non-Influx doc. |
+| `failed` | Read or write raised. Investigate the per-doc reason. |
+
+### Safety contract
+
+Same shape as `cmd_squatters`: dry-run by default; `--apply` requires
+one of `--yes <doc-id>`, `--yes-to-all`, or `--id <doc-id>` (the
+`--id` flag is its own confirmation since it names the targets
+explicitly). Idempotent — re-running after `--apply` is a no-op for
+already-fixed docs.
+
 ## 9. Scheduling stagger (issue #87)
 
 Profiles share a single global `[schedule].cron` expression. Within
