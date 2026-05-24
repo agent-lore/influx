@@ -95,7 +95,7 @@ Three quick signals, all read-only:
   | Severity | Triggers | Operator action |
   |----------|----------|-----------------|
   | `success` | `degraded_reasons` empty | None |
-  | `expected_lossy` | only `source_acquisition`, `source_cooldown_skip`, `archive_acquisition` present | Glance; investigate only if frequency spikes. These are tolerated upstream / policy-driven outcomes. |
+  | `expected_lossy` | only `source_acquisition`, `source_cooldown_skip`, `archive_acquisition`, `invalid_url_rejections` present | Glance; investigate only if frequency spikes. These are tolerated upstream / policy-driven outcomes. |
   | `unexpected_failure` | any of `invalid_note_state`, `invalid_url_stall`, `ingestion_stall`, `fetch_stall`, `filter_stall`, `filter_error` present | Triage — actionable regression signal. |
   | `not_applicable` | `outcome=skipped` (circuit breaker fired) or `outcome=failure` (body raised before reasons were computed) | Read the existing `outcome` label — `severity` is set to a constant so the metric series shape stays uniform across all completions. |
 
@@ -613,6 +613,77 @@ unaffected.
 - **No repair-sweep re-evaluation.**  The thin-summary rule fires
   at write-time only.  A note tagged `influx:archive-missing` before
   #166 landed is not retroactively dropped on a later sweep.
+
+## 8e. URL validation rules (issues #131 / #177)
+
+Influx validates every article URL pre-acquire so a misbehaving feed
+cannot persist garbage URLs into Lithos. The check happens in
+`classify_article_url` (`src/influx/urls.py`) and runs against every
+`<link>` parsed out of an RSS entry. Rejected entries are counted
+toward the run's `invalid_url_rejections_total` and never reach the
+LLM filter or the write path.
+
+### What gets rejected
+
+| Reason            | Examples that trip it                                          |
+| ----------------- | -------------------------------------------------------------- |
+| `malformed`       | unparseable URL string, missing scheme                         |
+| `scheme`          | non-`http(s)` schemes (`file://`, `javascript:`, `data:`, …)   |
+| `no_host`         | URL with empty host part                                       |
+| `loopback`        | `localhost`, `127.0.0.0/8`, `::1` (the Sourcegraph 5174 case)  |
+| `link_local`      | `169.254.0.0/16`, `fe80::/10`                                  |
+| `private`         | RFC1918 (`10/8`, `172.16/12`, `192.168/16`) and IPv6 equivalents |
+| `multicast`       | `224.0.0.0/4` and IPv6 equivalents                             |
+
+Each rejection logs a WARNING with `profile`, `feed`, `url`, `reason`,
+and `title` so operators can drill via:
+
+```
+./scripts/influx-diagnose.py warnings --contains "rss item rejected pre-acquire"
+```
+
+### Operator-facing severity
+
+Two degraded reasons surface URL-validation activity at the run level
+(see §2 degradation-severity table for placement):
+
+- **`invalid_url_stall`** (unexpected_failure, single-run) — every
+  fetched item was URL-rejected, so nothing reached the filter.
+  Single bad-feed shape: typically a feed-shape regression upstream.
+- **`invalid_url_rejections`** (expected_lossy, single-run, #177) —
+  rejection count meets or exceeds the burst threshold (currently
+  `10`, see `_INVALID_URL_REJECTIONS_BURST_THRESHOLD` in
+  `run_ledger.py`) while some good items still reached the filter.
+  Canonical incident: the Sourcegraph blog feed shipped
+  `http://localhost:5174/...` links for 5 days in May 2026, rejecting
+  ~30 URLs/run silently. The burst signal fires immediately so the
+  next operator review surfaces it.
+
+### Cleaning up after a leak
+
+If bad URLs slipped into Lithos before the validation was tightened
+(or before the burst signal was added), use the recipe from §8 plus
+the `--no-require-influx-authored` flag — the bad-URL squatters may
+have lost their `ingested-by:influx` tag through the repair sweep:
+
+```
+# Enumerate by host, e.g. localhost:5174:
+LITHOS_URL=...
+./scripts/influx-diagnose.py --env staging squatters --apply \
+  --no-require-influx-authored \
+  --id <doc-id-1> --id <doc-id-2> ...
+```
+
+Then drop the stale backlog entries (defensive backup first):
+
+```
+cp ${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl \
+   ${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl.bak.$(date +%s)
+# Filter out the bad host:
+grep -v '"source_url": "http://<bad-host>/' \
+  ${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl.bak.* \
+  > ${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl
+```
 
 ## 9. Scheduling stagger (issue #87)
 

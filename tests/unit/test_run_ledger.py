@@ -1623,6 +1623,62 @@ def test_invalid_url_stall_fires_on_first_run(tmp_path: Path) -> None:
     assert "invalid_url_stall" in reasons
 
 
+# ── #177: invalid_url_rejections (burst) detection ──────────────────
+
+
+def test_invalid_url_rejections_burst_at_threshold_fires(tmp_path: Path) -> None:
+    """When rejections meet the threshold AND some items reach filter,
+    fire ``invalid_url_rejections`` (the Sourcegraph 5174 shape — #177)."""
+    ledger = RunLedger(tmp_path / "state")
+    # 30 fetched, 10 rejected (threshold), 20 reached the filter and at
+    # least one was ingested → not a stall.
+    reasons = _start_complete(
+        ledger,
+        run_id="r-burst",
+        profile="p",
+        sources_checked=20,
+        ingested=2,
+        fetched_total=30,
+        invalid_url_rejections_total=10,
+    )
+    assert "invalid_url_rejections" in reasons
+    assert "invalid_url_stall" not in reasons
+
+
+def test_invalid_url_rejections_below_threshold_does_not_fire(
+    tmp_path: Path,
+) -> None:
+    """A handful of bad URLs is noise, not a degraded reason."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-noise",
+        profile="p",
+        sources_checked=30,
+        ingested=5,
+        fetched_total=33,
+        invalid_url_rejections_total=3,
+    )
+    assert "invalid_url_rejections" not in reasons
+
+
+def test_invalid_url_rejections_suppressed_by_url_stall(tmp_path: Path) -> None:
+    """When the stall variant fires (every URL bad), don't double-flag
+    with the burst variant — the stall is the more-specific signal."""
+    ledger = RunLedger(tmp_path / "state")
+    reasons = _start_complete(
+        ledger,
+        run_id="r-stall",
+        profile="p",
+        sources_checked=0,
+        ingested=0,
+        fetched_total=15,
+        invalid_url_rejections_total=15,
+    )
+    assert "invalid_url_stall" in reasons
+    assert "invalid_url_rejections" not in reasons
+
+
 # ── #152: degradation summary ────────────────────────────────────────
 
 
