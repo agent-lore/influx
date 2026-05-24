@@ -384,6 +384,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pypdf" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "trafilatura" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -421,6 +422,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0,<3" },
     { name = "pypdf", specifier = ">=5.0" },
     { name = "python-dotenv", specifier = ">=1.0" },
+    { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "trafilatura", specifier = ">=2.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
 ]
