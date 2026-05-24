@@ -1136,6 +1136,356 @@ def cmd_slug_collision_backlog(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── rewrite-legacy-notes (#176) ─────────────────────────────────────
+
+
+from typing import NamedTuple as _NamedTuple_for_legacy  # noqa: E402
+
+
+class ParsedLegacyFrontmatter(_NamedTuple_for_legacy):
+    """Structured fields extracted from a pre-fix Influx note's embedded YAML.
+
+    Pre-fix notes (created 2026-05-05 → 2026-05-07) carry an embedded
+    ``---``-fenced YAML block at the top of ``content`` with the tag set,
+    canonical source URL, and confidence value the renderer computed at
+    write time.  Doc-level Lithos metadata for these notes is empty;
+    the rewrite job recovers the values from here.
+
+    NamedTuple is used instead of ``@dataclass`` to keep the type usable
+    when the diagnose script is loaded via
+    ``importlib.util.spec_from_file_location`` (used by unit tests),
+    which doesn't register the module in ``sys.modules`` — the dataclass
+    decorator's module-resolution lookup fails in that mode.
+    """
+
+    tags: list[str]
+    source_url: str
+    confidence: float
+
+
+def parse_legacy_note_frontmatter(content: str) -> ParsedLegacyFrontmatter | None:
+    """Parse the embedded YAML frontmatter block from a legacy note's content.
+
+    Returns ``None`` when the content does not start with a valid ``---``
+    frontmatter fence, when the YAML body is unparseable, or when the
+    required fields (``tags`` as a non-empty list, ``source_url`` as a
+    non-empty string) are missing.  ``confidence`` defaults to 1.0 when
+    absent or unparseable — every pre-fix note the renderer produced
+    carried it, but we are defensive.
+    """
+    import yaml
+
+    from influx.notes import NoteParseError, _split_frontmatter
+
+    try:
+        frontmatter_raw, _body = _split_frontmatter(content)
+    except NoteParseError:
+        return None
+    try:
+        data = yaml.safe_load(frontmatter_raw)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    tags_raw = data.get("tags")
+    if not isinstance(tags_raw, list) or not tags_raw:
+        return None
+    tags = [str(t) for t in tags_raw]
+    source_url = data.get("source_url")
+    if not isinstance(source_url, str) or not source_url:
+        return None
+    confidence_raw = data.get("confidence", 1.0)
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError):
+        confidence = 1.0
+    return ParsedLegacyFrontmatter(
+        tags=tags,
+        source_url=source_url,
+        confidence=confidence,
+    )
+
+
+def strip_legacy_frontmatter(content: str) -> str:
+    """Return body-only markdown after stripping the embedded frontmatter and title.
+
+    The inner ``# Title`` line is removed too — Lithos's serialiser
+    re-prepends ``# {doc.title}`` from doc metadata on every save, so
+    leaving the inner title would produce a double-heading shape after
+    the rewrite lands.  Section content (``## Archive``, ``## Summary``,
+    ``## User Notes``, etc.) is preserved byte-for-byte.
+    """
+    from influx.notes import _split_frontmatter, _split_title
+
+    _frontmatter, after_fm = _split_frontmatter(content)
+    _title, body = _split_title(after_fm)
+    return body.lstrip("\n")
+
+
+# Outcome buckets — also used as the per-doc status label on stdout
+# and as the keys for the closing summary line.
+_LEGACY_OUTCOME_PLANNED = "would_rewrite"
+_LEGACY_OUTCOME_SKIPPED_ALREADY_FIXED = "skipped_already_fixed"
+_LEGACY_OUTCOME_SKIPPED_UNPARSEABLE = "skipped_unparseable"
+_LEGACY_OUTCOME_REFUSED_NON_INFLUX = "refused_non_influx_authored"
+_LEGACY_OUTCOME_REWROTE = "rewrote"
+_LEGACY_OUTCOME_FAILED = "failed"
+
+
+def _select_legacy_doc_ids_from_backlog(state_dir: Path) -> list[str]:
+    """Extract candidate doc ids from ``unresolved-slug-collisions.jsonl``.
+
+    Each backlog ``detail`` field carries two doc ids in the form
+    ``first_existing_id=<UUID>; ...; retry_existing_id=<UUID>; ...``.
+    Both sides may carry the legacy shape (the first existed before
+    today's run; the retry squatter is also a pre-fix doc when the
+    suffixed slug was taken historically).  We collect both; the
+    per-doc idempotency guard short-circuits already-fixed ones at
+    read time.
+    """
+    entries = _read_slug_collision_backlog(state_dir)
+    ids: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        detail = str(entry.get("detail", "") or "")
+        for marker in ("first_existing_id=", "retry_existing_id="):
+            idx = detail.find(marker)
+            if idx < 0:
+                continue
+            tail = detail[idx + len(marker) :]
+            end = tail.find(";")
+            doc_id = (tail[:end] if end >= 0 else tail).strip()
+            if doc_id and doc_id not in seen:
+                seen.add(doc_id)
+                ids.append(doc_id)
+    return ids
+
+
+async def _process_one_legacy_doc(
+    *,
+    client: Any,
+    doc_id: str,
+    apply: bool,
+) -> tuple[str, str, dict[str, Any] | None]:
+    """Read + classify one doc, and rewrite when ``apply=True``.
+
+    Returns ``(outcome, reason, plan)`` where ``plan`` is a dict of the
+    rewrite shape (parsed tags, source_url, confidence, content length
+    delta) so the operator-facing line can surface it for both dry-run
+    and apply modes.  ``plan`` is ``None`` for skip/refuse outcomes.
+    """
+    from influx.lithos_client import _doc_source_url, _doc_tags
+
+    try:
+        doc = await client.read_note(note_id=doc_id)
+    except BaseException as exc:  # noqa: BLE001
+        return (
+            _LEGACY_OUTCOME_FAILED,
+            f"read failed: {_format_exception_chain(exc)}",
+            None,
+        )
+
+    metadata = doc.get("metadata") or {}
+    author = metadata.get("author") or doc.get("author") or ""
+    if author != "influx":
+        return (
+            _LEGACY_OUTCOME_REFUSED_NON_INFLUX,
+            f"doc.author={author!r} — refusing to touch a non-influx-authored doc",
+            None,
+        )
+
+    if _doc_tags(doc) or _doc_source_url(doc):
+        return (
+            _LEGACY_OUTCOME_SKIPPED_ALREADY_FIXED,
+            "doc-level tags or source_url already populated — nothing to do",
+            None,
+        )
+
+    content = str(doc.get("content") or "")
+    parsed = parse_legacy_note_frontmatter(content)
+    if parsed is None:
+        return (
+            _LEGACY_OUTCOME_SKIPPED_UNPARSEABLE,
+            "content has no embedded frontmatter or required fields missing",
+            None,
+        )
+
+    new_content = strip_legacy_frontmatter(content)
+    plan: dict[str, Any] = {
+        "tags": parsed.tags,
+        "source_url": parsed.source_url,
+        "confidence": parsed.confidence,
+        "old_content_len": len(content),
+        "new_content_len": len(new_content),
+    }
+
+    if not apply:
+        return _LEGACY_OUTCOME_PLANNED, "ready for rewrite", plan
+
+    # UPDATE-by-id needs the ``id`` and ``expected_version`` args to reach
+    # the MCP boundary; ``LithosClient.write_note`` doesn't accept those.
+    # ``client.call_tool("lithos_write", args)`` is the canonical UPDATE
+    # path — same pattern as ``influx.repair::_sweep_call_write``.
+    write_args: dict[str, Any] = {
+        "id": doc_id,
+        "title": str(doc.get("title") or metadata.get("title") or ""),
+        "content": new_content,
+        "agent": "influx",
+        "path": str(doc.get("path") or metadata.get("path") or ""),
+        "source_url": parsed.source_url,
+        "tags": parsed.tags,
+        "confidence": parsed.confidence,
+        "note_type": str(metadata.get("note_type") or "summary"),
+        "namespace": str(metadata.get("namespace") or "influx"),
+    }
+    if metadata.get("version") is not None:
+        write_args["expected_version"] = metadata["version"]
+
+    try:
+        result = await client.call_tool("lithos_write", write_args)
+    except BaseException as exc:  # noqa: BLE001
+        return (
+            _LEGACY_OUTCOME_FAILED,
+            f"write failed: {_format_exception_chain(exc)}",
+            plan,
+        )
+
+    try:
+        body = json.loads(result.content[0].text)
+    except (AttributeError, IndexError, json.JSONDecodeError, TypeError) as exc:
+        return (
+            _LEGACY_OUTCOME_FAILED,
+            f"could not decode lithos_write response: {exc!r}",
+            plan,
+        )
+
+    status = body.get("status", "")
+    if status in {"updated", "created"}:
+        return _LEGACY_OUTCOME_REWROTE, f"write status={status}", plan
+    return (
+        _LEGACY_OUTCOME_FAILED,
+        f"unexpected write status: {status!r} (body={body!r})",
+        plan,
+    )
+
+
+def cmd_rewrite_legacy_notes(args: argparse.Namespace) -> int:
+    """Rewrite the ~245 pre-fix legacy notes that block slug-collision recovery.
+
+    See agent-lore/influx#176.  Selects candidate doc ids from
+    ``--id <doc-id>`` (repeatable, no extra confirmation needed) or
+    from ``${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl``
+    (default selector — the backlog file maintained by the run ledger).
+    Each candidate is read; legacy-shape docs are rewritten via
+    ``lithos_write`` with the structured fields parsed from the
+    embedded frontmatter as proper API parameters.  Already-fixed,
+    unparseable, and non-influx-authored docs are skipped or refused.
+    """
+    env = _load_env(args.env)
+
+    id_list = list(getattr(args, "id", None) or [])
+
+    # Early validation: --apply without any confirmation flag is rejected
+    # before we read the backlog file (so the test surface stays clean
+    # and the failure mode is obvious to the operator).
+    if args.apply and not id_list and not args.yes and not args.yes_to_all:
+        sys.exit(
+            "--apply requires at least one --yes <doc-id> "
+            "(or --yes-to-all, or --id <doc-id>).  Aborted."
+        )
+
+    # ── Candidate selection ──
+    if id_list:
+        seen: set[str] = set()
+        doc_ids: list[str] = []
+        for doc_id in id_list:
+            if doc_id not in seen:
+                seen.add(doc_id)
+                doc_ids.append(doc_id)
+    else:
+        state = _state_dir(env)
+        doc_ids = _select_legacy_doc_ids_from_backlog(state)
+
+    if not doc_ids:
+        print(
+            "No candidate doc ids — pass --id <doc-id> (repeatable) or ensure "
+            "${INFLUX_STATE_PATH}/unresolved-slug-collisions.jsonl is populated."
+        )
+        return 0
+
+    # ── Apply-mode subset narrowing ──
+    if args.apply:
+        if id_list:
+            # --id names the targets explicitly; no extra --yes required.
+            confirmed: set[str] = set(doc_ids)
+        else:
+            confirmed = set(args.yes or [])
+            if args.yes_to_all:
+                confirmed.update(doc_ids)
+            unknown = confirmed - set(doc_ids)
+            if unknown:
+                print(
+                    "Warning: --yes ids not present in the candidate set: "
+                    + ", ".join(sorted(unknown))
+                )
+                confirmed -= unknown
+            if not confirmed:
+                sys.exit("No matching --yes ids; nothing to rewrite.")
+        doc_ids = [d for d in doc_ids if d in confirmed]
+
+    # ── Re-exec under uv if needed (lithos_client imports mcp) ──
+    _ensure_project_runtime_or_reexec()
+    lithos_url = _read_lithos_url(args, env)
+
+    mode = "Apply" if args.apply else "Dry-run"
+    suffix = "+lithos_write" if args.apply else " (no writes)"
+    print(
+        f"{mode} mode: processing {len(doc_ids)} doc id(s) via "
+        f"lithos_read{suffix} on {lithos_url}\n"
+    )
+
+    import asyncio
+
+    counts: dict[str, int] = {}
+
+    async def _drive() -> None:
+        client = _make_lithos_client(lithos_url)
+        try:
+            for doc_id in doc_ids:
+                outcome, reason, plan = await _process_one_legacy_doc(
+                    client=client,
+                    doc_id=doc_id,
+                    apply=args.apply,
+                )
+                counts[outcome] = counts.get(outcome, 0) + 1
+                line = f"{outcome:>30}  doc_id={doc_id}  {reason}"
+                if plan is not None:
+                    line += (
+                        f"  tags={len(plan['tags'])}"
+                        f"  source_url={plan['source_url']}"
+                        f"  confidence={plan['confidence']}"
+                        f"  content_bytes={plan['old_content_len']}"
+                        f"→{plan['new_content_len']}"
+                    )
+                print(line)
+        finally:
+            await client.close()
+
+    asyncio.run(_drive())
+
+    print()
+    print("Summary: " + " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    if not args.apply:
+        print(
+            "\nTo rewrite these docs, re-run with:\n"
+            "    --apply --yes-to-all       (rewrite every 'would_rewrite' doc)\n"
+            "    --apply --yes <doc-id>     (rewrite specific docs, repeatable)\n"
+            "    --apply --id <doc-id>      (skip backlog scan, repeatable)"
+        )
+    # Exit non-zero only on genuine failures.
+    return 0 if counts.get(_LEGACY_OUTCOME_FAILED, 0) == 0 else 1
+
+
 async def _fetch_invalid_source_notes(
     *,
     lithos_url: str,
@@ -1600,6 +1950,60 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_backlog.set_defaults(func=cmd_slug_collision_backlog)
+
+    p_rewrite = sub.add_parser(
+        "rewrite-legacy-notes",
+        help=(
+            "rewrite legacy Influx notes (pre-fix residue) whose doc-level "
+            "tags/source_url/confidence are empty but whose content carries "
+            "an embedded YAML frontmatter block (issue #176).  Default mode "
+            "is read-only; --apply rewrites via lithos_write."
+        ),
+    )
+    p_rewrite.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "actually rewrite the docs (default: dry-run / read-only).  "
+            "Must be combined with --yes <doc-id>, --yes-to-all, or --id."
+        ),
+    )
+    p_rewrite.add_argument(
+        "--yes",
+        action="append",
+        metavar="DOC_ID",
+        help=(
+            "confirm rewrite of a specific doc (repeatable).  Required with "
+            "--apply unless --yes-to-all or --id is set."
+        ),
+    )
+    p_rewrite.add_argument(
+        "--yes-to-all",
+        action="store_true",
+        help=(
+            "rewrite every candidate listed in the read-only plan.  "
+            "Mutually exclusive with --yes."
+        ),
+    )
+    p_rewrite.add_argument(
+        "--id",
+        action="append",
+        metavar="DOC_ID",
+        help=(
+            "act on a known doc-id directly, bypassing the "
+            "unresolved-slug-collisions.jsonl scan (repeatable).  Without "
+            "--apply, fetches each doc and reports a planned rewrite line.  "
+            "With --apply, rewrites without an extra --yes."
+        ),
+    )
+    p_rewrite.add_argument(
+        "--lithos-url",
+        help=(
+            "override LITHOS_URL from the env file.  Useful when targeting a "
+            "non-default lithos instance."
+        ),
+    )
+    p_rewrite.set_defaults(func=cmd_rewrite_legacy_notes)
 
     p_invalid = sub.add_parser(
         "invalid-source",
