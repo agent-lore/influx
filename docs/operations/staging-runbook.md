@@ -32,7 +32,7 @@ Three quick signals, all read-only:
 ```
 ./scripts/influx-diagnose.py recent --limit 5
 ./scripts/influx-diagnose.py failures
-./scripts/influx-report.py staging
+./scripts/influx-report.py --env staging
 ```
 
 - **`recent`** lists the last terminal runs with status, profile, kind,
