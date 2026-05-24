@@ -146,6 +146,7 @@ def _make_args(**overrides: Any) -> argparse.Namespace:
         "yes": None,
         "yes_to_all": False,
         "id": None,
+        "corpus_scan": False,
         "lithos_url": None,
     }
     defaults.update(overrides)
@@ -431,3 +432,233 @@ class TestRewriteLegacyNotesCommand:
         client = MagicMock()
         with _patch_runtime(client), pytest.raises(SystemExit):
             _DIAGNOSE.cmd_rewrite_legacy_notes(args)
+
+
+# ── --corpus-scan selector (#181) ───────────────────────────────────
+
+
+def _write_md(path: Path, *, frontmatter: dict[str, Any], body: str = "body") -> None:
+    """Write a Lithos-shaped markdown file at *path*.
+
+    Mirrors the on-disk shape Lithos produces: ``---``-fenced YAML
+    frontmatter followed by markdown body content.  Used by the
+    corpus-scan tests to seed a temp directory with realistic fixtures.
+    """
+    import yaml
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fm_text = yaml.safe_dump(frontmatter, sort_keys=True).strip()
+    path.write_text(f"---\n{fm_text}\n---\n\n{body}\n", encoding="utf-8")
+
+
+class TestSelectLegacyDocIdsFromCorpus:
+    """``_select_legacy_doc_ids_from_corpus`` walks the on-disk articles tree."""
+
+    def test_finds_influx_authored_docs_with_empty_source_url(
+        self, tmp_path: Path
+    ) -> None:
+        # Broken: influx-authored, no source_url.
+        _write_md(
+            tmp_path / "blog/2026/02/broken-1.md",
+            frontmatter={
+                "id": "broken-1",
+                "author": "influx",
+                "source_url": None,
+                "tags": [],
+            },
+        )
+        _write_md(
+            tmp_path / "blog/2026/02/broken-2.md",
+            frontmatter={
+                "id": "broken-2",
+                "author": "influx",
+                "source_url": "",
+                "tags": [],
+            },
+        )
+        # Healthy: influx-authored, populated source_url.
+        _write_md(
+            tmp_path / "blog/2026/05/healthy.md",
+            frontmatter={
+                "id": "healthy-1",
+                "author": "influx",
+                "source_url": "https://example.com/healthy",
+                "tags": ["ingested-by:influx"],
+            },
+        )
+        # Other-agent: not in scope.
+        _write_md(
+            tmp_path / "agent-zero/personal.md",
+            frontmatter={
+                "id": "agent-zero-1",
+                "author": "agent-zero",
+                "source_url": None,
+                "tags": [],
+            },
+        )
+
+        ids = _DIAGNOSE._select_legacy_doc_ids_from_corpus(tmp_path)
+        assert sorted(ids) == ["broken-1", "broken-2"]
+
+    def test_returns_empty_when_articles_path_missing(self, tmp_path: Path) -> None:
+        # Non-existent directory should be a graceful empty list, not a crash.
+        ids = _DIAGNOSE._select_legacy_doc_ids_from_corpus(tmp_path / "nope")
+        assert ids == []
+
+    def test_returns_empty_when_corpus_has_no_broken_docs(self, tmp_path: Path) -> None:
+        _write_md(
+            tmp_path / "blog/healthy.md",
+            frontmatter={
+                "id": "h1",
+                "author": "influx",
+                "source_url": "https://example.com/h1",
+                "tags": ["ingested-by:influx"],
+            },
+        )
+        ids = _DIAGNOSE._select_legacy_doc_ids_from_corpus(tmp_path)
+        assert ids == []
+
+    def test_skips_files_without_frontmatter(self, tmp_path: Path) -> None:
+        # A stray non-Lithos markdown file in the tree shouldn't trip the
+        # parser — it has no ``---`` fence at the top.
+        (tmp_path / "stray.md").write_text("# Just markdown\n\nno frontmatter\n")
+        ids = _DIAGNOSE._select_legacy_doc_ids_from_corpus(tmp_path)
+        assert ids == []
+
+    def test_skips_malformed_yaml(self, tmp_path: Path) -> None:
+        # Frontmatter fences present but YAML body is malformed.  Don't crash.
+        (tmp_path / "malformed.md").write_text(
+            "---\n: not: valid: yaml :\n---\n\nbody\n"
+        )
+        ids = _DIAGNOSE._select_legacy_doc_ids_from_corpus(tmp_path)
+        assert ids == []
+
+    def test_dedupes_when_same_id_appears_twice(self, tmp_path: Path) -> None:
+        # Defensive: two on-disk files claiming the same id (e.g. a
+        # stale duplicate from a manual move) collapse to one entry.
+        for sub in ("a", "b"):
+            _write_md(
+                tmp_path / f"blog/{sub}/dup.md",
+                frontmatter={
+                    "id": "dup-id",
+                    "author": "influx",
+                    "source_url": None,
+                    "tags": [],
+                },
+            )
+        ids = _DIAGNOSE._select_legacy_doc_ids_from_corpus(tmp_path)
+        assert ids == ["dup-id"]
+
+
+class TestCorpusScanFlagWiring:
+    """``--corpus-scan`` end-to-end behaviour in ``cmd_rewrite_legacy_notes``."""
+
+    def test_corpus_scan_drives_the_candidate_list(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        # Seed a corpus with one broken doc + one healthy doc.
+        _write_md(
+            tmp_path / "blog/broken.md",
+            frontmatter={
+                "id": "scan-broken-1",
+                "author": "influx",
+                "source_url": None,
+                "tags": [],
+            },
+        )
+        _write_md(
+            tmp_path / "blog/healthy.md",
+            frontmatter={
+                "id": "scan-healthy-1",
+                "author": "influx",
+                "source_url": "https://example.com/healthy",
+                "tags": ["ingested-by:influx"],
+            },
+        )
+
+        # Mock the per-doc read so the only doc actually fetched is the
+        # one the selector identified.
+        doc = _legacy_doc("scan-broken-1")
+        client = MagicMock()
+        client.read_note = AsyncMock(return_value=doc)
+        client.call_tool = AsyncMock()
+        client.close = AsyncMock()
+
+        args = _make_args(corpus_scan=True)
+        with patch.multiple(
+            _DIAGNOSE,
+            _make_lithos_client=lambda url: client,
+            _load_env=lambda env: {"LITHOS_KNOWLEDGE_PATH": str(tmp_path.parent)},
+            _resolve_corpus_articles_path=lambda env: tmp_path,
+            _read_lithos_url=lambda args, env: "http://stub.lithos/sse",
+            _ensure_project_runtime_or_reexec=lambda: None,
+        ):
+            rc = _DIAGNOSE.cmd_rewrite_legacy_notes(args)
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        # Selector found the broken doc; the healthy doc never even reaches
+        # the read path because the selector filtered it out upstream.
+        assert "scan-broken-1" in captured.out
+        assert "scan-healthy-1" not in captured.out
+        # One ``read_note`` call (for scan-broken-1); no writes (dry-run).
+        client.read_note.assert_awaited_once()
+        client.call_tool.assert_not_called()
+
+    def test_corpus_scan_and_id_are_mutually_exclusive(self) -> None:
+        # The runtime check fires regardless of argparse settings —
+        # documents the contract even if the parser-level group is bypassed.
+        args = _make_args(corpus_scan=True, id=["any-id"])
+        client = MagicMock()
+        with _patch_runtime(client), pytest.raises(SystemExit):
+            _DIAGNOSE.cmd_rewrite_legacy_notes(args)
+
+    def test_corpus_scan_with_no_broken_docs_reports_clean_state(
+        self, tmp_path: Path, capsys: Any
+    ) -> None:
+        # Empty corpus → friendly "no candidates" message, not a crash.
+        client = MagicMock()
+        client.read_note = AsyncMock()
+        client.call_tool = AsyncMock()
+        client.close = AsyncMock()
+
+        args = _make_args(corpus_scan=True)
+        with patch.multiple(
+            _DIAGNOSE,
+            _make_lithos_client=lambda url: client,
+            _load_env=lambda env: {"LITHOS_KNOWLEDGE_PATH": str(tmp_path.parent)},
+            _resolve_corpus_articles_path=lambda env: tmp_path,
+            _read_lithos_url=lambda args, env: "http://stub.lithos/sse",
+            _ensure_project_runtime_or_reexec=lambda: None,
+        ):
+            rc = _DIAGNOSE.cmd_rewrite_legacy_notes(args)
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "corpus scan" in captured.out.lower()
+        client.read_note.assert_not_called()
+
+
+class TestResolveCorpusArticlesPath:
+    """``_resolve_corpus_articles_path`` env-resolution logic."""
+
+    def test_explicit_knowledge_path_wins(self, tmp_path: Path) -> None:
+        env = {"LITHOS_KNOWLEDGE_PATH": str(tmp_path / "kb")}
+        resolved = _DIAGNOSE._resolve_corpus_articles_path(env)
+        assert resolved == tmp_path / "kb" / "articles"
+
+    def test_falls_back_to_archive_path_staging_convention(
+        self, tmp_path: Path
+    ) -> None:
+        # Mirrors staging: ``data/staging/archive`` →
+        # ``data/staging/lithos/knowledge/articles``.
+        archive = tmp_path / "data" / "staging" / "archive"
+        env = {"INFLUX_ARCHIVE_PATH": str(archive)}
+        resolved = _DIAGNOSE._resolve_corpus_articles_path(env)
+        expected = tmp_path / "data" / "staging" / "lithos" / "knowledge" / "articles"
+        assert resolved == expected
+
+    def test_missing_both_env_vars_exits_with_message(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            _DIAGNOSE._resolve_corpus_articles_path({})
+        assert "LITHOS_KNOWLEDGE_PATH" in str(exc_info.value)
