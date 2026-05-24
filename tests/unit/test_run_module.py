@@ -492,6 +492,120 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
     wire.assert_awaited_once()
 
 
+async def test_run_execute_threads_tags_source_url_confidence_to_lithos_write() -> None:
+    """Regression test for the 2026-05-05→07 writer bug (#179).
+
+    Between 2026-05-05 and 2026-05-07, ~245 Influx-authored docs were
+    persisted to staging Lithos with empty doc-level ``tags`` /
+    ``source_url`` / ``confidence`` despite the source builders setting
+    those fields on the ``ProfileItem`` dict and the renderer emitting
+    them inside an embedded YAML frontmatter block.  The fix landed by
+    2026-05-08 but the exact commit was never pinned — see #179 for
+    investigation notes.  This test locks in the call shape so a future
+    refactor cannot silently re-introduce the bug: any drift between
+    the ``item`` dict's structured fields and the kwargs delivered to
+    ``LithosClient.write_note`` would fail this assertion.
+
+    The check is at the ``write_note`` boundary, not deeper at
+    ``call_tool``, because ``write_note`` was always correct (we
+    verified — see #176's audit-stage investigation); the dropped path
+    is the cascade between the source builder's return dict and the
+    ``write_note(...)`` call site in ``_run_ingest_stage`` (run.py:602).
+    """
+    config = _make_config()
+    plan = _scheduled_plan()
+
+    item: dict[str, Any] = {
+        "title": "Regression Test Paper",
+        "source_url": "https://arxiv.org/abs/2401.99999",
+        "content": "# Summary\n\nbody",
+        "tags": [
+            "profile:alpha",
+            "source:arxiv",
+            "arxiv-id:2401.99999",
+            "ingested-by:influx",
+            "schema:1",
+        ],
+        "confidence": 0.85,
+        "score": 9,
+        "path": "papers/arxiv/2024/01",
+        "abstract_or_summary": "abs",
+    }
+
+    async def provider(
+        profile: str, kind: RunKind, run_range: Any, filter_prompt: str
+    ) -> list[BoundScoredCandidate]:
+        return [_bound_for(item)]
+
+    from mcp import types as mcp_types
+
+    deps = RunDeps(config=config, item_provider=provider, probe_loop=None)
+
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
+    mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
+    mock_client.task_complete = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"status": "completed"})
+                )
+            ]
+        )
+    )
+    mock_client.cache_lookup_for_item_body = AsyncMock(return_value={"hit": False})
+    mock_client.cache_lookup_by_url_body = AsyncMock(return_value={"hit": False})
+    write_result = MagicMock()
+    write_result.status = "created"
+    write_result.note_id = "note-new"
+    mock_client.write_note = AsyncMock(return_value=write_result)
+
+    with (
+        patch("influx.run.LithosClient", return_value=mock_client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch("influx.run.lcma_wire", new_callable=AsyncMock, return_value=[]),
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        await Run(plan, deps).execute()
+
+    # Pin the call shape.  Each assertion targets one structured field
+    # the historical bug dropped between the source-builder ``item``
+    # dict and the MCP-bound ``write_note`` kwargs.
+    mock_client.write_note.assert_awaited_once()
+    kwargs = mock_client.write_note.await_args.kwargs
+
+    # title flows from the item.
+    assert kwargs["title"] == "Regression Test Paper"
+
+    # path flows from the item (used by Lithos to compute the storage
+    # location; an empty path here was one observable shape of the bug).
+    assert kwargs["path"] == "papers/arxiv/2024/01"
+
+    # source_url is the canonical dedup key — empty source_url at
+    # doc level was the primary observable symptom of the bug.
+    assert kwargs["source_url"] == "https://arxiv.org/abs/2401.99999"
+
+    # tags is the full pre-merge tag list.  Catches the historical
+    # shape where ``item.get('tags', [])`` returned ``[]`` because
+    # tags weren't attached to the item correctly.
+    assert kwargs["tags"] == [
+        "profile:alpha",
+        "source:arxiv",
+        "arxiv-id:2401.99999",
+        "ingested-by:influx",
+        "schema:1",
+    ]
+
+    # confidence flows through as a float (the bug shape had this
+    # default to 0.0 in the persisted doc).
+    assert kwargs["confidence"] == 0.85
+
+    # content is the rendered note body that was passed in.
+    assert kwargs["content"] == "# Summary\n\nbody"
+
+
 async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
     """A post-write LCMA failure does not prevent later items from ingesting."""
     config = _make_config()
