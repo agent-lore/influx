@@ -102,6 +102,39 @@ class TestWriteNoteStrictMode:
             )
         client.call_tool.assert_not_called()
 
+    async def test_canonicalises_source_url_at_the_api_boundary(self) -> None:
+        # Pre-#178, the renderer normalised source_url inside the rendered
+        # frontmatter (FR-MCP-4).  After the frontmatter was removed, the
+        # normalisation moved to the ``write_note`` boundary so callers
+        # who pass a tracking-param-laden or case-/port-noisy URL still
+        # get the canonical form on the MCP wire.  Without this
+        # normalisation, Influx's own logs / telemetry / WriteResult
+        # would carry the raw URL even though Lithos canonicalises it
+        # internally for dedup-map storage, leading to identity drift
+        # between Influx and Lithos.
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=_tool_result({"status": "created", "id": "note-1"})
+        )
+
+        noisy = "https://ArXiv.org:443/abs/2601.12345?utm_source=twitter&utm_id=42"
+        result = await client.write_note(
+            title="t",
+            content="# Title\n\n## Archive\n",
+            path="papers/arxiv/2026/01",
+            source_url=noisy,
+            tags=["ingested-by:influx"],
+            confidence=1.0,
+        )
+
+        # The MCP call must carry the canonical URL — lowercase host,
+        # no default port, no tracking params.
+        args_dict = client.call_tool.await_args.args[1]
+        assert args_dict["source_url"] == "https://arxiv.org/abs/2601.12345"
+        # And the WriteResult surfaces the canonical form too so any
+        # log line / metric tag emitted by the caller stays consistent.
+        assert result.source_url == "https://arxiv.org/abs/2601.12345"
+
     async def test_accepts_body_only_content(self) -> None:
         # The body-only shape produced by the post-#178 renderer must
         # pass the strict-mode check.  Mock the MCP layer just enough
