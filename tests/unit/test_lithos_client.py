@@ -129,7 +129,9 @@ class TestWriteNoteStrictMode:
 
         # The MCP call must carry the canonical URL — lowercase host,
         # no default port, no tracking params.
-        args_dict = client.call_tool.await_args.args[1]
+        await_args = client.call_tool.await_args
+        assert await_args is not None
+        args_dict = await_args.args[1]
         assert args_dict["source_url"] == "https://arxiv.org/abs/2601.12345"
         # And the WriteResult surfaces the canonical form too so any
         # log line / metric tag emitted by the caller stays consistent.
