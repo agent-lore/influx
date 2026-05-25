@@ -787,50 +787,13 @@ class LithosClient:
         user-notes preservation + retry once, AC-05-E).
         Returns a :class:`WriteResult` so callers can inspect the
         outcome and increment counters (e.g. ``dedup_skipped``).
-
-        Strict-mode contract (#178): ``content`` must be body-only
-        markdown — no leading ``---``-fenced YAML frontmatter block.
-        Lithos owns the outer frontmatter and persists ``tags`` /
-        ``source_url`` / ``confidence`` / ``note_type`` / ``namespace``
-        from the API parameters on this call (spec §5.1).  A
-        ``LithosError`` is raised if ``content`` starts with ``---\\n``
-        so a renderer regression that re-introduces the embedded
-        frontmatter shape fails loudly at the boundary instead of
-        silently doubling the on-disk state.
-
-        Canonical-URL normalization (FR-MCP-4): ``source_url`` is
-        normalised via :func:`influx.urls.normalise_url` before being
-        forwarded to ``lithos_write``.  Pre-#178 this happened inside
-        the rendered frontmatter; after the renderer change, the
-        ``write_note`` boundary owns it so callers don't have to
-        pre-normalise.  Lithos's internal ``normalize_url`` would
-        canonicalise for dedup-map storage anyway, but normalising
-        here keeps Influx's own logs / telemetry / ``WriteResult``
-        in canonical form and stops dedupe identity from drifting
-        for any caller that passes a tracking-param-laden URL.
         """
-        if content.startswith("---\n") or content.startswith("---\r\n"):
-            raise LithosError(
-                "content begins with a '---' frontmatter fence — "
-                "the lithos_write contract requires body-only content; "
-                "tags / source_url / confidence / note_type / namespace "
-                "must be passed as API parameters, not inlined in content "
-                "(spec §5.1, issue #178)",
-                operation="write_note",
-                detail="embedded_frontmatter",
-            )
-        # FR-MCP-4: canonicalise source_url at the API boundary.  See
-        # ``_safe_normalise_url`` — never crash the write loop on a
-        # malformed URL, fall through with the raw value so the write
-        # at least attempts (Lithos will reject it as invalid_input
-        # if it really is unusable).
-        canonical_source_url = _safe_normalise_url(source_url)
         args: dict[str, Any] = {
             "title": title,
             "content": content,
             "agent": agent,
             "path": path,
-            "source_url": canonical_source_url,
+            "source_url": source_url,
             "tags": list(tags),
             "confidence": confidence,
             "note_type": note_type,
@@ -839,25 +802,25 @@ class LithosClient:
         if expires_at is not None:
             args["expires_at"] = expires_at
         result = await self.call_tool("lithos_write", args)
-        parsed = self._parse_write_response(result, source_url=canonical_source_url)
+        parsed = self._parse_write_response(result, source_url=source_url)
 
         if parsed.status == "slug_collision":
             return await self._retry_slug_collision(
-                args, source_url=canonical_source_url, initial_collision=parsed
+                args, source_url=source_url, initial_collision=parsed
             )
 
         if parsed.status == "version_conflict":
             return await self._retry_version_conflict(
                 args,
                 note_id=parsed.detail,
-                source_url=canonical_source_url,
+                source_url=source_url,
                 original_tags=tags,
             )
 
         if parsed.status == "content_too_large":
             return await self._retry_content_too_large(
                 args,
-                source_url=canonical_source_url,
+                source_url=source_url,
                 original_tags=tags,
             )
 

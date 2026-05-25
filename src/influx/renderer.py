@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 from influx.errors import InfluxError
 from influx.schemas import Tier1Enrichment, Tier3Extraction
+from influx.urls import normalise_url
 
 __all__ = [
     "ArchiveInvariantError",
@@ -111,7 +112,41 @@ def validate_archive_tag_invariant(
         )
 
 
-# ── Profile-relevance body helpers ──────────────────────────────────
+# ── Frontmatter / profile-relevance body helpers ────────────────────
+
+
+def _format_confidence(confidence: float) -> str:
+    """Format confidence as a clean decimal string for frontmatter."""
+    val = round(confidence, 4)
+    if val == int(val):
+        return f"{int(val)}.0"
+    return str(val)
+
+
+def _render_frontmatter(
+    *,
+    source_url: str,
+    tags: list[str],
+    confidence: float,
+) -> str:
+    """Render the YAML frontmatter content (between ``---`` fences).
+
+    ``source_url`` is normalised via :func:`influx.urls.normalise_url`
+    so that frontmatter always carries the canonical form (FR-MCP-4).
+    """
+    lines = [
+        "note_type: summary",
+        "namespace: influx",
+        f"source_url: {normalise_url(source_url)}",
+    ]
+    if tags:
+        lines.append("tags:")
+        for tag in tags:
+            lines.append(f"  - {tag}")
+    else:
+        lines.append("tags: []")
+    lines.append(f"confidence: {_format_confidence(confidence)}")
+    return "\n".join(lines)
 
 
 def _render_profile_relevance_body(
@@ -203,19 +238,16 @@ def render_note(
         )
     validate_archive_tag_invariant(archive_path=archive_path, tags=tags)
 
+    frontmatter = _render_frontmatter(
+        source_url=source_url,
+        tags=tags,
+        confidence=confidence,
+    )
     archive_section = render_archive_section(archive_path)
 
-    # Compose note — body-only output (#178).  Lithos owns the outer
-    # YAML frontmatter and persists tags / source_url / confidence /
-    # note_type / namespace as first-class API parameters on
-    # ``lithos_write`` (spec §5.1); the renderer must NOT emit a
-    # ``---``-fenced frontmatter block of its own.  The ``# {title}``
-    # heading is retained — Lithos's ``extract_title_from_content``
-    # strips its own prepended title on read, leaving this one as the
-    # body's canonical H1.  ``LithosClient.write_note`` enforces this
-    # contract via a strict-mode assertion that rejects content
-    # starting with ``---\\n``.
-    output = f"# {title}\n\n"
+    # Compose note
+    output = f"---\n{frontmatter}\n---\n"
+    output += f"# {title}\n\n"
     output += archive_section + "\n"
 
     # Summary section: structured Tier1Enrichment → plain summary → omit
