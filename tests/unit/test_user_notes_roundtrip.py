@@ -17,7 +17,6 @@ import pytest
 from influx.notes import (
     parse_note,
     parse_profile_relevance,
-    recompute_confidence,
 )
 from influx.renderer import (
     ArchiveInvariantError,
@@ -365,89 +364,6 @@ class TestRejectedProfileNotRefreshed:
 # ── FR-RES-6: ingested-by:influx tag ────────────────────────────────
 
 
-class TestIngestedByTag:
-    """All Influx-authored notes carry ingested-by:influx."""
-
-    def test_ingested_by_influx_in_rendered_note(self) -> None:
-        tags = [
-            "source:arxiv",
-            "ingested-by:influx",
-            "schema:1",
-        ]
-        rendered = render_note(
-            title="Tag Test",
-            source_url="https://arxiv.org/abs/2601.00001",
-            tags=tags,
-            confidence=0.7,
-            archive_path=None,
-            summary="Summary.",
-            keywords=[],
-            profile_entries=[],
-            user_notes=None,
-        )
-        assert "  - ingested-by:influx" in rendered
-
-
-# ── Confidence computation ───────────────────────────────────────────
-
-
-class TestConfidenceInRenderer:
-    """Confidence rendered correctly for initial and rewrite cases."""
-
-    def test_initial_confidence(self) -> None:
-        """Initial creation: confidence = max(profile_scores) / 10.0."""
-        rendered = render_note(
-            title="Initial",
-            source_url="https://arxiv.org/abs/2601.00001",
-            tags=["source:arxiv", "ingested-by:influx", "schema:1"],
-            confidence=8 / 10.0,
-            archive_path=None,
-            summary="Summary.",
-            keywords=[],
-            profile_entries=[],
-            user_notes=None,
-        )
-        assert "confidence: 0.8" in rendered
-
-    def test_rewrite_confidence_increases(self) -> None:
-        """Rewrite: confidence = max(existing, new_score / 10.0)."""
-        new_confidence = recompute_confidence(
-            existing_confidence=0.7,
-            current_max_score=9,
-        )
-        rendered = render_note(
-            title="Rewrite",
-            source_url="https://arxiv.org/abs/2601.00001",
-            tags=["source:arxiv", "ingested-by:influx", "schema:1"],
-            confidence=new_confidence,
-            archive_path=None,
-            summary="Summary.",
-            keywords=[],
-            profile_entries=[],
-            user_notes=None,
-        )
-        assert "confidence: 0.9" in rendered
-
-    def test_rewrite_confidence_no_decrease(self) -> None:
-        """Rewrite: confidence never decreases."""
-        new_confidence = recompute_confidence(
-            existing_confidence=0.9,
-            current_max_score=7,
-        )
-        rendered = render_note(
-            title="Rewrite",
-            source_url="https://arxiv.org/abs/2601.00001",
-            tags=["source:arxiv", "ingested-by:influx", "schema:1"],
-            confidence=new_confidence,
-            archive_path=None,
-            summary="Summary.",
-            keywords=[],
-            profile_entries=[],
-            user_notes=None,
-        )
-        assert "confidence: 0.9" in rendered
-
-
 # ── Section ordering ─────────────────────────────────────────────────
 
 
@@ -548,50 +464,16 @@ class TestRendererArchiveInvariant:
 # ── Frontmatter fields ──────────────────────────────────────────────
 
 
-class TestFrontmatterFields:
-    """Frontmatter includes required fields."""
+class TestIngestedByTagValidation:
+    """``render_note`` rejects tag lists missing ``ingested-by:influx``.
 
-    def test_note_type_summary(self) -> None:
-        rendered = render_note(
-            title="FM Test",
-            source_url="https://arxiv.org/abs/2601.00001",
-            tags=["source:arxiv", "ingested-by:influx"],
-            confidence=0.7,
-            archive_path=None,
-            summary="Summary.",
-            keywords=[],
-            profile_entries=[],
-            user_notes=None,
-        )
-        assert "note_type: summary" in rendered
-
-    def test_namespace_influx(self) -> None:
-        rendered = render_note(
-            title="FM Test",
-            source_url="https://arxiv.org/abs/2601.00001",
-            tags=["source:arxiv", "ingested-by:influx"],
-            confidence=0.7,
-            archive_path=None,
-            summary="Summary.",
-            keywords=[],
-            profile_entries=[],
-            user_notes=None,
-        )
-        assert "namespace: influx" in rendered
-
-    def test_source_url_present(self) -> None:
-        rendered = render_note(
-            title="FM Test",
-            source_url="https://arxiv.org/abs/2601.00001",
-            tags=["source:arxiv", "ingested-by:influx"],
-            confidence=0.7,
-            archive_path=None,
-            summary="Summary.",
-            keywords=[],
-            profile_entries=[],
-            user_notes=None,
-        )
-        assert "source_url: https://arxiv.org/abs/2601.00001" in rendered
+    The validator stays on the renderer side even though the tags
+    no longer appear in the render output (#178) — the source builder
+    contract still requires the tag, and the renderer is the chokepoint
+    where every Influx-authored note is composed.  The tag flows
+    through to the ``lithos_write`` API parameter via the source
+    builder's item dict.
+    """
 
     def test_missing_ingested_by_raises(self) -> None:
         """FR-RES-6: render_note rejects tags lacking ingested-by:influx."""
@@ -622,28 +504,6 @@ class TestFrontmatterFields:
                 profile_entries=[],
                 user_notes=None,
             )
-
-    def test_source_url_is_normalised_by_renderer(self) -> None:
-        """Renderer writes canonical source_url even if caller passes
-        mixed-case host, default port, and tracking params (FR-MCP-4)."""
-        rendered = render_note(
-            title="FM Test",
-            source_url=(
-                "https://ArXiv.org:443/abs/2601.12345?utm_source=twitter&utm_id=42"
-            ),
-            tags=["source:arxiv", "ingested-by:influx"],
-            confidence=0.7,
-            archive_path=None,
-            summary="Summary.",
-            keywords=[],
-            profile_entries=[],
-            user_notes=None,
-        )
-        assert "source_url: https://arxiv.org/abs/2601.12345" in rendered
-        assert "ArXiv.org" not in rendered
-        assert "utm_source" not in rendered
-        assert "utm_id" not in rendered
-        assert ":443" not in rendered
 
 
 # ── parse_profile_relevance ──────────────────────────────────────────

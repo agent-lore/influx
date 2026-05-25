@@ -47,35 +47,45 @@ def _render_minimal(**overrides: object) -> str:
     return render(**kwargs)  # type: ignore[arg-type]
 
 
-# ── Frontmatter ─────────────────────────────────────────────────────
+# ── Body-only output (post-#178) ────────────────────────────────────
 
 
-class TestFrontmatter:
-    """``render`` produces well-formed YAML frontmatter."""
+class TestBodyOnlyOutput:
+    """``render`` emits markdown body only.
 
-    def test_frontmatter_fences(self) -> None:
+    Lithos owns the outer YAML frontmatter and persists tags /
+    source_url / confidence / note_type / namespace as first-class
+    API parameters on ``lithos_write`` (spec §5.1).  The renderer
+    MUST NOT emit a ``---``-fenced frontmatter block of its own —
+    ``LithosClient.write_note`` enforces this via a strict-mode
+    assertion (#178).
+    """
+
+    def test_does_not_emit_frontmatter_fence(self) -> None:
         text = _render_minimal()
-        assert text.startswith("---\n")
-        assert "\n---\n" in text
+        assert not text.startswith("---")
+        # No fenced YAML block anywhere in the leading region (catches
+        # a regression that re-introduced the fence further down).
+        head = text.split("\n## ", 1)[0]
+        assert "---" not in head
 
-    def test_frontmatter_fields_present(self) -> None:
-        text = _render_minimal()
-        head = text.split("\n---\n", 1)[0]
-        assert "note_type: summary" in head
-        assert "namespace: influx" in head
-        assert "source_url: https://arxiv.org/abs/2601.00001" in head
-        assert "confidence: 0.8" in head
+    def test_starts_with_title_heading(self) -> None:
+        text = _render_minimal(title="A Particular Paper Title")
+        assert text.startswith("# A Particular Paper Title\n")
 
-    def test_frontmatter_tags_listed(self) -> None:
+    def test_does_not_inline_tags(self) -> None:
+        # Tags belong on the API parameter; the body must not carry
+        # them in a YAML block.  Catches any future re-introduction
+        # of a frontmatter-style emission.
         text = _render_minimal(tags=["source:arxiv", "ingested-by:influx", "favourite"])
-        head = text.split("\n---\n", 1)[0]
-        assert "  - source:arxiv" in head
-        assert "  - ingested-by:influx" in head
-        assert "  - favourite" in head
+        assert "tags:" not in text
+        assert "  - favourite" not in text
 
-    def test_confidence_normalised_to_decimal(self) -> None:
-        text = _render_minimal(confidence=1.0)
-        assert "confidence: 1.0" in text
+    def test_does_not_inline_source_url(self) -> None:
+        text = _render_minimal(source_url="https://arxiv.org/abs/2601.00001")
+        # The URL may appear inside section content (it doesn't here),
+        # but never in a ``source_url: …`` YAML key shape.
+        assert "source_url:" not in text
 
 
 # ── Section ordering ────────────────────────────────────────────────

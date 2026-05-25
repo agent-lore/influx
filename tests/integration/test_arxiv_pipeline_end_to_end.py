@@ -17,6 +17,7 @@ extraction stack end-to-end (PRD 07 US-014).
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -51,13 +52,21 @@ from tests.contract.test_lithos_client import FakeLithosServer
 _ARXIV_ID = "2601.99777"
 _ARXIV_HTML_URL = f"https://arxiv.org/html/{_ARXIV_ID}"
 
+# Compute the fixture's published date relative to ``datetime.now`` so the
+# entry is always inside the ``lookback_days=30`` window used by the tests
+# below.  A hardcoded date rots into a CI failure on the day the wall
+# clock crosses the lookback boundary (this fixture previously carried
+# ``2026-04-25T00:00:00Z``, which failed CI on 2026-05-25 at 30 days +
+# the ``>=`` boundary rejection in the source filter).
+_PUBLISHED_AT = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 _ATOM_FEED = f"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <entry>
     <id>http://arxiv.org/abs/{_ARXIV_ID}v1</id>
     <title>End-To-End Pipeline Paper</title>
     <summary>Paper about end-to-end arxiv ingestion validation.</summary>
-    <published>2026-04-25T00:00:00Z</published>
+    <published>{_PUBLISHED_AT}</published>
     <category term="cs.RO"/>
   </entry>
 </feed>

@@ -102,23 +102,42 @@ class ParsedNote:
 def parse_note(text: str) -> ParsedNote:
     """Parse a canonical Lithos note into its constituent parts.
 
+    Accepts two shapes:
+
+    * **Body-only** (the post-#178 renderer output, and what
+      ``lithos_read`` returns for any new doc): text starts with the
+      ``# {title}`` heading and runs through the ``## ...`` sections
+      and optional ``## User Notes`` region.  ``frontmatter_raw`` is
+      empty in this case.
+    * **Legacy frontmatter-prefixed** (the pre-#178 renderer output,
+      still found on disk for any pre-#178 Influx write that was
+      never rewritten): text starts with a ``---``-fenced YAML
+      frontmatter block, followed by the title heading and body.
+      ``frontmatter_raw`` carries the YAML between the fences.
+
     Parameters
     ----------
     text:
-        The full note text including frontmatter fences.
+        The note text — either body-only or legacy-prefixed.
 
     Returns
     -------
     ParsedNote
-        Structured representation with frontmatter, title, Influx-owned
-        sections, and the ``## User Notes`` region.
+        Structured representation with frontmatter (legacy only,
+        empty for body-only input), title, Influx-owned sections,
+        and the ``## User Notes`` region.
 
     Raises
     ------
     NoteParseError
-        When the note lacks valid frontmatter fences or a title.
+        When the note lacks a title heading, or when a legacy-shape
+        input has an unclosed frontmatter fence.
     """
-    frontmatter_raw, after_frontmatter = _split_frontmatter(text)
+    if text.startswith(_FRONTMATTER_FENCE):
+        frontmatter_raw, after_frontmatter = _split_frontmatter(text)
+    else:
+        frontmatter_raw = ""
+        after_frontmatter = text
     title, body = _split_title(after_frontmatter)
     sections, user_notes = _split_sections(body)
 
