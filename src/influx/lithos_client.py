@@ -826,6 +826,14 @@ class LithosClient:
         the repair sweep's rewrite-arg construction — see the correct
         values instead of empties.
         """
+        # SINGLE NORMALISATION CHOKEPOINT for the lithos_read tool (#187/#190).
+        # This is the only place the raw "lithos_read" tool may be invoked: it
+        # is the one call site that runs _normalise_read_envelope, which hoists
+        # the metadata-nested fields Lithos returns. Reading the tool anywhere
+        # else bypasses normalisation and reintroduces #187 (notes stripped into
+        # influx:source-invalid zombies). Always read via read_note(); never
+        # invoke the lithos_read tool directly elsewhere. Enforced by
+        # tests/unit/test_lithos_read_chokepoint.py.
         result = await self.call_tool("lithos_read", {"id": note_id})
         return _normalise_read_envelope(
             self._result_json_dict(result, operation="read_note")
