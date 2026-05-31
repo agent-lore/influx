@@ -52,12 +52,14 @@ from influx.extraction.pipeline import extract_arxiv_text
 from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
 from influx.renderer import render
+from influx.repair_hooks import has_usable_source
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.storage import download_archive
 from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
     current_run_id,
     get_tracer,
+    record_empty_source_write,
     record_fetched_items,
     record_filter_error,
     record_source_acquisition_error,
@@ -1206,6 +1208,30 @@ def build_arxiv_note_item(
                 thin_rule,
             )
             return None
+
+    # Issue #189: observe-only empty-source guard, for per-source
+    # consistency with the RSS builder.  arXiv notes always carry a
+    # ``source:arxiv`` tag and an arxiv ``source_url``, so this never
+    # fires here — but wiring it identically keeps the two builders
+    # symmetric and guards against a future arXiv code path that somehow
+    # produces a tag-less item.  Counts, never drops (mirrors RSS).
+    if not has_usable_source(source_tag_suffix="arxiv", source_url=source_url):
+        metrics.empty_source_writes().add(
+            1,
+            {
+                "profile": profile_name,
+                "source": "arxiv",
+                "reason": "no_usable_source",
+            },
+        )
+        record_empty_source_write()
+        _log.info(
+            "empty-source write source=arxiv profile=%s arxiv_id=%s "
+            "url=%s reason=no_usable_source",
+            profile_name,
+            item.arxiv_id,
+            source_url,
+        )
 
     # Issue #166 review: the item survived the thin-summary suppression
     # check and will be written below.  Bump the archive-missing-side

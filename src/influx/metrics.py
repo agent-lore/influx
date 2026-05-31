@@ -54,6 +54,7 @@ __all__ = [
     "slug_collision_reclaimed",
     "slug_collision_unresolved",
     "slug_collision_url_recovery",
+    "empty_source_writes",
     "source_acquisition_errors",
     "source_cooldown_skips",
     "summary_thin_drops",
@@ -321,6 +322,43 @@ def summary_thin_drops() -> Any:
             "Items suppressed by the thin-summary rule because their "
             "archive fetch failed and the feed-provided summary was "
             "too thin to keep (issue #166)."
+        ),
+    )
+
+
+def empty_source_writes() -> Any:
+    """Counter of notes written despite having no usable source (#189).
+
+    Increments once per note the source builders write whose ``source:``
+    tag is blank AND whose URL is not one a source can be inferred from
+    (a non-arxiv link) — the would-be ``influx:source-invalid`` zombie
+    population that a #187-class metadata loss would later terminalise.
+
+    Observe-only: the note is **always still written** (these items are
+    often legitimate content with a working link but no reconstructable
+    feed-slug tag), so this counts *writes*, not drops.  Deliberately
+    excluded from ``archive_failures_total`` / ``source_acquisition_errors``
+    and any degraded run reason — a quality/metadata signal, mirroring
+    :func:`summary_thin_drops`.
+
+    Labels:
+
+    - ``profile`` — profile name.
+    - ``source`` — the source-adapter identity, matching the convention
+      used by :func:`summary_thin_drops`: for arXiv the literal
+      ``"arxiv"`` (this never fires there — the abstract carries a
+      ``source:arxiv`` tag and an arxiv URL); for RSS the per-feed
+      ``source_tag``, falling back to ``"rss"`` when that tag is the
+      empty value that triggered the count.
+    - ``reason`` — why the source was unusable; currently the single
+      value ``"no_usable_source"`` (blank tag and no arxiv-inferable
+      URL), carried as a label so future narrower reasons can pivot.
+    """
+    return get_meter().counter(
+        "influx_empty_source_writes_total",
+        description=(
+            "Notes written despite having no usable source tag or "
+            "inferable source URL (issue #189, observe-only)."
         ),
     )
 

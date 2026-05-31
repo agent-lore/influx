@@ -36,6 +36,7 @@ __all__ = [
     "WriteOutcomeCounts",
     "current_archive_terminal_arxiv_ids",
     "current_cache_hits",
+    "current_empty_source_writes",
     "current_fetched_total",
     "current_filter_errors",
     "current_invalid_url_rejections",
@@ -49,6 +50,7 @@ __all__ = [
     "get_meter",
     "get_tracer",
     "record_cache_hit",
+    "record_empty_source_write",
     "record_fetched_items",
     "record_filter_error",
     "record_invalid_url_rejection",
@@ -339,6 +341,45 @@ def record_summary_thin_drop(count: int = 1) -> None:
     if count <= 0:
         return
     counter = current_summary_thin_drops.get()
+    if counter is None:
+        return
+    counter[0] += count
+
+
+# Per-run count of notes written despite having no usable source (#189).
+# Set to ``[0]`` at run start by ``run_service.ledger_lifecycle``; the
+# source builders increment via :func:`record_empty_source_write` when a
+# note is built whose ``source:`` tag is blank AND whose URL is not one a
+# source can be inferred from (a non-arxiv link) — the would-be
+# ``influx:source-invalid`` zombie population.
+#
+# Surfaced on the run-ledger entry as ``empty_source_writes_total`` so an
+# operator can measure how often this happens before any decision to drop.
+# This is a *write* count, not a drop: the note is always still written
+# (#189 ships observe-only — those items are often legitimate content with
+# a working non-arxiv link but no reconstructable feed-slug tag).
+# Deliberately does NOT contribute to ``archive_failures_total``,
+# ``source_acquisition_errors``, or any degraded run reason — like the
+# thin-summary counter, it is a quality/metadata signal, not a failure.
+current_empty_source_writes: ContextVar[list[int] | None] = ContextVar(
+    "current_empty_source_writes",
+    default=None,
+)
+
+
+def record_empty_source_write(count: int = 1) -> None:
+    """Add *count* to the current run's ``empty_source_writes_total`` (#189).
+
+    Safe to call outside a run context — silently no-ops when
+    :data:`current_empty_source_writes` is unset.  Source builders call
+    this once per source-less note, alongside the per-note INFO log line
+    and the ``influx_empty_source_writes_total`` metric bump, so the
+    ledger entry can carry the per-run total without re-scanning written
+    notes.
+    """
+    if count <= 0:
+        return
+    counter = current_empty_source_writes.get()
     if counter is None:
         return
     counter[0] += count
