@@ -193,6 +193,11 @@ def _doc_tags(doc: dict[str, Any]) -> list[str]:
     Tags live under ``metadata`` in the canonical envelope but some
     code paths (and the diagnose-script preview) read them at the top
     level — be tolerant of both shapes.
+
+    Note: docs obtained via :meth:`LithosClient.read_note` are already
+    flattened by :func:`_normalise_read_envelope` (#187), so for those the
+    top-level branch hits first.  The ``metadata`` fallback here still
+    guards any direct caller that passes a raw, un-normalised envelope.
     """
     direct = doc.get("tags")
     if isinstance(direct, list):
@@ -216,6 +221,59 @@ def _doc_source_url(doc: dict[str, Any]) -> str | None:
         if isinstance(nested, str) and nested:
             return nested
     return None
+
+
+# Structured fields that Lithos returns nested under ``metadata`` in a
+# ``lithos_read`` response but that Influx reads at the top level — most
+# importantly the repair sweep (``influx.repair``), which builds its
+# rewrite args from ``note.get("source_url")`` / ``note.get("path")`` /
+# ``note.get("tags")``.  Issue #187: when these stayed nested, each sweep
+# pass rewrote a repair-needed note with empty source_url / path / tags,
+# progressively stripping it into an ``influx:source-invalid`` zombie.
+#
+# Each entry maps the field to its expected JSON type — a schema-violating
+# nested value (e.g. ``metadata.tags`` as a string) is NOT hoisted, mirroring
+# the ``isinstance`` guards in ``_doc_tags`` / ``_doc_source_url`` so callers
+# that apply ``list(...)`` to a hoisted value can never iterate a stray
+# string into character-garbage tags.
+_READ_ENVELOPE_FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
+    "tags": list,
+    "source_url": str,
+    "path": str,
+    "confidence": (int, float),
+    "note_type": str,
+    "namespace": str,
+    "version": int,
+    "author": str,
+}
+
+
+def _normalise_read_envelope(doc: dict[str, Any]) -> dict[str, Any]:
+    """Hoist nested ``metadata.*`` fields to the top level of a read doc (#187).
+
+    For each allow-listed field, copy ``metadata[field]`` to the top
+    level **only when the top-level value is missing or empty AND the
+    nested value has the expected type** — a present, non-empty top-level
+    value always wins, so this never clobbers real data and is a no-op on
+    already-flat docs.  "Empty" means ``None`` / ``""`` / ``[]`` only, so a
+    legitimate ``confidence: 0.0`` or ``version: 0`` is preserved, while an
+    empty ``tags: []`` or ``source_url: ""`` is correctly replaced from
+    ``metadata``.  List values are copied so the hoisted top-level field
+    does not alias ``metadata[field]``.  Mutates and returns *doc* for
+    caller convenience.
+    """
+    meta = doc.get("metadata")
+    if not isinstance(meta, dict):
+        return doc
+    for field, expected in _READ_ENVELOPE_FIELD_TYPES.items():
+        if doc.get(field) not in (None, "", []):
+            continue  # a present, non-empty top-level value always wins
+        value = meta.get(field)
+        if field not in meta or not isinstance(value, expected):
+            continue  # absent, or schema-violating nested type — skip
+        # Copy lists so the hoisted value doesn't alias metadata[field].
+        doc[field] = list(value) if isinstance(value, list) else value
+    return doc
 
 
 @dataclasses.dataclass(frozen=True)
@@ -760,9 +818,18 @@ class LithosClient:
         )
 
     async def read_note(self, *, note_id: str) -> dict[str, Any]:
-        """Read a note by ID (used for version_conflict re-reads)."""
+        """Read a note by ID (used for version_conflict re-reads).
+
+        The returned dict is envelope-normalised (#187): structured
+        fields Lithos nests under ``metadata`` are hoisted to the top
+        level so downstream top-level ``note.get(...)`` reads — notably
+        the repair sweep's rewrite-arg construction — see the correct
+        values instead of empties.
+        """
         result = await self.call_tool("lithos_read", {"id": note_id})
-        return self._result_json_dict(result, operation="read_note")
+        return _normalise_read_envelope(
+            self._result_json_dict(result, operation="read_note")
+        )
 
     async def write_note(
         self,

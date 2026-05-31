@@ -1496,3 +1496,90 @@ class TestSweepTextExtractionRetry:
         rewritten = self._last_write_args(client)
         assert "source:arxiv" in rewritten["tags"]
         assert "text:html" in rewritten["tags"]
+
+
+def _payload_result(payload: dict[str, Any]) -> MagicMock:
+    """Build a fake ``CallToolResult`` whose body is *payload*."""
+    text_content = MagicMock()
+    text_content.text = json.dumps(payload)
+    result = MagicMock()
+    result.content = [text_content]
+    result.isError = False
+    return result
+
+
+class TestSweepEnvelopeNormalisation:
+    """#187 end-to-end: a repair-needed RSS note whose structured fields
+    arrive nested under ``metadata`` (the real ``lithos_read`` shape) must
+    be rewritten with source_url / path / source-tag intact, not stripped
+    into an ``influx:source-invalid`` zombie.
+
+    Unlike the other sweep tests this drives a *real* ``LithosClient`` with
+    only the transport (``call_tool``) mocked, so the read goes through the
+    real ``read_note`` envelope-normalisation (the fix site).
+    """
+
+    async def test_metadata_nested_source_survives_sweep_rewrite(self) -> None:
+        from influx.lithos_client import LithosClient
+        from influx.repair_hooks import infer_note_source
+
+        note_id = "11111111-2222-3333-4444-555555555555"  # Lithos UUID id
+        source_url = "https://www.alignmentforum.org/posts/x/retrying-vs-resampling"
+        nested_read = {
+            "id": note_id,
+            "title": "Retrying vs Resampling in AI Control",
+            "content": "# Retrying vs Resampling\n\n## Archive\n\n## Summary\nBody.\n",
+            # Real Lithos shape: structured fields under ``metadata`` only.
+            "metadata": {
+                "tags": [
+                    "profile:ai-foundations",
+                    "source:rss",
+                    "feed-slug:alignmentforum",
+                    "ingested-by:influx",
+                    "influx:repair-needed",
+                ],
+                "source_url": source_url,
+                "path": "articles/rss/2026/05",
+                "confidence": 0.4,
+                "version": 3,
+            },
+        }
+
+        def _dispatch(tool: str, args: dict[str, Any]) -> MagicMock:
+            if tool == "lithos_list":
+                return _payload_result({"items": [{"id": note_id}]})
+            if tool == "lithos_read":
+                return _payload_result(nested_read)
+            if tool == "lithos_write":
+                return _payload_result({"status": "updated"})
+            return _payload_result({"status": "ok"})
+
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(side_effect=_dispatch)  # type: ignore[method-assign]
+
+        await sweep(
+            "ai-foundations", client=client, config=_make_config(), hooks=SweepHooks()
+        )
+
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected a lithos_write rewrite"
+        args = cast("dict[str, Any]", write_calls[0].args[1])
+
+        # The nested-only fields must reach the rewrite — not be blanked.
+        assert args["source_url"] == source_url
+        assert args["path"] == "articles/rss/2026/05"
+        assert "source:rss" in args["tags"]
+        assert "profile:ai-foundations" in args["tags"]
+
+        # Causal chain: the rewritten note is still source-recoverable, so a
+        # subsequent sweep would NOT terminalise it as influx:source-invalid.
+        rewritten = {
+            "id": note_id,
+            "tags": args["tags"],
+            "source_url": args["source_url"],
+            "path": args["path"],
+            "content": args["content"],
+        }
+        assert infer_note_source(rewritten) == "rss"
