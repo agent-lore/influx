@@ -53,7 +53,10 @@ class Tier3Extraction(BaseModel):
     """Tier-3 deep extraction output validated against FR-ENR-5 (PRD 07 §5.3).
 
     Constraints:
-    - ``claims`` length must be in ``[1, 10]`` inclusive.
+    - ``claims`` length must be in ``[1, TIER3_LIST_MAX]`` inclusive
+      (issue #186 — raised from 10 for the same reason as #81 below;
+      models returned up to 20 claims on claim-rich papers, discarding
+      the whole extraction).
     - ``datasets`` and ``builds_on`` lengths must be in
       ``[0, TIER3_LIST_MAX]`` inclusive (issue #81 — raised from 10 to
       accommodate structured-output models routinely returning 14-39
@@ -64,7 +67,7 @@ class Tier3Extraction(BaseModel):
     - Empty/whitespace-only elements fail validation.
     """
 
-    claims: list[str] = Field(min_length=1, max_length=10)
+    claims: list[str] = Field(min_length=1, max_length=TIER3_LIST_MAX)
     datasets: list[str] = Field(default_factory=list, max_length=TIER3_LIST_MAX)
     builds_on: list[str] = Field(default_factory=list, max_length=TIER3_LIST_MAX)
     open_questions: list[str] = Field(default_factory=list, max_length=10)

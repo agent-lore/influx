@@ -32,6 +32,19 @@ class TestTier3ExtractionPositive:
         t = Tier3Extraction(**_valid(claims=[f"c{i}" for i in range(10)]))
         assert len(t.claims) == 10
 
+    def test_claims_length_at_cap(self) -> None:
+        """Issue #186: claims accepts up to TIER3_LIST_MAX items."""
+        t = Tier3Extraction(**_valid(claims=[f"c{i}" for i in range(TIER3_LIST_MAX)]))
+        assert len(t.claims) == TIER3_LIST_MAX
+
+    @pytest.mark.parametrize("size", [11, 20, TIER3_LIST_MAX])
+    def test_claims_over_10_now_parse(self, size: int) -> None:
+        """Issue #186: >10 claims (observed up to 20) now parse and
+        round-trip instead of discarding the whole extraction."""
+        claims = [f"c{i}" for i in range(size)]
+        t = Tier3Extraction(**_valid(claims=claims))
+        assert t.claims == claims
+
     def test_datasets_length_0(self) -> None:
         t = Tier3Extraction(**_valid(datasets=[]))
         assert len(t.datasets) == 0
@@ -120,9 +133,13 @@ class TestTier3ExtractionNegative:
         with pytest.raises(ValidationError):
             Tier3Extraction(**_valid(claims=[]))
 
-    def test_claims_length_11(self) -> None:
+    def test_claims_length_over_cap(self) -> None:
+        """Issue #186: claims length TIER3_LIST_MAX + 1 is still rejected
+        (raised the bound, did not remove it)."""
         with pytest.raises(ValidationError):
-            Tier3Extraction(**_valid(claims=[f"c{i}" for i in range(11)]))
+            Tier3Extraction(
+                **_valid(claims=[f"c{i}" for i in range(TIER3_LIST_MAX + 1)])
+            )
 
     def test_datasets_length_over_cap(self) -> None:
         """Issue #81: datasets length TIER3_LIST_MAX + 1 is still rejected."""
@@ -222,5 +239,6 @@ class TestTier3ListMaxConstant:
         ``TIER3_LIST_MAX`` so a future bump propagates without code drift.
         """
         schema = Tier3Extraction.model_json_schema()
+        assert schema["properties"]["claims"]["maxItems"] == TIER3_LIST_MAX
         assert schema["properties"]["datasets"]["maxItems"] == TIER3_LIST_MAX
         assert schema["properties"]["builds_on"]["maxItems"] == TIER3_LIST_MAX
