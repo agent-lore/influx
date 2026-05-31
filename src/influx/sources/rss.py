@@ -47,12 +47,14 @@ from influx.extraction.article import extract_article
 from influx.filter import FilterScorerError, _acall_filter_model_with_retry
 from influx.http_client import aguarded_fetch as _aguarded_fetch
 from influx.renderer import render
+from influx.repair_hooks import has_usable_source
 from influx.slugs import slugify_feed_name
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.storage import download_archive
 from influx.telemetry import (
     current_run_id,
     get_tracer,
+    record_empty_source_write,
     record_fetched_items,
     record_filter_error,
     record_invalid_url_rejection,
@@ -540,6 +542,37 @@ def build_rss_note_item(
                 thin_rule,
             )
             return None
+
+    # Issue #189: observe-only empty-source guard.  The item survived the
+    # thin-summary check and WILL be written below.  When it has no usable
+    # source — a blank ``source:`` tag AND a URL we can't infer a source
+    # from (a non-arxiv link) — it is exactly the population a future
+    # #187-class metadata loss would later strip into an
+    # ``influx:source-invalid`` zombie.  We do NOT drop it (a real article
+    # with a working link but no reconstructable feed-slug tag is still
+    # legitimate content); we count + log it so the real-world fire-rate
+    # is measurable.  Shares ``has_usable_source`` with the repair sweep's
+    # ``infer_note_source`` so ingest and repair agree on "usable source".
+    if not has_usable_source(source_tag_suffix=item.source_tag, source_url=source_url):
+        metrics.empty_source_writes().add(
+            1,
+            {
+                "profile": profile_name,
+                # The guard only fires when ``item.source_tag`` is blank
+                # (that is the trigger), so there is no per-feed suffix to
+                # label with — use the stable adapter identity.
+                "source": "rss",
+                "reason": "no_usable_source",
+            },
+        )
+        record_empty_source_write()
+        _log.info(
+            "empty-source write source=rss profile=%s feed-slug=%s "
+            "url=%s reason=no_usable_source",
+            profile_name,
+            feed_slug,
+            source_url,
+        )
 
     # Issue #166 review: the item survived the thin-summary suppression
     # check and will be written below.  Bump the deferred

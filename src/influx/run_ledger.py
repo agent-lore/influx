@@ -548,6 +548,12 @@ class RunLedger:
             # Stays ``None`` while the run is in flight; populated from
             # the per-run contextvar at ``complete`` time.
             "summary_thin_drops_total": None,
+            # Issue #189: per-run total of notes written despite having no
+            # usable source (blank source tag AND no arxiv-inferable URL).
+            # Observe-only signal, distinct from any failure total and
+            # never a degraded reason.  Stays ``None`` in flight; populated
+            # from the per-run contextvar at ``complete`` time.
+            "empty_source_writes_total": None,
             "error": None,
             "degraded": False,
             "degraded_reasons": [],
@@ -601,6 +607,7 @@ class RunLedger:
         invalid_url_rejections_total: int | None = None,
         archive_failures_total: int | None = None,
         summary_thin_drops_total: int | None = None,
+        empty_source_writes_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         source_cooldown_skips: list[dict[str, str]] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
@@ -904,6 +911,7 @@ class RunLedger:
             invalid_url_rejections_total=invalid_url_rejections_total,
             archive_failures_total=archive_failures_total,
             summary_thin_drops_total=summary_thin_drops_total,
+            empty_source_writes_total=empty_source_writes_total,
             error=None,
             degraded=bool(reasons),
             source_acquisition_errors=errors,
@@ -1262,6 +1270,7 @@ class RunLedger:
         invalid_url_rejections_total: int | None = None,
         archive_failures_total: int | None = None,
         summary_thin_drops_total: int | None = None,
+        empty_source_writes_total: int | None = None,
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         source_cooldown_skips: list[dict[str, str]] | None = None,
@@ -1303,6 +1312,10 @@ class RunLedger:
                     # suppressions so operators can see how many items
                     # the rule is dropping without scraping logs.
                     "summary_thin_drops_total": summary_thin_drops_total,
+                    # Issue #189: persist per-run count of source-less
+                    # writes so operators can measure the rate without
+                    # scraping logs.  Observe-only; not a failure total.
+                    "empty_source_writes_total": empty_source_writes_total,
                     "error": error,
                     "degraded": degraded,
                     "degraded_reasons": list(degraded_reasons or []),

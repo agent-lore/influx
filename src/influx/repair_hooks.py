@@ -319,10 +319,59 @@ def _infer_source_from_note_id(note_id: str) -> str | None:
     return None
 
 
+def _resolve_source_from_tag_or_url(
+    *, source_tag_suffix: str | None, source_url: str | None
+) -> str | None:
+    """Resolve a dispatchable ``source:*`` suffix from the signals that
+    exist at *ingest* time: an explicit source-tag suffix, then an
+    arxiv-inferable URL.
+
+    Single source of truth shared by :func:`infer_note_source` (its tag
+    and top-level-``source_url`` rules) and :func:`has_usable_source`,
+    so the ingest-time guard and the repair sweep agree by construction
+    on what counts as a usable source (#189).  A non-empty
+    *source_tag_suffix* wins verbatim — even one naming a source we
+    don't support yet is well-formed metadata, not our call to
+    second-guess — otherwise fall back to the arxiv-host URL inference.
+    Returns ``None`` when neither signal yields a source.
+    """
+    if source_tag_suffix:
+        return source_tag_suffix
+    return _infer_source_from_url(source_url or "")
+
+
+def has_usable_source(*, source_tag_suffix: str | None, source_url: str | None) -> bool:
+    """Whether a note has a usable, dispatchable source at ingest time (#189).
+
+    ``True`` iff a non-empty ``source:*`` suffix is present, or the
+    source URL is one a suffix can be inferred from (an arxiv host).
+    This is the boolean form of :func:`_resolve_source_from_tag_or_url`
+    and mirrors the terminal (returns-``None``) branch of
+    :func:`infer_note_source`, restricted to the signals that exist
+    *before* a note is written — the note ``path`` / ``id`` fallbacks
+    only exist post-write, so they are repair-only.
+
+    The source builders use this to **count, never drop** notes written
+    with no usable source: exactly the population a future #187-class
+    metadata loss would later strip into an ``influx:source-invalid``
+    zombie.  Observe-only by design (#189) — a blank ``source:`` tag on
+    an item with real content and a working non-arxiv link is still
+    legitimate content we must not discard.
+    """
+    return (
+        _resolve_source_from_tag_or_url(
+            source_tag_suffix=source_tag_suffix, source_url=source_url
+        )
+        is not None
+    )
+
+
 def infer_note_source(note: dict[str, object]) -> str | None:
     """Return a dispatchable ``source:*`` suffix for *note*, or ``None``.
 
-    Resolution order, stopping at the first hit:
+    Resolution order, stopping at the first hit (rules 1–2 share the
+    :func:`_resolve_source_from_tag_or_url` primitive with
+    :func:`has_usable_source` so ingest and repair never drift, #189):
 
     1. Any **non-empty** existing ``source:*`` tag is honoured
        verbatim — even if it names a source we don't support yet
@@ -349,15 +398,17 @@ def infer_note_source(note: dict[str, object]) -> str | None:
     that as a terminal metadata failure (#150) rather than a
     transient extraction failure.
     """
+    # Rules 1–2: existing non-empty tag, then top-level ``source_url``
+    # pointing at arxiv.  Shared with :func:`has_usable_source` via the
+    # resolver so the ingest guard and the sweep stay in lock-step (#189).
     existing = _note_source_tag(note)
-    if existing:
-        return existing
-
     top_level_url = note.get("source_url")
     top_level_url_str = top_level_url if isinstance(top_level_url, str) else ""
-    inferred = _infer_source_from_url(top_level_url_str)
-    if inferred is not None:
-        return inferred
+    resolved = _resolve_source_from_tag_or_url(
+        source_tag_suffix=existing, source_url=top_level_url_str
+    )
+    if resolved is not None:
+        return resolved
 
     source_url = _parse_source_url_from_note(note) or ""
     inferred = _infer_source_from_url(source_url)
