@@ -367,6 +367,39 @@ class TestTier3ExtractSuccess:
 
         assert len(result.claims) == 10
 
+    def test_twenty_claims_no_longer_discarded(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Issue #186: the observed 20-claim response now validates and
+        persists through the deep-extraction path instead of raising
+        ``LCMAError`` and feeding the Tier-3 terminal-flip counter."""
+        config = load_config()
+        payload = _valid_tier3_response(claims=[f"Claim {i}" for i in range(20)])
+
+        with patch("influx.enrich._call_json_model", return_value=payload):
+            result = tier3_extract(
+                title="Title",
+                full_text="Full text",
+                config=config,
+            )
+
+        assert len(result.claims) == 20
+
+    def test_claims_at_cap(self, influx_config_env: Any, tmp_path: Any) -> None:
+        config = load_config()
+        payload = _valid_tier3_response(
+            claims=[f"Claim {i}" for i in range(TIER3_LIST_MAX)]
+        )
+
+        with patch("influx.enrich._call_json_model", return_value=payload):
+            result = tier3_extract(
+                title="Title",
+                full_text="Full text",
+                config=config,
+            )
+
+        assert len(result.claims) == TIER3_LIST_MAX
+
     def test_optional_lists_empty(self, influx_config_env: Any, tmp_path: Any) -> None:
         config = load_config()
         payload = _valid_tier3_response(
@@ -445,7 +478,10 @@ class TestTier3ExtractValidationFailure:
         self, influx_config_env: Any, tmp_path: Any
     ) -> None:
         config = load_config()
-        payload = _valid_tier3_response(claims=[f"c{i}" for i in range(11)])
+        # Over the raised cap (issue #186): TIER3_LIST_MAX + 1 still hard-fails.
+        payload = _valid_tier3_response(
+            claims=[f"c{i}" for i in range(TIER3_LIST_MAX + 1)]
+        )
 
         with (
             patch("influx.enrich._call_json_model", return_value=payload),
