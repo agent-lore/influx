@@ -468,3 +468,198 @@ class TestUnresolvedDetailFormat:
         )
         assert "first_existing_id=<missing>" in out
         assert "retry_existing_id=doc-b" in out
+
+
+class TestReadNoteEnvelopeNormalisation:
+    """``read_note`` hoists nested ``metadata.*`` fields to the top level (#187).
+
+    Regression guard for the repair-sweep zombie bug: Lithos returns
+    structured fields nested under ``metadata``, but the sweep reads them
+    at the top level via ``note.get(...)``.  Without normalisation the
+    sweep rewrote notes with empty source_url / path / tags and
+    terminalised them as ``influx:source-invalid``.
+    """
+
+    def _read_result(self, payload: dict[str, object]) -> MagicMock:
+        return _tool_result(payload)
+
+    async def test_hoists_nested_source_url_path_tags(self) -> None:
+        """The canonical Lithos shape (fields under ``metadata``) is flattened."""
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._read_result(
+                {
+                    "id": "11111111-2222-3333-4444-555555555555",
+                    "title": "Retrying vs Resampling in AI Control",
+                    "content": "## Summary\n\nBody.\n",
+                    "metadata": {
+                        "tags": [
+                            "profile:ai-foundations",
+                            "source:rss",
+                            "feed-slug:alignmentforum",
+                            "ingested-by:influx",
+                            "influx:repair-needed",
+                        ],
+                        "source_url": "https://www.alignmentforum.org/posts/x/retrying",
+                        "path": "articles/rss/2026/05",
+                        "confidence": 0.4,
+                        "version": 3,
+                    },
+                }
+            )
+        )
+
+        note = await client.read_note(note_id="11111111-2222-3333-4444-555555555555")
+
+        # Top-level reads (what the repair sweep performs) now resolve.
+        assert note["source_url"] == "https://www.alignmentforum.org/posts/x/retrying"
+        assert note["path"] == "articles/rss/2026/05"
+        assert "source:rss" in note["tags"]
+        assert "profile:ai-foundations" in note["tags"]
+        assert note["confidence"] == 0.4
+        assert note["version"] == 3
+
+    async def test_present_top_level_value_is_not_clobbered(self) -> None:
+        """A non-empty top-level field always wins over the nested copy."""
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._read_result(
+                {
+                    "id": "n1",
+                    "source_url": "https://top.example/canonical",
+                    "tags": ["source:rss"],
+                    "metadata": {
+                        "source_url": "https://nested.example/stale",
+                        "tags": ["source:stale"],
+                    },
+                }
+            )
+        )
+
+        note = await client.read_note(note_id="n1")
+
+        assert note["source_url"] == "https://top.example/canonical"
+        assert note["tags"] == ["source:rss"]
+
+    async def test_empty_top_level_is_filled_from_metadata(self) -> None:
+        """Empty ``""`` / ``[]`` top-level values are treated as missing."""
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._read_result(
+                {
+                    "id": "n1",
+                    "source_url": "",
+                    "tags": [],
+                    "metadata": {
+                        "source_url": "https://nested.example/real",
+                        "tags": ["source:rss"],
+                    },
+                }
+            )
+        )
+
+        note = await client.read_note(note_id="n1")
+
+        assert note["source_url"] == "https://nested.example/real"
+        assert note["tags"] == ["source:rss"]
+
+    async def test_already_flat_doc_is_unchanged(self) -> None:
+        """A response with no ``metadata`` object passes through untouched."""
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._read_result(
+                {
+                    "id": "n1",
+                    "source_url": "https://example.com/a",
+                    "path": "articles/rss/2026/05",
+                    "tags": ["source:rss"],
+                    "confidence": 0.9,
+                }
+            )
+        )
+
+        note = await client.read_note(note_id="n1")
+
+        assert note["source_url"] == "https://example.com/a"
+        assert note["path"] == "articles/rss/2026/05"
+        assert note["tags"] == ["source:rss"]
+        assert note["confidence"] == 0.9
+
+    async def test_zero_confidence_top_level_preserved(self) -> None:
+        """A legitimate ``confidence: 0.0`` is not treated as empty."""
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._read_result(
+                {
+                    "id": "n1",
+                    "confidence": 0.0,
+                    "metadata": {"confidence": 0.7},
+                }
+            )
+        )
+
+        note = await client.read_note(note_id="n1")
+
+        assert note["confidence"] == 0.0
+
+    async def test_zero_confidence_hoisted_from_metadata(self) -> None:
+        """A nested ``confidence: 0.0`` IS hoisted when top-level is absent."""
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._read_result(
+                {"id": "n1", "metadata": {"confidence": 0.0}}
+            )
+        )
+
+        note = await client.read_note(note_id="n1")
+
+        assert note["confidence"] == 0.0
+
+    async def test_metadata_not_a_dict_is_noop(self) -> None:
+        """A non-dict ``metadata`` value is ignored (no crash, no hoist)."""
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._read_result(
+                {"id": "n1", "source_url": "https://example.com/a", "metadata": None}
+            )
+        )
+
+        note = await client.read_note(note_id="n1")
+
+        assert note["source_url"] == "https://example.com/a"
+
+    async def test_schema_violating_nested_type_not_hoisted(self) -> None:
+        """A nested value of the wrong type is NOT hoisted (mirrors the
+        isinstance guards in _doc_tags/_doc_source_url) — prevents a stray
+        ``metadata.tags`` string being list()'d into character-garbage.
+        """
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._read_result(
+                {
+                    "id": "n1",
+                    "tags": [],
+                    "metadata": {"tags": "not-a-list", "source_url": 12345},
+                }
+            )
+        )
+
+        note = await client.read_note(note_id="n1")
+
+        # Wrong-typed nested values are skipped; top-level stays empty/absent.
+        assert note["tags"] == []
+        assert note.get("source_url") in (None, "")
+
+    async def test_hoisted_tags_do_not_alias_metadata(self) -> None:
+        """The hoisted top-level ``tags`` is a copy, not the metadata list."""
+        client = LithosClient(url="http://localhost:1234/sse")
+        client.call_tool = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._read_result(
+                {"id": "n1", "metadata": {"tags": ["source:rss"]}}
+            )
+        )
+
+        note = await client.read_note(note_id="n1")
+        note["tags"].append("mutated")
+
+        assert note["metadata"]["tags"] == ["source:rss"]
