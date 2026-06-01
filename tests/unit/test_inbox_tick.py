@@ -295,8 +295,9 @@ async def test_circuit_open_skips_whole_tick() -> None:
     assert client.completed == []
 
 
-async def test_busy_profile_is_skipped_not_overlapped() -> None:
-    """When the profile lock is held, the dispatch is skipped (no overlap)."""
+async def test_busy_profile_skipped_this_tick_not_completed() -> None:
+    """A busy profile is skipped (no overlap) AND the task is left un-completed
+    so a later tick retries it — not terminally dropped (§5.5 / §10)."""
     client = FakeClient(tasks=[_task()])
     coordinator = Coordinator()
     tick = InboxTick(
@@ -319,10 +320,11 @@ async def test_busy_profile_is_skipped_not_overlapped() -> None:
         ):
             await tick.execute()
 
-    # The Run is never dispatched while the profile is busy.
+    # The Run is never dispatched while the profile is busy …
     mock_dispatch.assert_not_called()
-    assert "profile_busy" in client.completed[0]["outcome"]
-    assert client.completed[0]["cited_nodes"] is None
+    # … the task was claimed but NOT completed (claim lease expires → retry).
+    assert client.claimed == ["task-1"]
+    assert client.completed == []
 
 
 async def test_per_item_failure_isolation() -> None:

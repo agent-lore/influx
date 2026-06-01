@@ -339,6 +339,12 @@ class InboxTick:
             summary_hint=summary_hint,
             source_tag=source_tag,
         )
+        # ``None`` is the skip-this-tick signal (profile busy): leave the task
+        # un-completed so its claim lease expires and a later tick re-claims
+        # and retries it (§5.5 / §10 try-acquire-skip).  Completing here would
+        # permanently drop the submission on a transient lock collision.
+        if result is None:
+            return
         await self._complete(client, task_id, result)
 
     async def _ingest_item(
@@ -350,11 +356,13 @@ class InboxTick:
         title_hint: str | None,
         summary_hint: str | None,
         source_tag: str,
-    ) -> _ItemOutcome:
+    ) -> _ItemOutcome | None:
         """Acquire, score (first profile), dispatch, and report one item.
 
-        Slice 1 scores only the first enabled profile.  Returns the
-        per-item outcome used to complete the task.
+        Slice 1 scores only the first enabled profile.  Returns the per-item
+        outcome used to complete the task, or ``None`` to signal
+        skip-this-tick (profile busy) — the caller then leaves the task
+        un-completed so a later tick retries it.
         """
         started = time.monotonic()
         profiles = self.config.profiles
@@ -429,24 +437,16 @@ class InboxTick:
                     run_id=run_id,
                 )
         except ProfileBusyError:
+            # Skip this tick: leave the task un-completed so its claim lease
+            # expires and a later tick re-claims + retries (§5.5 / §10).  Do
+            # NOT terminally complete — that would drop the submission on a
+            # transient collision (no inbox-level auto-retry, §5.6).
             metrics.inbox_items_processed().add(1, {"outcome": "profile_busy_skipped"})
-            return _ItemOutcome(
-                outcome=(
-                    f"profile_busy: {profile_cfg.name} already running; "
-                    "resubmit to retry"
-                ),
-                cited_nodes=[],
-                inbox_result={
-                    "source_url": acquired.source_url,
-                    "per_profile": {
-                        profile_cfg.name: {
-                            "score": scored.score,
-                            "ingested": False,
-                            "reason": "profile_busy",
-                        }
-                    },
-                },
+            logger.info(
+                "inbox profile %s busy; leaving task to retry on a later tick",
+                profile_cfg.name,
             )
+            return None
 
         ingested = outcome.ingested > 0
         # Only recover the note id when a write actually happened — a skipped
