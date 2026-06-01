@@ -242,7 +242,7 @@ NotificationWebhookType = Literal[
     "openclaw_agent",
 ]
 NotificationEventMode = Literal["digest", "article"]
-NotificationRunKind = Literal["scheduled", "manual", "backfill"]
+NotificationRunKind = Literal["scheduled", "manual", "backfill", "inbox"]
 
 
 _WEBHOOK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
