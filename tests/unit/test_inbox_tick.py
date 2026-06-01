@@ -66,10 +66,20 @@ class FakeClient:
         tasks: list[dict[str, Any]],
         claim_success: bool = True,
         note_id: str | None = "note-xyz",
+        existing_note_id: str | None = None,
+        existing_note: dict[str, Any] | None = None,
     ) -> None:
         self._tasks = tasks
         self._claim_success = claim_success
+        # ``note_id`` is what post-dispatch recovery resolves for a *fresh*
+        # item; ``existing_note_id`` (+ ``existing_note``) drive the
+        # cache-hit gate + read_note for replay tests.  cache_lookup is
+        # called twice on the fresh path (gate miss, then recovery hit), so
+        # the first call models the gate and later calls model recovery.
         self._note_id = note_id
+        self._existing_note_id = existing_note_id
+        self._existing_note = existing_note or {"content": "", "tags": []}
+        self._gated: set[str] = set()
         self.claimed: list[str] = []
         self.updated: list[tuple[str, dict[str, Any]]] = []
         self.completed: list[dict[str, Any]] = []
@@ -103,9 +113,19 @@ class FakeClient:
         return {"status": "completed"}
 
     async def cache_lookup_by_url_body(self, *, source_url: str) -> dict[str, Any]:
+        # First lookup for a URL is the cache-hit gate; later lookups for the
+        # same URL are post-dispatch note-id recovery (fresh path).
+        if source_url not in self._gated:
+            self._gated.add(source_url)
+            if self._existing_note_id:
+                return {"hit": True, "id": self._existing_note_id}
+            return {"hit": False}
         if self._note_id:
             return {"hit": True, "id": self._note_id}
         return {"hit": False}
+
+    async def read_note(self, *, note_id: str) -> dict[str, Any]:
+        return self._existing_note
 
     async def close(self) -> None:
         return None
@@ -358,7 +378,12 @@ async def test_per_item_failure_isolation() -> None:
     Acquisition raises for the first item — an error that propagates to the
     execute()-level per-item handler (not caught inside dispatch).
     """
-    client = FakeClient(tasks=[_task(task_id="task-1"), _task(task_id="task-2")])
+    client = FakeClient(
+        tasks=[
+            _task(task_id="task-1", url="https://example.com/a"),
+            _task(task_id="task-2", url="https://example.com/b"),
+        ]
+    )
 
     def _acquire_side_effect(*_a: Any, **_k: Any) -> InboxAcquisition:
         if client.claimed and client.claimed[-1] == "task-1":
@@ -609,3 +634,130 @@ async def test_bytes_acquired_once_for_all_profiles() -> None:
         await _tick(client, config).execute()
 
     mock_acquire.assert_called_once()
+
+
+# ── Slice 3: cache-hit replay (§6) ──────────────────────────────────
+
+
+def _note_content(ingested: list[str]) -> str:
+    """Render note body whose ## Profile Relevance lists *ingested* profiles."""
+    from influx.renderer import ProfileRelevanceEntry, render_note
+
+    return render_note(
+        title="Existing",
+        source_url="https://example.com/article",
+        tags=["ingested-by:influx"],
+        confidence=1.0,
+        archive_path=None,
+        summary="s",
+        keywords=[],
+        profile_entries=[
+            ProfileRelevanceEntry(profile_name=n, score=8, reason="r") for n in ingested
+        ],
+    )
+
+
+async def test_cache_hit_replays_only_complement_profiles() -> None:
+    """On a cache hit, only profiles that haven't ingested are re-dispatched."""
+    config = _make_config([("a", 7), ("b", 7), ("c", 7)])
+    client = FakeClient(
+        tasks=[_task()],
+        existing_note_id="note-1",
+        existing_note={"content": _note_content(["a", "b"]), "tags": []},
+    )
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"a": 8, "b": 8, "c": 8}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch(
+            "influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)
+        ) as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+
+    # a and b already ingested → only c is dispatched.
+    assert [c.args[0] for c in mock_dispatch.call_args_list] == ["c"]
+    outcome = client.completed[0]["outcome"]
+    assert outcome == "cache_hit: existing note note-1; added 1 profile entry: c"
+    assert client.completed[0]["cited_nodes"] == ["note-1"]
+
+
+async def test_cache_hit_excludes_rejected_tag_profiles() -> None:
+    """influx:rejected:<profile> suppresses that profile from replay (§6)."""
+    config = _make_config([("a", 7), ("b", 7), ("c", 7)])
+    client = FakeClient(
+        tasks=[_task()],
+        existing_note_id="note-1",
+        existing_note={
+            "content": _note_content(["a"]),
+            "tags": ["influx:rejected:b"],
+        },
+    )
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"c": 8}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch(
+            "influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)
+        ) as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+
+    # a ingested, b operator-suppressed → only c is a candidate.
+    assert [c.args[0] for c in mock_dispatch.call_args_list] == ["c"]
+
+
+async def test_cache_hit_no_new_profiles_to_consider_skips_acquire() -> None:
+    """When every profile already ingested, no acquire/dispatch happens."""
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(
+        tasks=[_task()],
+        existing_note_id="note-1",
+        existing_note={"content": _note_content(["a", "b"]), "tags": []},
+    )
+    with (
+        patch("influx.inbox.acquire_inbox_bytes") as mock_acquire,
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({}),
+        ),
+        patch("influx.inbox.dispatch_profile") as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+
+    mock_acquire.assert_not_called()
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"] == (
+        "cache_hit: existing note note-1; no new profiles to consider"
+    )
+    assert client.completed[0]["cited_nodes"] == ["note-1"]
+
+
+async def test_cache_hit_complement_scored_but_none_clear() -> None:
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(
+        tasks=[_task()],
+        existing_note_id="note-1",
+        existing_note={"content": _note_content(["a"]), "tags": []},
+    )
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"b": 3}),  # below threshold
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile") as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"] == (
+        "cache_hit: existing note note-1; no new profiles matched"
+    )

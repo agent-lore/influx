@@ -18,8 +18,10 @@ dispatched to each that clears its threshold, merging into one canonical
 note via the existing ``write_note`` path.  Each dispatch holds the
 per-Profile coordinator lock (so inbox never overlaps a scheduled Run for
 the same profile); when every clearing profile is busy the item is left
-for a later tick.  Cache-hit replay (§6) and the richer §10 reporting
-(cross-tick re-scoring of busy/skipped profiles) arrive in a later slice.
+for a later tick.  A resubmitted URL is a cache-hit replay (§6): only the
+*complement* (profiles that have neither ingested it nor been suppressed)
+is re-scored, which is how a busy-skipped profile is picked up on a later
+tick (§10).
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from influx.errors import LCMAError, LithosError
 from influx.feedback import build_filter_prompt
 from influx.filter import make_default_batch_scorer
 from influx.lithos_client import LithosClient
+from influx.notes import parse_note, parse_profile_relevance
 from influx.run import ItemProvider, RunOutcome, RunPlan
 from influx.run_service import RunService
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
@@ -49,6 +52,7 @@ from influx.sources.inbox import (
     acquire_inbox_bytes,
     build_inbox_note_item,
 )
+from influx.urls import normalise_url
 
 if TYPE_CHECKING:
     from influx.run_ledger import RunLedger
@@ -64,6 +68,7 @@ _SUBMITTER_STRIP_RE = re.compile(r"[^A-Za-z0-9:._-]+")
 _DEFAULT_SOURCE_TAG = "inbox"
 _CLAIM_ASPECT = "ingest"
 _ALLOWED_URL_SCHEMES = ("http", "https")
+_REJECTED_TAG_PREFIX = "influx:rejected:"
 
 
 def _valid_source_tag(tag: str) -> bool:
@@ -403,6 +408,36 @@ class InboxTick:
                 inbox_result={"source_url": url, "error": reason},
             )
 
+        # ── Cache-hit replay (§6) ─────────────────────────────────────
+        # If this URL is already a note, score + dispatch only the
+        # *complement* — profiles that have neither ingested it nor been
+        # operator-suppressed (``influx:rejected:<profile>``).  This both
+        # avoids re-dispatching profiles already present and re-scores
+        # profiles a previous tick left out (e.g. busy-skipped), which is
+        # how the §10 try-acquire-skip work is picked up on a later tick.
+        source_url = normalise_url(url)
+        cache_note_id = await self._lookup_existing(client, source_url)
+        candidate_profiles = profiles
+        if cache_note_id is not None:
+            candidate_profiles = await self._complement_profiles(
+                client, cache_note_id, profiles
+            )
+            if not candidate_profiles:
+                metrics.inbox_items_processed().add(1, {"outcome": "cache_hit"})
+                return _ItemOutcome(
+                    outcome=(
+                        f"cache_hit: existing note {cache_note_id}; "
+                        "no new profiles to consider"
+                    ),
+                    cited_nodes=[cache_note_id],
+                    inbox_result={
+                        "source_url": source_url,
+                        "cache_hit": True,
+                        "note_id": cache_note_id,
+                        "per_profile": {},
+                    },
+                )
+
         # Acquire once (blocking download/extract → thread); bytes + extracted
         # text are reused across every per-profile filter + dispatch below.
         acquired = await asyncio.to_thread(
@@ -447,11 +482,13 @@ class InboxTick:
 
         # gather preserves config order; profile count is small (§17 leaves a
         # tighter concurrency cap as a future tuning knob).
-        scored_profiles = list(await asyncio.gather(*(_score(p) for p in profiles)))
+        scored_profiles = list(
+            await asyncio.gather(*(_score(p) for p in candidate_profiles))
+        )
         clearing = [ps for ps in scored_profiles if ps.clears]
 
         if not clearing:
-            return self._filtered_out_outcome(acquired, scored_profiles, url)
+            return self._filtered_out_outcome(acquired, scored_profiles, cache_note_id)
 
         # ── Per-(item, Profile) dispatch: sequential so the first write
         # creates the canonical note and the rest merge into it ────────
@@ -500,22 +537,29 @@ class InboxTick:
         ingested_names = [
             name for name, (o, _rid) in dispatched.items() if o.ingested > 0
         ]
-        note_id = (
-            await self._recover_note_id(client, acquired.source_url)
-            if ingested_names
-            else None
-        )
+        # On a cache hit the canonical note id is already known; otherwise
+        # recover it after the first write created it.
+        note_id = cache_note_id
+        if note_id is None and ingested_names:
+            note_id = await self._recover_note_id(client, acquired.source_url)
 
         per_profile = self._build_per_profile(
             scored_profiles, dispatched, busy, dispatch_failed, note_id
         )
         filter_errors = [ps.name for ps in scored_profiles if ps.error]
         outcome_str = self._build_outcome_string(
-            ingested_names, dispatched, busy, dispatch_failed, filter_errors
+            ingested_names,
+            dispatched,
+            busy,
+            dispatch_failed,
+            filter_errors,
+            cache_note_id,
         )
-        metrics.inbox_items_processed().add(
-            1, {"outcome": "ingested" if ingested_names else "error"}
-        )
+        if cache_note_id is not None:
+            metric_outcome = "cache_hit"
+        else:
+            metric_outcome = "ingested" if ingested_names else "error"
+        metrics.inbox_items_processed().add(1, {"outcome": metric_outcome})
 
         return _ItemOutcome(
             outcome=outcome_str,
@@ -523,6 +567,7 @@ class InboxTick:
             inbox_result={
                 "source_url": acquired.source_url,
                 "archive_path": acquired.archive_path,
+                "cache_hit": cache_note_id is not None,
                 "per_profile": per_profile,
                 "processing_time_ms": int((time.monotonic() - started) * 1000),
             },
@@ -532,35 +577,92 @@ class InboxTick:
         self,
         acquired: InboxAcquisition,
         scored_profiles: list[_ProfileScore],
-        url: str,
+        cache_note_id: str | None,
     ) -> _ItemOutcome:
-        """Build the terminal outcome when no profile cleared threshold (§7.1)."""
-        metrics.inbox_items_processed().add(1, {"outcome": "filtered_out"})
-        # (score, name, threshold) for every profile the model scored.
-        scored = [
-            (ps.scored.score, ps.name, ps.threshold)
-            for ps in scored_profiles
-            if ps.scored is not None
-        ]
-        if scored:
-            top_score, top_name, top_threshold = max(scored)
+        """Build the terminal outcome when no candidate profile cleared (§7.1).
+
+        Frames as a cache-hit replay (``no new profiles matched``) when this
+        URL is already a note, else a fresh ``filtered out: top score …``.
+        """
+        if cache_note_id is not None:
+            metrics.inbox_items_processed().add(1, {"outcome": "cache_hit"})
             outcome = (
-                f"filtered out: top score {top_score} ({top_name}) "
-                f"below threshold {top_threshold}"
+                f"cache_hit: existing note {cache_note_id}; no new profiles matched"
             )
         else:
-            outcome = "filtered out: no profile scored the item"
+            metrics.inbox_items_processed().add(1, {"outcome": "filtered_out"})
+            # (score, name, threshold) for every profile the model scored.
+            scored = [
+                (ps.scored.score, ps.name, ps.threshold)
+                for ps in scored_profiles
+                if ps.scored is not None
+            ]
+            if scored:
+                top_score, top_name, top_threshold = max(scored)
+                outcome = (
+                    f"filtered out: top score {top_score} ({top_name}) "
+                    f"below threshold {top_threshold}"
+                )
+            else:
+                outcome = "filtered out: no profile scored the item"
         return _ItemOutcome(
             outcome=outcome,
-            cited_nodes=[],
+            cited_nodes=[cache_note_id] if cache_note_id else [],
             inbox_result={
                 "source_url": acquired.source_url,
                 "archive_path": acquired.archive_path,
+                "cache_hit": cache_note_id is not None,
                 "per_profile": self._build_per_profile(
                     scored_profiles, {}, [], {}, None
                 ),
             },
         )
+
+    async def _lookup_existing(
+        self, client: LithosClient, source_url: str
+    ) -> str | None:
+        """Return the existing canonical note id for *source_url*, or ``None``.
+
+        Best-effort: a lookup failure is treated as a miss so the cache-hit
+        replay (§6) is purely an optimisation, never a correctness gate.
+        """
+        try:
+            body = await client.cache_lookup_by_url_body(source_url=source_url)
+        except (LithosError, LCMAError):
+            logger.warning(
+                "inbox cache lookup failed for %s; treating as miss",
+                source_url,
+                exc_info=True,
+            )
+            return None
+        return _extract_note_id(body)
+
+    async def _complement_profiles(
+        self, client: LithosClient, note_id: str, profiles: list[Any]
+    ) -> list[Any]:
+        """Profiles eligible for cache-hit replay (§6): enabled minus those
+        that already ingested the note minus operator-suppressed
+        (``influx:rejected:<profile>``).  On read failure, fall back to all
+        profiles (the in-Run merge still dedupes correctly)."""
+        try:
+            note = await client.read_note(note_id=note_id)
+        except (LithosError, LCMAError):
+            logger.warning(
+                "inbox read_note failed for %s; replaying all profiles",
+                note_id,
+                exc_info=True,
+            )
+            return profiles
+        parsed = parse_note(str(note.get("content") or ""))
+        ingested = {entry.profile_name for entry in parse_profile_relevance(parsed)}
+        tags = note.get("tags") or []
+        suppressed = {
+            tag[len(_REJECTED_TAG_PREFIX) :]
+            for tag in tags
+            if isinstance(tag, str) and tag.startswith(_REJECTED_TAG_PREFIX)
+        }
+        excluded = ingested | suppressed
+        return [p for p in profiles if p.name not in excluded]
 
     @staticmethod
     def _build_per_profile(
@@ -622,6 +724,7 @@ class InboxTick:
         busy: list[str],
         dispatch_failed: dict[str, str],
         filter_errors: list[str],
+        cache_note_id: str | None = None,
     ) -> str:
         """Build the free-text outcome string (§7.1).
 
@@ -630,6 +733,8 @@ class InboxTick:
         and filter-errored.  Profiles that scored below threshold are not
         candidates and are excluded (they surface only in ``per_profile``).
         Filter failures (§5.5 / #196) are reported as ``X filter failed``.
+        When *cache_note_id* is set the item is a cache-hit replay (§6) and
+        the wording shifts to ``cache_hit: … added N profile entr…``.
         """
         total = len(dispatched) + len(busy) + len(dispatch_failed) + len(filter_errors)
         failed = [
@@ -647,15 +752,24 @@ class InboxTick:
         if filter_errors:
             issues.append(f"{', '.join(filter_errors)} filter failed")
 
+        tail = ("; " + "; ".join(issues)) if issues else ""
+        names = ", ".join(ingested_names)
+
+        if cache_note_id is not None:
+            prefix = f"cache_hit: existing note {cache_note_id}; "
+            if not ingested_names:
+                return prefix + f"no new profiles matched{tail}"
+            entry_word = "entry" if len(ingested_names) == 1 else "entries"
+            return (
+                prefix
+                + f"added {len(ingested_names)} profile {entry_word}: {names}{tail}"
+            )
+
         if not ingested_names:
             return f"not ingested ({'; '.join(issues) or 'no note written'})"
-
-        names = ", ".join(ingested_names)
         if not issues and len(ingested_names) == total:
             return f"ingested into {len(ingested_names)} profile(s): {names}"
-
-        head = f"ingested into {len(ingested_names)}/{total} profiles ({names})"
-        return head + ("; " + "; ".join(issues) if issues else "")
+        return f"ingested into {len(ingested_names)}/{total} profiles ({names}){tail}"
 
     async def _recover_note_id(
         self, client: LithosClient, source_url: str
