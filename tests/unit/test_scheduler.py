@@ -805,11 +805,11 @@ class TestSweepWriteErrorMarksReadinessDegraded:
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=_empty_neg_block,
             ),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=_empty_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook"),
@@ -876,11 +876,11 @@ class TestSweepWriteErrorMarksReadinessDegraded:
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=_empty_neg_block,
             ),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=_empty_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook"),
@@ -970,11 +970,11 @@ class TestScheduledFireInvokesRepairSweep:
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=empty_neg_block,
             ),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=empty_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook"),
@@ -1078,11 +1078,11 @@ class TestNegativeExampleMaxTitleCharsWired:
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=fake_neg_block,
             ),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=fake_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook"),
@@ -1370,7 +1370,7 @@ class TestManualRunDispatchesToRunModule:
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=_empty_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook"),
@@ -1478,7 +1478,7 @@ class TestBackfillRunDispatchesToRunModule:
             patch("influx.run.repair_sweep", side_effect=_run_sweep),
             patch("influx.run.LithosClient", return_value=_NoopClient()),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 side_effect=_empty_neg_block,
             ),
             patch("influx.service.post_run_webhook_hook", side_effect=_webhook),

@@ -225,7 +225,7 @@ async def _run_arxiv_scenario(meter: InfluxMeter, config: Any) -> None:
         ),
         patch("influx.run.LithosClient", return_value=mock_client),
         patch(
-            "influx.run.build_negative_examples_block",
+            "influx.feedback.build_negative_examples_block",
             new_callable=AsyncMock,
             return_value="",
         ),
@@ -413,7 +413,7 @@ class TestOtelDisabledZeroMetrics:
             ),
             patch("influx.run.LithosClient", return_value=mock_client),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 new_callable=AsyncMock,
                 return_value="",
             ),

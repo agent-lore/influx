@@ -1180,12 +1180,12 @@ class TestInfluxLithosWriteSpan:
                 patch("influx.run.LithosClient") as mock_client_cls,
                 patch("influx.run.LithosClient") as mock_client_cls_run,
                 patch(
-                    "influx.run.build_negative_examples_block",
+                    "influx.feedback.build_negative_examples_block",
                     new_callable=AsyncMock,
                     return_value="",
                 ),
                 patch(
-                    "influx.run.build_negative_examples_block",
+                    "influx.feedback.build_negative_examples_block",
                     new_callable=AsyncMock,
                     return_value="",
                 ),
@@ -1284,12 +1284,12 @@ class TestInfluxLithosWriteSpan:
             patch("influx.run.LithosClient") as mock_client_cls,
             patch("influx.run.LithosClient") as mock_client_cls_run,
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 new_callable=AsyncMock,
                 return_value="",
             ),
             patch(
-                "influx.run.build_negative_examples_block",
+                "influx.feedback.build_negative_examples_block",
                 new_callable=AsyncMock,
                 return_value="",
             ),

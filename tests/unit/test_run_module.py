@@ -249,7 +249,10 @@ async def test_run_execute_happy_path_returns_outcome() -> None:
     with (
         patch("influx.run.LithosClient", return_value=client),
         patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
-        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
         patch("influx.service.post_run_webhook_hook"),
     ):
         outcome = await Run(plan, deps).execute()
@@ -293,7 +296,10 @@ async def test_run_execute_retries_task_complete_after_reconnect() -> None:
     with (
         patch("influx.run.LithosClient", return_value=client),
         patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
-        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
         patch("influx.service.post_run_webhook_hook"),
     ):
         outcome = await Run(plan, deps).execute()
@@ -325,7 +331,10 @@ async def test_run_execute_suppresses_terminal_task_complete_failure_after_retry
     with (
         patch("influx.run.LithosClient", return_value=client),
         patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
-        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
         patch("influx.service.post_run_webhook_hook"),
     ):
         outcome = await Run(plan, deps).execute()
@@ -401,7 +410,10 @@ async def test_run_execute_clears_repair_latch_on_success() -> None:
     with (
         patch("influx.run.LithosClient", return_value=client),
         patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
-        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
         patch("influx.service.post_run_webhook_hook"),
     ):
         await Run(plan, deps).execute()
@@ -420,7 +432,10 @@ async def test_run_execute_skips_repair_for_backfill() -> None:
     with (
         patch("influx.run.LithosClient", return_value=client),
         patch("influx.run.repair_sweep", new=sweep_mock),
-        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
         patch("influx.service.post_run_webhook_hook"),
     ):
         await Run(plan, deps).execute()
@@ -480,7 +495,10 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
     with (
         patch("influx.run.LithosClient", return_value=mock_client),
         patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
-        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
         patch("influx.run.lcma_wire", new_callable=AsyncMock, return_value=[]) as wire,
         patch("influx.service.post_run_webhook_hook"),
     ):
@@ -564,7 +582,10 @@ async def test_run_execute_threads_tags_source_url_confidence_to_lithos_write() 
     with (
         patch("influx.run.LithosClient", return_value=mock_client),
         patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
-        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
         patch("influx.run.lcma_wire", new_callable=AsyncMock, return_value=[]),
         patch("influx.service.post_run_webhook_hook"),
     ):
@@ -669,7 +690,10 @@ async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
     with (
         patch("influx.run.LithosClient", return_value=mock_client),
         patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
-        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
         patch(
             "influx.run.lcma_wire",
             new_callable=AsyncMock,
@@ -743,7 +767,10 @@ async def test_run_execute_persists_unresolved_slug_collision_without_injected_l
     with (
         patch("influx.run.LithosClient", return_value=mock_client),
         patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
-        patch("influx.run.build_negative_examples_block", side_effect=_empty_neg_block),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
         patch("influx.service.post_run_webhook_hook"),
     ):
         outcome = await Run(plan, deps).execute()

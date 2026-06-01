@@ -12,7 +12,7 @@ import os
 import re
 import tomllib
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -30,6 +30,7 @@ __all__ = [
     "ExtractionConfig",
     "FeedbackConfig",
     "FilterTuningConfig",
+    "InboxConfig",
     "InfluxSectionConfig",
     "LithosConfig",
     "ModelSlotConfig",
@@ -96,6 +97,45 @@ class ScheduleConfig(BaseModel):
                 "schedule.initial_jitter_seconds and "
                 "schedule.inter_profile_gap_seconds must be non-negative"
             )
+        return v
+
+
+class InboxConfig(BaseModel):
+    """``[inbox]`` manual-submission inbox settings.
+
+    Opt-in (default ``enabled=False``) intake of agent-submitted URLs via
+    Lithos tasks tagged ``influx:inbox``.  See ``docs/plans/inbox.md``.
+    The task tag is a fixed protocol constant — not operator-tunable — so
+    it lives as a class attribute rather than a config field.
+    """
+
+    TASK_TAG: ClassVar[str] = "influx:inbox"
+
+    enabled: bool = False
+    poll_cron: str = "*/5 * * * *"
+    timezone: str = "UTC"
+    max_items_per_tick: int = 20
+    agent_id: str = "influx-inbox"
+
+    @field_validator("poll_cron")
+    @classmethod
+    def _valid_cron(cls, v: str) -> str:
+        # Fail fast at config-load time rather than at scheduler start.
+        from apscheduler.triggers.cron import CronTrigger
+
+        try:
+            CronTrigger.from_crontab(v)
+        except (ValueError, TypeError) as exc:
+            raise ConfigError(
+                f"inbox.poll_cron is not a valid cron expression: {v!r}"
+            ) from exc
+        return v
+
+    @field_validator("max_items_per_tick")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 1:
+            raise ConfigError("inbox.max_items_per_tick must be >= 1")
         return v
 
 
@@ -689,6 +729,7 @@ class AppConfig(BaseModel):
     feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
     repair: RepairConfig = Field(default_factory=RepairConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    inbox: InboxConfig = Field(default_factory=InboxConfig)
 
 
 # ══════════════════════════════════════════════════════════════════════

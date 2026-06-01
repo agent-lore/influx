@@ -28,6 +28,7 @@ from influx.coordinator import Coordinator, RunKind
 from influx.errors import ConfigError
 from influx.filter import make_default_arxiv_filter_scorer
 from influx.http_api import install_exception_handlers, router
+from influx.inbox import InboxTick
 from influx.lithos_client import LithosClient
 from influx.notifications import ProfileRunResult, dispatch_notifications
 from influx.probes import ProbeLoop
@@ -203,6 +204,20 @@ def create_app(
         )
         return provider, cache
 
+    run_ledger = RunLedger(Path(config.storage.state_dir))
+    run_ledger.abandon_active(reason="Influx process restarted")
+
+    # Inbox manual-submission orchestrator (docs/plans/inbox.md).  Wired
+    # unconditionally but only registered as a cron job when
+    # ``[inbox] enabled`` (see InfluxScheduler.start).  Shares the
+    # coordinator + probe loop + ledger with scheduled runs.
+    inbox_tick = InboxTick(
+        config=config,
+        coordinator=coordinator,
+        probe_loop=probe_loop,
+        ledger=run_ledger,
+    )
+
     scheduler = InfluxScheduler(
         config,
         coordinator,
@@ -211,10 +226,8 @@ def create_app(
         item_provider=item_provider,
         fetch_cache=fetch_cache,
         item_provider_factory=_scheduled_tick_provider_factory,
+        inbox_tick=inbox_tick,
     )
-
-    run_ledger = RunLedger(Path(config.storage.state_dir))
-    run_ledger.abandon_active(reason="Influx process restarted")
 
     app.state.config = config
     app.state.coordinator = coordinator

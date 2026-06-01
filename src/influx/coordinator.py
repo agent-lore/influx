@@ -20,6 +20,7 @@ class RunKind(Enum):
     SCHEDULED = "scheduled"
     MANUAL = "manual"
     BACKFILL = "backfill"
+    INBOX = "inbox"
 
 
 class ProfileBusyError(Exception):
