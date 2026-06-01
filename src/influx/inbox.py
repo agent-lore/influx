@@ -509,8 +509,9 @@ class InboxTick:
         per_profile = self._build_per_profile(
             scored_profiles, dispatched, busy, dispatch_failed, note_id
         )
+        filter_errors = [ps.name for ps in scored_profiles if ps.error]
         outcome_str = self._build_outcome_string(
-            ingested_names, dispatched, busy, dispatch_failed
+            ingested_names, dispatched, busy, dispatch_failed, filter_errors
         )
         metrics.inbox_items_processed().add(
             1, {"outcome": "ingested" if ingested_names else "error"}
@@ -620,35 +621,41 @@ class InboxTick:
         dispatched: dict[str, tuple[RunOutcome, str]],
         busy: list[str],
         dispatch_failed: dict[str, str],
+        filter_errors: list[str],
     ) -> str:
         """Build the free-text outcome string (§7.1).
 
-        ``total`` counts only profiles that cleared threshold (dispatched +
-        busy + dispatch-failed); profiles that never scored / scored below
-        threshold are not ingestion candidates and are excluded.
+        ``total`` counts profiles that were ingestion candidates or failed
+        being made into one — cleared-and-dispatched, busy, dispatch-failed,
+        and filter-errored.  Profiles that scored below threshold are not
+        candidates and are excluded (they surface only in ``per_profile``).
+        Filter failures (§5.5 / #196) are reported as ``X filter failed``.
         """
-        total = len(dispatched) + len(busy) + len(dispatch_failed)
+        total = len(dispatched) + len(busy) + len(dispatch_failed) + len(filter_errors)
         failed = [
             (name, (o.skip_reason or o.error or "no note written"))
             for name, (o, _rid) in dispatched.items()
             if o.ingested == 0
         ]
         failed += list(dispatch_failed.items())
+
+        issues: list[str] = []
+        if busy:
+            issues.append(f"{', '.join(busy)} profile_busy")
+        for name, reason in failed:
+            issues.append(f"{name} failed: {reason}")
+        if filter_errors:
+            issues.append(f"{', '.join(filter_errors)} filter failed")
+
         if not ingested_names:
-            details = "; ".join(f"{n}: {r}" for n, r in failed) or "no note written"
-            return f"not ingested ({details})"
+            return f"not ingested ({'; '.join(issues) or 'no note written'})"
 
         names = ", ".join(ingested_names)
-        if len(ingested_names) == total and not busy and not failed:
+        if not issues and len(ingested_names) == total:
             return f"ingested into {len(ingested_names)} profile(s): {names}"
 
         head = f"ingested into {len(ingested_names)}/{total} profiles ({names})"
-        tail: list[str] = []
-        if busy:
-            tail.append(f"{', '.join(busy)} profile_busy")
-        for name, reason in failed:
-            tail.append(f"{name} failed: {reason}")
-        return head + ("; " + "; ".join(tail) if tail else "")
+        return head + ("; " + "; ".join(issues) if issues else "")
 
     async def _recover_note_id(
         self, client: LithosClient, source_url: str

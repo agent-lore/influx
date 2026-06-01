@@ -523,7 +523,11 @@ async def test_filter_failure_isolated_to_one_profile() -> None:
         await _tick(client, config).execute()
 
     assert [c.args[0] for c in mock_dispatch.call_args_list] == ["a"]
-    assert client.completed[0]["outcome"] == "ingested into 1 profile(s): a"
+    # The filter failure is reported in the human outcome (#196), not just
+    # the structured payload.
+    assert client.completed[0]["outcome"] == (
+        "ingested into 1/2 profiles (a); b filter failed"
+    )
     per_profile = client.updated[0][1]["inbox_result"]["per_profile"]
     assert per_profile["b"] == {"ingested": False, "reason": "filter_error"}
 
