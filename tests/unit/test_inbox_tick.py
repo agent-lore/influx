@@ -295,6 +295,36 @@ async def test_circuit_open_skips_whole_tick() -> None:
     assert client.completed == []
 
 
+async def test_busy_profile_is_skipped_not_overlapped() -> None:
+    """When the profile lock is held, the dispatch is skipped (no overlap)."""
+    client = FakeClient(tasks=[_task()])
+    coordinator = Coordinator()
+    tick = InboxTick(
+        config=_make_config(),
+        coordinator=coordinator,
+        probe_loop=None,
+        ledger=None,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    )
+    # Hold the lock for the whole tick so dispatch hits ProfileBusyError.
+    async with coordinator.hold("alpha"):
+        with (
+            patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+            patch(
+                "influx.inbox.make_default_batch_scorer",
+                return_value=_scorer_returning(8),
+            ),
+            patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+            patch("influx.inbox.dispatch_profile") as mock_dispatch,
+        ):
+            await tick.execute()
+
+    # The Run is never dispatched while the profile is busy.
+    mock_dispatch.assert_not_called()
+    assert "profile_busy" in client.completed[0]["outcome"]
+    assert client.completed[0]["cited_nodes"] is None
+
+
 async def test_per_item_failure_isolation() -> None:
     """A crashing item does not prevent sibling items from completing."""
     client = FakeClient(

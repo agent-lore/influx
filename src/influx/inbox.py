@@ -15,8 +15,10 @@ ingestion pipeline.  See §5.3 of the plan.
 
 **Slice 1 scope.** This is the thin end-to-end happy path: one URL is
 scored against the *first* enabled profile only, and dispatched if it
-clears threshold.  Multi-profile fan-out (§5/§8), cache-hit replay (§6),
-and coordinator try-acquire-skip (§10) arrive in later slices.
+clears threshold.  The dispatch already holds the per-Profile coordinator
+lock (so inbox never overlaps a scheduled Run for the same profile);
+multi-profile fan-out (§5/§8), cache-hit replay (§6), and the richer §10
+try-acquire-skip reporting arrive in later slices.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from urllib.parse import urlparse
 
 from influx import metrics
 from influx.config import AppConfig, InboxConfig
-from influx.coordinator import Coordinator, RunKind
+from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.errors import LCMAError, LithosError
 from influx.feedback import build_filter_prompt
 from influx.filter import Filter, make_default_batch_scorer
@@ -205,9 +207,9 @@ class InboxTick:
     """
 
     config: AppConfig
-    # Reserved for slice 3 (§10 try-acquire-skip): per-Profile dispatches
-    # will be wrapped in ``coordinator.hold(profile)``.  Held now so the
-    # service wiring + construction shape is stable across slices.
+    # Shared per-Profile lock authority — each dispatch is wrapped in
+    # ``coordinator.hold(profile)`` so inbox Runs never overlap scheduled /
+    # manual / backfill Runs for the same profile (FR-SCHED-2/3).
     coordinator: Coordinator
     probe_loop: Any | None = None
     ledger: RunLedger | None = None
@@ -406,18 +408,45 @@ class InboxTick:
 
         scored = scored_list[0]
         run_id = uuid.uuid4().hex
-        outcome = await dispatch_profile(
-            profile_cfg.name,
-            scored=scored,
-            acquired=acquired,
-            source_tag=source_tag,
-            submitted_by=submitted_by,
-            title_hint=title_hint,
-            config=self.config,
-            probe_loop=self.probe_loop,
-            ledger=self.ledger,
-            run_id=run_id,
-        )
+        # Hold the per-Profile coordinator lock so an inbox dispatch never
+        # overlaps a scheduled / manual / backfill Run for the same profile
+        # (the service-wide "at most one Run per profile" invariant,
+        # FR-SCHED-2/3).  On contention skip this profile this tick and
+        # report it — the richer §10 try-acquire-skip reporting + cache-hit
+        # replay land in a later slice.
+        try:
+            async with self.coordinator.hold(profile_cfg.name):
+                outcome = await dispatch_profile(
+                    profile_cfg.name,
+                    scored=scored,
+                    acquired=acquired,
+                    source_tag=source_tag,
+                    submitted_by=submitted_by,
+                    title_hint=title_hint,
+                    config=self.config,
+                    probe_loop=self.probe_loop,
+                    ledger=self.ledger,
+                    run_id=run_id,
+                )
+        except ProfileBusyError:
+            metrics.inbox_items_processed().add(1, {"outcome": "profile_busy_skipped"})
+            return _ItemOutcome(
+                outcome=(
+                    f"profile_busy: {profile_cfg.name} already running; "
+                    "resubmit to retry"
+                ),
+                cited_nodes=[],
+                inbox_result={
+                    "source_url": acquired.source_url,
+                    "per_profile": {
+                        profile_cfg.name: {
+                            "score": scored.score,
+                            "ingested": False,
+                            "reason": "profile_busy",
+                        }
+                    },
+                },
+            )
 
         ingested = outcome.ingested > 0
         # Only recover the note id when a write actually happened — a skipped
