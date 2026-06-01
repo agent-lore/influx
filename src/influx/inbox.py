@@ -13,12 +13,13 @@ The per-Profile dispatch reuses the unchanged Run pipeline by *injecting*
 a single-item :data:`~influx.run.ItemProvider` — there is no parallel
 ingestion pipeline.  See §5.3 of the plan.
 
-**Slice 1 scope.** This is the thin end-to-end happy path: one URL is
-scored against the *first* enabled profile only, and dispatched if it
-clears threshold.  The dispatch already holds the per-Profile coordinator
-lock (so inbox never overlaps a scheduled Run for the same profile);
-multi-profile fan-out (§5/§8), cache-hit replay (§6), and the richer §10
-try-acquire-skip reporting arrive in later slices.
+**Scope.** A URL is scored against *every* enabled profile (§5/§8) and
+dispatched to each that clears its threshold, merging into one canonical
+note via the existing ``write_note`` path.  Each dispatch holds the
+per-Profile coordinator lock (so inbox never overlaps a scheduled Run for
+the same profile); when every clearing profile is busy the item is left
+for a later tick.  Cache-hit replay (§6) and the richer §10 reporting
+(cross-tick re-scoring of busy/skipped profiles) arrive in a later slice.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from influx.config import AppConfig, InboxConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.errors import LCMAError, LithosError
 from influx.feedback import build_filter_prompt
-from influx.filter import Filter, make_default_batch_scorer
+from influx.filter import make_default_batch_scorer
 from influx.lithos_client import LithosClient
 from influx.run import ItemProvider, RunOutcome, RunPlan
 from influx.run_service import RunService
@@ -194,6 +195,27 @@ class _ItemOutcome:
     outcome: str
     cited_nodes: list[str]
     inbox_result: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ProfileScore:
+    """One profile's filter result for an inbox item (pre-dispatch).
+
+    ``scored`` is the raw :class:`ScoredCandidate` from the filter model
+    (carrying the 1–10 score regardless of threshold), or ``None`` when the
+    model omitted the item.  ``error`` is ``True`` when the filter call
+    raised — kept distinct so a per-profile filter failure isolates to that
+    profile rather than sinking the whole item (§5.5).
+    """
+
+    name: str
+    threshold: int
+    scored: ScoredCandidate | None
+    error: bool
+
+    @property
+    def clears(self) -> bool:
+        return self.scored is not None and self.scored.score >= self.threshold
 
 
 @dataclass
@@ -357,33 +379,34 @@ class InboxTick:
         summary_hint: str | None,
         source_tag: str,
     ) -> _ItemOutcome | None:
-        """Acquire, score (first profile), dispatch, and report one item.
+        """Acquire once, score every enabled profile, fan out, and report.
 
-        Slice 1 scores only the first enabled profile.  Returns the per-item
-        outcome used to complete the task, or ``None`` to signal
-        skip-this-tick (profile busy) — the caller then leaves the task
-        un-completed so a later tick retries it.
+        Scores the item against all enabled profiles (in parallel, reusing
+        the single acquisition), dispatches a ``RunKind.INBOX`` Run for each
+        profile that clears its threshold (sequentially, so the first creates
+        the canonical note and the rest merge into it), and aggregates the
+        result.
+
+        Returns the per-item outcome used to complete the task, or ``None``
+        to signal skip-this-tick — used when *every* clearing profile is busy
+        (§5.5 / §10): the task is left un-completed so a later tick retries.
         """
         started = time.monotonic()
         profiles = self.config.profiles
-        if not profiles:
+        scorer = make_default_batch_scorer(self.config)
+        if not profiles or scorer is None:
             metrics.inbox_items_processed().add(1, {"outcome": "error"})
+            reason = "no_profiles" if not profiles else "no_filter_model"
             return _ItemOutcome(
-                outcome="error: no profiles configured",
+                outcome=f"error: {reason}",
                 cited_nodes=[],
-                inbox_result={"source_url": url, "error": "no_profiles"},
+                inbox_result={"source_url": url, "error": reason},
             )
 
-        # Acquire once (blocking download/extract → thread).
+        # Acquire once (blocking download/extract → thread); bytes + extracted
+        # text are reused across every per-profile filter + dispatch below.
         acquired = await asyncio.to_thread(
             acquire_inbox_bytes, url, config=self.config, summary_hint=summary_hint
-        )
-
-        profile_cfg = profiles[0]
-        scorer = make_default_batch_scorer(self.config)
-        filt = Filter(config=self.config, profile_cfg=profile_cfg, scorer=scorer)
-        filter_prompt = await build_filter_prompt(
-            self.config, client, profile=profile_cfg.name
         )
         candidate = Candidate(
             item_id=f"inbox-{acquired.url_hash}",
@@ -391,105 +414,241 @@ class InboxTick:
             abstract=acquired.summary,
             source_url=acquired.source_url,
         )
-        scored_list = await filt.score(
-            [candidate], filter_prompt=filter_prompt, source="inbox"
-        )
 
-        if not scored_list:
-            metrics.inbox_items_processed().add(1, {"outcome": "filtered_out"})
-            return _ItemOutcome(
-                outcome=(
-                    f"filtered out: below threshold "
-                    f"({profile_cfg.name} threshold {profile_cfg.thresholds.relevance})"
-                ),
-                cited_nodes=[],
-                inbox_result={
-                    "source_url": acquired.source_url,
-                    "per_profile": {
-                        profile_cfg.name: {
-                            "ingested": False,
-                            "reason": "below_threshold",
-                        }
-                    },
-                },
-            )
-
-        scored = scored_list[0]
-        run_id = uuid.uuid4().hex
-        # Hold the per-Profile coordinator lock so an inbox dispatch never
-        # overlaps a scheduled / manual / backfill Run for the same profile
-        # (the service-wide "at most one Run per profile" invariant,
-        # FR-SCHED-2/3).  On contention skip this profile this tick and
-        # report it — the richer §10 try-acquire-skip reporting + cache-hit
-        # replay land in a later slice.
-        try:
-            async with self.coordinator.hold(profile_cfg.name):
-                outcome = await dispatch_profile(
-                    profile_cfg.name,
-                    scored=scored,
-                    acquired=acquired,
-                    source_tag=source_tag,
-                    submitted_by=submitted_by,
-                    title_hint=title_hint,
-                    config=self.config,
-                    probe_loop=self.probe_loop,
-                    ledger=self.ledger,
-                    run_id=run_id,
+        # ── Filter fan-out: score every profile in parallel (§8) ──────
+        # Call the batch scorer directly (not Filter.score) so the raw
+        # per-profile score is available even below threshold — needed for
+        # the per_profile payload (§7.3) and the "top score K" outcome.
+        # Trade-off: inbox scoring does not emit the per-decision
+        # ``articles_filtered`` metric that Filter.score does (the inbox
+        # surfaces outcomes via ``inbox_items_processed`` instead).
+        async def _score(profile_cfg: Any) -> _ProfileScore:
+            threshold = profile_cfg.thresholds.relevance
+            try:
+                prompt = await build_filter_prompt(
+                    self.config, client, profile=profile_cfg.name
                 )
-        except ProfileBusyError:
-            # Skip this tick: leave the task un-completed so its claim lease
-            # expires and a later tick re-claims + retries (§5.5 / §10).  Do
-            # NOT terminally complete — that would drop the submission on a
-            # transient collision (no inbox-level auto-retry, §5.6).
+                scores = await scorer([candidate], profile_cfg.name, prompt)
+                return _ProfileScore(
+                    name=profile_cfg.name,
+                    threshold=threshold,
+                    scored=scores.get(candidate.item_id),
+                    error=False,
+                )
+            except Exception:  # noqa: BLE001 — per-profile filter isolation (§5.5)
+                logger.warning(
+                    "inbox filter failed for profile %s",
+                    profile_cfg.name,
+                    exc_info=True,
+                )
+                return _ProfileScore(
+                    name=profile_cfg.name, threshold=threshold, scored=None, error=True
+                )
+
+        # gather preserves config order; profile count is small (§17 leaves a
+        # tighter concurrency cap as a future tuning knob).
+        scored_profiles = list(await asyncio.gather(*(_score(p) for p in profiles)))
+        clearing = [ps for ps in scored_profiles if ps.clears]
+
+        if not clearing:
+            return self._filtered_out_outcome(acquired, scored_profiles, url)
+
+        # ── Per-(item, Profile) dispatch: sequential so the first write
+        # creates the canonical note and the rest merge into it ────────
+        dispatched: dict[str, tuple[RunOutcome, str]] = {}
+        busy: list[str] = []
+        dispatch_failed: dict[str, str] = {}
+        for ps in clearing:
+            if ps.scored is None:  # ps.clears guarantees this; defensive guard
+                continue
+            run_id = uuid.uuid4().hex
+            try:
+                async with self.coordinator.hold(ps.name):
+                    outcome = await dispatch_profile(
+                        ps.name,
+                        scored=ps.scored,
+                        acquired=acquired,
+                        source_tag=source_tag,
+                        submitted_by=submitted_by,
+                        title_hint=title_hint,
+                        config=self.config,
+                        probe_loop=self.probe_loop,
+                        ledger=self.ledger,
+                        run_id=run_id,
+                    )
+                dispatched[ps.name] = (outcome, run_id)
+            except ProfileBusyError:
+                busy.append(ps.name)
+                logger.info("inbox profile %s busy; skipping this tick", ps.name)
+            except Exception:  # noqa: BLE001 — per-profile dispatch isolation (§5.5)
+                # A dispatch failure for one profile must not abandon the item:
+                # the lock is already released, sibling profiles still run, and
+                # the item completes with a partial outcome.  Abandoning here
+                # would orphan an earlier profile's write and double its ledger
+                # entry on the retry.
+                logger.warning(
+                    "inbox dispatch failed for profile %s", ps.name, exc_info=True
+                )
+                dispatch_failed[ps.name] = "dispatch_error"
+
+        if not dispatched and not dispatch_failed:
+            # Every clearing profile was busy — skip this tick and let a later
+            # tick retry the whole item (§5.5 / §10); do NOT complete.
             metrics.inbox_items_processed().add(1, {"outcome": "profile_busy_skipped"})
-            logger.info(
-                "inbox profile %s busy; leaving task to retry on a later tick",
-                profile_cfg.name,
-            )
             return None
 
-        ingested = outcome.ingested > 0
-        # Only recover the note id when a write actually happened — a skipped
-        # or write-less run would otherwise attach a stale/missing lookup.
+        ingested_names = [
+            name for name, (o, _rid) in dispatched.items() if o.ingested > 0
+        ]
         note_id = (
             await self._recover_note_id(client, acquired.source_url)
-            if ingested
+            if ingested_names
             else None
         )
-        cited = [note_id] if note_id else []
-        elapsed_ms = int((time.monotonic() - started) * 1000)
 
-        per_profile: dict[str, Any] = {
-            profile_cfg.name: {
-                "score": scored.score,
-                "ingested": ingested,
-                "note_id": note_id,
-                "run_id": run_id,
-            }
-        }
-        inbox_result = {
-            "source_url": acquired.source_url,
-            "archive_path": acquired.archive_path,
-            "per_profile": per_profile,
-            "processing_time_ms": elapsed_ms,
-        }
-
-        if ingested:
-            metrics.inbox_items_processed().add(1, {"outcome": "ingested"})
-            outcome_str = f"ingested into 1 profile(s): {profile_cfg.name}"
-        elif outcome.skipped:
-            metrics.inbox_items_processed().add(1, {"outcome": "error"})
-            outcome_str = (
-                f"skipped ({profile_cfg.name}): {outcome.skip_reason or 'unknown'}"
-            )
-        else:
-            metrics.inbox_items_processed().add(1, {"outcome": "error"})
-            detail = outcome.error or "no note written"
-            outcome_str = f"not ingested ({profile_cfg.name}): {detail}"
+        per_profile = self._build_per_profile(
+            scored_profiles, dispatched, busy, dispatch_failed, note_id
+        )
+        outcome_str = self._build_outcome_string(
+            ingested_names, dispatched, busy, dispatch_failed
+        )
+        metrics.inbox_items_processed().add(
+            1, {"outcome": "ingested" if ingested_names else "error"}
+        )
 
         return _ItemOutcome(
-            outcome=outcome_str, cited_nodes=cited, inbox_result=inbox_result
+            outcome=outcome_str,
+            cited_nodes=[note_id] if note_id else [],
+            inbox_result={
+                "source_url": acquired.source_url,
+                "archive_path": acquired.archive_path,
+                "per_profile": per_profile,
+                "processing_time_ms": int((time.monotonic() - started) * 1000),
+            },
         )
+
+    def _filtered_out_outcome(
+        self,
+        acquired: InboxAcquisition,
+        scored_profiles: list[_ProfileScore],
+        url: str,
+    ) -> _ItemOutcome:
+        """Build the terminal outcome when no profile cleared threshold (§7.1)."""
+        metrics.inbox_items_processed().add(1, {"outcome": "filtered_out"})
+        # (score, name, threshold) for every profile the model scored.
+        scored = [
+            (ps.scored.score, ps.name, ps.threshold)
+            for ps in scored_profiles
+            if ps.scored is not None
+        ]
+        if scored:
+            top_score, top_name, top_threshold = max(scored)
+            outcome = (
+                f"filtered out: top score {top_score} ({top_name}) "
+                f"below threshold {top_threshold}"
+            )
+        else:
+            outcome = "filtered out: no profile scored the item"
+        return _ItemOutcome(
+            outcome=outcome,
+            cited_nodes=[],
+            inbox_result={
+                "source_url": acquired.source_url,
+                "archive_path": acquired.archive_path,
+                "per_profile": self._build_per_profile(
+                    scored_profiles, {}, [], {}, None
+                ),
+            },
+        )
+
+    @staticmethod
+    def _build_per_profile(
+        scored_profiles: list[_ProfileScore],
+        dispatched: dict[str, tuple[RunOutcome, str]],
+        busy: list[str],
+        dispatch_failed: dict[str, str],
+        note_id: str | None,
+    ) -> dict[str, Any]:
+        """Assemble the structured ``per_profile`` payload (§7.3)."""
+        per_profile: dict[str, Any] = {}
+        for ps in scored_profiles:
+            # score is present for every dispatched / busy / failed profile
+            # (all drawn from ``clearing``, which requires a non-None score).
+            score = ps.scored.score if ps.scored is not None else None
+            if ps.name in dispatched:
+                outcome, run_id = dispatched[ps.name]
+                ingested = outcome.ingested > 0
+                entry: dict[str, Any] = {
+                    "score": score,
+                    "ingested": ingested,
+                    "run_id": run_id,
+                }
+                if ingested:
+                    entry["note_id"] = note_id
+                else:
+                    entry["reason"] = (
+                        outcome.skip_reason or outcome.error or "not_ingested"
+                    )
+                per_profile[ps.name] = entry
+            elif ps.name in dispatch_failed:
+                per_profile[ps.name] = {
+                    "score": score,
+                    "ingested": False,
+                    "reason": dispatch_failed[ps.name],
+                }
+            elif ps.name in busy:
+                per_profile[ps.name] = {
+                    "score": score,
+                    "ingested": False,
+                    "reason": "profile_busy",
+                }
+            elif ps.error:
+                per_profile[ps.name] = {"ingested": False, "reason": "filter_error"}
+            elif ps.scored is None:
+                per_profile[ps.name] = {"ingested": False, "reason": "not_scored"}
+            else:
+                per_profile[ps.name] = {
+                    "score": score,
+                    "ingested": False,
+                    "reason": "below_threshold",
+                }
+        return per_profile
+
+    @staticmethod
+    def _build_outcome_string(
+        ingested_names: list[str],
+        dispatched: dict[str, tuple[RunOutcome, str]],
+        busy: list[str],
+        dispatch_failed: dict[str, str],
+    ) -> str:
+        """Build the free-text outcome string (§7.1).
+
+        ``total`` counts only profiles that cleared threshold (dispatched +
+        busy + dispatch-failed); profiles that never scored / scored below
+        threshold are not ingestion candidates and are excluded.
+        """
+        total = len(dispatched) + len(busy) + len(dispatch_failed)
+        failed = [
+            (name, (o.skip_reason or o.error or "no note written"))
+            for name, (o, _rid) in dispatched.items()
+            if o.ingested == 0
+        ]
+        failed += list(dispatch_failed.items())
+        if not ingested_names:
+            details = "; ".join(f"{n}: {r}" for n, r in failed) or "no note written"
+            return f"not ingested ({details})"
+
+        names = ", ".join(ingested_names)
+        if len(ingested_names) == total and not busy and not failed:
+            return f"ingested into {len(ingested_names)} profile(s): {names}"
+
+        head = f"ingested into {len(ingested_names)}/{total} profiles ({names})"
+        tail: list[str] = []
+        if busy:
+            tail.append(f"{', '.join(busy)} profile_busy")
+        for name, reason in failed:
+            tail.append(f"{name} failed: {reason}")
+        return head + ("; " + "; ".join(tail) if tail else "")
 
     async def _recover_note_id(
         self, client: LithosClient, source_url: str
