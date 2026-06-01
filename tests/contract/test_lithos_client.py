@@ -56,6 +56,9 @@ class FakeLithosServer:
         self.edge_upsert_responses: list[str] = []
         self.task_create_responses: list[str] = []
         self.task_complete_responses: list[str] = []
+        self.task_list_responses: list[str] = []
+        self.task_claim_responses: list[str] = []
+        self.task_update_responses: list[str] = []
         # When True, lithos_retrieve raises to simulate unknown_tool (FR-LCMA-6).
         self.raise_on_retrieve: bool = False
         self._register_tools()
@@ -72,6 +75,9 @@ class FakeLithosServer:
         edge_upsert_responses = self.edge_upsert_responses
         task_create_responses = self.task_create_responses
         task_complete_responses = self.task_complete_responses
+        task_list_responses = self.task_list_responses
+        task_claim_responses = self.task_claim_responses
+        task_update_responses = self.task_update_responses
         server_self = self  # capture for closures that need mutable flags
 
         @self._mcp.tool(name="lithos_ping")
@@ -268,16 +274,71 @@ class FakeLithosServer:
             task_id: str = "",
             agent: str = "",
             outcome: str | None = None,
+            cited_nodes: list[str] | None = None,
         ) -> str:
             calls.append(
                 (
                     "lithos_task_complete",
-                    {"task_id": task_id, "agent": agent, "outcome": outcome},
+                    {
+                        "task_id": task_id,
+                        "agent": agent,
+                        "outcome": outcome,
+                        "cited_nodes": cited_nodes,
+                    },
                 )
             )
             if task_complete_responses:
                 return task_complete_responses.pop(0)
             return _json.dumps({"status": "completed"})
+
+        @self._mcp.tool(name="lithos_task_list")
+        async def lithos_task_list(
+            agent: str | None = None,
+            status: str | None = None,
+            tags: list[str] | None = None,
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_task_list",
+                    {"agent": agent, "status": status, "tags": tags or []},
+                )
+            )
+            if task_list_responses:
+                return task_list_responses.pop(0)
+            return _json.dumps({"tasks": []})
+
+        @self._mcp.tool(name="lithos_task_claim")
+        async def lithos_task_claim(
+            task_id: str = "",
+            aspect: str = "",
+            agent: str = "",
+            ttl_minutes: int = 60,
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_task_claim",
+                    {"task_id": task_id, "aspect": aspect, "agent": agent},
+                )
+            )
+            if task_claim_responses:
+                return task_claim_responses.pop(0)
+            return _json.dumps({"success": True, "expires_at": "2099-01-01T00:00:00Z"})
+
+        @self._mcp.tool(name="lithos_task_update")
+        async def lithos_task_update(
+            task_id: str = "",
+            agent: str = "",
+            metadata: dict[str, Any] | None = None,
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_task_update",
+                    {"task_id": task_id, "agent": agent, "metadata": metadata or {}},
+                )
+            )
+            if task_update_responses:
+                return task_update_responses.pop(0)
+            return _json.dumps({"success": True, "message": "updated"})
 
     def start(self) -> None:
         app = self._mcp.sse_app()

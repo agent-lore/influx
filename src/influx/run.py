@@ -41,7 +41,7 @@ from typing import Any, Literal
 from influx import metrics
 from influx.config import AppConfig
 from influx.coordinator import RunKind
-from influx.feedback import build_negative_examples_block
+from influx.feedback import build_filter_prompt
 from influx.lcma_wiring import CascadeOutput, LcmaWiringDeps
 from influx.lcma_wiring import wire as lcma_wire
 from influx.lithos_client import LithosClient
@@ -372,25 +372,7 @@ async def _run_feedback_stage(
     config: AppConfig,
 ) -> tuple[FeedbackResult, StageDiagnostics]:
     """Stage 2 — feedback ingestion + filter prompt rendering."""
-    profile_cfg = next((p for p in config.profiles if p.name == plan.profile), None)
-    neg_block = await build_negative_examples_block(
-        client,
-        profile=plan.profile,
-        limit=config.feedback.negative_examples_per_profile,
-        max_title_chars=config.filter.negative_example_max_title_chars,
-    )
-    prompt_text = config.prompts.filter.text or ""
-    try:
-        filter_prompt = prompt_text.format(
-            profile_description=(
-                profile_cfg.description if profile_cfg else plan.profile
-            ),
-            negative_examples=neg_block,
-            min_score_in_results=config.filter.min_score_in_results,
-        )
-    except (KeyError, IndexError):
-        filter_prompt = prompt_text
-
+    filter_prompt = await build_filter_prompt(config, client, profile=plan.profile)
     return FeedbackResult(filter_prompt=filter_prompt), StageDiagnostics()
 
 

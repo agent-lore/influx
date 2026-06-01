@@ -177,10 +177,15 @@ class InfluxScheduler:
         probe_loop: Any | None = None,
         fetch_cache: Any | None = None,
         item_provider_factory: ItemProviderFactory | None = None,
+        inbox_tick: Any | None = None,
     ) -> None:
         self._config = config
         self._coordinator = coordinator
         self._scheduler = AsyncIOScheduler()
+        # Optional inbox-tick orchestrator (``influx.inbox.InboxTick``).
+        # When wired and ``[inbox] enabled``, a second cron job fires it on
+        # the inbox poll cadence, independent of the per-Profile tick.
+        self._inbox_tick = inbox_tick
         # Optional shared set for tracking in-flight scheduler fires so
         # that the service layer can await them within
         # ``schedule.shutdown_grace_seconds`` during graceful shutdown
@@ -239,6 +244,19 @@ class InfluxScheduler:
                 coalesce=True,
                 misfire_grace_time=self._config.schedule.misfire_grace_seconds,
             )
+        if self._config.inbox.enabled and self._inbox_tick is not None:
+            inbox_trigger = CronTrigger.from_crontab(
+                self._config.inbox.poll_cron,
+                timezone=self._config.inbox.timezone,
+            )
+            self._scheduler.add_job(
+                self._inbox_dispatch,
+                trigger=inbox_trigger,
+                id="influx-inbox-tick",
+                max_instances=_TICK_MAX_INSTANCES,
+                coalesce=True,
+                misfire_grace_time=self._config.schedule.misfire_grace_seconds,
+            )
         self._scheduler.start()
 
     def pause(self) -> None:
@@ -289,6 +307,25 @@ class InfluxScheduler:
         task = asyncio.create_task(
             self._fire_tick(provider=tick_provider, cache=tick_cache),
             name="influx-tick-fanout",
+        )
+        if self._active_tasks is not None:
+            self._active_tasks.add(task)
+            task.add_done_callback(self._active_tasks.discard)
+        return task
+
+    async def _inbox_dispatch(self) -> asyncio.Task[None]:
+        """Cron entrypoint for the inbox tick — spawn + return immediately.
+
+        Mirrors :meth:`_cron_dispatch`: the orchestrator runs as a tracked
+        background task so APScheduler's instance slot is never the gate on
+        a slow tick, and graceful shutdown can await it within the
+        shutdown grace window.
+        """
+        if self._inbox_tick is None:  # pragma: no cover — job only registered when set
+            raise RuntimeError("inbox dispatch fired without an inbox_tick wired")
+        task = asyncio.create_task(
+            self._inbox_tick.execute(),
+            name="influx-inbox-tick",
         )
         if self._active_tasks is not None:
             self._active_tasks.add(task)

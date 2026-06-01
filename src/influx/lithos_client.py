@@ -1675,11 +1675,19 @@ class LithosClient:
         task_id: str,
         agent: str,
         outcome: str | None = None,
+        cited_nodes: list[str] | None = None,
     ) -> mcp_types.CallToolResult:
-        """Call ``lithos_task_complete`` (FR-LCMA-5)."""
+        """Call ``lithos_task_complete`` (FR-LCMA-5).
+
+        ``cited_nodes`` (inbox, ``docs/plans/inbox.md`` §7.2) links the
+        task to the canonical note(s) the work produced.  Omitted from the
+        RPC when ``None`` so scheduled-run callers are unaffected.
+        """
         args: dict[str, Any] = {"task_id": task_id, "agent": agent}
         if outcome is not None:
             args["outcome"] = outcome
+        if cited_nodes is not None:
+            args["cited_nodes"] = cited_nodes
         return await self._call_lcma_tool("lithos_task_complete", args)
 
     async def task_complete_body(
@@ -1688,11 +1696,116 @@ class LithosClient:
         task_id: str,
         agent: str,
         outcome: str | None = None,
+        cited_nodes: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run ``task_complete`` and decode the JSON body."""
         return self._result_json_dict(
-            await self.task_complete(task_id=task_id, agent=agent, outcome=outcome),
+            await self.task_complete(
+                task_id=task_id,
+                agent=agent,
+                outcome=outcome,
+                cited_nodes=cited_nodes,
+            ),
             operation="task_complete",
+        )
+
+    async def task_list(
+        self,
+        *,
+        tags: list[str] | None = None,
+        status: str | None = None,
+        agent: str | None = None,
+    ) -> mcp_types.CallToolResult:
+        """Call ``lithos_task_list`` (inbox intake, ``docs/plans/inbox.md`` §4.1).
+
+        ``limit`` is enforced by the inbox tick (max-items-per-tick) rather
+        than the server — ``lithos_task_list`` has no ``limit`` parameter.
+        """
+        args: dict[str, Any] = {}
+        if tags is not None:
+            args["tags"] = tags
+        if status is not None:
+            args["status"] = status
+        if agent is not None:
+            args["agent"] = agent
+        return await self._call_lcma_tool("lithos_task_list", args)
+
+    async def task_list_body(
+        self,
+        *,
+        tags: list[str] | None = None,
+        status: str | None = None,
+        agent: str | None = None,
+    ) -> dict[str, Any]:
+        """Run ``task_list`` and decode the JSON body (``{"tasks": [...]}``)."""
+        return self._result_json_dict(
+            await self.task_list(tags=tags, status=status, agent=agent),
+            operation="task_list",
+        )
+
+    async def task_claim(
+        self,
+        *,
+        task_id: str,
+        agent: str,
+        aspect: str,
+        ttl_minutes: int = 60,
+    ) -> mcp_types.CallToolResult:
+        """Call ``lithos_task_claim`` (inbox intake, ``docs/plans/inbox.md`` §4.1)."""
+        return await self._call_lcma_tool(
+            "lithos_task_claim",
+            {
+                "task_id": task_id,
+                "aspect": aspect,
+                "agent": agent,
+                "ttl_minutes": ttl_minutes,
+            },
+        )
+
+    async def task_claim_body(
+        self,
+        *,
+        task_id: str,
+        agent: str,
+        aspect: str,
+        ttl_minutes: int = 60,
+    ) -> dict[str, Any]:
+        """Run ``task_claim`` and decode the body (``{"success", "expires_at"}``)."""
+        return self._result_json_dict(
+            await self.task_claim(
+                task_id=task_id, agent=agent, aspect=aspect, ttl_minutes=ttl_minutes
+            ),
+            operation="task_claim",
+        )
+
+    async def task_update(
+        self,
+        *,
+        task_id: str,
+        agent: str,
+        metadata: dict[str, Any],
+    ) -> mcp_types.CallToolResult:
+        """Call ``lithos_task_update`` (inbox intake, ``docs/plans/inbox.md`` §7.3).
+
+        Attaches the structured ``inbox_result`` payload before completion.
+        ``metadata`` is applied as an additive per-key merge by the server.
+        """
+        return await self._call_lcma_tool(
+            "lithos_task_update",
+            {"task_id": task_id, "agent": agent, "metadata": metadata},
+        )
+
+    async def task_update_body(
+        self,
+        *,
+        task_id: str,
+        agent: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run ``task_update`` and decode the JSON body (``{"success", "message"}``)."""
+        return self._result_json_dict(
+            await self.task_update(task_id=task_id, agent=agent, metadata=metadata),
+            operation="task_update",
         )
 
     async def call_tool(

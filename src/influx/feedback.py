@@ -11,6 +11,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from influx.config import AppConfig
     from influx.lithos_client import LithosClient
 
 logger = logging.getLogger(__name__)
@@ -98,3 +99,35 @@ async def build_negative_examples_block(
         limit=limit,
     )
     return format_negative_examples(titles, max_title_chars=max_title_chars)
+
+
+async def build_filter_prompt(
+    config: AppConfig,
+    client: LithosClient,
+    *,
+    profile: str,
+) -> str:
+    """Render the per-profile filter prompt (profile description +
+    negative-feedback examples + ``min_score_in_results``).
+
+    Shared by the Run's Stage-2 Feedback (``influx.run._run_feedback_stage``)
+    and the inbox tick (``influx.inbox``) so both filter against the same
+    prompt shape, including negative-feedback examples.  Falls back to the
+    raw template when the ``.format`` placeholders are absent.
+    """
+    profile_cfg = next((p for p in config.profiles if p.name == profile), None)
+    neg_block = await build_negative_examples_block(
+        client,
+        profile=profile,
+        limit=config.feedback.negative_examples_per_profile,
+        max_title_chars=config.filter.negative_example_max_title_chars,
+    )
+    prompt_text = config.prompts.filter.text or ""
+    try:
+        return prompt_text.format(
+            profile_description=(profile_cfg.description if profile_cfg else profile),
+            negative_examples=neg_block,
+            min_score_in_results=config.filter.min_score_in_results,
+        )
+    except (KeyError, IndexError):
+        return prompt_text

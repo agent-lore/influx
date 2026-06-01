@@ -55,6 +55,10 @@ __all__ = [
     "slug_collision_unresolved",
     "slug_collision_url_recovery",
     "empty_source_writes",
+    "inbox_tick_started",
+    "inbox_tasks_listed",
+    "inbox_tasks_claimed",
+    "inbox_items_processed",
     "source_acquisition_errors",
     "source_cooldown_skips",
     "summary_thin_drops",
@@ -70,6 +74,53 @@ def run_starts() -> Any:
     return get_meter().counter(
         "influx_run_starts_total",
         description="Number of influx runs started.",
+    )
+
+
+def inbox_tick_started() -> Any:
+    """Counter incremented once per inbox poll tick that runs.
+
+    No labels.  See ``docs/plans/inbox.md`` §13.5.
+    """
+    return get_meter().counter(
+        "influx_inbox_tick_started_total",
+        description="Number of inbox poll ticks started.",
+    )
+
+
+def inbox_tasks_listed() -> Any:
+    """Counter of InboxTasks returned by ``lithos_task_list`` per tick.
+
+    No labels.
+    """
+    return get_meter().counter(
+        "influx_inbox_tasks_listed_total",
+        description="InboxTasks returned by lithos_task_list across ticks.",
+    )
+
+
+def inbox_tasks_claimed() -> Any:
+    """Counter of InboxTasks successfully claimed for processing.
+
+    No labels.
+    """
+    return get_meter().counter(
+        "influx_inbox_tasks_claimed_total",
+        description="InboxTasks claimed by the inbox tick.",
+    )
+
+
+def inbox_items_processed() -> Any:
+    """Counter of inbox items processed, by terminal outcome.
+
+    Labels: ``outcome`` (``ingested`` | ``filtered_out`` | ``cache_hit`` |
+    ``profile_busy_skipped`` | ``error``).  Slice 1 emits ``ingested`` /
+    ``filtered_out`` / ``error``; ``cache_hit`` and ``profile_busy_skipped``
+    are reserved for the cache-hit-replay + coordinator-skip slices.
+    """
+    return get_meter().counter(
+        "influx_inbox_items_processed_total",
+        description="Inbox items processed, labelled by terminal outcome.",
     )
 
 
