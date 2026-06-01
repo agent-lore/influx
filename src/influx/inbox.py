@@ -424,6 +424,8 @@ class InboxTick:
             )
             if not candidate_profiles:
                 metrics.inbox_items_processed().add(1, {"outcome": "cache_hit"})
+                # Acquisition is skipped here, so ``archive_path`` is null —
+                # kept in the payload for a stable shape across all outcomes.
                 return _ItemOutcome(
                     outcome=(
                         f"cache_hit: existing note {cache_note_id}; "
@@ -432,9 +434,11 @@ class InboxTick:
                     cited_nodes=[cache_note_id],
                     inbox_result={
                         "source_url": source_url,
+                        "archive_path": None,
                         "cache_hit": True,
                         "note_id": cache_note_id,
                         "per_profile": {},
+                        "processing_time_ms": int((time.monotonic() - started) * 1000),
                     },
                 )
 

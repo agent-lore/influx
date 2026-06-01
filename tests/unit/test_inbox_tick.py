@@ -737,6 +737,11 @@ async def test_cache_hit_no_new_profiles_to_consider_skips_acquire() -> None:
         "cache_hit: existing note note-1; no new profiles to consider"
     )
     assert client.completed[0]["cited_nodes"] == ["note-1"]
+    # Stable inbox_result shape even when acquisition is skipped.
+    result = client.updated[0][1]["inbox_result"]
+    assert result["cache_hit"] is True
+    assert result["archive_path"] is None
+    assert "processing_time_ms" in result
 
 
 async def test_cache_hit_complement_scored_but_none_clear() -> None:
