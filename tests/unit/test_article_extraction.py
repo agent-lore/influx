@@ -303,6 +303,29 @@ class TestTitleRecovery:
     def test_none_when_no_title_present(self) -> None:
         assert _recover_html_title("<p>just a paragraph</p>") is None
 
+    def test_decodes_html_entities(self) -> None:
+        assert _recover_html_title("<title>AT&amp;T &lt;2025&gt;</title>") == (
+            "AT&T <2025>"
+        )
+
+    def test_og_title_content_before_property(self) -> None:
+        # WordPress/Ghost emit content= before property= — must still match.
+        html = '<meta content="Reversed Order" property="og:title">'
+        assert _recover_html_title(html) == "Reversed Order"
+
+    def test_og_title_name_attribute(self) -> None:
+        html = '<meta name="og:title" content="Via Name Attr">'
+        assert _recover_html_title(html) == "Via Name Attr"
+
+    def test_cdata_title_recovered(self) -> None:
+        html = "<title><![CDATA[CDATA Title & More]]></title>"
+        assert _recover_html_title(html) == "CDATA Title & More"
+
+    def test_strips_control_characters(self) -> None:
+        assert _recover_html_title("<title>\x00clean\x01 title\x7f</title>") == (
+            "clean title"
+        )
+
     def test_caps_overlong_title(self) -> None:
         html = f"<title>{'x' * 500}</title>"
         recovered = _recover_html_title(html)

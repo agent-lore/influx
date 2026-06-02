@@ -717,7 +717,13 @@ class InboxTick:
             item_id=f"inbox-{acquired.url_hash}",
             # Title preference (#210): submitter hint → recovered HTML title
             # → bare URL — so the filter scores a real title, not a raw URL.
-            title=title_hint or acquired.extracted_title or acquired.source_url,
+            # ``.strip()`` mirrors build_inbox_note_item so a whitespace-only
+            # hint doesn't win over a real recovered title.
+            title=(
+                (title_hint or "").strip()
+                or acquired.extracted_title
+                or acquired.source_url
+            ),
             abstract=acquired.summary,
             source_url=acquired.source_url,
         )

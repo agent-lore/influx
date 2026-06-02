@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from html import unescape
 from typing import Literal
 
 import trafilatura
@@ -27,25 +28,56 @@ __all__ = [
 # Title recovery (issue #210): prefer the document ``<title>``, then an
 # ``og:title`` meta tag, then the first ``<h1>``.  Regex-based to avoid a
 # heavier HTML-parse dependency; titles only feed the candidate/note title
-# slot, so best-effort recovery is acceptable.
+# slot, so best-effort recovery is acceptable.  All patterns use negated
+# character classes (linear-time; no catastrophic backtracking).
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-_OG_TITLE_RE = re.compile(
-    r"<meta[^>]+(?:property|name)=[\"']og:title[\"'][^>]+content=[\"'](.*?)[\"']",
-    re.IGNORECASE,
-)
 _H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
+# og:title via two passes (a single regex can't handle both attribute orders,
+# `content=` before or after `property=`): find each <meta> tag, keep the one
+# whose attrs name og:title, then pull its content value.
+_META_TAG_RE = re.compile(r"<meta\b([^>]*)>", re.IGNORECASE)
+_OG_TITLE_PROP_RE = re.compile(r"(?:property|name)=[\"']og:title[\"']", re.IGNORECASE)
+_META_CONTENT_RE = re.compile(r"content=[\"'](.*?)[\"']", re.IGNORECASE | re.DOTALL)
+_CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _TITLE_MAX_CHARS = 300
+
+
+def _og_title(html: str) -> str | None:
+    """Content of the first ``og:title`` meta tag (attribute-order agnostic)."""
+    for m in _META_TAG_RE.finditer(html):
+        attrs = m.group(1)
+        if _OG_TITLE_PROP_RE.search(attrs):
+            content = _META_CONTENT_RE.search(attrs)
+            if content:
+                return content.group(1)
+    return None
+
+
+def _clean_title(raw: str) -> str | None:
+    """Normalise a raw title fragment: CDATA, tags, entities, control chars."""
+    inner = _CDATA_RE.sub(r"\1", raw)
+    text = unescape(_clean_html_fragments(inner))
+    text = _CONTROL_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:_TITLE_MAX_CHARS] if text else None
 
 
 def _recover_html_title(html: str) -> str | None:
     """Best-effort document title from *html* (``<title>`` → og:title → h1)."""
-    for rx in (_TITLE_RE, _OG_TITLE_RE, _H1_RE):
-        m = rx.search(html)
-        if not m:
+    title_match = _TITLE_RE.search(html)
+    h1_match = _H1_RE.search(html)
+    raw_candidates = [
+        title_match.group(1) if title_match else None,
+        _og_title(html),
+        h1_match.group(1) if h1_match else None,
+    ]
+    for raw in raw_candidates:
+        if raw is None:
             continue
-        title = re.sub(r"\s+", " ", _clean_html_fragments(m.group(1))).strip()
-        if title:
-            return title[:_TITLE_MAX_CHARS]
+        cleaned = _clean_title(raw)
+        if cleaned:
+            return cleaned
     return None
 
 
