@@ -522,13 +522,13 @@ The metadata `kind` enum extends to accept `"pdf"`. New metadata fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `local_path` | string | Required when `kind="pdf"`. Absolute path on the Influx host filesystem; MUST resolve inside `[inbox] pdf_root`. |
+| `local_path` | string | Required when `kind="pdf"`. A path on the Influx host that MUST resolve inside `[inbox] pdf_root`. An absolute path is used as-is; a relative path is resolved **against `pdf_root`** (not the server's CWD), so `papers/foo.pdf` works regardless of where the service was started. |
 
 The `url` field becomes mutually exclusive with `local_path` based on `kind`. v1 submitters that send `kind="url"` are unaffected.
 
 ### 16.3 v2 path trust model
 
-A new `[inbox] pdf_root` config setting names a directory under which all submitted `local_path` values must resolve. Influx canonicalises (`Path(local_path).resolve()`) and rejects anything not under `pdf_root` with a terminal `outcome="error: path_not_in_pdf_root"`.
+A new `[inbox] pdf_root` config setting names a directory under which all submitted `local_path` values must resolve. A relative `local_path` is anchored to `pdf_root`; an absolute one is taken as-is. Influx canonicalises the result (`Path.resolve()`, which also collapses `..` and follows symlinks) and rejects anything not under `pdf_root` with a terminal `outcome="error: path_not_in_pdf_root"`.
 
 This mirrors the existing security posture (`security.allow_private_ips=false`, SSRF-guarded HTTP fetch) on the file-system side.
 

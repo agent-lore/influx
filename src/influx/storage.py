@@ -508,16 +508,22 @@ def archive_bytes(
 
 
 def resolve_within_root(path: str | Path, root: Path) -> Path:
-    """Resolve *path* and confirm it lives under *root*; else raise.
+    """Resolve *path* against *root* and confirm it lives under it; else raise.
 
-    Canonicalises both via :meth:`Path.resolve` (which follows symlinks,
-    so a symlink escaping *root* is caught) and checks containment with
-    :meth:`Path.is_relative_to`.  Returns the resolved path.  Does NOT
-    check existence — callers distinguish "outside root" from "missing
-    file" separately (inbox §16.3 vs §16.5).
+    A **relative** *path* is anchored to *root* (not the process CWD), so a
+    submitter can send ``papers/foo.pdf`` regardless of where the server was
+    started (inbox §16.3); an **absolute** *path* is used as-is.  Both are
+    canonicalised via :meth:`Path.resolve` (which follows symlinks, so a
+    symlink — or a ``..`` segment — escaping *root* is caught) and checked
+    with :meth:`Path.is_relative_to`.  Returns the resolved path.  Does NOT
+    check existence — callers distinguish "outside root" from "missing file"
+    separately (§16.3 vs §16.5).
     """
-    resolved = Path(path).expanduser().resolve()
     root_resolved = root.resolve()
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root_resolved / candidate
+    resolved = candidate.resolve()
     if not resolved.is_relative_to(root_resolved):
         raise ArchivePathError(
             f"Path {path} (resolved to {resolved}) escapes root {root_resolved}"
