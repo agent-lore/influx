@@ -36,8 +36,12 @@ _H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
 # `content=` before or after `property=`): find each <meta> tag, keep the one
 # whose attrs name og:title, then pull its content value.
 _META_TAG_RE = re.compile(r"<meta\b([^>]*)>", re.IGNORECASE)
-_OG_TITLE_PROP_RE = re.compile(r"(?:property|name)\s*=\s*[\"']og:title[\"']", re.IGNORECASE)
-_META_CONTENT_RE = re.compile(r"content\s*=\s*[\"'](.*?)[\"']", re.IGNORECASE | re.DOTALL)
+_OG_TITLE_PROP_RE = re.compile(
+    r"(?:property|name)\s*=\s*[\"']og:title[\"']", re.IGNORECASE
+)
+_META_CONTENT_RE = re.compile(
+    r"content\s*=\s*[\"'](.*?)[\"']", re.IGNORECASE | re.DOTALL
+)
 _CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _TITLE_MAX_CHARS = 300
