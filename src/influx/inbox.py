@@ -325,8 +325,11 @@ class InboxTick:
                 status.pending = len(all_tasks)
             tasks = all_tasks[: self.config.inbox.max_items_per_tick]
             # Record the full open backlog returned by task_list (not just the
-            # processed slice) so listed-minus-claimed reveals queue pressure
-            # (#212); the per-tick processed count is ``inbox_tasks_claimed``.
+            # processed slice) so queue pressure is observable (#212); the
+            # per-tick processed count is ``inbox_tasks_claimed``.  Both are
+            # monotonic counters — compare their per-tick *deltas*
+            # (e.g. ``increase(listed) - increase(claimed)`` over the poll
+            # window), not raw cumulative totals.
             metrics.inbox_tasks_listed().add(len(all_tasks))
 
             for task in tasks:

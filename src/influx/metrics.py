@@ -19,7 +19,11 @@ Label values are bounded by construction:
 * ``decision`` — ``"pass"`` / ``"drop"``.
 * ``kind`` — repair stage names or source-acquisition error kinds.
 * ``tier`` — ``"1"`` / ``"3"``.
-* ``outcome`` — ``"success"`` / ``"failure"`` / ``"degraded"``.
+* ``outcome`` — for run metrics, ``"success"`` / ``"failure"`` /
+  ``"degraded"``.  :func:`inbox_items_processed` reuses the ``outcome``
+  attribute name with a *distinct* bounded enum (see its docstring).
+* ``phase`` — inbox task-lifecycle stage: ``"list"`` / ``"claim"`` /
+  ``"update"`` / ``"complete"`` (:func:`inbox_task_call_failures`).
 
 Per-item identifiers (``run_id``, ``note_id``, ``arxiv_id``,
 ``source_url``, ``title``) are **not** label values for any instrument
