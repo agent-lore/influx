@@ -324,6 +324,14 @@ class TestResolveWithinRoot:
         with pytest.raises(ArchivePathError):
             resolve_within_root("../secret.pdf", root)
 
+    def test_home_expansion_path_rejected(self, tmp_path: Path) -> None:
+        # A ``~``-prefixed path expands to an absolute home dir outside the
+        # tmp pdf_root, so it is taken as absolute and rejected by containment.
+        root = tmp_path / "pdfs"
+        root.mkdir()
+        with pytest.raises(ArchivePathError):
+            resolve_within_root("~/outside.pdf", root)
+
     def test_path_outside_root_raises(self, tmp_path: Path) -> None:
         root = tmp_path / "pdfs"
         root.mkdir()
