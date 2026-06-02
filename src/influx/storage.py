@@ -29,7 +29,12 @@ from influx.archive_policy import (
 )
 from influx.config import StorageConfig
 from influx.errors import InfluxError, NetworkError
-from influx.http_client import ContentTypeFamily, guarded_fetch
+from influx.http_client import (
+    ContentTypeFamily,
+    FetchResult,
+    content_type_family,
+    guarded_fetch,
+)
 from influx.slugs import is_valid_slug
 from influx.source_kind import classify_source_kind
 
@@ -38,6 +43,7 @@ __all__ = [
     "ArchiveResult",
     "build_archive_path",
     "download_archive",
+    "download_archive_autodetect",
 ]
 
 _log = logging.getLogger(__name__)
@@ -166,6 +172,16 @@ class ArchiveResult:
     # Domain (host) of the URL the policy was applied against.
     # Convenience field so callers don't have to re-parse the URL.
     domain: str = ""
+    # Issue #200: the response Content-Type seen on the fetch (raw
+    # header, e.g. ``application/pdf; charset=...``) and its classified
+    # family (``"html"`` / ``"pdf"`` / …), plus the fetched bytes.
+    # Populated on a successful network fetch so callers can route
+    # extraction on the real content type and reuse the bytes without a
+    # second fetch.  Empty / ``None`` when no fetch happened (policy
+    # short-circuit) or on failure.
+    content_type: str = ""
+    content_type_family: str = ""
+    body: bytes | None = None
 
 
 # ── Archive download ────────────────────────────────────────────────
@@ -367,9 +383,37 @@ def download_archive(
             domain=domain,
         )
 
+    return _persist_archive_body(
+        fetched=result,
+        fs_path=fs_path,
+        rel_posix=rel_posix,
+        family=content_type_family(result.content_type),
+        policy_mode=policy.mode,
+        domain=domain,
+    )
+
+
+def _persist_archive_body(
+    *,
+    fetched: FetchResult,
+    fs_path: Path,
+    rel_posix: str,
+    family: ContentTypeFamily | None,
+    policy_mode: str,
+    domain: str,
+) -> ArchiveResult:
+    """Write a fetched response body to *fs_path* and build the result.
+
+    Shared by :func:`download_archive` and
+    :func:`download_archive_autodetect` so the archive-write step plus
+    the issue #200 body / content-type surfacing live in one place.  The
+    fetched bytes and content type are carried on the returned
+    :class:`ArchiveResult` even on a write failure, so a caller can still
+    extract from the in-memory bytes when the disk write fails.
+    """
     try:
         fs_path.parent.mkdir(parents=True, exist_ok=True)
-        fs_path.write_bytes(result.body)
+        fs_path.write_bytes(fetched.body)
     except OSError as exc:
         error = f"write: {exc}"
         _log.warning("Archive write failed for %s: %s", fs_path, exc)
@@ -378,8 +422,11 @@ def download_archive(
             rel_posix_path=None,
             error=error,
             failure_kind="write",
-            policy_mode=policy.mode,
+            policy_mode=policy_mode,
             domain=domain,
+            content_type=fetched.content_type,
+            content_type_family=family or "",
+            body=fetched.body,
         )
 
     return ArchiveResult(
@@ -387,6 +434,172 @@ def download_archive(
         rel_posix_path=rel_posix,
         error="",
         failure_kind="",
+        policy_mode=policy_mode,
+        domain=domain,
+        content_type=fetched.content_type,
+        content_type_family=family or "",
+        body=fetched.body,
+    )
+
+
+_DEFAULT_EXT_BY_FAMILY: dict[ContentTypeFamily, str] = {
+    "html": ".html",
+    "pdf": ".pdf",
+    "xml": ".xml",
+}
+
+
+def download_archive_autodetect(
+    *,
+    url: str,
+    archive_root: Path,
+    source: str,
+    item_id: str,
+    published_year: int,
+    published_month: int,
+    acceptable_families: tuple[ContentTypeFamily, ...] = ("html", "pdf"),
+    allow_private_ips: bool = False,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
+    policy_registry: ArchivePolicyRegistry | None = None,
+) -> ArchiveResult:
+    """Fetch a URL once and archive it, routing on the real Content-Type.
+
+    Unlike :func:`download_archive` — which is told the expected content
+    type and file extension up front — this fetches with **no**
+    content-type guard, classifies the response via
+    :func:`~influx.http_client.content_type_family`, derives the archive
+    extension from that family, and returns the fetched bytes on the
+    :class:`ArchiveResult` so the caller can extract without a second
+    fetch (issue #200).  Used by the inbox source, where a submitter
+    hands an arbitrary URL whose true type is only known after the fetch.
+
+    ``skip`` / ``unsupported`` domain policies short-circuit before any
+    network call, exactly as in :func:`download_archive`.  The issue
+    #160 non-HTML-source URL-shape short-circuit is intentionally *not*
+    applied here: routing happens on the actual response type, so a
+    URL-shape guard would be redundant and could wrongly reject a real
+    article served from a feed-shaped URL.
+
+    A response whose family is not in *acceptable_families* yields an
+    ``ok=False`` result with ``failure_kind="content_type_mismatch"``
+    but still carries ``content_type`` + ``body`` for the caller's
+    fallback and diagnostics.
+    """
+    if max_download_bytes is None or timeout_seconds is None:
+        _storage_defaults = StorageConfig()
+        if max_download_bytes is None:
+            max_download_bytes = _storage_defaults.max_download_bytes
+        if timeout_seconds is None:
+            timeout_seconds = _storage_defaults.download_timeout_seconds
+
+    registry = policy_registry if policy_registry is not None else default_registry()
+    policy = registry.policy_for(url)
+    domain = _domain_from_url(url)
+
+    if policy.mode in ("skip", "unsupported"):
+        note = policy.note or f"archive {policy.mode} by policy"
+        _log.info(
+            "archive download skipped (policy=%s) url=%s domain=%s note=%s",
+            policy.mode,
+            url,
+            domain,
+            policy.note,
+        )
+        failure_kind = "missing_by_policy" if policy.mode == "skip" else "unsupported"
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=f"{failure_kind}: {note}",
+            failure_kind=failure_kind,
+            policy_mode=policy.mode,
+            domain=domain,
+        )
+
+    try:
+        result = guarded_fetch(
+            url,
+            allow_private_ips=allow_private_ips,
+            max_download_bytes=max_download_bytes,
+            timeout_seconds=timeout_seconds,
+            expected_content_type=None,
+        )
+    except NetworkError as exc:
+        error = f"{exc.kind}: {exc}"
+        failure_kind = classify_failure_kind(error=error, policy_mode=policy.mode)
+        _log.warning(
+            "Archive download failed for %s: [%s] %s (failure_kind=%s "
+            "policy=%s domain=%s)",
+            url,
+            exc.kind,
+            exc,
+            failure_kind,
+            policy.mode,
+            domain,
+        )
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=error,
+            failure_kind=failure_kind,
+            policy_mode=policy.mode,
+            domain=domain,
+        )
+
+    if result.status_code >= 400:
+        msg = f"HTTP {result.status_code} for {url}"
+        failure_kind = classify_failure_kind(error=msg, policy_mode=policy.mode)
+        _log.warning(
+            "Archive download failed: %s (failure_kind=%s policy=%s domain=%s)",
+            msg,
+            failure_kind,
+            policy.mode,
+            domain,
+        )
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=msg,
+            failure_kind=failure_kind,
+            policy_mode=policy.mode,
+            domain=domain,
+            content_type=result.content_type,
+            body=result.body,
+        )
+
+    family = content_type_family(result.content_type)
+    if family is None or family not in acceptable_families:
+        msg = (
+            f"content_type_mismatch: {result.content_type!r} "
+            f"(family={family!r}) not in {acceptable_families}"
+        )
+        _log.info("archive autodetect content-type mismatch url=%s %s", url, msg)
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=msg,
+            failure_kind="content_type_mismatch",
+            policy_mode=policy.mode,
+            domain=domain,
+            content_type=result.content_type,
+            content_type_family=family or "",
+            body=result.body,
+        )
+
+    fs_path, rel_posix = build_archive_path(
+        archive_root=archive_root,
+        source=source,
+        item_id=item_id,
+        published_year=published_year,
+        published_month=published_month,
+        ext=_DEFAULT_EXT_BY_FAMILY[family],
+    )
+
+    return _persist_archive_body(
+        fetched=result,
+        fs_path=fs_path,
+        rel_posix=rel_posix,
+        family=family,
         policy_mode=policy.mode,
         domain=domain,
     )

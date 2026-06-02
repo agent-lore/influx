@@ -7,9 +7,15 @@ from unittest.mock import patch
 
 import pytest
 
+from influx.archive_policy import build_registry
 from influx.errors import NetworkError
 from influx.http_client import FetchResult
-from influx.storage import ArchivePathError, ArchiveResult, download_archive
+from influx.storage import (
+    ArchivePathError,
+    ArchiveResult,
+    download_archive,
+    download_archive_autodetect,
+)
 
 _URL = "https://arxiv.org/pdf/2601.12345"
 
@@ -255,3 +261,119 @@ class TestPathSafetyBeforeDownload:
         """Unsafe IDs are rejected before any network call."""
         with pytest.raises(ArchivePathError):
             _dl(tmp_path, item_id="../../etc/passwd")
+
+
+class TestSuccessResultCarriesBody:
+    """Issue #200: download_archive surfaces the fetched bytes + content type."""
+
+    @patch("influx.storage.guarded_fetch")
+    def test_success_carries_body_and_content_type(
+        self, mock_fetch: object, tmp_path: Path
+    ) -> None:
+        mock_fetch.return_value = _make_fetch_result()  # type: ignore[union-attr]
+        result = _dl(tmp_path)
+
+        assert result.ok is True
+        assert result.body == b"%PDF-1.4 sample"
+        assert result.content_type == "application/pdf"
+        assert result.content_type_family == "pdf"
+
+
+def _autodetect(
+    tmp_path: Path,
+    *,
+    url: str = "https://example.com/article",
+    item_id: str = "abc123",
+    source: str = "inbox",
+    **kwargs: object,
+) -> ArchiveResult:
+    return download_archive_autodetect(
+        url=url,
+        archive_root=tmp_path,
+        source=source,
+        item_id=item_id,
+        published_year=2026,
+        published_month=6,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+class TestDownloadArchiveAutodetect:
+    """Issue #200: fetch-once + route on the real response Content-Type."""
+
+    @patch("influx.storage.guarded_fetch")
+    def test_html_response_archives_as_html(
+        self, mock_fetch: object, tmp_path: Path
+    ) -> None:
+        mock_fetch.return_value = _make_fetch_result(  # type: ignore[union-attr]
+            body=b"<html>x</html>",
+            content_type="text/html; charset=utf-8",
+        )
+        result = _autodetect(tmp_path)
+
+        assert result.ok is True
+        assert result.rel_posix_path == "inbox/2026/06/abc123.html"
+        assert result.content_type_family == "html"
+        assert result.body == b"<html>x</html>"
+        assert (tmp_path / "inbox" / "2026" / "06" / "abc123.html").exists()
+
+    @patch("influx.storage.guarded_fetch")
+    def test_pdf_at_non_pdf_url_routes_on_content_type(
+        self, mock_fetch: object, tmp_path: Path
+    ) -> None:
+        """A PDF served from a non-.pdf URL archives as .pdf (AC-1)."""
+        mock_fetch.return_value = _make_fetch_result(  # type: ignore[union-attr]
+            body=b"%PDF-1.4 ok",
+            content_type="application/pdf",
+        )
+        result = _autodetect(tmp_path, url="https://example.com/download?doc=42")
+
+        assert result.ok is True
+        assert result.rel_posix_path == "inbox/2026/06/abc123.pdf"
+        assert result.content_type_family == "pdf"
+
+    @patch("influx.storage.guarded_fetch")
+    def test_unacceptable_type_is_content_type_mismatch(
+        self, mock_fetch: object, tmp_path: Path
+    ) -> None:
+        mock_fetch.return_value = _make_fetch_result(  # type: ignore[union-attr]
+            body=b"\x89PNG...",
+            content_type="image/png",
+        )
+        result = _autodetect(tmp_path)
+
+        assert result.ok is False
+        assert result.failure_kind == "content_type_mismatch"
+        assert result.rel_posix_path is None
+        # Body + content type are still carried for caller fallback.
+        assert result.content_type == "image/png"
+        assert result.body == b"\x89PNG..."
+        assert not (tmp_path / "inbox").exists()
+
+    @patch("influx.storage.guarded_fetch")
+    def test_http_4xx_returns_failure(self, mock_fetch: object, tmp_path: Path) -> None:
+        mock_fetch.return_value = _make_fetch_result(  # type: ignore[union-attr]
+            status_code=404, content_type="text/html"
+        )
+        result = _autodetect(tmp_path)
+
+        assert result.ok is False
+        assert "404" in result.error
+        assert result.rel_posix_path is None
+
+    def test_skip_policy_short_circuits_before_fetch(self, tmp_path: Path) -> None:
+        registry = build_registry(
+            skip={"blocked.example": "permanent skip"},
+            include_defaults=False,
+        )
+        with patch("influx.storage.guarded_fetch") as mock_fetch:
+            result = _autodetect(
+                tmp_path,
+                url="https://blocked.example/article",
+                policy_registry=registry,
+            )
+        mock_fetch.assert_not_called()
+        assert result.ok is False
+        assert result.failure_kind == "missing_by_policy"
+        assert result.policy_mode == "skip"
+        assert not (tmp_path / "inbox").exists()

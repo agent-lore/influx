@@ -43,7 +43,7 @@ from influx.archive_policy import (
 from influx.cascade import Acquired, Cascade
 from influx.coordinator import RunKind
 from influx.errors import ExtractionError, NetworkError
-from influx.extraction.article import extract_article
+from influx.extraction.article import extract_article, extract_article_from_html
 from influx.filter import FilterScorerError, _acall_filter_model_with_retry
 from influx.http_client import aguarded_fetch as _aguarded_fetch
 from influx.renderer import render
@@ -482,14 +482,29 @@ def build_rss_note_item(
     extracted_text: str | None = None
     summary = item.summary
     try:
-        extraction = extract_article(
-            item.url,
-            min_web_chars=config.extraction.min_web_chars,
-            strip_tags=config.extraction.strip_tags,
-            allow_private_ips=config.security.allow_private_ips,
-            max_download_bytes=config.storage.max_download_bytes,
-            timeout_seconds=config.storage.download_timeout_seconds,
-        )
+        if archive_result.ok and archive_result.body is not None:
+            # Issue #200: the archive download already fetched this exact
+            # URL's HTML — reuse those bytes for extraction instead of a
+            # redundant second fetch (same URL, same representation), so
+            # the archived artifact and the scored text never diverge.
+            extraction = extract_article_from_html(
+                archive_result.body.decode("utf-8", errors="replace"),
+                url=item.url,
+                min_web_chars=config.extraction.min_web_chars,
+                strip_tags=config.extraction.strip_tags,
+            )
+        else:
+            # No archived bytes (policy skip/block, non-HTML short-circuit,
+            # HTTP error, write failure, …) — fall back to a direct fetch
+            # so policy-skipped items still get an extraction attempt.
+            extraction = extract_article(
+                item.url,
+                min_web_chars=config.extraction.min_web_chars,
+                strip_tags=config.extraction.strip_tags,
+                allow_private_ips=config.security.allow_private_ips,
+                max_download_bytes=config.storage.max_download_bytes,
+                timeout_seconds=config.storage.download_timeout_seconds,
+            )
         summary = extraction.text
         extracted_text = extraction.text
     except (ExtractionError, NetworkError) as exc:
