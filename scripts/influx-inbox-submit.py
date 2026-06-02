@@ -34,10 +34,11 @@ from typing import Any
 
 _TASK_TAG = "influx:inbox"
 _SOURCE_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
-# An http(s) URL → kind="url".  Any other URI scheme (file:, ftp:, …) is a
-# URL-shaped value we reject as not-http; everything else is a local path.
+# An http(s) URL → kind="url".  Any other URI scheme (file:, ftp:, mailto:,
+# data:, …) on a value that is not an existing file is rejected as not-http;
+# everything else is treated as a local path.
 _HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
-_URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+_URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
 
 def _repo_root() -> Path:
@@ -137,10 +138,18 @@ def _stage_pdf_into_root(path: Path, pdf_root: Path, *, copy: bool) -> Path:
     root = pdf_root.resolve()
     if resolved.is_relative_to(root):
         return resolved
-    digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
-    dest = root / f"{digest[:16]}-{resolved.name}"
+    h = hashlib.sha256()
+    with resolved.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    dest = root / f"{h.hexdigest()[:16]}-{resolved.name}"
     if copy and not dest.exists():
-        shutil.copy2(resolved, dest)
+        # Atomic publish: copy to a temp sibling then rename, so an
+        # interrupted copy never leaves a partial file that a later run
+        # would skip (dest.exists()) and submit as a valid PDF.
+        tmp = dest.with_name(f".{dest.name}.tmp")
+        shutil.copy2(resolved, tmp)
+        os.replace(tmp, dest)
     return dest
 
 
@@ -221,20 +230,29 @@ def main(argv: list[str] | None = None) -> int:
     _apply_env_to_process(env)
 
     if _HTTP_RE.match(target):
+        from urllib.parse import urlparse
+
+        if not urlparse(target).netloc:
+            print(f"error: URL must have a host, got {target!r}", file=sys.stderr)
+            return 2
         kind = "url"
         metadata = _add_optional_metadata(
             args,
             {"kind": "url", "url": target, "submitted_by": args.submitted_by},
         )
         label = args.title or target
-    elif _URL_SCHEME_RE.match(target):
-        print(f"error: URL must be http(s), got {target!r}", file=sys.stderr)
-        return 2
     else:
         kind = "pdf"
         path = Path(target).expanduser()
         if not path.is_file():
-            print(f"error: PDF file not found: {target!r}", file=sys.stderr)
+            # A non-http URI scheme (file:, ftp:, mailto:, …) is a malformed
+            # URL, not a path; everything else is a missing/non-file path.
+            if path.exists():
+                print(f"error: not a regular file: {target!r}", file=sys.stderr)
+            elif _URI_SCHEME_RE.match(target):
+                print(f"error: URL must be http(s), got {target!r}", file=sys.stderr)
+            else:
+                print(f"error: PDF file not found: {target!r}", file=sys.stderr)
             return 2
         if not _looks_like_pdf(path):
             print(
@@ -250,9 +268,19 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        if not args.dry_run and not pdf_root.is_dir():
-            print(f"error: pdf_root is not a directory: {pdf_root}", file=sys.stderr)
-            return 2
+        if not pdf_root.is_dir():
+            if args.dry_run:
+                # Preview only — warn but still show the would-be local_path.
+                print(
+                    f"warning: pdf_root does not exist yet: {pdf_root}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"error: pdf_root is not a directory: {pdf_root}",
+                    file=sys.stderr,
+                )
+                return 2
         local_path = _stage_pdf_into_root(path, pdf_root, copy=not args.dry_run)
         metadata = _add_optional_metadata(
             args,

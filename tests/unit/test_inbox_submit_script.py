@@ -96,9 +96,33 @@ def test_non_http_url_scheme_rejected_before_mcp(
     assert "must be http" in capsys.readouterr().err
 
 
-def test_non_url_argument_rejected(capsys: pytest.CaptureFixture) -> None:
+def test_nonexistent_path_treated_as_pdf_and_rejected(
+    capsys: pytest.CaptureFixture,
+) -> None:
     rc = _SUBMIT.main(["not a url", "--dry-run"])
     assert rc == 2
+    assert "not found" in capsys.readouterr().err
+
+
+def test_http_url_without_host_rejected(capsys: pytest.CaptureFixture) -> None:
+    """Regression: a scheme-only https:// (no host) must not reach MCP."""
+    rc = _SUBMIT.main(["https://", "--dry-run"])
+    assert rc == 2
+    assert "host" in capsys.readouterr().err
+
+
+def test_mailto_scheme_rejected_as_non_http(capsys: pytest.CaptureFixture) -> None:
+    rc = _SUBMIT.main(["mailto:someone@example.com", "--dry-run"])
+    assert rc == 2
+    assert "must be http" in capsys.readouterr().err
+
+
+def test_directory_argument_rejected(
+    capsys: pytest.CaptureFixture, tmp_path: Path
+) -> None:
+    rc = _SUBMIT.main([str(tmp_path), "--dry-run"])
+    assert rc == 2
+    assert "not a regular file" in capsys.readouterr().err
 
 
 def test_invalid_source_tag_rejected(capsys: pytest.CaptureFixture) -> None:
