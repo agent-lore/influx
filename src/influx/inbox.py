@@ -590,7 +590,7 @@ class InboxTick:
             await self._complete_terminal(
                 client,
                 task_id,
-                outcome=f"file_missing: {local_path}",
+                outcome=f"error: file_read_error: {local_path}",
                 metric_outcome="pdf_rejected",
                 inbox_result={"local_path": local_path, "error": "file_read_error"},
             )
@@ -1099,7 +1099,10 @@ class InboxTick:
 
         Centralises the ``inbox_items_processed`` increment for the no-retry
         validation failures (invalid submission / source_tag / pdf rejection)
-        that otherwise never reached metrics.
+        that otherwise never reached metrics.  These are pre-flight rejections
+        (before acquisition/scoring), so the ``inbox_result`` payload
+        intentionally omits ``processing_time_ms`` — consumers should treat it
+        as optional and read it with ``.get``.
         """
         metrics.inbox_items_processed().add(1, {"outcome": metric_outcome})
         await self._complete(

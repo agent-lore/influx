@@ -131,7 +131,10 @@ def inbox_task_call_failures() -> Any:
 
     Labels: ``phase`` (``list`` | ``claim`` | ``update`` | ``complete``).
     Lets an operator distinguish "claims are failing" from "queue is backing
-    up" without log-spelunking.
+    up" without log-spelunking.  Severity differs by phase: ``update``
+    failures are non-fatal (the task still completes; only the structured
+    ``inbox_result`` metadata is lost), whereas ``complete`` failures leave the
+    task open for a later tick to re-claim.
     """
     return get_meter().counter(
         "influx_inbox_task_call_failures_total",

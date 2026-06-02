@@ -1071,7 +1071,8 @@ async def test_pdf_read_error_completes_terminally(tmp_path: Path) -> None:
     ):
         await _tick(client, config).execute()
     mock_dispatch.assert_not_called()
-    assert client.completed[0]["outcome"].startswith("file_missing:")
+    # A post-validation read failure is distinct from a truly missing file.
+    assert client.completed[0]["outcome"].startswith("error: file_read_error")
     assert client.updated[0][1]["inbox_result"]["error"] == "file_read_error"
 
 
@@ -1103,12 +1104,10 @@ async def test_invalid_kind_increments_items_processed() -> None:
 
 
 async def test_invalid_source_tag_increments_items_processed() -> None:
+    # The source_tag guard short-circuits before acquisition, so no
+    # acquire/dispatch patches are needed.
     client = FakeClient(tasks=[_task(source_tag="Not A Slug")])
-    with (
-        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
-        patch("influx.inbox.dispatch_profile"),
-        patch("influx.metrics.inbox_items_processed") as m,
-    ):
+    with patch("influx.metrics.inbox_items_processed") as m:
         await _tick(client).execute()
     assert "invalid_source_tag" in _outcomes(m)
 
