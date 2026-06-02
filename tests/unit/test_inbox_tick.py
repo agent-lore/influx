@@ -1006,6 +1006,35 @@ async def test_pdf_happy_path_ingests(tmp_path: Path) -> None:
     assert client.completed[0]["cited_nodes"] == ["note-pdf"]
 
 
+async def test_pdf_relative_local_path_resolves_against_pdf_root(
+    tmp_path: Path,
+) -> None:
+    """Regression #209: a relative local_path resolves under pdf_root, not CWD."""
+    pdf_root = tmp_path / "pdfs"
+    pdf_root.mkdir()
+    pdf = pdf_root / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 body")
+    config = _make_pdf_config(pdf_root, tmp_path / "archive")
+    # Submitter sends a path relative to pdf_root.
+    client = FakeClient(tasks=[_task_pdf(local_path="paper.pdf")], note_id="note-pdf")
+    with (
+        patch(
+            "influx.inbox.acquire_inbox_pdf", return_value=_pdf_acquisition()
+        ) as mock_acquire,
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_returning(8),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)),
+    ):
+        await _tick(client, config).execute()
+
+    mock_acquire.assert_called_once()
+    assert Path(mock_acquire.call_args.args[0]) == pdf.resolve()
+    assert "ingested into 1 profile(s): alpha" in client.completed[0]["outcome"]
+
+
 async def test_pdf_dedup_cache_hit_no_new_profiles(tmp_path: Path) -> None:
     """A re-submitted PDF whose note already lists the profile is a cache hit.
 

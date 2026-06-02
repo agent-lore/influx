@@ -309,6 +309,29 @@ class TestResolveWithinRoot:
         target.write_bytes(b"%PDF")
         assert resolve_within_root(target, root) == target.resolve()
 
+    def test_relative_path_anchored_to_root_not_cwd(self, tmp_path: Path) -> None:
+        # Regression #209: a relative path resolves against root, not the CWD.
+        root = tmp_path / "pdfs"
+        (root / "sub").mkdir(parents=True)
+        target = root / "sub" / "paper.pdf"
+        target.write_bytes(b"%PDF")
+        assert resolve_within_root("sub/paper.pdf", root) == target.resolve()
+
+    def test_relative_dotdot_escape_raises(self, tmp_path: Path) -> None:
+        root = tmp_path / "pdfs"
+        root.mkdir()
+        (tmp_path / "secret.pdf").write_bytes(b"%PDF")
+        with pytest.raises(ArchivePathError):
+            resolve_within_root("../secret.pdf", root)
+
+    def test_home_expansion_path_rejected(self, tmp_path: Path) -> None:
+        # A ``~``-prefixed path expands to an absolute home dir outside the
+        # tmp pdf_root, so it is taken as absolute and rejected by containment.
+        root = tmp_path / "pdfs"
+        root.mkdir()
+        with pytest.raises(ArchivePathError):
+            resolve_within_root("~/outside.pdf", root)
+
     def test_path_outside_root_raises(self, tmp_path: Path) -> None:
         root = tmp_path / "pdfs"
         root.mkdir()
