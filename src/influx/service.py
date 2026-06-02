@@ -28,7 +28,7 @@ from influx.coordinator import Coordinator, RunKind
 from influx.errors import ConfigError
 from influx.filter import make_default_arxiv_filter_scorer
 from influx.http_api import install_exception_handlers, router
-from influx.inbox import InboxTick
+from influx.inbox import InboxStatus, InboxTick
 from influx.lithos_client import LithosClient
 from influx.notifications import ProfileRunResult, dispatch_notifications
 from influx.probes import ProbeLoop
@@ -210,12 +210,15 @@ def create_app(
     # Inbox manual-submission orchestrator (docs/plans/inbox.md).  Wired
     # unconditionally but only registered as a cron job when
     # ``[inbox] enabled`` (see InfluxScheduler.start).  Shares the
-    # coordinator + probe loop + ledger with scheduled runs.
+    # coordinator + probe loop + ledger with scheduled runs.  ``inbox_status``
+    # is the shared snapshot the ``/status`` handler reads (FR-HTTP-7).
+    inbox_status = InboxStatus(enabled=config.inbox.enabled)
     inbox_tick = InboxTick(
         config=config,
         coordinator=coordinator,
         probe_loop=probe_loop,
         ledger=run_ledger,
+        status=inbox_status,
     )
 
     scheduler = InfluxScheduler(
@@ -237,6 +240,7 @@ def create_app(
     app.state.item_provider = item_provider
     app.state.fetch_cache = fetch_cache
     app.state.run_ledger = run_ledger
+    app.state.inbox_status = inbox_status
     app.state.close_lithos_probe_client = _close_lithos_probe_client
 
     return app

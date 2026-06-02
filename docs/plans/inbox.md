@@ -1,11 +1,11 @@
 # Influx Inbox — Manual Submission Pipeline
 
-Status: **Plan / Not Yet Implemented**
-Date: 2026-05-09
+Status: **v1 Shipped** (slices #195 fan-out groundwork → #198 operational surface)
+Date: 2026-05-09 (design) · v1 landed 2026-06
 
 Forward spec for a manual-submission pathway into the existing Influx ingestion pipeline. Submitting agents (e.g. daily-report agents) hand Influx a URL; Influx treats the item the way it treats RSS-discovered candidates — runs the same Filter, Cascade, Renderer, write, and LCMA wiring — except submitters don't pick a Profile.
 
-This document describes design decisions only. It is not yet reflected in code. `docs/SPECIFICATION.md` continues to describe what is actually shipped.
+v1 is implemented (default-off `[inbox]` block; opt in to enable). This document remains the design source of truth; `docs/SPECIFICATION.md` describes the shipped behaviour. v2 (local PDF, §16) is not yet implemented.
 
 **Scope:** v1 covers URL submission only. Local PDF support is a planned v2 addition; see §16 for the design that v2 will implement.
 
@@ -37,12 +37,12 @@ This document describes design decisions only. It is not yet reflected in code. 
 
 ## 2. Vocabulary additions
 
-These extend the vocabulary defined in `CONTEXT.md`. Once v1 lands, the `_(proposed)_` markers below should be dropped and the entries moved into `CONTEXT.md` proper.
+These extend the vocabulary defined in `CONTEXT.md`. v1 has landed (slices #195–#198); these entries are now also recorded in `CONTEXT.md` proper.
 
-**InboxTask** _(proposed)_:
+**InboxTask**:
 A Lithos task tagged `influx:inbox` carrying submission metadata. Created by external agents via `lithos_task_create`; consumed by Influx's inbox tick. Each task represents one candidate URL.
 
-**InboxTick** _(proposed)_:
+**InboxTick**:
 One execution of the inbox-tick scheduler entry. Claims pending InboxTasks, fans out per-(item, Profile) ingestion across enabled Profiles, dispatches each ingestion as a real single-Profile Run, and writes outcomes back via `lithos_task_complete`. NOT itself a `Run` — it is an orchestrator above the Run layer.
 
 **Submitter**:

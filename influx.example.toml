@@ -376,3 +376,18 @@ console_fallback = false
 service_name = "influx"
 # environment = "staging"        # usually supplied by env INFLUX_ENVIRONMENT
 export_interval_ms = 30000
+
+# ---------------------------------------------------------------------------
+# Inbox (manual submission) — docs/plans/inbox.md
+# ---------------------------------------------------------------------------
+# Opt-in intake of agent-submitted URLs via Lithos tasks tagged
+# "influx:inbox". Default-off: with [inbox] absent or enabled=false no
+# inbox-tick job is registered and behaviour is unchanged.
+
+[inbox]
+enabled = false                 # opt in to register the influx-inbox-tick job
+poll_cron = "*/5 * * * *"       # how often to poll for pending InboxTasks
+timezone = "UTC"
+max_items_per_tick = 20         # cap on items claimed+processed per tick
+agent_id = "influx-inbox"       # agent id used for task claim/update/complete
+# task_tag is the fixed protocol constant "influx:inbox" (not tunable)

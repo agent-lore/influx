@@ -197,7 +197,7 @@ The admin API is intended to bind to loopback by default. Non-loopback bind host
 
 - `GET /live`: always returns `200 {"live": true}` while the process is alive.
 - `GET /ready`: returns `200` when cached probes are ready, otherwise `503`.
-- `GET /status`: returns process status, readiness, version, dependency probe states, and per-profile scheduler, busy, and last-run state.
+- `GET /status`: returns process status, readiness, version, dependency probe states, and per-profile scheduler, busy, and last-run state. When the inbox is wired it also includes an `inbox` block (`enabled`, `pending`, `in_flight`, `last_tick_at`, `last_tick_outcome`) sourced from cached tick state — never a per-request `lithos_task_list` (§17).
 - `GET /runs/recent`: returns active runs and recent terminal run ledger entries. Query parameters are `limit` and `profile`.
 - `POST /runs`: accepts `{"profile": "<name>"}` or `{"all_profiles": true}`.
 - `POST /backfills`: accepts `{"profile": "<name>", "days": n}` or `{"profile": "<name>", "from": "...", "to": "..."}`; `all_profiles` is also supported.
@@ -593,7 +593,7 @@ Notification configuration:
   - `type`
   - `url`
   - `enabled`
-  - `notify_on`
+  - `notify_on` (`scheduled`, `manual`, `backfill`, `inbox`; webhooks opt in to inbox-run notifications by listing `inbox`)
   - `event_mode`
   - optional `min_score`
   - optional `auth_token_env`
@@ -774,3 +774,29 @@ Known warnings in the suite:
 7. RSS filtering requires a configured `models.filter` slot and provider; failed RSS filter batches are skipped.
 8. Source archives and Lithos notes can diverge when archive download fails; repair tags mark those notes for later recovery.
 9. All profiles share a single global cron expression. Within a tick they run sequentially in declared order, separated by `schedule.inter_profile_gap_seconds`, with an initial random jitter of `[0, schedule.initial_jitter_seconds]`. True per-profile cadence (different cron expressions per profile) is not yet supported; tracked separately under issue #90.
+
+## 17. Inbox (Manual Submission)
+
+Opt-in pathway for external agents to submit candidate URLs into the existing ingestion pipeline. Design source of truth: `docs/plans/inbox.md`. Default-off — with `[inbox]` absent or `enabled = false`, no inbox-tick job is registered and behaviour is unchanged.
+
+### 17.1 Submission
+
+A submitter creates a Lithos task tagged `influx:inbox` (via `lithos_task_create`) with metadata `{kind: "url", url, submitted_by, optional title/summary/source_tag}`. The `scripts/influx-inbox-submit.py` helper builds and creates this task (URL-only in v1; a public PDF URL works). No HTTP intake endpoint and no Profile selection — multi-profile fan-out is the model.
+
+### 17.2 InboxTick
+
+A dedicated scheduler job (`influx-inbox-tick`, cadence `[inbox] poll_cron`) runs the tick when `enabled`. Each tick: lists open InboxTasks (capped at `max_items_per_tick`), claims each (aspect `ingest`, `agent_id`), and per item: acquires the URL once into `archive_root/inbox/YYYY/MM/<url_hash>`, scores it against every enabled Profile, and dispatches a real single-Profile `RunKind.INBOX` Run for each Profile that clears its `relevance` threshold. The first dispatch creates the canonical note; the rest merge their `## Profile Relevance` entry into it. The tick is not a Run — it never writes a ledger entry for itself; each per-(item, Profile) dispatch is an ordinary single-Profile Run with `kind="inbox"`.
+
+Each dispatch holds the per-Profile coordinator lock, so an inbox Run never overlaps a scheduled/manual/backfill Run for the same Profile. A busy Profile is skipped for the tick; if every clearing Profile is busy the task is left un-completed for a later tick. A per-Profile filter or dispatch failure is isolated and reported in the outcome; it does not sink the item.
+
+### 17.3 Cache-hit replay
+
+A resubmitted URL is detected by `lithos_cache_lookup`; the tick reads the existing note and re-scores only the complement — enabled Profiles minus those already in `## Profile Relevance` minus operator-suppressed (`influx:rejected:<profile>`). This is also how a Profile skipped on an earlier tick (e.g. busy) is eventually ingested. There is no persisted filter-rejection memory: a previously below-threshold Profile is re-scored on resubmission. Cache-hit replay is best-effort — a read/parse failure falls back to replaying all Profiles (the write merge dedupes).
+
+### 17.4 Outcomes and observability
+
+Each task is completed with a free-text outcome (`ingested into N profile(s): …`, `cache_hit: …`, `filtered out: top score K …`, partial `… ; X profile_busy / X filter failed`) plus `cited_nodes` (the canonical note id) and a structured `inbox_result` (`per_profile` scores/ingested/run_id, `source_url`, `archive_path`, `processing_time_ms`). Metrics: `influx_inbox_tick_started_total`, `influx_inbox_tasks_listed_total`, `influx_inbox_tasks_claimed_total`, and `influx_inbox_items_processed_total{outcome}`; per-(item, Profile) Runs also carry `run_type="inbox"` on the standard run metrics. The `/status` `inbox` block (§5.2) surfaces tick state from cache.
+
+### 17.5 v1 constraints
+
+URL-only (local PDF is the planned v2, `docs/plans/inbox.md` §16). PDF vs HTML extraction is currently chosen by URL shape, not the response Content-Type (tracked as a follow-up). The inbox-tick scheduler/coordinator is in-process (the same multi-process caveat as scheduled runs).
