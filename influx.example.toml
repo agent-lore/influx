@@ -391,3 +391,7 @@ timezone = "UTC"
 max_items_per_tick = 20         # cap on items claimed+processed per tick
 agent_id = "influx-inbox"       # agent id used for task claim/update/complete
 # task_tag is the fixed protocol constant "influx:inbox" (not tunable)
+# Local-PDF intake (v2): root directory under which submitted kind="pdf"
+# local_path values must resolve. Unset (the default) disables local-PDF
+# submissions — such tasks complete with "error: pdf_root_not_configured".
+# pdf_root = "/inbox-pdfs"

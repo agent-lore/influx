@@ -15,16 +15,19 @@ scorer, ``build_filter_prompt``, ``dispatch_profile``):
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from influx.config import (
     AppConfig,
+    InboxConfig,
     LithosConfig,
     ProfileConfig,
     ProfileThresholds,
     PromptEntryConfig,
     PromptsConfig,
+    StorageConfig,
 )
 from influx.coordinator import Coordinator
 from influx.inbox import InboxTick, _extract_note_id
@@ -868,3 +871,167 @@ async def test_status_records_success_and_pending() -> None:
     assert status.last_tick_outcome == "success"
     assert status.pending == 2
     assert status.in_flight == 0  # balanced after the tick
+
+
+# ── v2 local-PDF tick path (docs/plans/inbox.md §16) ─────────────────
+
+
+def _make_pdf_config(
+    pdf_root: Path,
+    archive_dir: Path,
+    profiles: list[tuple[str, int]] | None = None,
+) -> AppConfig:
+    specs = profiles if profiles is not None else [("alpha", 7)]
+    return AppConfig(
+        lithos=LithosConfig(url="http://localhost:0/sse"),
+        storage=StorageConfig(archive_dir=str(archive_dir)),
+        inbox=InboxConfig(pdf_root=str(pdf_root)),
+        profiles=[
+            ProfileConfig(
+                name=name,
+                description=f"{name} profile",
+                thresholds=ProfileThresholds(relevance=threshold),
+            )
+            for name, threshold in specs
+        ],
+        prompts=PromptsConfig(
+            filter=PromptEntryConfig(text="x"),
+            tier1_enrich=PromptEntryConfig(text="x"),
+            tier3_extract=PromptEntryConfig(text="x"),
+        ),
+    )
+
+
+def _task_pdf(
+    *,
+    local_path: str,
+    task_id: str = "task-1",
+    source_tag: str | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "kind": "pdf",
+        "submitted_by": "agent:test",
+        "local_path": local_path,
+    }
+    if source_tag is not None:
+        metadata["source_tag"] = source_tag
+    return {"id": task_id, "metadata": metadata}
+
+
+def _pdf_acquisition() -> InboxAcquisition:
+    return InboxAcquisition(
+        source_url="inbox-pdf:sha256:deadbeef",
+        url_hash="deadbeef",
+        archive_path="inbox-pdf/2026/06/deadbeef.pdf",
+        archive_missing=False,
+        extracted_text="pdf body text",
+        summary="pdf body text",
+        text_flavour="pdf",
+    )
+
+
+async def test_pdf_without_local_path_completes_with_error() -> None:
+    client = FakeClient(tasks=[{"id": "t", "metadata": {"kind": "pdf"}}])
+    with patch("influx.inbox.dispatch_profile") as mock_dispatch:
+        await _tick(client).execute()
+    mock_dispatch.assert_not_called()
+    assert "invalid submission" in client.completed[0]["outcome"]
+
+
+async def test_pdf_root_not_configured_completes_terminally() -> None:
+    # Default _make_config leaves pdf_root unset.
+    client = FakeClient(tasks=[_task_pdf(local_path="/somewhere/paper.pdf")])
+    with patch("influx.inbox.dispatch_profile") as mock_dispatch:
+        await _tick(client).execute()
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"] == "error: pdf_root_not_configured"
+
+
+async def test_pdf_path_outside_pdf_root_rejected(tmp_path: Path) -> None:
+    pdf_root = tmp_path / "pdfs"
+    pdf_root.mkdir()
+    outside = tmp_path / "secret.pdf"
+    outside.write_bytes(b"%PDF")
+    config = _make_pdf_config(pdf_root, tmp_path / "archive")
+    client = FakeClient(tasks=[_task_pdf(local_path=str(outside))])
+    with patch("influx.inbox.dispatch_profile") as mock_dispatch:
+        await _tick(client, config).execute()
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"] == "error: path_not_in_pdf_root"
+
+
+async def test_pdf_file_missing_completes_terminally(tmp_path: Path) -> None:
+    pdf_root = tmp_path / "pdfs"
+    pdf_root.mkdir()
+    missing = pdf_root / "missing.pdf"
+    config = _make_pdf_config(pdf_root, tmp_path / "archive")
+    client = FakeClient(tasks=[_task_pdf(local_path=str(missing))])
+    with patch("influx.inbox.dispatch_profile") as mock_dispatch:
+        await _tick(client, config).execute()
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"].startswith("file_missing:")
+
+
+async def test_pdf_happy_path_ingests(tmp_path: Path) -> None:
+    pdf_root = tmp_path / "pdfs"
+    pdf_root.mkdir()
+    pdf = pdf_root / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 body")
+    config = _make_pdf_config(pdf_root, tmp_path / "archive")
+    client = FakeClient(tasks=[_task_pdf(local_path=str(pdf))], note_id="note-pdf")
+    with (
+        patch(
+            "influx.inbox.acquire_inbox_pdf", return_value=_pdf_acquisition()
+        ) as mock_acquire,
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_returning(8),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch(
+            "influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)
+        ) as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+
+    mock_acquire.assert_called_once()
+    # The resolved (absolute) path inside pdf_root was handed to acquisition.
+    assert Path(mock_acquire.call_args.args[0]) == pdf.resolve()
+    mock_dispatch.assert_called_once()
+    assert "ingested into 1 profile(s): alpha" in client.completed[0]["outcome"]
+    assert client.completed[0]["cited_nodes"] == ["note-pdf"]
+
+
+async def test_pdf_dedup_cache_hit_no_new_profiles(tmp_path: Path) -> None:
+    """A re-submitted PDF whose note already lists the profile is a cache hit.
+
+    Unlike the URL path, acquisition still runs (the synthetic source_url is
+    only known after hashing), but no new dispatch happens (§16.4).
+    """
+    pdf_root = tmp_path / "pdfs"
+    pdf_root.mkdir()
+    pdf = pdf_root / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 body")
+    config = _make_pdf_config(pdf_root, tmp_path / "archive")
+    client = FakeClient(
+        tasks=[_task_pdf(local_path=str(pdf))],
+        existing_note_id="note-1",
+        existing_note={"content": _note_content(["alpha"]), "tags": []},
+    )
+    with (
+        patch(
+            "influx.inbox.acquire_inbox_pdf", return_value=_pdf_acquisition()
+        ) as mock_acquire,
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({}),
+        ),
+        patch("influx.inbox.dispatch_profile") as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+
+    mock_acquire.assert_called_once()  # PDF acquires before the cache lookup
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"] == (
+        "cache_hit: existing note note-1; no new profiles to consider"
+    )

@@ -178,3 +178,76 @@ def test_fanout_produces_one_inbox_ledger_entry_per_clearing_profile(
     inbox_complete = [c for c in complete_calls if c["agent"] == "influx-inbox"]
     assert len(inbox_complete) == 1
     assert "ingested into 3 profile(s)" in inbox_complete[0]["outcome"]
+
+
+def test_local_pdf_fanout_with_synthetic_source_url(
+    fake_lithos: FakeLithosServer,
+    fake_lithos_url: str,
+    tmp_path: Path,
+) -> None:
+    """A local PDF fans out to N profiles; the synthetic inbox-pdf:sha256:
+    source URL flows through real writes + ledger (Inbox v2 §16)."""
+    import hashlib
+
+    pdf_root = tmp_path / "pdfs"
+    pdf_root.mkdir()
+    pdf_bytes = b"%PDF-1.4 a local research paper body"
+    pdf_path = pdf_root / "paper.pdf"
+    pdf_path.write_bytes(pdf_bytes)
+    sha = hashlib.sha256(pdf_bytes).hexdigest()
+
+    config = _make_config(fake_lithos_url)
+    config = config.model_copy(
+        update={"inbox": config.inbox.model_copy(update={"pdf_root": str(pdf_root)})}
+    )
+    config.storage.archive_dir = str(tmp_path / "archive")
+    ledger = RunLedger(tmp_path)
+    fake_lithos.task_list_responses.append(
+        '{"tasks": [{"id": "task-pdf", "metadata": '
+        '{"kind": "pdf", "local_path": "'
+        + str(pdf_path)
+        + '", "submitted_by": "agent:test"}}]}'
+    )
+
+    tick = InboxTick(
+        config=config,
+        coordinator=Coordinator(),
+        probe_loop=None,
+        ledger=ledger,
+        client_factory=lambda: LithosClient(url=fake_lithos_url),
+    )
+
+    # Real acquire_inbox_pdf (real sha256 + archive copy); only the PDF text
+    # extraction and the filter scorer are stubbed.
+    class _Extraction:
+        text = "A sufficiently long extracted PDF body to clear thin checks."
+
+    with (
+        patch("influx.sources.inbox.extract_pdf", return_value=_Extraction()),
+        patch(
+            "influx.inbox.make_default_batch_scorer", return_value=_clearing_scorer()
+        ),
+    ):
+        asyncio.run(tick.execute())
+
+    recent = ledger.recent(limit=10)
+    assert len(recent) == 3
+    assert {e["kind"] for e in recent} == {"inbox"}
+
+    writes = _calls(fake_lithos, "lithos_write")
+    assert len(writes) == 3
+    # The synthetic content-hash source URL reached the real write layer.
+    assert all(w["source_url"] == f"inbox-pdf:sha256:{sha}" for w in writes)
+
+    # The PDF was archive-copied under the inbox-pdf subtree by content hash.
+    archived = list((tmp_path / "archive" / "inbox-pdf").rglob(f"{sha}.pdf"))
+    assert len(archived) == 1
+    assert archived[0].read_bytes() == pdf_bytes
+
+    inbox_complete = [
+        c
+        for c in _calls(fake_lithos, "lithos_task_complete")
+        if c["agent"] == "influx-inbox"
+    ]
+    assert len(inbox_complete) == 1
+    assert "ingested into 3 profile(s)" in inbox_complete[0]["outcome"]

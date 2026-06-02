@@ -13,8 +13,10 @@ from influx.http_client import FetchResult
 from influx.storage import (
     ArchivePathError,
     ArchiveResult,
+    archive_bytes,
     download_archive,
     download_archive_autodetect,
+    resolve_within_root,
 )
 
 _URL = "https://arxiv.org/pdf/2601.12345"
@@ -261,6 +263,76 @@ class TestPathSafetyBeforeDownload:
         """Unsafe IDs are rejected before any network call."""
         with pytest.raises(ArchivePathError):
             _dl(tmp_path, item_id="../../etc/passwd")
+
+
+class TestArchiveBytes:
+    """archive_bytes writes in-memory bytes without any network fetch (#205)."""
+
+    def test_writes_and_returns_success(self, tmp_path: Path) -> None:
+        result = archive_bytes(
+            body=b"%PDF-1.4 local",
+            archive_root=tmp_path,
+            source="inbox-pdf",
+            item_id="a" * 64,
+            published_year=2026,
+            published_month=6,
+            ext=".pdf",
+            content_type="application/pdf",
+            content_type_family="pdf",
+        )
+        assert result.ok is True
+        assert result.rel_posix_path == f"inbox-pdf/2026/06/{'a' * 64}.pdf"
+        assert result.body == b"%PDF-1.4 local"
+        assert result.content_type_family == "pdf"
+        fs = tmp_path / "inbox-pdf" / "2026" / "06" / f"{'a' * 64}.pdf"
+        assert fs.read_bytes() == b"%PDF-1.4 local"
+
+    def test_rejects_unsafe_item_id(self, tmp_path: Path) -> None:
+        with pytest.raises(ArchivePathError):
+            archive_bytes(
+                body=b"x",
+                archive_root=tmp_path,
+                source="inbox-pdf",
+                item_id="../../etc/passwd",
+                published_year=2026,
+                published_month=6,
+            )
+
+
+class TestResolveWithinRoot:
+    """resolve_within_root enforces pdf_root containment (incl. symlinks)."""
+
+    def test_path_inside_root_resolves(self, tmp_path: Path) -> None:
+        root = tmp_path / "pdfs"
+        root.mkdir()
+        target = root / "paper.pdf"
+        target.write_bytes(b"%PDF")
+        assert resolve_within_root(target, root) == target.resolve()
+
+    def test_path_outside_root_raises(self, tmp_path: Path) -> None:
+        root = tmp_path / "pdfs"
+        root.mkdir()
+        outside = tmp_path / "secret.pdf"
+        outside.write_bytes(b"%PDF")
+        with pytest.raises(ArchivePathError):
+            resolve_within_root(outside, root)
+
+    def test_symlink_escape_raises(self, tmp_path: Path) -> None:
+        root = tmp_path / "pdfs"
+        root.mkdir()
+        secret = tmp_path / "secret.pdf"
+        secret.write_bytes(b"%PDF")
+        link = root / "link.pdf"
+        link.symlink_to(secret)
+        with pytest.raises(ArchivePathError):
+            resolve_within_root(link, root)
+
+    def test_missing_file_inside_root_does_not_raise(self, tmp_path: Path) -> None:
+        # Containment check only; existence is the caller's concern.
+        root = tmp_path / "pdfs"
+        root.mkdir()
+        resolved = resolve_within_root(root / "missing.pdf", root)
+        assert resolved == (root / "missing.pdf").resolve()
 
 
 class TestSuccessResultCarriesBody:

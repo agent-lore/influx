@@ -75,10 +75,13 @@ The collaborator that owns "build RunPlan → execute Run → dispatch notificat
 ### Domain — Inbox (manual submission)
 
 **InboxTask**:
-A Lithos task tagged `influx:inbox` carrying submission metadata (`kind="url"`, `url`, `submitted_by`, optional `title`/`summary`/`source_tag`). Created by external agents via `lithos_task_create`; consumed by the InboxTick. Each task is one candidate URL. See `docs/plans/inbox.md`.
+A Lithos task tagged `influx:inbox` carrying submission metadata. `kind="url"` (`url` + `submitted_by`, optional `title`/`summary`/`source_tag`) submits a web URL; `kind="pdf"` (v2 — `local_path` + `submitted_by`) submits a PDF already on the Influx host under `[inbox] pdf_root`. Created by external agents via `lithos_task_create`; consumed by the InboxTick. See `docs/plans/inbox.md`.
+
+**Local-PDF submission** (v2):
+A `kind="pdf"` InboxTask whose `local_path` resolves under `[inbox] pdf_root` is read once, identified by SHA-256 of its bytes (synthetic `source_url = inbox-pdf:sha256:<hex>`, so identical bytes dedup to one note), archive-copied to `archive_root/inbox-pdf/YYYY/MM/<sha256>.pdf`, extracted via `extract_pdf`, then ingested through the same per-Profile fan-out as a URL item. Unsafe / absent paths complete terminally (`pdf_root_not_configured` / `path_not_in_pdf_root` / `file_missing`). `acquire_inbox_pdf` (`src/influx/sources/inbox.py`) is the local-file sibling of `acquire_inbox_bytes`.
 
 **InboxTick**:
-One execution of the inbox-tick scheduler entry (`influx-inbox-tick`, registered only when `[inbox] enabled`). Claims pending InboxTasks, acquires each URL once, scores it against every enabled Profile, and dispatches a real single-Profile `RunKind.INBOX` Run for each Profile that clears threshold (merging into one canonical note), then completes the task with an outcome string + `cited_nodes`. NOT itself a `Run` — an orchestrator above the Run layer. Lives in `src/influx/inbox.py` as `InboxTick.execute()`.
+One execution of the inbox-tick scheduler entry (`influx-inbox-tick`, registered only when `[inbox] enabled`). Claims pending InboxTasks, acquires each item once (URL fetch or local PDF read), scores it against every enabled Profile, and dispatches a real single-Profile `RunKind.INBOX` Run for each Profile that clears threshold (merging into one canonical note), then completes the task with an outcome string + `cited_nodes`. NOT itself a `Run` — an orchestrator above the Run layer. Lives in `src/influx/inbox.py` as `InboxTick.execute()`.
 
 **Submitter**:
 The external agent that creates an InboxTask, identified by the `submitted_by` metadata field (sanitised into a `submitter:<id>` note tag).

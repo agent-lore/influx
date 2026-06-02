@@ -34,6 +34,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -51,8 +52,10 @@ from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.sources.inbox import (
     InboxAcquisition,
     acquire_inbox_bytes,
+    acquire_inbox_pdf,
     build_inbox_note_item,
 )
+from influx.storage import ArchivePathError, resolve_within_root
 from influx.urls import normalise_url
 
 if TYPE_CHECKING:
@@ -367,7 +370,6 @@ class InboxTick:
         # ── Parse + validate metadata ──────────────────────────────
         metadata = task.get("metadata") or {}
         kind = metadata.get("kind")
-        url = metadata.get("url")
         submitted_by = _sanitise_submitter(
             str(metadata.get("submitted_by") or "unknown")
         )
@@ -375,17 +377,74 @@ class InboxTick:
         summary_hint = metadata.get("summary")
         source_tag = metadata.get("source_tag") or _DEFAULT_SOURCE_TAG
 
-        if kind != "url" or not isinstance(url, str) or not url:
+        if kind == "url":
+            result = await self._process_url_task(
+                client,
+                task_id,
+                url=metadata.get("url"),
+                submitted_by=submitted_by,
+                title_hint=title_hint,
+                summary_hint=summary_hint,
+                source_tag=source_tag,
+            )
+        elif kind == "pdf":
+            result = await self._process_pdf_task(
+                client,
+                task_id,
+                local_path=metadata.get("local_path"),
+                submitted_by=submitted_by,
+                title_hint=title_hint,
+                summary_hint=summary_hint,
+                source_tag=source_tag,
+            )
+        else:
             await self._complete(
                 client,
                 task_id,
                 _ItemOutcome(
-                    outcome="error: invalid submission (kind must be 'url' with a url)",
+                    outcome="error: invalid submission (kind must be 'url' or 'pdf')",
+                    cited_nodes=[],
+                    inbox_result={"kind": kind, "error": "invalid_submission"},
+                ),
+            )
+            return
+
+        # ``_process_*_task`` returns ``None`` either because it already
+        # completed the task terminally (validation error) or as the
+        # skip-this-tick signal (every clearing profile busy): in both cases
+        # leave completion alone here.  A real per-item outcome is completed.
+        if result is None:
+            return
+        await self._complete(client, task_id, result)
+
+    async def _process_url_task(
+        self,
+        client: LithosClient,
+        task_id: str,
+        *,
+        url: Any,
+        submitted_by: str,
+        title_hint: str | None,
+        summary_hint: str | None,
+        source_tag: str,
+    ) -> _ItemOutcome | None:
+        """Validate a ``kind="url"`` submission and ingest it (v1 path).
+
+        Returns the per-item outcome, or ``None`` when the task was already
+        completed terminally (validation error) or should be skipped this
+        tick (profile busy).
+        """
+        if not isinstance(url, str) or not url:
+            await self._complete(
+                client,
+                task_id,
+                _ItemOutcome(
+                    outcome="error: invalid submission (kind 'url' needs a url)",
                     cited_nodes=[],
                     inbox_result={"source_url": url, "error": "invalid_submission"},
                 ),
             )
-            return
+            return None
         if urlparse(url).scheme not in _ALLOWED_URL_SCHEMES:
             await self._complete(
                 client,
@@ -396,7 +455,7 @@ class InboxTick:
                     inbox_result={"source_url": url, "error": "invalid_url_scheme"},
                 ),
             )
-            return
+            return None
         if not _valid_source_tag(source_tag):
             await self._complete(
                 client,
@@ -407,35 +466,140 @@ class InboxTick:
                     inbox_result={"source_url": url, "error": "invalid_source_tag"},
                 ),
             )
-            return
+            return None
 
-        result = await self._ingest_item(
+        return await self._ingest_item(
             client=client,
-            url=url,
+            source_url=normalise_url(url),
+            acquire=lambda: acquire_inbox_bytes(
+                url, config=self.config, summary_hint=summary_hint
+            ),
             submitted_by=submitted_by,
             title_hint=title_hint,
-            summary_hint=summary_hint,
             source_tag=source_tag,
         )
-        # ``None`` is the skip-this-tick signal (profile busy): leave the task
-        # un-completed so its claim lease expires and a later tick re-claims
-        # and retries it (§5.5 / §10 try-acquire-skip).  Completing here would
-        # permanently drop the submission on a transient lock collision.
-        if result is None:
-            return
-        await self._complete(client, task_id, result)
 
-    async def _ingest_item(
+    async def _process_pdf_task(
         self,
-        *,
         client: LithosClient,
-        url: str,
+        task_id: str,
+        *,
+        local_path: Any,
         submitted_by: str,
         title_hint: str | None,
         summary_hint: str | None,
         source_tag: str,
     ) -> _ItemOutcome | None:
+        """Validate a ``kind="pdf"`` submission and ingest it (v2 §16).
+
+        Validates ``local_path`` against ``[inbox] pdf_root`` and the file's
+        existence **before** acquisition, completing the task terminally (no
+        auto-retry) on any failure.  Unlike the URL path, the file is acquired
+        (read + hashed + extracted — all local, cheap) before the cache lookup,
+        because the synthetic ``source_url`` is only known after hashing and
+        the cache-hit replay needs the body anyway (§16.4).
+        """
+        if not isinstance(local_path, str) or not local_path:
+            await self._complete(
+                client,
+                task_id,
+                _ItemOutcome(
+                    outcome="error: invalid submission (kind 'pdf' needs local_path)",
+                    cited_nodes=[],
+                    inbox_result={
+                        "local_path": local_path,
+                        "error": "invalid_submission",
+                    },
+                ),
+            )
+            return None
+        if not _valid_source_tag(source_tag):
+            await self._complete(
+                client,
+                task_id,
+                _ItemOutcome(
+                    outcome="error: invalid_source_tag",
+                    cited_nodes=[],
+                    inbox_result={
+                        "local_path": local_path,
+                        "error": "invalid_source_tag",
+                    },
+                ),
+            )
+            return None
+        pdf_root = self.config.inbox.pdf_root
+        if not pdf_root:
+            await self._complete(
+                client,
+                task_id,
+                _ItemOutcome(
+                    outcome="error: pdf_root_not_configured",
+                    cited_nodes=[],
+                    inbox_result={
+                        "local_path": local_path,
+                        "error": "pdf_root_not_configured",
+                    },
+                ),
+            )
+            return None
+        try:
+            resolved = resolve_within_root(local_path, Path(pdf_root))
+        except ArchivePathError:
+            await self._complete(
+                client,
+                task_id,
+                _ItemOutcome(
+                    outcome="error: path_not_in_pdf_root",
+                    cited_nodes=[],
+                    inbox_result={
+                        "local_path": local_path,
+                        "error": "path_not_in_pdf_root",
+                    },
+                ),
+            )
+            return None
+        if not resolved.is_file():
+            await self._complete(
+                client,
+                task_id,
+                _ItemOutcome(
+                    outcome=f"file_missing: {local_path}",
+                    cited_nodes=[],
+                    inbox_result={"local_path": local_path, "error": "file_missing"},
+                ),
+            )
+            return None
+
+        acquired = await asyncio.to_thread(
+            acquire_inbox_pdf, resolved, config=self.config, summary_hint=summary_hint
+        )
+        return await self._ingest_item(
+            client=client,
+            source_url=acquired.source_url,
+            acquired=acquired,
+            submitted_by=submitted_by,
+            title_hint=title_hint,
+            source_tag=source_tag,
+        )
+
+    async def _ingest_item(
+        self,
+        *,
+        client: LithosClient,
+        source_url: str,
+        submitted_by: str,
+        title_hint: str | None,
+        source_tag: str,
+        acquire: Callable[[], InboxAcquisition] | None = None,
+        acquired: InboxAcquisition | None = None,
+    ) -> _ItemOutcome | None:
         """Acquire once, score every enabled profile, fan out, and report.
+
+        The item is identified by *source_url* (used for the cache lookup).
+        Acquisition is supplied either pre-computed via *acquired* (the PDF
+        path, which must hash the file to know its source_url before the
+        lookup) or lazily via the *acquire* thunk (the URL path, run only
+        after a cache miss so a full cache-hit skips the network fetch).
 
         Scores the item against all enabled profiles (in parallel, reusing
         the single acquisition), dispatches a ``RunKind.INBOX`` Run for each
@@ -456,7 +620,7 @@ class InboxTick:
             return _ItemOutcome(
                 outcome=f"error: {reason}",
                 cited_nodes=[],
-                inbox_result={"source_url": url, "error": reason},
+                inbox_result={"source_url": source_url, "error": reason},
             )
 
         # ── Cache-hit replay (§6) ─────────────────────────────────────
@@ -466,7 +630,6 @@ class InboxTick:
         # avoids re-dispatching profiles already present and re-scores
         # profiles a previous tick left out (e.g. busy-skipped), which is
         # how the §10 try-acquire-skip work is picked up on a later tick.
-        source_url = normalise_url(url)
         cache_note_id = await self._lookup_existing(client, source_url)
         candidate_profiles = profiles
         if cache_note_id is not None:
@@ -495,9 +658,12 @@ class InboxTick:
 
         # Acquire once (blocking download/extract → thread); bytes + extracted
         # text are reused across every per-profile filter + dispatch below.
-        acquired = await asyncio.to_thread(
-            acquire_inbox_bytes, url, config=self.config, summary_hint=summary_hint
-        )
+        # The PDF path pre-acquires (it hashes the file to derive source_url
+        # before the lookup); the URL path acquires lazily here, after the
+        # cache miss, so a full cache-hit skips the network fetch entirely.
+        if acquired is None:
+            assert acquire is not None  # one of acquire/acquired is always set
+            acquired = await asyncio.to_thread(acquire)
         candidate = Candidate(
             item_id=f"inbox-{acquired.url_hash}",
             title=title_hint or acquired.source_url,
