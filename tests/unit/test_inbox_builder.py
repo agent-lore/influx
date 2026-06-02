@@ -182,7 +182,7 @@ def test_acquire_non_extractable_type_uses_summary_fallback(
             "influx.sources.inbox.download_archive_autodetect",
             return_value=mismatch,
         ),
-        caplog.at_level(logging.INFO, logger="influx.sources.inbox"),  # type: ignore[attr-defined]
+        caplog.at_level(logging.DEBUG, logger="influx.sources.inbox"),  # type: ignore[attr-defined]
     ):
         acquired = acquire_inbox_bytes(_URL, config=config, summary_hint="a hint")
 

@@ -73,6 +73,17 @@ _DEFAULT_SOURCE_TAG = "inbox"
 _CLAIM_ASPECT = "ingest"
 _ALLOWED_URL_SCHEMES = ("http", "https")
 _REJECTED_TAG_PREFIX = "influx:rejected:"
+# Cap source identifiers in the per-item summary log so a pathological URL
+# can't bloat the line; the full value still rides in the ``extra`` field.
+_LOG_SOURCE_MAX = 200
+
+
+def _log_source(value: object) -> str:
+    """Render a source_url / local_path for a log message, length-capped."""
+    text = str(value)
+    if len(text) <= _LOG_SOURCE_MAX:
+        return text
+    return text[: _LOG_SOURCE_MAX - 1] + "…"
 
 
 def _valid_source_tag(tag: str) -> bool:
@@ -231,6 +242,12 @@ class _ItemOutcome:
     outcome: str
     cited_nodes: list[str]
     inbox_result: dict[str, Any]
+    # The bounded ``inbox_items_processed`` outcome label for this item, reused
+    # for the per-item operational summary log so it matches the metric.
+    metric_outcome: str
+    # Profiles the item was actually ingested into (empty for terminal /
+    # filtered / cache-hit outcomes); surfaced in the per-item summary log.
+    ingested_profiles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -646,6 +663,7 @@ class InboxTick:
                 outcome=f"error: {reason}",
                 cited_nodes=[],
                 inbox_result={"source_url": source_url, "error": reason},
+                metric_outcome="error",
             )
 
         # ── Cache-hit replay (§6) ─────────────────────────────────────
@@ -680,6 +698,7 @@ class InboxTick:
                         "per_profile": {},
                         "processing_time_ms": int((time.monotonic() - started) * 1000),
                     },
+                    metric_outcome="cache_hit",
                 )
 
         # Acquire once (blocking download/extract → thread); bytes + extracted
@@ -790,8 +809,21 @@ class InboxTick:
 
         if not dispatched and not dispatch_failed:
             # Every clearing profile was busy — skip this tick and let a later
-            # tick retry the whole item (§5.5 / §10); do NOT complete.
+            # tick retry the whole item (§5.5 / §10); do NOT complete.  This
+            # branch never reaches ``_complete``, so log the deferral here so
+            # the item is still visible at INFO (it is left ``open`` for a
+            # later tick).
             metrics.inbox_items_processed().add(1, {"outcome": "profile_busy_skipped"})
+            logger.info(
+                "inbox item deferred: all profiles busy source_url=%s profiles=%s",
+                _log_source(acquired.source_url),
+                busy,
+                extra={
+                    "source_url": acquired.source_url,
+                    "outcome": "profile_busy_skipped",
+                    "profiles": list(busy),
+                },
+            )
             return None
 
         ingested_names = [
@@ -831,6 +863,8 @@ class InboxTick:
                 "per_profile": per_profile,
                 "processing_time_ms": int((time.monotonic() - started) * 1000),
             },
+            metric_outcome=metric_outcome,
+            ingested_profiles=tuple(ingested_names),
         )
 
     def _filtered_out_outcome(
@@ -846,12 +880,14 @@ class InboxTick:
         URL is already a note, else a fresh ``filtered out: top score …``.
         """
         if cache_note_id is not None:
-            metrics.inbox_items_processed().add(1, {"outcome": "cache_hit"})
+            metric_outcome = "cache_hit"
+            metrics.inbox_items_processed().add(1, {"outcome": metric_outcome})
             outcome = (
                 f"cache_hit: existing note {cache_note_id}; no new profiles matched"
             )
         else:
-            metrics.inbox_items_processed().add(1, {"outcome": "filtered_out"})
+            metric_outcome = "filtered_out"
+            metrics.inbox_items_processed().add(1, {"outcome": metric_outcome})
             # (score, name, threshold) for every profile the model scored.
             scored = [
                 (ps.scored.score, ps.name, ps.threshold)
@@ -878,6 +914,7 @@ class InboxTick:
                 ),
                 "processing_time_ms": int((time.monotonic() - started) * 1000),
             },
+            metric_outcome=metric_outcome,
         )
 
     async def _lookup_existing(
@@ -890,11 +927,14 @@ class InboxTick:
         """
         try:
             body = await client.cache_lookup_by_url_body(source_url=source_url)
-        except (LithosError, LCMAError):
+        except (LithosError, LCMAError) as exc:
+            # Graceful degradation, not a failure — no stack trace (this fires
+            # once per item during a Lithos blip; the error class + message is
+            # enough to correlate without spamming traces).
             logger.warning(
-                "inbox cache lookup failed for %s; treating as miss",
+                "inbox cache lookup failed for %s; treating as miss: %s",
                 source_url,
-                exc_info=True,
+                exc,
             )
             return None
         return _extract_note_id(body)
@@ -916,18 +956,20 @@ class InboxTick:
             note = await client.read_note(note_id=note_id)
             parsed = parse_note(str(note.get("content") or ""))
             ingested = {e.profile_name for e in parse_profile_relevance(parsed)}
-        except (LithosError, LCMAError):
+        except (LithosError, LCMAError) as exc:
+            # Replay-all fallback is correct-by-design (merge dedupes), so this
+            # is a degradation, not a failure — message + identifier, no trace.
             logger.warning(
-                "inbox read_note failed for %s; replaying all profiles",
+                "inbox read_note failed for %s; replaying all profiles: %s",
                 note_id,
-                exc_info=True,
+                exc,
             )
             return profiles
-        except Exception:  # noqa: BLE001 — parse of a non-canonical note must not poison
+        except Exception as exc:  # noqa: BLE001 — parse of a non-canonical note must not poison
             logger.warning(
-                "inbox could not parse existing note %s; replaying all profiles",
+                "inbox could not parse existing note %s; replaying all profiles: %s",
                 note_id,
-                exc_info=True,
+                exc,
             )
             return profiles
         tags = note.get("tags") or []
@@ -1096,6 +1138,28 @@ class InboxTick:
                 "inbox task_complete failed task_id=%s", task_id, exc_info=True
             )
             metrics.inbox_task_call_failures().add(1, {"phase": "complete"})
+            return
+
+        # Single per-item operational summary: the happy-path INFO line an
+        # operator greps to see exactly which URL / local PDF was processed and
+        # how it resolved.  Emitted once per completed item (success, filtered,
+        # cache-hit, and validation-terminal all funnel through here); the
+        # busy-skip path logs its own deferral line instead.
+        ir = result.inbox_result
+        source = ir.get("source_url") or ir.get("local_path") or "<unknown>"
+        logger.info(
+            "inbox item done source_url=%s outcome=%s profiles=%s task_id=%s",
+            _log_source(source),
+            result.metric_outcome,
+            list(result.ingested_profiles),
+            task_id,
+            extra={
+                "source_url": source,
+                "outcome": result.metric_outcome,
+                "profiles": list(result.ingested_profiles),
+                "task_id": task_id,
+            },
+        )
 
     async def _complete_terminal(
         self,
@@ -1119,5 +1183,10 @@ class InboxTick:
         await self._complete(
             client,
             task_id,
-            _ItemOutcome(outcome=outcome, cited_nodes=[], inbox_result=inbox_result),
+            _ItemOutcome(
+                outcome=outcome,
+                cited_nodes=[],
+                inbox_result=inbox_result,
+                metric_outcome=metric_outcome,
+            ),
         )

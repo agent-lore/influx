@@ -15,6 +15,7 @@ scorer, ``build_filter_prompt``, ``dispatch_profile``):
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -1213,3 +1214,96 @@ async def test_tasks_listed_records_full_backlog_not_slice() -> None:
     )
     assert listed_total == 2
     assert client.claimed == ["a"]  # only the slice was claimed
+
+
+# ── Per-item operational summary log ─────────────────────────────────────
+# One INFO line per item so an operator can grep what was processed and how
+# it resolved without metric-spelunking or reading Lithos task metadata.
+
+
+def _summary_records(caplog: Any) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.message.startswith("inbox item done")]
+
+
+async def test_item_done_summary_logged_for_ingested(caplog: Any) -> None:
+    client = FakeClient(tasks=[_task()], note_id="note-xyz")
+    with (
+        caplog.at_level(logging.INFO, logger="influx.inbox"),
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_returning(8),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)),
+    ):
+        await _tick(client).execute()
+
+    records = _summary_records(caplog)
+    assert len(records) == 1
+    rec = records[0]
+    assert getattr(rec, "outcome", None) == "ingested"
+    assert getattr(rec, "source_url", None) == "https://example.com/article"
+    assert getattr(rec, "profiles", None) == ["alpha"]
+    assert getattr(rec, "task_id", None) == "task-1"
+
+
+async def test_item_done_summary_logged_for_filtered_out(caplog: Any) -> None:
+    client = FakeClient(tasks=[_task()])
+    with (
+        caplog.at_level(logging.INFO, logger="influx.inbox"),
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_returning(3),  # below threshold 7
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile"),
+    ):
+        await _tick(client).execute()
+
+    records = _summary_records(caplog)
+    assert len(records) == 1
+    assert getattr(records[0], "outcome", None) == "filtered_out"
+    assert getattr(records[0], "profiles", None) == []  # nothing ingested
+
+
+async def test_item_done_summary_logged_for_invalid_submission(caplog: Any) -> None:
+    client = FakeClient(tasks=[{"id": "t", "metadata": {"kind": "bogus"}}])
+    with caplog.at_level(logging.INFO, logger="influx.inbox"):
+        await _tick(client).execute()
+
+    records = _summary_records(caplog)
+    assert len(records) == 1
+    assert getattr(records[0], "outcome", None) == "invalid_submission"
+
+
+async def test_busy_skip_logs_deferral_with_source(caplog: Any) -> None:
+    """The all-profiles-busy branch never completes, so it logs its own
+    deferral line — otherwise the item would be invisible at INFO."""
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(tasks=[_task()])
+    coordinator = Coordinator()
+    tick = InboxTick(
+        config=config,
+        coordinator=coordinator,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    )
+    async with coordinator.hold("a"), coordinator.hold("b"):
+        with (
+            caplog.at_level(logging.INFO, logger="influx.inbox"),
+            patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+            patch(
+                "influx.inbox.make_default_batch_scorer",
+                return_value=_scorer_by_profile({"a": 8, "b": 8}),
+            ),
+            patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+            patch("influx.inbox.dispatch_profile"),
+        ):
+            await tick.execute()
+
+    assert _summary_records(caplog) == []  # no completion → no "item done"
+    deferred = [r for r in caplog.records if "deferred: all profiles busy" in r.message]
+    assert len(deferred) == 1
+    assert getattr(deferred[0], "source_url", None) == "https://example.com/article"
+    assert sorted(getattr(deferred[0], "profiles", [])) == ["a", "b"]

@@ -135,16 +135,20 @@ def acquire_inbox_bytes(
         elif body is not None:
             # Fetched bytes whose Content-Type is neither HTML nor PDF
             # (e.g. an XML feed URL submitted to the inbox): no extractor
-            # applies, so fall through to the summary hint.  Logged so an
-            # operator can see why a submitted URL produced no body.
-            _log.info(
+            # applies, so fall through to the summary hint.  DEBUG, not INFO:
+            # this is a routine fallback that fires for every feed URL, and
+            # the per-item summary log already records the outcome (#212).
+            _log.debug(
                 "inbox content-type not extractable url=%s family=%r, "
                 "using summary fallback",
                 url,
                 family or archive_result.content_type,
             )
     except (ExtractionError, NetworkError, OSError) as exc:
-        _log.debug("inbox extraction failed for %s, using summary hint: %s", url, exc)
+        # WARNING, not DEBUG: extraction failed and the item proceeds on the
+        # (thinner) summary hint — a content-quality degradation an operator
+        # should see at the default level.
+        _log.warning("inbox extraction failed for %s, using summary hint: %s", url, exc)
 
     return InboxAcquisition(
         source_url=source_url,
@@ -211,7 +215,9 @@ def acquire_inbox_pdf(
         summary = extracted_text
         flavour = "pdf"
     except (ExtractionError, OSError) as exc:
-        _log.debug(
+        # WARNING, not DEBUG: see ``acquire_inbox_bytes`` — a failed PDF
+        # extraction proceeds on the summary hint and is worth surfacing.
+        _log.warning(
             "inbox pdf extraction failed for %s, using summary hint: %s",
             local_path,
             exc,
