@@ -151,10 +151,13 @@ class InboxConfig(BaseModel):
         # against a stable root.  ``None`` leaves local-PDF intake off.
         if v is None:
             return None
-        p = Path(v).expanduser()
+        # Resolve before the directory check so the stored value is the same
+        # canonical path the per-task containment check compares against
+        # (independent of the process CWD at config-load time).
+        p = Path(v).expanduser().resolve()
         if not p.is_dir():
             raise ConfigError(f"inbox.pdf_root is not a directory: {v!r}")
-        return str(p.resolve())
+        return str(p)
 
 
 class ArchivePolicyConfig(BaseModel):

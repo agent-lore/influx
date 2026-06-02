@@ -880,11 +880,15 @@ def _make_pdf_config(
     pdf_root: Path,
     archive_dir: Path,
     profiles: list[tuple[str, int]] | None = None,
+    *,
+    max_download_bytes: int = 52_428_800,
 ) -> AppConfig:
     specs = profiles if profiles is not None else [("alpha", 7)]
     return AppConfig(
         lithos=LithosConfig(url="http://localhost:0/sse"),
-        storage=StorageConfig(archive_dir=str(archive_dir)),
+        storage=StorageConfig(
+            archive_dir=str(archive_dir), max_download_bytes=max_download_bytes
+        ),
         inbox=InboxConfig(pdf_root=str(pdf_root)),
         profiles=[
             ProfileConfig(
@@ -1035,3 +1039,34 @@ async def test_pdf_dedup_cache_hit_no_new_profiles(tmp_path: Path) -> None:
     assert client.completed[0]["outcome"] == (
         "cache_hit: existing note note-1; no new profiles to consider"
     )
+
+
+async def test_pdf_too_large_completes_terminally(tmp_path: Path) -> None:
+    pdf_root = tmp_path / "pdfs"
+    pdf_root.mkdir()
+    pdf = pdf_root / "huge.pdf"
+    pdf.write_bytes(b"%PDF-1.4 " + b"x" * 100)
+    config = _make_pdf_config(pdf_root, tmp_path / "archive", max_download_bytes=10)
+    client = FakeClient(tasks=[_task_pdf(local_path=str(pdf))])
+    with patch("influx.inbox.dispatch_profile") as mock_dispatch:
+        await _tick(client, config).execute()
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"].startswith("error: pdf_too_large")
+
+
+async def test_pdf_read_error_completes_terminally(tmp_path: Path) -> None:
+    """A read failure after validation completes terminally (no auto-retry)."""
+    pdf_root = tmp_path / "pdfs"
+    pdf_root.mkdir()
+    pdf = pdf_root / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 body")
+    config = _make_pdf_config(pdf_root, tmp_path / "archive")
+    client = FakeClient(tasks=[_task_pdf(local_path=str(pdf))])
+    with (
+        patch("influx.inbox.acquire_inbox_pdf", side_effect=OSError("vanished")),
+        patch("influx.inbox.dispatch_profile") as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"].startswith("file_missing:")
+    assert client.updated[0][1]["inbox_result"]["error"] == "file_read_error"

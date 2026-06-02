@@ -558,7 +558,13 @@ class InboxTick:
                 ),
             )
             return None
-        if not resolved.is_file():
+        try:
+            is_file = resolved.is_file()
+            size = resolved.stat().st_size if is_file else 0
+        except OSError:
+            is_file = False
+            size = 0
+        if not is_file:
             await self._complete(
                 client,
                 task_id,
@@ -569,10 +575,49 @@ class InboxTick:
                 ),
             )
             return None
+        # Bound memory: a local PDF is read whole into memory to hash +
+        # extract, so cap it by the same knob the URL fetch uses.
+        max_bytes = self.config.storage.max_download_bytes
+        if size > max_bytes:
+            await self._complete(
+                client,
+                task_id,
+                _ItemOutcome(
+                    outcome=f"error: pdf_too_large ({size} > {max_bytes} bytes)",
+                    cited_nodes=[],
+                    inbox_result={"local_path": local_path, "error": "pdf_too_large"},
+                ),
+            )
+            return None
 
-        acquired = await asyncio.to_thread(
-            acquire_inbox_pdf, resolved, config=self.config, summary_hint=summary_hint
-        )
+        # Read happens in the worker thread; guard the TOCTOU window (the file
+        # could vanish/become unreadable between the stat above and the read)
+        # so a doomed read completes the task terminally rather than crashing
+        # the item and leaving the claim to be re-tried (§5.6 no auto-retry).
+        try:
+            acquired = await asyncio.to_thread(
+                acquire_inbox_pdf,
+                resolved,
+                config=self.config,
+                summary_hint=summary_hint,
+            )
+        except OSError:
+            logger.warning(
+                "inbox pdf read failed task_id=%s path=%s",
+                task_id,
+                local_path,
+                exc_info=True,
+            )
+            await self._complete(
+                client,
+                task_id,
+                _ItemOutcome(
+                    outcome=f"file_missing: {local_path}",
+                    cited_nodes=[],
+                    inbox_result={"local_path": local_path, "error": "file_read_error"},
+                ),
+            )
+            return None
         return await self._ingest_item(
             client=client,
             source_url=acquired.source_url,
@@ -638,8 +683,9 @@ class InboxTick:
             )
             if not candidate_profiles:
                 metrics.inbox_items_processed().add(1, {"outcome": "cache_hit"})
-                # Acquisition is skipped here, so ``archive_path`` is null —
-                # kept in the payload for a stable shape across all outcomes.
+                # The URL path skips acquisition on a full cache-hit (archive
+                # null); the PDF path pre-acquired (it had to hash the file to
+                # know source_url), so report its real archive_path.
                 return _ItemOutcome(
                     outcome=(
                         f"cache_hit: existing note {cache_note_id}; "
@@ -648,7 +694,7 @@ class InboxTick:
                     cited_nodes=[cache_note_id],
                     inbox_result={
                         "source_url": source_url,
-                        "archive_path": None,
+                        "archive_path": acquired.archive_path if acquired else None,
                         "cache_hit": True,
                         "note_id": cache_note_id,
                         "per_profile": {},
@@ -662,7 +708,10 @@ class InboxTick:
         # before the lookup); the URL path acquires lazily here, after the
         # cache miss, so a full cache-hit skips the network fetch entirely.
         if acquired is None:
-            assert acquire is not None  # one of acquire/acquired is always set
+            if acquire is None:  # exactly one of acquire/acquired is always set
+                raise ValueError(
+                    "_ingest_item requires exactly one of acquire/acquired"
+                )
             acquired = await asyncio.to_thread(acquire)
         candidate = Candidate(
             item_id=f"inbox-{acquired.url_hash}",
