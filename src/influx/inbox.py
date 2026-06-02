@@ -210,6 +210,8 @@ class InboxStatus:
     last_tick_outcome: str | None = None
 
     def snapshot(self) -> dict[str, Any]:
+        # ``last_tick_outcome`` reflects the most recently *completed* tick; it
+        # is unchanged while a tick is in progress (``in_flight > 0``).
         return {
             "enabled": self.enabled,
             "pending": self.pending,

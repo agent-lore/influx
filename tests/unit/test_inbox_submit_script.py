@@ -100,3 +100,9 @@ def test_invalid_source_tag_rejected(capsys: pytest.CaptureFixture) -> None:
     rc = _SUBMIT.main([_URL, "--dry-run", "--source-tag", "Not A Slug"])
     assert rc == 2
     assert "source-tag" in capsys.readouterr().err
+
+
+def test_summary_and_summary_file_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit) as exc:
+        _SUBMIT.main([_URL, "--dry-run", "--summary", "x", "--summary-file", "y"])
+    assert exc.value.code == 2

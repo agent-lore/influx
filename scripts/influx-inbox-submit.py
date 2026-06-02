@@ -105,8 +105,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="the URL to submit (http/https)")
     parser.add_argument("--title", help="hint for the candidate's title slot")
-    parser.add_argument("--summary", help="pre-fetched summary for the filter prompt")
-    parser.add_argument(
+    summary_group = parser.add_mutually_exclusive_group()
+    summary_group.add_argument(
+        "--summary", help="pre-fetched summary for the filter prompt"
+    )
+    summary_group.add_argument(
         "--summary-file",
         help="read the summary from a file (alternative to --summary)",
     )

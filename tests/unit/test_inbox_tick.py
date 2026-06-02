@@ -797,3 +797,74 @@ async def test_cache_hit_unparseable_note_falls_back_to_all_profiles() -> None:
     # Parse failure → fell back to replaying ALL profiles (not crashed/skipped).
     assert sorted(c.args[0] for c in mock_dispatch.call_args_list) == ["a", "b"]
     assert len(client.completed) == 1
+
+
+# ── Slice 4: InboxStatus updates across exit paths ──────────────────
+
+
+async def test_status_records_circuit_open_skip() -> None:
+    from influx.inbox import InboxStatus
+
+    class _Probe:
+        def lithos_circuit_open(self) -> bool:
+            return True
+
+    status = InboxStatus(enabled=True)
+    client = FakeClient(tasks=[_task()])
+    tick = InboxTick(
+        config=_make_config(),
+        coordinator=Coordinator(),
+        probe_loop=_Probe(),
+        status=status,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    )
+    await tick.execute()
+    assert status.last_tick_at is not None
+    assert status.last_tick_outcome == "skipped: lithos circuit open"
+    assert client.list_calls == 0
+
+
+async def test_status_records_task_list_failure() -> None:
+    from influx.errors import LithosError
+    from influx.inbox import InboxStatus
+
+    class _BadListClient(FakeClient):
+        async def task_list_body(self, **_: Any) -> dict[str, Any]:
+            raise LithosError("boom", operation="task_list")
+
+    status = InboxStatus(enabled=True)
+    client = _BadListClient(tasks=[])
+    tick = InboxTick(
+        config=_make_config(),
+        coordinator=Coordinator(),
+        status=status,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    )
+    await tick.execute()
+    assert status.last_tick_outcome == "error: task_list failed"
+
+
+async def test_status_records_success_and_pending() -> None:
+    from influx.inbox import InboxStatus
+
+    status = InboxStatus(enabled=True)
+    client = FakeClient(tasks=[_task(), _task(task_id="task-2")], note_id="n")
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_returning(8),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)),
+    ):
+        tick = InboxTick(
+            config=_make_config(),
+            coordinator=Coordinator(),
+            status=status,
+            client_factory=lambda: client,  # type: ignore[arg-type]
+        )
+        await tick.execute()
+    assert status.last_tick_outcome == "success"
+    assert status.pending == 2
+    assert status.in_flight == 0  # balanced after the tick
