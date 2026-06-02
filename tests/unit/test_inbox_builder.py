@@ -160,6 +160,40 @@ def test_acquire_routes_pdf_on_content_type_not_url_shape() -> None:
     assert acquired.extracted_text == _LONG_BODY
 
 
+def test_acquire_non_extractable_type_uses_summary_fallback(
+    caplog: object,
+) -> None:
+    """A fetched body whose type is neither HTML nor PDF falls back + logs."""
+    import logging
+
+    config = _make_config()
+    mismatch = ArchiveResult(
+        ok=False,
+        rel_posix_path=None,
+        error="content_type_mismatch: 'application/xml'",
+        failure_kind=cast("str", "content_type_mismatch"),
+        content_type="application/xml",
+        content_type_family="xml",
+        body=b"<rss></rss>",
+    )
+    with (
+        patch(
+            "influx.sources.inbox.download_archive_autodetect",
+            return_value=mismatch,
+        ),
+        caplog.at_level(logging.INFO, logger="influx.sources.inbox"),  # type: ignore[attr-defined]
+    ):
+        acquired = acquire_inbox_bytes(_URL, config=config, summary_hint="a hint")
+
+    assert acquired.extracted_text is None
+    assert acquired.text_flavour == "summary-fallback"
+    assert acquired.summary == "a hint"
+    assert any(
+        "content-type not extractable" in r.message
+        for r in caplog.records  # type: ignore[attr-defined]
+    )
+
+
 def test_acquire_falls_back_to_summary_hint_on_archive_failure() -> None:
     config = _make_config()
     with patch(

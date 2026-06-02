@@ -122,6 +122,17 @@ def acquire_inbox_bytes(
             ).text
             summary = extracted_text
             flavour = "html"
+        elif body is not None:
+            # Fetched bytes whose Content-Type is neither HTML nor PDF
+            # (e.g. an XML feed URL submitted to the inbox): no extractor
+            # applies, so fall through to the summary hint.  Logged so an
+            # operator can see why a submitted URL produced no body.
+            _log.info(
+                "inbox content-type not extractable url=%s family=%r, "
+                "using summary fallback",
+                url,
+                family or archive_result.content_type,
+            )
     except (ExtractionError, NetworkError, OSError) as exc:
         _log.debug("inbox extraction failed for %s, using summary hint: %s", url, exc)
 

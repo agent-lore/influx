@@ -482,11 +482,15 @@ def build_rss_note_item(
     extracted_text: str | None = None
     summary = item.summary
     try:
-        if archive_result.ok and archive_result.body is not None:
+        if archive_result.body is not None:
             # Issue #200: the archive download already fetched this exact
             # URL's HTML — reuse those bytes for extraction instead of a
             # redundant second fetch (same URL, same representation), so
             # the archived artifact and the scored text never diverge.
+            # ``download_archive`` only populates ``body`` on a successful
+            # HTML fetch (incl. the write-failure case, which still holds
+            # the fetched bytes), so reusing it whenever present avoids a
+            # redundant fetch even when the disk write failed.
             extraction = extract_article_from_html(
                 archive_result.body.decode("utf-8", errors="replace"),
                 url=item.url,
@@ -495,7 +499,7 @@ def build_rss_note_item(
             )
         else:
             # No archived bytes (policy skip/block, non-HTML short-circuit,
-            # HTTP error, write failure, …) — fall back to a direct fetch
+            # HTTP error, network failure, …) — fall back to a direct fetch
             # so policy-skipped items still get an extraction attempt.
             extraction = extract_article(
                 item.url,

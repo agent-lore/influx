@@ -361,6 +361,20 @@ class TestDownloadArchiveAutodetect:
         assert "404" in result.error
         assert result.rel_posix_path is None
 
+    @patch("influx.storage.guarded_fetch")
+    def test_acceptable_families_override_rejects_disallowed(
+        self, mock_fetch: object, tmp_path: Path
+    ) -> None:
+        """Narrowing acceptable_families rejects an otherwise-valid family."""
+        mock_fetch.return_value = _make_fetch_result(  # type: ignore[union-attr]
+            body=b"%PDF-1.4 ok", content_type="application/pdf"
+        )
+        result = _autodetect(tmp_path, acceptable_families=("html",))
+
+        assert result.ok is False
+        assert result.failure_kind == "content_type_mismatch"
+        assert result.content_type_family == "pdf"
+
     def test_skip_policy_short_circuits_before_fetch(self, tmp_path: Path) -> None:
         registry = build_registry(
             skip={"blocked.example": "permanent skip"},

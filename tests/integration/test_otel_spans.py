@@ -314,10 +314,13 @@ async def _run_rss_scenario(
                     ok=True,
                     rel_posix_path="blog/2026/04/test.html",
                     error="",
+                    content_type="text/html",
+                    content_type_family="html",
+                    body=b"<html>article</html>",
                 ),
             ),
             patch(
-                "influx.sources.rss.extract_article",
+                "influx.sources.rss.extract_article_from_html",
                 return_value=MagicMock(text="Extracted text", source_tag="html"),
             ),
         ):
