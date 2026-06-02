@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import getpass
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -41,6 +42,19 @@ def _load_env(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         env[key.strip()] = value.strip().strip('"').strip("'")
     return env
+
+
+def _apply_env_to_process(env: dict[str, str]) -> None:
+    """Make ``docker/.env.<env>`` values visible to ``influx.config.load_config``.
+
+    ``load_config`` discovers ``INFLUX_CONFIG``/``LITHOS_URL``/etc. from
+    ``os.environ`` (config.py:749, :780), not from our local dict — so without
+    this the ``--env`` file never influences the config-loader fallback path.
+    ``setdefault`` keeps an explicitly-exported process var winning over the
+    file (the file is the fallback, never an override).
+    """
+    for key, value in env.items():
+        os.environ.setdefault(key, value)
 
 
 def _resolve_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str | None:
@@ -162,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
 
     env_path = _repo_root() / "docker" / f".env.{args.env}"
     env = _load_env(env_path) if env_path.exists() else {}
+    _apply_env_to_process(env)
     lithos_url = _resolve_lithos_url(args, env)
     if not lithos_url:
         print(

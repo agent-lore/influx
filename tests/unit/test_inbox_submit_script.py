@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -106,3 +107,48 @@ def test_summary_and_summary_file_are_mutually_exclusive() -> None:
     with pytest.raises(SystemExit) as exc:
         _SUBMIT.main([_URL, "--dry-run", "--summary", "x", "--summary-file", "y"])
     assert exc.value.code == 2
+
+
+def test_apply_env_to_process_uses_setdefault(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Process-exported vars win over the env file; absent keys are filled in."""
+    monkeypatch.setenv("INFLUX_INBOX_WINS", "from-process")
+    monkeypatch.delenv("INFLUX_INBOX_FILLED", raising=False)
+    _SUBMIT._apply_env_to_process(
+        {"INFLUX_INBOX_WINS": "from-file", "INFLUX_INBOX_FILLED": "from-file"}
+    )
+    assert os.environ["INFLUX_INBOX_WINS"] == "from-process"
+    assert os.environ["INFLUX_INBOX_FILLED"] == "from-file"
+
+
+def test_env_file_reaches_load_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``docker/.env.<env>`` values are visible to the load_config fallback.
+
+    Regression for the #198 helper-script contract: with no --lithos-url and no
+    LITHOS_URL in the file, resolution falls through to load_config(), which
+    reads INFLUX_CONFIG from os.environ — so the env file must be applied there.
+    """
+    docker = tmp_path / "docker"
+    docker.mkdir()
+    (docker / ".env.test").write_text(
+        "INFLUX_CONFIG=/custom/influx.toml\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(_SUBMIT, "_repo_root", lambda: tmp_path)
+    monkeypatch.delenv("INFLUX_CONFIG", raising=False)
+    monkeypatch.delenv("LITHOS_URL", raising=False)
+
+    captured: dict[str, str | None] = {}
+
+    import influx.config as influx_config
+
+    def _fake_load_config() -> Any:
+        captured["INFLUX_CONFIG"] = os.environ.get("INFLUX_CONFIG")
+        raise RuntimeError("stop before real load")
+
+    monkeypatch.setattr(influx_config, "load_config", _fake_load_config)
+
+    rc = _SUBMIT.main([_URL, "--env", "test"])
+
+    assert captured["INFLUX_CONFIG"] == "/custom/influx.toml"
+    assert rc == 2  # load_config raised → URL unresolved → exit 2
