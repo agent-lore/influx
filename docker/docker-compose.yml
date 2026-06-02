@@ -13,6 +13,14 @@ services:
       - ${INFLUX_DATA_PATH:-./data}:/data
       - ${INFLUX_ARCHIVE_PATH:-./archive}:/archive
       - ${INFLUX_STATE_PATH:-./state}:/state
+      # Inbox PDF intake (docs/plans/inbox.md §16.3): the host submit script
+      # stages PDFs here and sends an absolute local_path that the container
+      # opens as-is, so submitter and Influx MUST share this directory at the
+      # SAME absolute path. This is an identity mount (host path == container
+      # path), not a remap like the volumes above. Override per environment
+      # via INFLUX_INBOX_PDF_ROOT; leave [inbox] pdf_root unset to disable
+      # local-PDF intake entirely (the mount is then harmless/unused).
+      - ${INFLUX_INBOX_PDF_ROOT:-/tmp/staging-pdf-inbox}:${INFLUX_INBOX_PDF_ROOT:-/tmp/staging-pdf-inbox}
     ports:
       - "${INFLUX_ADMIN_HOST_PORT:-8080}:${INFLUX_ADMIN_PORT:-8080}"
     extra_hosts:
