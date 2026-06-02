@@ -65,6 +65,10 @@ class InboxAcquisition:
     extracted_text: str | None
     summary: str
     text_flavour: TextFlavour
+    # Best-effort title recovered from the fetched HTML (issue #210), or
+    # ``None`` (PDFs, extraction failure, no recoverable title).  Used as the
+    # title fallback below the submitter hint and above the bare URL.
+    extracted_title: str | None = None
 
 
 def acquire_inbox_bytes(
@@ -108,6 +112,7 @@ def acquire_inbox_bytes(
     family = archive_result.content_type_family
 
     extracted_text: str | None = None
+    extracted_title: str | None = None
     summary = summary_hint or ""
     flavour: TextFlavour = "summary-fallback"
     try:
@@ -117,12 +122,14 @@ def acquire_inbox_bytes(
             flavour = "pdf"
         elif family == "html" and body is not None:
             html_body = body.decode("utf-8", errors="replace")
-            extracted_text = extract_article_from_html(
+            article = extract_article_from_html(
                 html_body,
                 url=url,
                 min_web_chars=config.extraction.min_web_chars,
                 strip_tags=config.extraction.strip_tags,
-            ).text
+            )
+            extracted_text = article.text
+            extracted_title = article.title
             summary = extracted_text
             flavour = "html"
         elif body is not None:
@@ -147,6 +154,7 @@ def acquire_inbox_bytes(
         extracted_text=extracted_text,
         summary=summary,
         text_flavour=flavour,
+        extracted_title=extracted_title,
     )
 
 
@@ -243,9 +251,13 @@ def build_inbox_note_item(
     from influx.config import ProfileThresholds
 
     source_url = acquired.source_url
-    # extract_article does not recover an HTML <title>; title falls back
-    # to the submitter hint, then the URL (§3.2).
-    title = (title_hint or "").strip() or source_url
+    # Title preference (§3.2 / #210): submitter hint → recovered HTML title
+    # → bare URL.
+    title = (
+        (title_hint or "").strip()
+        or (acquired.extracted_title or "").strip()
+        or source_url
+    )
     profile_cfg = next((p for p in config.profiles if p.name == profile_name), None)
 
     # Thin-summary suppression (#166): only when no body was extracted.

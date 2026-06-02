@@ -100,8 +100,9 @@ def _failed_archive() -> ArchiveResult:
 
 
 class _Extraction:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, title: str | None = None) -> None:
         self.text = text
+        self.title = title
 
 
 # ── acquire_inbox_bytes ─────────────────────────────────────────────
@@ -319,6 +320,64 @@ def test_build_item_title_falls_back_to_url() -> None:
     )
     assert item is not None
     assert item["title"] == _URL
+
+
+def _acquire_with_title(config: AppConfig, title: str | None) -> object:
+    with (
+        patch(
+            "influx.sources.inbox.download_archive_autodetect",
+            return_value=_ok_html_archive(),
+        ),
+        patch(
+            "influx.sources.inbox.extract_article_from_html",
+            return_value=_Extraction(_LONG_BODY, title=title),
+        ),
+    ):
+        return acquire_inbox_bytes(_URL, config=config)
+
+
+def test_acquire_captures_extracted_title() -> None:
+    """The HTML branch threads the recovered title onto InboxAcquisition (#210)."""
+    acquired = _acquire_with_title(_make_config(), "Recovered Title")
+    assert acquired.extracted_title == "Recovered Title"  # type: ignore[attr-defined]
+
+
+def test_build_item_uses_extracted_title_when_no_hint() -> None:
+    config = _make_config()
+    acquired = _acquire_with_title(config, "Recovered Title")
+    item = build_inbox_note_item(
+        acquired=acquired,  # type: ignore[arg-type]
+        profile_name="ai-robotics",
+        score=8,
+        confidence=0.9,
+        reason="relevant",
+        filter_tags=(),
+        source_tag="inbox",
+        submitted_by="x",
+        title_hint=None,
+        config=config,
+    )
+    assert item is not None
+    assert item["title"] == "Recovered Title"
+
+
+def test_build_item_hint_wins_over_extracted_title() -> None:
+    config = _make_config()
+    acquired = _acquire_with_title(config, "Recovered Title")
+    item = build_inbox_note_item(
+        acquired=acquired,  # type: ignore[arg-type]
+        profile_name="ai-robotics",
+        score=8,
+        confidence=0.9,
+        reason="relevant",
+        filter_tags=(),
+        source_tag="inbox",
+        submitted_by="x",
+        title_hint="Submitter Title",
+        config=config,
+    )
+    assert item is not None
+    assert item["title"] == "Submitter Title"
 
 
 def test_build_item_thin_summary_suppressed() -> None:

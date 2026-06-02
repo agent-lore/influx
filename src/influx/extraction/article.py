@@ -7,6 +7,7 @@ trafilatura.  Rejects output below ``extraction.min_web_chars``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -23,13 +24,42 @@ __all__ = [
     "extract_article_from_html",
 ]
 
+# Title recovery (issue #210): prefer the document ``<title>``, then an
+# ``og:title`` meta tag, then the first ``<h1>``.  Regex-based to avoid a
+# heavier HTML-parse dependency; titles only feed the candidate/note title
+# slot, so best-effort recovery is acceptable.
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_OG_TITLE_RE = re.compile(
+    r"<meta[^>]+(?:property|name)=[\"']og:title[\"'][^>]+content=[\"'](.*?)[\"']",
+    re.IGNORECASE,
+)
+_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
+_TITLE_MAX_CHARS = 300
+
+
+def _recover_html_title(html: str) -> str | None:
+    """Best-effort document title from *html* (``<title>`` → og:title → h1)."""
+    for rx in (_TITLE_RE, _OG_TITLE_RE, _H1_RE):
+        m = rx.search(html)
+        if not m:
+            continue
+        title = re.sub(r"\s+", " ", _clean_html_fragments(m.group(1))).strip()
+        if title:
+            return title[:_TITLE_MAX_CHARS]
+    return None
+
 
 @dataclass(frozen=True, slots=True)
 class ArticleExtractionResult:
-    """Result of a successful web article extraction."""
+    """Result of a successful web article extraction.
+
+    ``title`` is the best-effort recovered document title (issue #210), or
+    ``None`` when none could be found.
+    """
 
     text: str
     source: Literal["article"]
+    title: str | None = None
 
 
 def extract_article_from_html(
@@ -79,6 +109,9 @@ def extract_article_from_html(
         if strip_tags is None:
             strip_tags = list(_extraction_defaults.strip_tags)
 
+    # Recover the title from the original markup before tag-stripping.
+    title = _recover_html_title(html_body)
+
     # Strip dangerous tags before extraction
     html_body = _strip_tags(html_body, strip_tags)
 
@@ -103,7 +136,7 @@ def extract_article_from_html(
             detail=f"Got {len(extracted)} chars, need {min_web_chars}",
         )
 
-    return ArticleExtractionResult(text=extracted, source="article")
+    return ArticleExtractionResult(text=extracted, source="article", title=title)
 
 
 def extract_article(

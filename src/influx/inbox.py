@@ -715,7 +715,9 @@ class InboxTick:
             acquired = await asyncio.to_thread(acquire)
         candidate = Candidate(
             item_id=f"inbox-{acquired.url_hash}",
-            title=title_hint or acquired.source_url,
+            # Title preference (#210): submitter hint → recovered HTML title
+            # → bare URL — so the filter scores a real title, not a raw URL.
+            title=title_hint or acquired.extracted_title or acquired.source_url,
             abstract=acquired.summary,
             source_url=acquired.source_url,
         )
