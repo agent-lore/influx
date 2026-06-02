@@ -7,7 +7,9 @@ trafilatura.  Rejects output below ``extraction.min_web_chars``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from html import unescape
 from typing import Literal
 
 import trafilatura
@@ -23,13 +25,78 @@ __all__ = [
     "extract_article_from_html",
 ]
 
+# Title recovery (issue #210): prefer the document ``<title>``, then an
+# ``og:title`` meta tag, then the first ``<h1>``.  Regex-based to avoid a
+# heavier HTML-parse dependency; titles only feed the candidate/note title
+# slot, so best-effort recovery is acceptable.  All patterns use negated
+# character classes / lazy quantifiers (linear-time; no catastrophic
+# backtracking).
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
+# og:title via two passes (a single regex can't handle both attribute orders,
+# `content=` before or after `property=`): find each <meta> tag, keep the one
+# whose attrs name og:title, then pull its content value.
+_META_TAG_RE = re.compile(r"<meta\b([^>]*)>", re.IGNORECASE)
+_OG_TITLE_PROP_RE = re.compile(
+    r"(?:property|name)\s*=\s*[\"']og:title[\"']", re.IGNORECASE
+)
+_META_CONTENT_RE = re.compile(
+    r"content\s*=\s*[\"'](.*?)[\"']", re.IGNORECASE | re.DOTALL
+)
+_CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_TITLE_MAX_CHARS = 300
+
+
+def _og_title(html: str) -> str | None:
+    """Content of the first ``og:title`` meta tag (attribute-order agnostic)."""
+    for m in _META_TAG_RE.finditer(html):
+        attrs = m.group(1)
+        if _OG_TITLE_PROP_RE.search(attrs):
+            content = _META_CONTENT_RE.search(attrs)
+            if content:
+                return content.group(1)
+    return None
+
+
+def _clean_title(raw: str) -> str | None:
+    """Normalise a raw title fragment: CDATA, tags, entities, control chars."""
+    inner = _CDATA_RE.sub(r"\1", raw)
+    text = unescape(_clean_html_fragments(inner))
+    text = _CONTROL_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:_TITLE_MAX_CHARS] if text else None
+
+
+def _recover_html_title(html: str) -> str | None:
+    """Best-effort document title from *html* (``<title>`` → og:title → h1)."""
+    title_match = _TITLE_RE.search(html)
+    h1_match = _H1_RE.search(html)
+    raw_candidates = [
+        title_match.group(1) if title_match else None,
+        _og_title(html),
+        h1_match.group(1) if h1_match else None,
+    ]
+    for raw in raw_candidates:
+        if raw is None:
+            continue
+        cleaned = _clean_title(raw)
+        if cleaned:
+            return cleaned
+    return None
+
 
 @dataclass(frozen=True, slots=True)
 class ArticleExtractionResult:
-    """Result of a successful web article extraction."""
+    """Result of a successful web article extraction.
+
+    ``title`` is the best-effort recovered document title (issue #210), or
+    ``None`` when none could be found.
+    """
 
     text: str
     source: Literal["article"]
+    title: str | None = None
 
 
 def extract_article_from_html(
@@ -79,6 +146,9 @@ def extract_article_from_html(
         if strip_tags is None:
             strip_tags = list(_extraction_defaults.strip_tags)
 
+    # Recover the title from the original markup before tag-stripping.
+    title = _recover_html_title(html_body)
+
     # Strip dangerous tags before extraction
     html_body = _strip_tags(html_body, strip_tags)
 
@@ -103,7 +173,7 @@ def extract_article_from_html(
             detail=f"Got {len(extracted)} chars, need {min_web_chars}",
         )
 
-    return ArticleExtractionResult(text=extracted, source="article")
+    return ArticleExtractionResult(text=extracted, source="article", title=title)
 
 
 def extract_article(

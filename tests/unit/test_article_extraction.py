@@ -14,6 +14,7 @@ import pytest
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import (
     ArticleExtractionResult,
+    _recover_html_title,
     extract_article,
     extract_article_from_html,
 )
@@ -279,3 +280,67 @@ class TestExtractArticleFromHtml:
         result = extract_article("https://example.com/article/123", min_web_chars=100)
         assert isinstance(result, ArticleExtractionResult)
         mock_fetch.assert_called_once()  # type: ignore[union-attr]
+
+
+# -- Title recovery (issue #210) ------------------------------------------
+
+
+class TestTitleRecovery:
+    """_recover_html_title: <title> → og:title → <h1>, else None."""
+
+    def test_prefers_title_tag_and_collapses_whitespace(self) -> None:
+        html = "<title>  Hello   World </title><h1>Other</h1>"
+        assert _recover_html_title(html) == "Hello World"
+
+    def test_og_title_fallback_when_no_title_tag(self) -> None:
+        html = '<head><meta property="og:title" content="OG Title"></head>'
+        assert _recover_html_title(html) == "OG Title"
+
+    def test_h1_fallback_strips_inner_tags(self) -> None:
+        html = "<body><h1>Heading <b>Bold</b></h1></body>"
+        assert _recover_html_title(html) == "Heading Bold"
+
+    def test_none_when_no_title_present(self) -> None:
+        assert _recover_html_title("<p>just a paragraph</p>") is None
+
+    def test_decodes_html_entities(self) -> None:
+        assert _recover_html_title("<title>AT&amp;T &lt;2025&gt;</title>") == (
+            "AT&T <2025>"
+        )
+
+    def test_og_title_content_before_property(self) -> None:
+        # WordPress/Ghost emit content= before property= — must still match.
+        html = '<meta content="Reversed Order" property="og:title">'
+        assert _recover_html_title(html) == "Reversed Order"
+
+    def test_og_title_name_attribute(self) -> None:
+        html = '<meta name="og:title" content="Via Name Attr">'
+        assert _recover_html_title(html) == "Via Name Attr"
+
+    def test_og_title_tolerates_whitespace_around_equals(self) -> None:
+        html = '<meta property = "og:title" content = "Spaced Attrs">'
+        assert _recover_html_title(html) == "Spaced Attrs"
+
+    def test_cdata_title_recovered(self) -> None:
+        html = "<title><![CDATA[CDATA Title & More]]></title>"
+        assert _recover_html_title(html) == "CDATA Title & More"
+
+    def test_strips_control_characters(self) -> None:
+        assert _recover_html_title("<title>\x00clean\x01 title\x7f</title>") == (
+            "clean title"
+        )
+
+    def test_caps_overlong_title(self) -> None:
+        html = f"<title>{'x' * 500}</title>"
+        recovered = _recover_html_title(html)
+        assert recovered is not None
+        assert len(recovered) == 300
+
+    def test_extract_article_from_html_threads_title(self) -> None:
+        html = _read_fixture("web_article.html").decode("utf-8")
+        result = extract_article_from_html(
+            html, url="https://example.com/article/123", min_web_chars=100
+        )
+        assert result.title == (
+            "Building Reliable Distributed Systems with Consensus Protocols"
+        )
