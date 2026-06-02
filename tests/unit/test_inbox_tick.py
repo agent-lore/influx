@@ -766,3 +766,34 @@ async def test_cache_hit_complement_scored_but_none_clear() -> None:
     assert client.completed[0]["outcome"] == (
         "cache_hit: existing note note-1; no new profiles matched"
     )
+
+
+async def test_cache_hit_unparseable_note_falls_back_to_all_profiles() -> None:
+    """A same-URL note that read_note returns but parse can't handle must not
+    poison the item — fall back to replaying all profiles (#202 review)."""
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(
+        tasks=[_task()],
+        existing_note_id="note-1",
+        existing_note={"content": "garbage that is not a canonical note", "tags": []},
+        note_id="note-1",
+    )
+    with (
+        patch(
+            "influx.inbox.parse_note", side_effect=RuntimeError("not a canonical note")
+        ),
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"a": 8, "b": 8}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch(
+            "influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)
+        ) as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+
+    # Parse failure → fell back to replaying ALL profiles (not crashed/skipped).
+    assert sorted(c.args[0] for c in mock_dispatch.call_args_list) == ["a", "b"]
+    assert len(client.completed) == 1

@@ -646,10 +646,18 @@ class InboxTick:
     ) -> list[Any]:
         """Profiles eligible for cache-hit replay (§6): enabled minus those
         that already ingested the note minus operator-suppressed
-        (``influx:rejected:<profile>``).  On read failure, fall back to all
-        profiles (the in-Run merge still dedupes correctly)."""
+        (``influx:rejected:<profile>``).
+
+        Best-effort: on read OR parse failure, fall back to replaying all
+        profiles (the in-Run ``write_note`` merge dedupes already-present
+        entries idempotently).  Cache-hit replay is an optimisation, never a
+        correctness gate — a malformed / non-Influx note sharing the URL must
+        not poison the item (which would crash every retry forever).
+        """
         try:
             note = await client.read_note(note_id=note_id)
+            parsed = parse_note(str(note.get("content") or ""))
+            ingested = {e.profile_name for e in parse_profile_relevance(parsed)}
         except (LithosError, LCMAError):
             logger.warning(
                 "inbox read_note failed for %s; replaying all profiles",
@@ -657,8 +665,13 @@ class InboxTick:
                 exc_info=True,
             )
             return profiles
-        parsed = parse_note(str(note.get("content") or ""))
-        ingested = {entry.profile_name for entry in parse_profile_relevance(parsed)}
+        except Exception:  # noqa: BLE001 — parse of a non-canonical note must not poison
+            logger.warning(
+                "inbox could not parse existing note %s; replaying all profiles",
+                note_id,
+                exc_info=True,
+            )
+            return profiles
         tags = note.get("tags") or []
         suppressed = {
             tag[len(_REJECTED_TAG_PREFIX) :]
