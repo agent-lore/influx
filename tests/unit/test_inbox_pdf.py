@@ -120,13 +120,19 @@ def test_acquire_pdf_same_bytes_two_names_one_identity(tmp_path: Path) -> None:
 
 def test_acquire_pdf_falls_back_to_summary_hint_on_extraction_failure(
     tmp_path: Path,
+    caplog: object,
 ) -> None:
+    import logging
+
     config = _make_config(str(tmp_path / "archive"))
     pdf = _write_pdf(tmp_path)
 
-    with patch(
-        "influx.sources.inbox.extract_pdf",
-        side_effect=ExtractionError("boom", url="x", stage="read", detail="d"),
+    with (
+        patch(
+            "influx.sources.inbox.extract_pdf",
+            side_effect=ExtractionError("boom", url="x", stage="read", detail="d"),
+        ),
+        caplog.at_level(logging.WARNING, logger="influx.sources.inbox"),  # type: ignore[attr-defined]
     ):
         acquired = acquire_inbox_pdf(pdf, config=config, summary_hint="a hint")
 
@@ -135,6 +141,12 @@ def test_acquire_pdf_falls_back_to_summary_hint_on_extraction_failure(
     assert acquired.text_flavour == "summary-fallback"
     # The archive copy still succeeded — bytes were read before extraction.
     assert acquired.archive_missing is False
+    # A failed extraction that proceeds on the (thinner) summary hint is a
+    # content-quality degradation an operator should see at the default level.
+    assert any(
+        "inbox pdf extraction failed" in r.message
+        for r in caplog.records  # type: ignore[attr-defined]
+    )
 
 
 def test_synthetic_url_slug_suffix() -> None:
