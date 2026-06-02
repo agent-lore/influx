@@ -250,6 +250,9 @@ async def test_filtered_out_does_not_dispatch() -> None:
     mock_dispatch.assert_not_called()
     assert "filtered out" in client.completed[0]["outcome"]
     assert client.completed[0]["cited_nodes"] is None
+    # #212: the filtered-out payload carries processing_time_ms like the
+    # ingested/cache-hit payloads.
+    assert "processing_time_ms" in client.updated[0][1]["inbox_result"]
 
 
 async def test_invalid_submission_completes_with_error() -> None:
@@ -1097,5 +1100,116 @@ async def test_pdf_read_error_completes_terminally(tmp_path: Path) -> None:
     ):
         await _tick(client, config).execute()
     mock_dispatch.assert_not_called()
-    assert client.completed[0]["outcome"].startswith("file_missing:")
+    # A post-validation read failure is distinct from a truly missing file.
+    assert client.completed[0]["outcome"].startswith("error: file_read_error")
     assert client.updated[0][1]["inbox_result"]["error"] == "file_read_error"
+
+
+# ── Observability metrics (#212) ─────────────────────────────────────
+
+
+def _outcomes(mock_counter: Any) -> list[str]:
+    """Collect the {"outcome": ...} labels passed to a patched counter."""
+    return [
+        call.args[1]["outcome"]
+        for call in mock_counter.return_value.add.call_args_list
+        if len(call.args) > 1 and isinstance(call.args[1], dict)
+    ]
+
+
+def _phases(mock_counter: Any) -> list[str]:
+    return [
+        call.args[1]["phase"]
+        for call in mock_counter.return_value.add.call_args_list
+        if len(call.args) > 1 and isinstance(call.args[1], dict)
+    ]
+
+
+async def test_invalid_kind_increments_items_processed() -> None:
+    client = FakeClient(tasks=[{"id": "t", "metadata": {"kind": "bogus"}}])
+    with patch("influx.metrics.inbox_items_processed") as m:
+        await _tick(client).execute()
+    assert "invalid_submission" in _outcomes(m)
+
+
+async def test_invalid_source_tag_increments_items_processed() -> None:
+    # The source_tag guard short-circuits before acquisition, so no
+    # acquire/dispatch patches are needed.
+    client = FakeClient(tasks=[_task(source_tag="Not A Slug")])
+    with patch("influx.metrics.inbox_items_processed") as m:
+        await _tick(client).execute()
+    assert "invalid_source_tag" in _outcomes(m)
+
+
+async def test_pdf_rejected_increments_items_processed() -> None:
+    # pdf_root unset on the default config → pdf_rejected.
+    client = FakeClient(tasks=[_task_pdf(local_path="/somewhere/x.pdf")])
+    with patch("influx.metrics.inbox_items_processed") as m:
+        await _tick(client).execute()
+    assert "pdf_rejected" in _outcomes(m)
+
+
+async def test_task_list_failure_increments_call_failures() -> None:
+    from influx.errors import LithosError
+
+    client = FakeClient(tasks=[])
+
+    async def _boom(**_: Any) -> dict[str, Any]:
+        raise LithosError("list boom")
+
+    client.task_list_body = _boom  # type: ignore[method-assign]
+    with patch("influx.metrics.inbox_task_call_failures") as m:
+        await _tick(client).execute()
+    assert "list" in _phases(m)
+
+
+async def test_claim_failure_increments_call_failures() -> None:
+    from influx.errors import LithosError
+
+    client = FakeClient(tasks=[_task()])
+
+    async def _boom(**_: Any) -> dict[str, Any]:
+        raise LithosError("claim boom")
+
+    client.task_claim_body = _boom  # type: ignore[method-assign]
+    with patch("influx.metrics.inbox_task_call_failures") as m:
+        await _tick(client).execute()
+    assert "claim" in _phases(m)
+
+
+async def test_tasks_listed_records_full_backlog_not_slice() -> None:
+    """#212: inbox_tasks_listed records the full open backlog, not the slice."""
+    config = AppConfig(
+        lithos=LithosConfig(url="http://localhost:0/sse"),
+        inbox=InboxConfig(max_items_per_tick=1),
+        profiles=[
+            ProfileConfig(
+                name="alpha",
+                description="alpha",
+                thresholds=ProfileThresholds(relevance=7),
+            )
+        ],
+        prompts=PromptsConfig(
+            filter=PromptEntryConfig(text="x"),
+            tier1_enrich=PromptEntryConfig(text="x"),
+            tier3_extract=PromptEntryConfig(text="x"),
+        ),
+    )
+    client = FakeClient(tasks=[_task(task_id="a"), _task(task_id="b")])
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_returning(3),  # filtered out → no dispatch
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile"),
+        patch("influx.metrics.inbox_tasks_listed") as m_listed,
+    ):
+        await _tick(client, config).execute()
+    # Two open tasks, slice of 1 processed, but the metric records the full 2.
+    listed_total = sum(
+        call.args[0] for call in m_listed.return_value.add.call_args_list
+    )
+    assert listed_total == 2
+    assert client.claimed == ["a"]  # only the slice was claimed

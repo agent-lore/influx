@@ -401,12 +401,13 @@ New tick-level metrics emitted by the InboxTick orchestrator (NOT by Runs):
 
 ```
 inbox_tick_started{}                                       # counter, ticks/min
-inbox_tasks_listed{}                                       # gauge, set per tick
-inbox_tasks_claimed{}                                      # counter, claims/tick
-inbox_items_processed{outcome="ingested"|"filtered_out"|"cache_hit"|"profile_busy_skipped"|"error"}   # counter
+inbox_tasks_listed{}                                       # counter, full open backlog returned by task_list
+inbox_tasks_claimed{}                                      # counter, claims/tick (processed slice)
+inbox_items_processed{outcome=ingested|filtered_out|cache_hit|profile_busy_skipped|error|invalid_submission|invalid_source_tag|pdf_rejected}  # counter
+inbox_task_call_failures{phase=list|claim|update|complete}  # counter (#212)
 ```
 
-The `profile_busy_skipped` outcome captures the §10.1 skip case for observability.
+The `profile_busy_skipped` outcome captures the §10.1 skip case; `invalid_submission` / `invalid_source_tag` / `pdf_rejected` cover the validation-terminal completions (#212) so a bad-submission rate is visible in metrics, not just logs. `inbox_tasks_listed` records the full open backlog each tick; since both it and `inbox_tasks_claimed` are monotonic counters, compare their per-tick deltas (e.g. `increase(influx_inbox_tasks_listed_total[w]) − increase(influx_inbox_tasks_claimed_total[w])` over a window `w`) to see queue pressure — not raw cumulative totals.
 
 ### 13.6 `/status` endpoint
 

@@ -19,7 +19,11 @@ Label values are bounded by construction:
 * ``decision`` — ``"pass"`` / ``"drop"``.
 * ``kind`` — repair stage names or source-acquisition error kinds.
 * ``tier`` — ``"1"`` / ``"3"``.
-* ``outcome`` — ``"success"`` / ``"failure"`` / ``"degraded"``.
+* ``outcome`` — for run metrics, ``"success"`` / ``"failure"`` /
+  ``"degraded"``.  :func:`inbox_items_processed` reuses the ``outcome``
+  attribute name with a *distinct* bounded enum (see its docstring).
+* ``phase`` — inbox task-lifecycle stage: ``"list"`` / ``"claim"`` /
+  ``"update"`` / ``"complete"`` (:func:`inbox_task_call_failures`).
 
 Per-item identifiers (``run_id``, ``note_id``, ``arxiv_id``,
 ``source_url``, ``title``) are **not** label values for any instrument
@@ -59,6 +63,7 @@ __all__ = [
     "inbox_tasks_listed",
     "inbox_tasks_claimed",
     "inbox_items_processed",
+    "inbox_task_call_failures",
     "source_acquisition_errors",
     "source_cooldown_skips",
     "summary_thin_drops",
@@ -113,14 +118,31 @@ def inbox_tasks_claimed() -> Any:
 def inbox_items_processed() -> Any:
     """Counter of inbox items processed, by terminal outcome.
 
-    Labels: ``outcome`` (``ingested`` | ``filtered_out`` | ``cache_hit`` |
-    ``profile_busy_skipped`` | ``error``).  Slice 1 emits ``ingested`` /
-    ``filtered_out`` / ``error``; ``cache_hit`` and ``profile_busy_skipped``
-    are reserved for the cache-hit-replay + coordinator-skip slices.
+    Labels: ``outcome`` — one of ``ingested`` | ``filtered_out`` |
+    ``cache_hit`` | ``profile_busy_skipped`` | ``error`` |
+    ``invalid_submission`` | ``invalid_source_tag`` | ``pdf_rejected``.  The
+    last three (#212) cover validation-terminal completions so a bad-submission
+    rate is visible in metrics rather than only in logs.
     """
     return get_meter().counter(
         "influx_inbox_items_processed_total",
         description="Inbox items processed, labelled by terminal outcome.",
+    )
+
+
+def inbox_task_call_failures() -> Any:
+    """Counter of failed Lithos task-lifecycle calls in the inbox tick (#212).
+
+    Labels: ``phase`` (``list`` | ``claim`` | ``update`` | ``complete``).
+    Lets an operator distinguish "claims are failing" from "queue is backing
+    up" without log-spelunking.  Severity differs by phase: ``update``
+    failures are non-fatal (the task still completes; only the structured
+    ``inbox_result`` metadata is lost), whereas ``complete`` failures leave the
+    task open for a later tick to re-claim.
+    """
+    return get_meter().counter(
+        "influx_inbox_task_call_failures_total",
+        description="Failed Lithos task-lifecycle calls in the inbox tick.",
     )
 
 
