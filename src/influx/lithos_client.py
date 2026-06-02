@@ -113,12 +113,15 @@ _EXISTING_ID_RE = re.compile(r"existing_id=([^\s;,]+)")
 def _extract_slug_suffix(source_url: str) -> str:
     """Compute disambiguating title suffix for slug_collision retry.
 
-    arXiv URLs get `` [arXiv <id>]``; all others get `` [<host>]``
-    (FR-MCP-7, AC-05-D).
+    arXiv URLs get `` [arXiv <id>]``; inbox local-PDF synthetic URLs
+    (``inbox-pdf:sha256:…``, which have no host) get `` [inbox-pdf]``;
+    all others get `` [<host>]`` (FR-MCP-7, AC-05-D; inbox §13.3).
     """
     m = _ARXIV_ID_RE.search(source_url)
     if m:
         return f" [arXiv {m.group(1)}]"
+    if source_url.startswith("inbox-pdf:"):
+        return " [inbox-pdf]"
     host = urlparse(source_url).hostname or urlparse(source_url).netloc
     return f" [{host}]"
 

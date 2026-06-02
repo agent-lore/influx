@@ -6,6 +6,8 @@ constant, cron validation, and the positive ``max_items_per_tick`` guard.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from influx.config import AppConfig, InboxConfig, PromptEntryConfig, PromptsConfig
@@ -49,3 +51,22 @@ def test_poll_cron_accepts_valid_cron() -> None:
 def test_max_items_per_tick_must_be_positive() -> None:
     with pytest.raises(ConfigError, match="max_items_per_tick must be >= 1"):
         InboxConfig(max_items_per_tick=0)
+
+
+def test_pdf_root_defaults_none() -> None:
+    """Local-PDF intake is off until pdf_root is configured (v2 §16)."""
+    assert InboxConfig().pdf_root is None
+
+
+def test_pdf_root_must_be_a_directory() -> None:
+    with pytest.raises(ConfigError, match="pdf_root is not a directory"):
+        InboxConfig(pdf_root="/nonexistent/inbox/pdfs")
+
+
+def test_pdf_root_resolves_to_absolute(tmp_path: Path) -> None:
+    inbox_dir = tmp_path / "pdfs"
+    inbox_dir.mkdir()
+    config = InboxConfig(pdf_root=str(inbox_dir))
+    assert config.pdf_root is not None
+    assert Path(config.pdf_root).is_absolute()
+    assert Path(config.pdf_root) == inbox_dir.resolve()

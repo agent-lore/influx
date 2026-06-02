@@ -23,6 +23,7 @@ URL-shape driven.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,7 +35,7 @@ from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article_from_html
 from influx.extraction.pdf import extract_pdf
 from influx.renderer import render
-from influx.storage import download_archive_autodetect
+from influx.storage import archive_bytes, download_archive_autodetect
 from influx.thin_summary import is_thin_summary
 from influx.urls import normalise_url, url_hash
 
@@ -45,6 +46,8 @@ _log = logging.getLogger(__name__)
 
 # Fixed archive subtree + default ``source:`` tag (§13.1).
 INBOX_SOURCE = "inbox"
+# v2 local-PDF archive subtree + synthetic source-URL scheme (§16.4).
+INBOX_PDF_SOURCE = "inbox-pdf"
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +142,76 @@ def acquire_inbox_bytes(
     return InboxAcquisition(
         source_url=source_url,
         url_hash=hash_val,
+        archive_path=archive_path,
+        archive_missing=archive_missing,
+        extracted_text=extracted_text,
+        summary=summary,
+        text_flavour=flavour,
+    )
+
+
+def acquire_inbox_pdf(
+    local_path: str | Path,
+    *,
+    config: AppConfig,
+    summary_hint: str | None = None,
+) -> InboxAcquisition:
+    """Acquire one local PDF into the fixed ``inbox-pdf`` archive subtree.
+
+    Reads the file once, identifies it by **SHA-256 of its bytes** — so the
+    same paper under two filenames is one note and a re-submit dedups
+    (docs/plans/inbox.md §16.4) — archives a copy under
+    ``archive_root/inbox-pdf/YYYY/MM/<sha256>.pdf``, and extracts text via
+    :func:`extract_pdf` over the in-memory bytes.  The synthetic
+    ``source_url`` is ``inbox-pdf:sha256:<hex>``: stable, collision-free
+    with HTTP URLs, and accepted by the existing slug / cache machinery.
+
+    Returns the same :class:`InboxAcquisition` shape as
+    :func:`acquire_inbox_bytes`, so the per-Profile fan-out and
+    :func:`build_inbox_note_item` are reused unchanged.
+
+    The caller MUST validate *local_path* against ``[inbox] pdf_root``
+    before calling (§16.3); this function trusts the path.  Extraction
+    runs off the in-memory bytes, so a PDF still ingests even when the
+    archive disk-write fails.
+    """
+    archive_root = Path(config.storage.archive_dir)
+    body = Path(local_path).read_bytes()
+    sha = hashlib.sha256(body).hexdigest()
+    source_url = f"inbox-pdf:sha256:{sha}"
+    now = datetime.now(UTC)
+
+    archive_result = archive_bytes(
+        body=body,
+        archive_root=archive_root,
+        source=INBOX_PDF_SOURCE,
+        item_id=sha,
+        published_year=now.year,
+        published_month=now.month,
+        ext=".pdf",
+        content_type="application/pdf",
+        content_type_family="pdf",
+    )
+    archive_path = archive_result.rel_posix_path
+    archive_missing = not archive_result.ok
+
+    extracted_text: str | None = None
+    summary = summary_hint or ""
+    flavour: TextFlavour = "summary-fallback"
+    try:
+        extracted_text = extract_pdf(body, source_url=source_url).text
+        summary = extracted_text
+        flavour = "pdf"
+    except (ExtractionError, OSError) as exc:
+        _log.debug(
+            "inbox pdf extraction failed for %s, using summary hint: %s",
+            local_path,
+            exc,
+        )
+
+    return InboxAcquisition(
+        source_url=source_url,
+        url_hash=sha,
         archive_path=archive_path,
         archive_missing=archive_missing,
         extracted_text=extracted_text,

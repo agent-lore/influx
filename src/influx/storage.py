@@ -41,9 +41,11 @@ from influx.source_kind import classify_source_kind
 __all__ = [
     "ArchivePathError",
     "ArchiveResult",
+    "archive_bytes",
     "build_archive_path",
     "download_archive",
     "download_archive_autodetect",
+    "resolve_within_root",
 ]
 
 _log = logging.getLogger(__name__)
@@ -393,6 +395,53 @@ def download_archive(
     )
 
 
+def _write_archive_bytes(
+    *,
+    body: bytes,
+    content_type: str,
+    fs_path: Path,
+    rel_posix: str,
+    family: ContentTypeFamily | None,
+    policy_mode: str,
+    domain: str,
+) -> ArchiveResult:
+    """Write *body* to *fs_path* and build the :class:`ArchiveResult`.
+
+    The bytes + content type are carried on the result even on a write
+    failure, so a caller can still extract from the in-memory bytes when
+    the disk write fails (issue #200).
+    """
+    try:
+        fs_path.parent.mkdir(parents=True, exist_ok=True)
+        fs_path.write_bytes(body)
+    except OSError as exc:
+        error = f"write: {exc}"
+        _log.warning("Archive write failed for %s: %s", fs_path, exc)
+        return ArchiveResult(
+            ok=False,
+            rel_posix_path=None,
+            error=error,
+            failure_kind="write",
+            policy_mode=policy_mode,
+            domain=domain,
+            content_type=content_type,
+            content_type_family=family or "",
+            body=body,
+        )
+
+    return ArchiveResult(
+        ok=True,
+        rel_posix_path=rel_posix,
+        error="",
+        failure_kind="",
+        policy_mode=policy_mode,
+        domain=domain,
+        content_type=content_type,
+        content_type_family=family or "",
+        body=body,
+    )
+
+
 def _persist_archive_body(
     *,
     fetched: FetchResult,
@@ -406,40 +455,74 @@ def _persist_archive_body(
 
     Shared by :func:`download_archive` and
     :func:`download_archive_autodetect` so the archive-write step plus
-    the issue #200 body / content-type surfacing live in one place.  The
-    fetched bytes and content type are carried on the returned
-    :class:`ArchiveResult` even on a write failure, so a caller can still
-    extract from the in-memory bytes when the disk write fails.
+    the issue #200 body / content-type surfacing live in one place.
     """
-    try:
-        fs_path.parent.mkdir(parents=True, exist_ok=True)
-        fs_path.write_bytes(fetched.body)
-    except OSError as exc:
-        error = f"write: {exc}"
-        _log.warning("Archive write failed for %s: %s", fs_path, exc)
-        return ArchiveResult(
-            ok=False,
-            rel_posix_path=None,
-            error=error,
-            failure_kind="write",
-            policy_mode=policy_mode,
-            domain=domain,
-            content_type=fetched.content_type,
-            content_type_family=family or "",
-            body=fetched.body,
-        )
-
-    return ArchiveResult(
-        ok=True,
-        rel_posix_path=rel_posix,
-        error="",
-        failure_kind="",
+    return _write_archive_bytes(
+        body=fetched.body,
+        content_type=fetched.content_type,
+        fs_path=fs_path,
+        rel_posix=rel_posix,
+        family=family,
         policy_mode=policy_mode,
         domain=domain,
-        content_type=fetched.content_type,
-        content_type_family=family or "",
-        body=fetched.body,
     )
+
+
+def archive_bytes(
+    *,
+    body: bytes,
+    archive_root: Path,
+    source: str,
+    item_id: str,
+    published_year: int,
+    published_month: int,
+    ext: str = ".pdf",
+    content_type: str = "",
+    content_type_family: ContentTypeFamily | None = None,
+) -> ArchiveResult:
+    """Archive already-in-memory *body* (no network fetch).
+
+    Builds the archive path via :func:`build_archive_path` (which rejects
+    unsafe ``source`` / ``item_id`` first) and writes the bytes.  Used by
+    the inbox local-PDF path (``docs/plans/inbox.md`` §16.4), which reads
+    a file from disk rather than fetching a URL, so it does not go through
+    :func:`download_archive`'s guarded-fetch + policy machinery.
+    """
+    fs_path, rel_posix = build_archive_path(
+        archive_root=archive_root,
+        source=source,
+        item_id=item_id,
+        published_year=published_year,
+        published_month=published_month,
+        ext=ext,
+    )
+    return _write_archive_bytes(
+        body=body,
+        content_type=content_type,
+        fs_path=fs_path,
+        rel_posix=rel_posix,
+        family=content_type_family,
+        policy_mode="",
+        domain="",
+    )
+
+
+def resolve_within_root(path: str | Path, root: Path) -> Path:
+    """Resolve *path* and confirm it lives under *root*; else raise.
+
+    Canonicalises both via :meth:`Path.resolve` (which follows symlinks,
+    so a symlink escaping *root* is caught) and checks containment with
+    :meth:`Path.is_relative_to`.  Returns the resolved path.  Does NOT
+    check existence — callers distinguish "outside root" from "missing
+    file" separately (inbox §16.3 vs §16.5).
+    """
+    resolved = Path(path).expanduser().resolve()
+    root_resolved = root.resolve()
+    if not resolved.is_relative_to(root_resolved):
+        raise ArchivePathError(
+            f"Path {path} (resolved to {resolved}) escapes root {root_resolved}"
+        )
+    return resolved
 
 
 _DEFAULT_EXT_BY_FAMILY: dict[ContentTypeFamily, str] = {

@@ -5,9 +5,9 @@ Date: 2026-05-09 (design) · v1 landed 2026-06
 
 Forward spec for a manual-submission pathway into the existing Influx ingestion pipeline. Submitting agents (e.g. daily-report agents) hand Influx a URL; Influx treats the item the way it treats RSS-discovered candidates — runs the same Filter, Cascade, Renderer, write, and LCMA wiring — except submitters don't pick a Profile.
 
-v1 is implemented (default-off `[inbox]` block; opt in to enable). This document remains the design source of truth; `docs/SPECIFICATION.md` describes the shipped behaviour. v2 (local PDF, §16) is not yet implemented.
+v1 is implemented (default-off `[inbox]` block; opt in to enable). This document remains the design source of truth; `docs/SPECIFICATION.md` describes the shipped behaviour. v2 (local PDF, §16) is now implemented (opt in via `[inbox] pdf_root`).
 
-**Scope:** v1 covers URL submission only. Local PDF support is a planned v2 addition; see §16 for the design that v2 will implement.
+**Scope:** v1 covers URL submission; v2 adds local-PDF submission (`kind="pdf"` + `local_path` under `pdf_root`). See §16 for the v2 design.
 
 ---
 
@@ -506,9 +506,9 @@ The trailing line points the human at the Lithos CLI (or equivalent) for checkin
 
 ---
 
-## 16. v2 — Local PDF support (planned)
+## 16. v2 — Local PDF support (shipped)
 
-PDF support is explicitly v2, not v1. The design below is recorded here so v2 implementation does not need to re-grill the design. v2 is purely additive to v1: no v1 behaviour changes when v2 lands.
+PDF support shipped as v2 (opt in via `[inbox] pdf_root`); it is purely additive — no v1 behaviour changed. The design below describes the implemented behaviour.
 
 ### 16.1 v2 goal
 

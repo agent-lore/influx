@@ -116,6 +116,11 @@ class InboxConfig(BaseModel):
     timezone: str = "UTC"
     max_items_per_tick: int = 20
     agent_id: str = "influx-inbox"
+    # v2 (docs/plans/inbox.md §16): root directory under which submitted
+    # ``kind="pdf"`` ``local_path`` values must resolve.  ``None`` (the
+    # default) disables local-PDF intake — such tasks complete terminally
+    # with ``error: pdf_root_not_configured``.
+    pdf_root: str | None = None
 
     @field_validator("poll_cron")
     @classmethod
@@ -137,6 +142,22 @@ class InboxConfig(BaseModel):
         if v < 1:
             raise ConfigError("inbox.max_items_per_tick must be >= 1")
         return v
+
+    @field_validator("pdf_root")
+    @classmethod
+    def _valid_pdf_root(cls, v: str | None) -> str | None:
+        # When set, must name an existing directory; canonicalise to an
+        # absolute path so the per-task path-trust check (§16.3) compares
+        # against a stable root.  ``None`` leaves local-PDF intake off.
+        if v is None:
+            return None
+        # Resolve before the directory check so the stored value is the same
+        # canonical path the per-task containment check compares against
+        # (independent of the process CWD at config-load time).
+        p = Path(v).expanduser().resolve()
+        if not p.is_dir():
+            raise ConfigError(f"inbox.pdf_root is not a directory: {v!r}")
+        return str(p)
 
 
 class ArchivePolicyConfig(BaseModel):
