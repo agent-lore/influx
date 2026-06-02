@@ -28,8 +28,8 @@ __all__ = [
 # Title recovery (issue #210): prefer the document ``<title>``, then an
 # ``og:title`` meta tag, then the first ``<h1>``.  Regex-based to avoid a
 # heavier HTML-parse dependency; titles only feed the candidate/note title
-# slot, so best-effort recovery is acceptable.  All patterns use negated
-# character classes (linear-time; no catastrophic backtracking).
+# heavier HTML-parse dependency; titles only feed the candidate/note title
+# slot, so best-effort recovery is acceptable. Patterns are intentionally simple to avoid catastrophic backtracking.
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
 # og:title via two passes (a single regex can't handle both attribute orders,
