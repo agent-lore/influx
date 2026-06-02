@@ -465,14 +465,15 @@ Agents create InboxTasks directly via Lithos MCP. Humans don't. A helper script 
 
 ### 15.2 Behaviour
 
-The script takes a single positional argument that MUST be a URL (URL-only in v1; PDF support arrives in v2 per §16). It validates the URL, builds the InboxTask body, and creates the task via Lithos MCP.
+The script takes a single positional argument, auto-detected by shape: an `http(s)://` URL submits `kind="url"`; any other value is treated as a local PDF path and submits `kind="pdf"` (v2 §16). A URL-shaped value with a non-http scheme (`file:`, `ftp:`, …) is rejected. For a local PDF the script validates the file, resolves `[inbox] pdf_root`, stages the file into it (§16.6), and sends the in-`pdf_root` `local_path`. It then creates the task via Lithos MCP.
 
 ```
 influx-inbox-submit https://example.com/article
 influx-inbox-submit https://arxiv.org/pdf/2401.12345.pdf --title "Some Paper Title"
+influx-inbox-submit ./papers/attention-is-all-you-need.pdf --title "Attention Is All You Need"
 ```
 
-A URL pointing at a PDF works in v1 because the existing `download_archive` + `extract_pdf` cascade handles content-type-based branching.
+A URL pointing at a PDF also works (the URL path's content-type routing handles it); `kind="pdf"` is for PDFs that are only on the local filesystem.
 
 ### 15.3 Optional flags
 
@@ -484,7 +485,8 @@ A URL pointing at a PDF works in v1 because the existing `download_archive` + `e
 | `--source-tag <tag>` | `inbox` | Sets the resulting note's `source:*` tag |
 | `--submitted-by <id>` | `manual:<username>` | Submitter agent identifier; defaults to a `manual:` prefix plus the OS username |
 | `--env <name>` | `staging` | Selects `docker/.env.<name>` for config resolution |
-| `--dry-run` | false | Print the task body that would be sent without creating it |
+| `--pdf-root <path>` | from config | Override `[inbox] pdf_root` for staging a local PDF |
+| `--dry-run` | false | Print the task body that would be sent (no copy, no MCP call) |
 
 ### 15.4 Output
 

@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""Submit a URL to the Influx inbox (docs/plans/inbox.md §15).
+"""Submit a URL or local PDF to the Influx inbox (docs/plans/inbox.md §15/§16).
 
-Creates a single Lithos task tagged ``influx:inbox`` carrying the v1
-submission metadata (``kind="url"``, ``url``, ``submitted_by``, optional
-``title`` / ``summary`` / ``source_tag``).  Influx's inbox tick claims it,
-scores it against every enabled profile, and ingests where it clears.
+Creates a single Lithos task tagged ``influx:inbox``.  The positional
+argument is auto-detected: an ``http(s)://`` URL submits ``kind="url"``
+(``url`` metadata); any other value is treated as a local PDF path and
+submits ``kind="pdf"`` (``local_path`` metadata).  Both carry
+``submitted_by`` and optional ``title`` / ``summary`` / ``source_tag``.
+Influx's inbox tick claims the task, scores it against every enabled
+profile, and ingests where it clears.
+
+For a local PDF the script resolves ``[inbox] pdf_root`` from config and,
+if the file is not already under it, copies it in under a deterministic
+``<sha256-prefix>-<basename>`` name (the original is never moved/deleted);
+the ``local_path`` sent is always the in-``pdf_root`` path.
 
 Write-only against Lithos (one ``lithos_task_create`` MCP call); it makes
-no calls to the Influx service itself.  v1 is URL-only — a public PDF URL
-works (the cascade branches on URL shape); local-PDF support is v2 (§16).
+no calls to the Influx service itself.
 """
 
 from __future__ import annotations
@@ -16,17 +23,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 _TASK_TAG = "influx:inbox"
 _SOURCE_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
-_ALLOWED_SCHEMES = ("http", "https")
+# An http(s) URL → kind="url".  Any other URI scheme (file:, ftp:, mailto:,
+# data:, …) on a value that is not an existing file is rejected as not-http;
+# everything else is treated as a local path.
+_HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
+_URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
 
 def _repo_root() -> Path:
@@ -71,12 +83,10 @@ def _resolve_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str | 
         return None
 
 
-def _build_metadata(args: argparse.Namespace) -> dict[str, Any]:
-    metadata: dict[str, Any] = {
-        "kind": "url",
-        "url": args.url,
-        "submitted_by": args.submitted_by,
-    }
+def _add_optional_metadata(
+    args: argparse.Namespace, metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Fold the shared optional fields (title/summary/source_tag) into *metadata*."""
     if args.title:
         metadata["title"] = args.title
     summary = args.summary
@@ -89,14 +99,58 @@ def _build_metadata(args: argparse.Namespace) -> dict[str, Any]:
     return metadata
 
 
-def _build_task_body(args: argparse.Namespace) -> dict[str, Any]:
-    label = args.title or args.url
-    return {
-        "title": f"Influx inbox: {label}",
-        "agent": args.submitted_by,
-        "tags": [_TASK_TAG],
-        "metadata": _build_metadata(args),
-    }
+def _looks_like_pdf(path: Path) -> bool:
+    """A ``.pdf`` suffix or a ``%PDF`` magic header (cheap pre-MCP check)."""
+    if path.suffix.lower() == ".pdf":
+        return True
+    try:
+        with path.open("rb") as fh:
+            return fh.read(5).startswith(b"%PDF")
+    except OSError:
+        return False
+
+
+def _resolve_pdf_root(args: argparse.Namespace, env: dict[str, str]) -> Path | None:
+    """Resolve pdf_root: --pdf-root → INFLUX_PDF_ROOT → influx config."""
+    if args.pdf_root:
+        return Path(args.pdf_root)
+    if env.get("INFLUX_PDF_ROOT"):
+        return Path(env["INFLUX_PDF_ROOT"])
+    try:
+        from influx.config import load_config
+
+        root = load_config().inbox.pdf_root
+        return Path(root) if root else None
+    except Exception:  # noqa: BLE001 — best-effort config discovery
+        return None
+
+
+def _stage_pdf_into_root(path: Path, pdf_root: Path, *, copy: bool) -> Path:
+    """Return the in-``pdf_root`` path for *path*, copying it in when outside.
+
+    A file already under *pdf_root* is used in place; otherwise it is copied
+    to a deterministic ``<sha256[:16]>-<basename>`` name (collision-safe and
+    keeps the human-readable name).  The user's original is never moved or
+    deleted.  When *copy* is false (``--dry-run``) the destination path is
+    computed but no file is written.
+    """
+    resolved = path.resolve()
+    root = pdf_root.resolve()
+    if resolved.is_relative_to(root):
+        return resolved
+    h = hashlib.sha256()
+    with resolved.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    dest = root / f"{h.hexdigest()[:16]}-{resolved.name}"
+    if copy and not dest.exists():
+        # Atomic publish: copy to a temp sibling then rename, so an
+        # interrupted copy never leaves a partial file that a later run
+        # would skip (dest.exists()) and submit as a valid PDF.
+        tmp = dest.with_name(f".{dest.name}.tmp")
+        shutil.copy2(resolved, tmp)
+        os.replace(tmp, dest)
+    return dest
 
 
 async def _submit(lithos_url: str, body: dict[str, Any]) -> str:
@@ -117,7 +171,11 @@ async def _submit(lithos_url: str, body: dict[str, Any]) -> str:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("url", help="the URL to submit (http/https)")
+    parser.add_argument(
+        "url",
+        metavar="URL_OR_PDF",
+        help="an http(s) URL, or a path to a local PDF (kind is auto-detected)",
+    )
     parser.add_argument("--title", help="hint for the candidate's title slot")
     summary_group = parser.add_mutually_exclusive_group()
     summary_group.add_argument(
@@ -143,6 +201,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--lithos-url", help="override the Lithos SSE URL")
     parser.add_argument(
+        "--pdf-root",
+        help="override [inbox] pdf_root (local PDFs are staged under it)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the task body that would be sent without creating it",
@@ -152,15 +214,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    target = args.url
 
-    # Validate BEFORE any MCP call (§15.5).
-    parsed = urlparse(args.url)
-    if parsed.scheme not in _ALLOWED_SCHEMES or not parsed.netloc:
-        print(
-            f"error: URL must be http(s) with a host, got {args.url!r}",
-            file=sys.stderr,
-        )
-        return 2
+    # All validation happens BEFORE any MCP call (§15.5).
     if args.source_tag and not _SOURCE_TAG_RE.match(args.source_tag):
         print(
             f"error: --source-tag must match {_SOURCE_TAG_RE.pattern}",
@@ -168,15 +224,85 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    body = _build_task_body(args)
+    # Env feeds both pdf_root and Lithos-URL resolution.
+    env_path = _repo_root() / "docker" / f".env.{args.env}"
+    env = _load_env(env_path) if env_path.exists() else {}
+    _apply_env_to_process(env)
+
+    if _HTTP_RE.match(target):
+        from urllib.parse import urlparse
+
+        if not urlparse(target).netloc:
+            print(f"error: URL must have a host, got {target!r}", file=sys.stderr)
+            return 2
+        kind = "url"
+        metadata = _add_optional_metadata(
+            args,
+            {"kind": "url", "url": target, "submitted_by": args.submitted_by},
+        )
+        label = args.title or target
+    else:
+        kind = "pdf"
+        path = Path(target).expanduser()
+        if not path.is_file():
+            # A non-http URI scheme (file:, ftp:, mailto:, …) is a malformed
+            # URL, not a path; everything else is a missing/non-file path.
+            if path.exists():
+                print(f"error: not a regular file: {target!r}", file=sys.stderr)
+            elif _URI_SCHEME_RE.match(target):
+                print(f"error: URL must be http(s), got {target!r}", file=sys.stderr)
+            else:
+                print(f"error: PDF file not found: {target!r}", file=sys.stderr)
+            return 2
+        if not _looks_like_pdf(path):
+            print(
+                f"error: not a PDF (need a .pdf suffix or %PDF header): {target!r}",
+                file=sys.stderr,
+            )
+            return 2
+        pdf_root = _resolve_pdf_root(args, env)
+        if pdf_root is None:
+            print(
+                "error: could not resolve [inbox] pdf_root — pass --pdf-root or "
+                "set INFLUX_PDF_ROOT",
+                file=sys.stderr,
+            )
+            return 2
+        if not pdf_root.is_dir():
+            if args.dry_run:
+                # Preview only — warn but still show the would-be local_path.
+                print(
+                    f"warning: pdf_root does not exist yet: {pdf_root}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"error: pdf_root is not a directory: {pdf_root}",
+                    file=sys.stderr,
+                )
+                return 2
+        local_path = _stage_pdf_into_root(path, pdf_root, copy=not args.dry_run)
+        metadata = _add_optional_metadata(
+            args,
+            {
+                "kind": "pdf",
+                "local_path": str(local_path),
+                "submitted_by": args.submitted_by,
+            },
+        )
+        label = args.title or path.name
+
+    body = {
+        "title": f"Influx inbox: {label}",
+        "agent": args.submitted_by,
+        "tags": [_TASK_TAG],
+        "metadata": metadata,
+    }
 
     if args.dry_run:
         print(json.dumps(body, indent=2))
         return 0
 
-    env_path = _repo_root() / "docker" / f".env.{args.env}"
-    env = _load_env(env_path) if env_path.exists() else {}
-    _apply_env_to_process(env)
     lithos_url = _resolve_lithos_url(args, env)
     if not lithos_url:
         print(
@@ -187,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     task_id = asyncio.run(_submit(lithos_url, body))
-    print(f"Created task {task_id} (kind=url)")
+    print(f"Created task {task_id} (kind={kind})")
     print(f"Track outcome: lithos task show {task_id}")
     return 0
 
