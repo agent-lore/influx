@@ -391,3 +391,12 @@ class TestDownloadArchiveAutodetect:
         assert result.failure_kind == "missing_by_policy"
         assert result.policy_mode == "skip"
         assert not (tmp_path / "inbox").exists()
+
+    def test_traversal_item_id_raises_before_fetch(self, tmp_path: Path) -> None:
+        """AC-04-C: unsafe item_id is rejected before any network fetch."""
+        with (
+            patch("influx.storage.guarded_fetch") as mock_fetch,
+            pytest.raises(ArchivePathError),
+        ):
+            _autodetect(tmp_path, item_id="../../etc/passwd")
+        mock_fetch.assert_not_called()

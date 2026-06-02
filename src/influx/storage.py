@@ -516,6 +516,19 @@ def download_archive_autodetect(
             domain=domain,
         )
 
+    # AC-04-C: reject unsafe ``source`` / ``item_id`` (path traversal,
+    # invalid slug, archive-root escape) BEFORE any network fetch, matching
+    # :func:`download_archive`.  Path safety is independent of the file
+    # extension, so this early call validates with the default ext; the real
+    # path is rebuilt from the detected family after the fetch below.
+    build_archive_path(
+        archive_root=archive_root,
+        source=source,
+        item_id=item_id,
+        published_year=published_year,
+        published_month=published_month,
+    )
+
     try:
         result = guarded_fetch(
             url,
