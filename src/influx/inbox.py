@@ -315,6 +315,7 @@ class InboxTick:
                 )
             except (LithosError, LCMAError):
                 logger.warning("inbox task_list failed; skipping tick", exc_info=True)
+                metrics.inbox_task_call_failures().add(1, {"phase": "list"})
                 if status is not None:
                     status.last_tick_outcome = "error: task_list failed"
                 return
@@ -323,7 +324,10 @@ class InboxTick:
             if status is not None:
                 status.pending = len(all_tasks)
             tasks = all_tasks[: self.config.inbox.max_items_per_tick]
-            metrics.inbox_tasks_listed().add(len(tasks))
+            # Record the full open backlog returned by task_list (not just the
+            # processed slice) so listed-minus-claimed reveals queue pressure
+            # (#212); the per-tick processed count is ``inbox_tasks_claimed``.
+            metrics.inbox_tasks_listed().add(len(all_tasks))
 
             for task in tasks:
                 if status is not None:
@@ -361,6 +365,7 @@ class InboxTick:
             )
         except (LithosError, LCMAError):
             logger.warning("inbox claim failed task_id=%s", task_id, exc_info=True)
+            metrics.inbox_task_call_failures().add(1, {"phase": "claim"})
             return
         if not claim.get("success"):
             # Already claimed by another influx instance — skip silently.
@@ -398,14 +403,12 @@ class InboxTick:
                 source_tag=source_tag,
             )
         else:
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome="error: invalid submission (kind must be 'url' or 'pdf')",
-                    cited_nodes=[],
-                    inbox_result={"kind": kind, "error": "invalid_submission"},
-                ),
+                outcome="error: invalid submission (kind must be 'url' or 'pdf')",
+                metric_outcome="invalid_submission",
+                inbox_result={"kind": kind, "error": "invalid_submission"},
             )
             return
 
@@ -435,36 +438,30 @@ class InboxTick:
         tick (profile busy).
         """
         if not isinstance(url, str) or not url:
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome="error: invalid submission (kind 'url' needs a url)",
-                    cited_nodes=[],
-                    inbox_result={"source_url": url, "error": "invalid_submission"},
-                ),
+                outcome="error: invalid submission (kind 'url' needs a url)",
+                metric_outcome="invalid_submission",
+                inbox_result={"source_url": url, "error": "invalid_submission"},
             )
             return None
         if urlparse(url).scheme not in _ALLOWED_URL_SCHEMES:
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome="error: invalid_url_scheme (only http/https accepted)",
-                    cited_nodes=[],
-                    inbox_result={"source_url": url, "error": "invalid_url_scheme"},
-                ),
+                outcome="error: invalid_url_scheme (only http/https accepted)",
+                metric_outcome="invalid_submission",
+                inbox_result={"source_url": url, "error": "invalid_url_scheme"},
             )
             return None
         if not _valid_source_tag(source_tag):
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome="error: invalid_source_tag",
-                    cited_nodes=[],
-                    inbox_result={"source_url": url, "error": "invalid_source_tag"},
-                ),
+                outcome="error: invalid_source_tag",
+                metric_outcome="invalid_source_tag",
+                inbox_result={"source_url": url, "error": "invalid_source_tag"},
             )
             return None
 
@@ -500,62 +497,48 @@ class InboxTick:
         the cache-hit replay needs the body anyway (§16.4).
         """
         if not isinstance(local_path, str) or not local_path:
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome="error: invalid submission (kind 'pdf' needs local_path)",
-                    cited_nodes=[],
-                    inbox_result={
-                        "local_path": local_path,
-                        "error": "invalid_submission",
-                    },
-                ),
+                outcome="error: invalid submission (kind 'pdf' needs local_path)",
+                metric_outcome="invalid_submission",
+                inbox_result={"local_path": local_path, "error": "invalid_submission"},
             )
             return None
         if not _valid_source_tag(source_tag):
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome="error: invalid_source_tag",
-                    cited_nodes=[],
-                    inbox_result={
-                        "local_path": local_path,
-                        "error": "invalid_source_tag",
-                    },
-                ),
+                outcome="error: invalid_source_tag",
+                metric_outcome="invalid_source_tag",
+                inbox_result={"local_path": local_path, "error": "invalid_source_tag"},
             )
             return None
         pdf_root = self.config.inbox.pdf_root
         if not pdf_root:
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome="error: pdf_root_not_configured",
-                    cited_nodes=[],
-                    inbox_result={
-                        "local_path": local_path,
-                        "error": "pdf_root_not_configured",
-                    },
-                ),
+                outcome="error: pdf_root_not_configured",
+                metric_outcome="pdf_rejected",
+                inbox_result={
+                    "local_path": local_path,
+                    "error": "pdf_root_not_configured",
+                },
             )
             return None
         try:
             resolved = resolve_within_root(local_path, Path(pdf_root))
         except ArchivePathError:
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome="error: path_not_in_pdf_root",
-                    cited_nodes=[],
-                    inbox_result={
-                        "local_path": local_path,
-                        "error": "path_not_in_pdf_root",
-                    },
-                ),
+                outcome="error: path_not_in_pdf_root",
+                metric_outcome="pdf_rejected",
+                inbox_result={
+                    "local_path": local_path,
+                    "error": "path_not_in_pdf_root",
+                },
             )
             return None
         try:
@@ -565,28 +548,24 @@ class InboxTick:
             is_file = False
             size = 0
         if not is_file:
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome=f"file_missing: {local_path}",
-                    cited_nodes=[],
-                    inbox_result={"local_path": local_path, "error": "file_missing"},
-                ),
+                outcome=f"file_missing: {local_path}",
+                metric_outcome="pdf_rejected",
+                inbox_result={"local_path": local_path, "error": "file_missing"},
             )
             return None
         # Bound memory: a local PDF is read whole into memory to hash +
         # extract, so cap it by the same knob the URL fetch uses.
         max_bytes = self.config.storage.max_download_bytes
         if size > max_bytes:
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome=f"error: pdf_too_large ({size} > {max_bytes} bytes)",
-                    cited_nodes=[],
-                    inbox_result={"local_path": local_path, "error": "pdf_too_large"},
-                ),
+                outcome=f"error: pdf_too_large ({size} > {max_bytes} bytes)",
+                metric_outcome="pdf_rejected",
+                inbox_result={"local_path": local_path, "error": "pdf_too_large"},
             )
             return None
 
@@ -608,14 +587,12 @@ class InboxTick:
                 local_path,
                 exc_info=True,
             )
-            await self._complete(
+            await self._complete_terminal(
                 client,
                 task_id,
-                _ItemOutcome(
-                    outcome=f"file_missing: {local_path}",
-                    cited_nodes=[],
-                    inbox_result={"local_path": local_path, "error": "file_read_error"},
-                ),
+                outcome=f"file_missing: {local_path}",
+                metric_outcome="pdf_rejected",
+                inbox_result={"local_path": local_path, "error": "file_read_error"},
             )
             return None
         return await self._ingest_item(
@@ -758,7 +735,9 @@ class InboxTick:
         clearing = [ps for ps in scored_profiles if ps.clears]
 
         if not clearing:
-            return self._filtered_out_outcome(acquired, scored_profiles, cache_note_id)
+            return self._filtered_out_outcome(
+                acquired, scored_profiles, cache_note_id, started
+            )
 
         # ── Per-(item, Profile) dispatch: sequential so the first write
         # creates the canonical note and the rest merge into it ────────
@@ -848,6 +827,7 @@ class InboxTick:
         acquired: InboxAcquisition,
         scored_profiles: list[_ProfileScore],
         cache_note_id: str | None,
+        started: float,
     ) -> _ItemOutcome:
         """Build the terminal outcome when no candidate profile cleared (§7.1).
 
@@ -885,6 +865,7 @@ class InboxTick:
                 "per_profile": self._build_per_profile(
                     scored_profiles, {}, [], {}, None
                 ),
+                "processing_time_ms": int((time.monotonic() - started) * 1000),
             },
         )
 
@@ -1091,6 +1072,7 @@ class InboxTick:
                 task_id,
                 exc_info=True,
             )
+            metrics.inbox_task_call_failures().add(1, {"phase": "update"})
         try:
             await client.task_complete_body(
                 task_id=task_id,
@@ -1102,3 +1084,26 @@ class InboxTick:
             logger.warning(
                 "inbox task_complete failed task_id=%s", task_id, exc_info=True
             )
+            metrics.inbox_task_call_failures().add(1, {"phase": "complete"})
+
+    async def _complete_terminal(
+        self,
+        client: LithosClient,
+        task_id: str,
+        *,
+        outcome: str,
+        metric_outcome: str,
+        inbox_result: dict[str, Any],
+    ) -> None:
+        """Record a validation-terminal outcome (#212) then complete the task.
+
+        Centralises the ``inbox_items_processed`` increment for the no-retry
+        validation failures (invalid submission / source_tag / pdf rejection)
+        that otherwise never reached metrics.
+        """
+        metrics.inbox_items_processed().add(1, {"outcome": metric_outcome})
+        await self._complete(
+            client,
+            task_id,
+            _ItemOutcome(outcome=outcome, cited_nodes=[], inbox_result=inbox_result),
+        )

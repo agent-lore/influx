@@ -63,6 +63,7 @@ HELPERS: dict[str, str] = {
     "summary_thin_drops": "influx_summary_thin_drops_total",
     "source_acquisition_errors": "influx_source_acquisition_errors_total",
     "slug_collision_url_recovery": "influx_slug_collision_url_recovery_total",
+    "inbox_task_call_failures": "influx_inbox_task_call_failures_total",
 }
 
 

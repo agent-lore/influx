@@ -59,6 +59,7 @@ __all__ = [
     "inbox_tasks_listed",
     "inbox_tasks_claimed",
     "inbox_items_processed",
+    "inbox_task_call_failures",
     "source_acquisition_errors",
     "source_cooldown_skips",
     "summary_thin_drops",
@@ -113,14 +114,28 @@ def inbox_tasks_claimed() -> Any:
 def inbox_items_processed() -> Any:
     """Counter of inbox items processed, by terminal outcome.
 
-    Labels: ``outcome`` (``ingested`` | ``filtered_out`` | ``cache_hit`` |
-    ``profile_busy_skipped`` | ``error``).  Slice 1 emits ``ingested`` /
-    ``filtered_out`` / ``error``; ``cache_hit`` and ``profile_busy_skipped``
-    are reserved for the cache-hit-replay + coordinator-skip slices.
+    Labels: ``outcome`` — one of ``ingested`` | ``filtered_out`` |
+    ``cache_hit`` | ``profile_busy_skipped`` | ``error`` |
+    ``invalid_submission`` | ``invalid_source_tag`` | ``pdf_rejected``.  The
+    last three (#212) cover validation-terminal completions so a bad-submission
+    rate is visible in metrics rather than only in logs.
     """
     return get_meter().counter(
         "influx_inbox_items_processed_total",
         description="Inbox items processed, labelled by terminal outcome.",
+    )
+
+
+def inbox_task_call_failures() -> Any:
+    """Counter of failed Lithos task-lifecycle calls in the inbox tick (#212).
+
+    Labels: ``phase`` (``list`` | ``claim`` | ``update`` | ``complete``).
+    Lets an operator distinguish "claims are failing" from "queue is backing
+    up" without log-spelunking.
+    """
+    return get_meter().counter(
+        "influx_inbox_task_call_failures_total",
+        description="Failed Lithos task-lifecycle calls in the inbox tick.",
     )
 
 
