@@ -799,4 +799,4 @@ Each task is completed with a free-text outcome (`ingested into N profile(s): �
 
 ### 17.5 v1 constraints
 
-URL-only (local PDF is the planned v2, `docs/plans/inbox.md` §16). PDF vs HTML extraction is currently chosen by URL shape, not the response Content-Type (tracked as a follow-up). The inbox-tick scheduler/coordinator is in-process (the same multi-process caveat as scheduled runs).
+URL-only (local PDF is the planned v2, `docs/plans/inbox.md` §16). A submitted URL is fetched once and the PDF vs HTML extraction branch is chosen from the response `Content-Type` (issue #200), so a PDF served from a non-`.pdf` URL is extracted correctly; the fetched bytes are reused for both archiving and extraction (no second fetch). RSS shares the same fetch-once reuse; arXiv keeps its HTML→PDF cascade (it deliberately fetches a different representation for extraction). The inbox-tick scheduler/coordinator is in-process (the same multi-process caveat as scheduled runs).

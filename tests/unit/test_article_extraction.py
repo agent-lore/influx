@@ -12,7 +12,11 @@ from unittest.mock import patch
 import pytest
 
 from influx.errors import ExtractionError, NetworkError
-from influx.extraction.article import ArticleExtractionResult, extract_article
+from influx.extraction.article import (
+    ArticleExtractionResult,
+    extract_article,
+    extract_article_from_html,
+)
 from influx.http_client import FetchResult
 
 _FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "extraction"
@@ -228,3 +232,50 @@ class TestFailurePropagation:
 
         with pytest.raises(ExtractionError, match="no content"):
             extract_article("https://example.com/article/123")
+
+
+# -- From-HTML seam (issue #200) ------------------------------------------
+
+
+class TestExtractArticleFromHtml:
+    """The network-free core extracts from an already-fetched HTML string."""
+
+    def test_extracts_from_string_without_fetching(self) -> None:
+        html = _read_fixture("web_article.html").decode("utf-8")
+        result = extract_article_from_html(
+            html, url="https://example.com/article/123", min_web_chars=100
+        )
+        assert isinstance(result, ArticleExtractionResult)
+        assert result.source == "article"
+        assert len(result.text) >= 100
+        assert "<" not in result.text
+
+    def test_strips_dangerous_tags(self) -> None:
+        html = _read_fixture("web_with_script.html").decode("utf-8")
+        result = extract_article_from_html(
+            html, url="https://example.com/x", min_web_chars=10
+        )
+        assert "malicious_web_script" not in result.text
+        assert "document.cookie" not in result.text
+
+    def test_rejects_below_min_length(self) -> None:
+        html = _read_fixture("short_web_article.html").decode("utf-8")
+        with pytest.raises(ExtractionError, match="too short"):
+            extract_article_from_html(
+                html, url="https://example.com/short", min_web_chars=500
+            )
+
+    def test_trafilatura_none_raises(self) -> None:
+        with pytest.raises(ExtractionError, match="no content"):
+            extract_article_from_html(
+                "<html><body></body></html>", url="https://example.com/x"
+            )
+
+    @patch("influx.extraction.article.guarded_fetch")
+    def test_extract_article_delegates_to_from_html(self, mock_fetch: object) -> None:
+        """extract_article fetches once then delegates (behavior preserved)."""
+        html = _read_fixture("web_article.html")
+        mock_fetch.return_value = _make_fetch_result(html)  # type: ignore[union-attr]
+        result = extract_article("https://example.com/article/123", min_web_chars=100)
+        assert isinstance(result, ArticleExtractionResult)
+        mock_fetch.assert_called_once()  # type: ignore[union-attr]

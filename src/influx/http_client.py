@@ -29,6 +29,7 @@ __all__ = [
     "FetchResult",
     "aguarded_fetch",
     "aguarded_post_json_fetch",
+    "content_type_family",
     "guarded_fetch",
     "guarded_outbound_post",
     "guarded_post_json",
@@ -144,6 +145,22 @@ def _ssrf_check(url: str, *, allow_private_ips: bool) -> None:
 
 
 # ── Public API ───────────────────────────────────────────────────────
+
+
+def content_type_family(content_type: str) -> ContentTypeFamily | None:
+    """Classify a raw ``Content-Type`` header into its family, or ``None``.
+
+    Parses the bare MIME type (drops parameters like ``; charset=utf-8``)
+    and maps it through :data:`_CONTENT_TYPE_FAMILIES`.  Used by callers
+    that fetch with no ``expected_content_type`` guard and route on the
+    actual response type (issue #200 — inbox auto-detect acquisition).
+    Returns ``None`` for any MIME not in a known family.
+    """
+    mime = content_type.split(";")[0].strip().lower()
+    for family, allowed in _CONTENT_TYPE_FAMILIES.items():
+        if mime in allowed:
+            return family
+    return None
 
 
 def _check_content_type(

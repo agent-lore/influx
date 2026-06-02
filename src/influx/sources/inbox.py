@@ -12,9 +12,13 @@ URLs.  Two differences from the RSS path:
   is then called once per scoring profile, reusing that acquisition so the
   URL is fetched only once per inbox item (§5.2/§5.3).
 
-A public PDF URL works in v1: the path branches on a ``.pdf`` URL shape to
-archive with a ``.pdf`` extension and extract via :func:`extract_pdf`;
-everything else takes the HTML article-extraction path.
+The URL is fetched a single time and the extraction branch is chosen from
+the response ``Content-Type`` (issue #200): a PDF response extracts via
+:func:`extract_pdf` over the fetched bytes, an HTML response via
+:func:`extract_article_from_html` over the same bytes, and anything else
+falls back to the submitter's summary hint.  A public PDF works even when
+served from a non-``.pdf`` URL because routing is content-type driven, not
+URL-shape driven.
 """
 
 from __future__ import annotations
@@ -24,14 +28,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
 from influx.cascade import Acquired, Cascade, TextFlavour
 from influx.errors import ExtractionError, NetworkError
-from influx.extraction.article import extract_article
+from influx.extraction.article import extract_article_from_html
 from influx.extraction.pdf import extract_pdf
 from influx.renderer import render
-from influx.storage import download_archive
+from influx.storage import download_archive_autodetect
 from influx.thin_summary import is_thin_summary
 from influx.urls import normalise_url, url_hash
 
@@ -42,14 +45,6 @@ _log = logging.getLogger(__name__)
 
 # Fixed archive subtree + default ``source:`` tag (§13.1).
 INBOX_SOURCE = "inbox"
-
-
-def _is_pdf_url(url: str) -> bool:
-    """Syntactic check — does the URL path point at a PDF?"""
-    try:
-        return urlparse(url).path.lower().endswith(".pdf")
-    except (TypeError, ValueError):
-        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,57 +72,67 @@ def acquire_inbox_bytes(
 ) -> InboxAcquisition:
     """Download + extract one inbox URL into the fixed inbox archive subtree.
 
-    Branches on a ``.pdf`` URL shape: PDF URLs archive with a ``.pdf``
-    extension and extract via :func:`extract_pdf` over the archived bytes;
-    all other URLs archive as ``.html`` and extract via
-    :func:`extract_article`.  On extraction failure the *summary_hint* (a
-    submitter-provided excerpt, if any) is the fallback body.
+    Fetches the URL **once** via :func:`download_archive_autodetect` and
+    routes the extraction branch on the response ``Content-Type`` (issue
+    #200): a ``pdf`` response extracts via :func:`extract_pdf` over the
+    fetched bytes; an ``html`` response via
+    :func:`extract_article_from_html` over the same bytes.  Extraction
+    runs off the in-memory bytes returned by the fetch, so it succeeds
+    even when the archive disk-write failed, and the archived artifact
+    and the scored text always come from the same response.  On any
+    failure the *summary_hint* (a submitter-provided excerpt, if any) is
+    the fallback body.
     """
     archive_root = Path(config.storage.archive_dir)
     source_url = normalise_url(url)
     hash_val = url_hash(url)
     now = datetime.now(UTC)
-    is_pdf = _is_pdf_url(url)
-    ext = ".pdf" if is_pdf else ".html"
-    expected: Any = "pdf" if is_pdf else "html"
 
-    archive_result = download_archive(
+    archive_result = download_archive_autodetect(
         url=url,
         archive_root=archive_root,
         source=INBOX_SOURCE,
         item_id=hash_val,
         published_year=now.year,
         published_month=now.month,
-        ext=ext,
         allow_private_ips=config.security.allow_private_ips,
         max_download_bytes=config.storage.max_download_bytes,
         timeout_seconds=config.storage.download_timeout_seconds,
-        expected_content_type=expected,
     )
     archive_path = archive_result.rel_posix_path
     archive_missing = not archive_result.ok
+    body = archive_result.body
+    family = archive_result.content_type_family
 
     extracted_text: str | None = None
     summary = summary_hint or ""
     flavour: TextFlavour = "summary-fallback"
     try:
-        if is_pdf:
-            if archive_path is not None:
-                pdf_bytes = (archive_root / archive_path).read_bytes()
-                extracted_text = extract_pdf(pdf_bytes, source_url=source_url).text
-                summary = extracted_text
-                flavour = "pdf"
-        else:
-            extracted_text = extract_article(
-                url,
+        if family == "pdf" and body is not None:
+            extracted_text = extract_pdf(body, source_url=source_url).text
+            summary = extracted_text
+            flavour = "pdf"
+        elif family == "html" and body is not None:
+            html_body = body.decode("utf-8", errors="replace")
+            extracted_text = extract_article_from_html(
+                html_body,
+                url=url,
                 min_web_chars=config.extraction.min_web_chars,
                 strip_tags=config.extraction.strip_tags,
-                allow_private_ips=config.security.allow_private_ips,
-                max_download_bytes=config.storage.max_download_bytes,
-                timeout_seconds=config.storage.download_timeout_seconds,
             ).text
             summary = extracted_text
             flavour = "html"
+        elif body is not None:
+            # Fetched bytes whose Content-Type is neither HTML nor PDF
+            # (e.g. an XML feed URL submitted to the inbox): no extractor
+            # applies, so fall through to the summary hint.  Logged so an
+            # operator can see why a submitted URL produced no body.
+            _log.info(
+                "inbox content-type not extractable url=%s family=%r, "
+                "using summary fallback",
+                url,
+                family or archive_result.content_type,
+            )
     except (ExtractionError, NetworkError, OSError) as exc:
         _log.debug("inbox extraction failed for %s, using summary hint: %s", url, exc)
 

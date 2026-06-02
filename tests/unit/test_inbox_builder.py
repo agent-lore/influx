@@ -1,10 +1,11 @@
 """Unit tests for the inbox acquisition + note builder (Inbox v1 slice 1).
 
 Covers :func:`influx.sources.inbox.acquire_inbox_bytes` (fixed archive
-subtree, content-type branch) and
+subtree, real-Content-Type routing — issue #200) and
 :func:`influx.sources.inbox.build_inbox_note_item` (title fallback,
-ProfileItem key set, tags, thin-summary suppression).  ``download_archive``
-and ``extract_article`` / ``extract_pdf`` are patched — no network IO.
+ProfileItem key set, tags, thin-summary suppression).
+``download_archive_autodetect`` and ``extract_article_from_html`` /
+``extract_pdf`` are patched — no network IO.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from influx.config import (
     SecurityConfig,
     StorageConfig,
 )
-from influx.errors import NetworkError
+from influx.http_client import FetchResult
 from influx.sources.inbox import (
     INBOX_SOURCE,
     acquire_inbox_bytes,
@@ -40,10 +41,12 @@ _LONG_BODY = (
 )
 
 
-def _make_config(*, min_summary_chars: int = 80) -> AppConfig:
+def _make_config(
+    *, min_summary_chars: int = 80, archive_dir: str = "/archive"
+) -> AppConfig:
     return AppConfig(
         lithos=LithosConfig(url="http://localhost:0/sse"),
-        storage=StorageConfig(archive_dir="/archive"),
+        storage=StorageConfig(archive_dir=archive_dir),
         profiles=[
             ProfileConfig(
                 name="ai-robotics",
@@ -63,11 +66,27 @@ def _make_config(*, min_summary_chars: int = 80) -> AppConfig:
     )
 
 
-def _ok_html_archive(url: str = _URL) -> ArchiveResult:
+def _ok_html_archive(
+    url: str = _URL, *, body: bytes = b"<html>article</html>"
+) -> ArchiveResult:
     return ArchiveResult(
         ok=True,
         rel_posix_path=f"inbox/2026/06/{url_hash(url)}.html",
         error="",
+        content_type="text/html; charset=utf-8",
+        content_type_family="html",
+        body=body,
+    )
+
+
+def _ok_pdf_archive(url: str, *, body: bytes = b"%PDF-1.4 ...") -> ArchiveResult:
+    return ArchiveResult(
+        ok=True,
+        rel_posix_path=f"inbox/2026/06/{url_hash(url)}.pdf",
+        error="",
+        content_type="application/pdf",
+        content_type_family="pdf",
+        body=body,
     )
 
 
@@ -89,14 +108,15 @@ class _Extraction:
 
 
 def test_acquire_archives_into_fixed_inbox_subtree() -> None:
-    """HTML URLs archive under inbox/YYYY/MM/<url_hash>.html (§13.1)."""
+    """HTML responses archive under inbox/YYYY/MM/<url_hash>.html (§13.1)."""
     config = _make_config()
     with (
         patch(
-            "influx.sources.inbox.download_archive", return_value=_ok_html_archive()
+            "influx.sources.inbox.download_archive_autodetect",
+            return_value=_ok_html_archive(),
         ) as mock_dl,
         patch(
-            "influx.sources.inbox.extract_article",
+            "influx.sources.inbox.extract_article_from_html",
             return_value=_Extraction(_LONG_BODY),
         ),
     ):
@@ -105,50 +125,123 @@ def test_acquire_archives_into_fixed_inbox_subtree() -> None:
     kwargs = mock_dl.call_args.kwargs
     assert kwargs["source"] == INBOX_SOURCE
     assert kwargs["item_id"] == url_hash(_URL)
-    assert kwargs["ext"] == ".html"
-    assert kwargs["expected_content_type"] == "html"
+    # No ext / expected_content_type is passed any more — the extension is
+    # derived from the response Content-Type by the autodetect helper.
+    assert "ext" not in kwargs
+    assert "expected_content_type" not in kwargs
     assert acquired.archive_path == f"inbox/2026/06/{url_hash(_URL)}.html"
     assert acquired.extracted_text == _LONG_BODY
     assert acquired.text_flavour == "html"
 
 
-def test_acquire_pdf_url_uses_pdf_branch() -> None:
-    """A .pdf URL archives with a .pdf ext and extracts via extract_pdf."""
+def test_acquire_routes_pdf_on_content_type_not_url_shape() -> None:
+    """A PDF served at a NON-.pdf URL still extracts as a PDF (issue #200 AC-1)."""
     config = _make_config()
-    pdf_url = "https://arxiv.org/pdf/2401.12345.pdf"
-    ok_pdf = ArchiveResult(
-        ok=True, rel_posix_path=f"inbox/2026/06/{url_hash(pdf_url)}.pdf", error=""
-    )
+    # URL has no .pdf suffix — only the response Content-Type marks it PDF.
+    pdf_url = "https://example.com/download?doc=42"
     with (
-        patch("influx.sources.inbox.download_archive", return_value=ok_pdf) as mock_dl,
-        patch("pathlib.Path.read_bytes", return_value=b"%PDF-1.4 ..."),
         patch(
-            "influx.sources.inbox.extract_pdf", return_value=_Extraction(_LONG_BODY)
+            "influx.sources.inbox.download_archive_autodetect",
+            return_value=_ok_pdf_archive(pdf_url, body=b"%PDF-1.4 bytes"),
+        ),
+        patch(
+            "influx.sources.inbox.extract_pdf",
+            return_value=_Extraction(_LONG_BODY),
         ) as mock_pdf,
+        patch("influx.sources.inbox.extract_article_from_html") as mock_html,
     ):
         acquired = acquire_inbox_bytes(pdf_url, config=config)
 
-    assert mock_dl.call_args.kwargs["ext"] == ".pdf"
-    assert mock_dl.call_args.kwargs["expected_content_type"] == "pdf"
     mock_pdf.assert_called_once()
+    # The PDF bytes from the fetch are what get extracted (not re-read).
+    assert mock_pdf.call_args.args[0] == b"%PDF-1.4 bytes"
+    mock_html.assert_not_called()
     assert acquired.text_flavour == "pdf"
     assert acquired.extracted_text == _LONG_BODY
 
 
-def test_acquire_falls_back_to_summary_hint_on_extraction_failure() -> None:
+def test_acquire_non_extractable_type_uses_summary_fallback(
+    caplog: object,
+) -> None:
+    """A fetched body whose type is neither HTML nor PDF falls back + logs."""
+    import logging
+
     config = _make_config()
+    mismatch = ArchiveResult(
+        ok=False,
+        rel_posix_path=None,
+        error="content_type_mismatch: 'application/xml'",
+        failure_kind=cast("str", "content_type_mismatch"),
+        content_type="application/xml",
+        content_type_family="xml",
+        body=b"<rss></rss>",
+    )
     with (
-        patch("influx.sources.inbox.download_archive", return_value=_failed_archive()),
         patch(
-            "influx.sources.inbox.extract_article",
-            side_effect=NetworkError("boom", url=_URL, kind="timeout"),
+            "influx.sources.inbox.download_archive_autodetect",
+            return_value=mismatch,
         ),
+        caplog.at_level(logging.INFO, logger="influx.sources.inbox"),  # type: ignore[attr-defined]
+    ):
+        acquired = acquire_inbox_bytes(_URL, config=config, summary_hint="a hint")
+
+    assert acquired.extracted_text is None
+    assert acquired.text_flavour == "summary-fallback"
+    assert acquired.summary == "a hint"
+    assert any(
+        "content-type not extractable" in r.message
+        for r in caplog.records  # type: ignore[attr-defined]
+    )
+
+
+def test_acquire_falls_back_to_summary_hint_on_archive_failure() -> None:
+    config = _make_config()
+    with patch(
+        "influx.sources.inbox.download_archive_autodetect",
+        return_value=_failed_archive(),
     ):
         acquired = acquire_inbox_bytes(_URL, config=config, summary_hint="a hint")
 
     assert acquired.extracted_text is None
     assert acquired.summary == "a hint"
     assert acquired.archive_missing is True
+    assert acquired.text_flavour == "summary-fallback"
+
+
+def test_acquire_html_item_fetches_url_exactly_once(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """An HTML inbox item triggers exactly one network fetch (issue #200 AC-2).
+
+    The bytes that get archived and the bytes that get extracted come from
+    the *same* response — there is no second fetch in the extraction step.
+    """
+    config = _make_config(archive_dir=str(tmp_path))
+    html = (
+        "<html><body><article><p>" + _LONG_BODY + "</p></article></body></html>"
+    ).encode("utf-8")
+    fetched = FetchResult(
+        body=html,
+        status_code=200,
+        content_type="text/html; charset=utf-8",
+        final_url=_URL,
+    )
+    seen: list[str] = []
+
+    with (
+        # Patch the fetch where the autodetect helper imported it.
+        patch("influx.storage.guarded_fetch", return_value=fetched) as mock_fetch,
+        # Capture what the extractor receives without invoking trafilatura.
+        patch(
+            "influx.sources.inbox.extract_article_from_html",
+            side_effect=lambda body, **_: seen.append(body) or _Extraction(_LONG_BODY),
+        ),
+    ):
+        acquired = acquire_inbox_bytes(_URL, config=config)
+
+    assert mock_fetch.call_count == 1
+    # The extractor saw exactly the fetched (decoded) bytes — same response.
+    assert seen == [html.decode("utf-8")]
+    assert acquired.text_flavour == "html"
+    assert acquired.archive_missing is False
 
 
 # ── build_inbox_note_item ───────────────────────────────────────────
@@ -156,9 +249,12 @@ def test_acquire_falls_back_to_summary_hint_on_extraction_failure() -> None:
 
 def _acquire_ok(config: AppConfig) -> object:
     with (
-        patch("influx.sources.inbox.download_archive", return_value=_ok_html_archive()),
         patch(
-            "influx.sources.inbox.extract_article",
+            "influx.sources.inbox.download_archive_autodetect",
+            return_value=_ok_html_archive(),
+        ),
+        patch(
+            "influx.sources.inbox.extract_article_from_html",
             return_value=_Extraction(_LONG_BODY),
         ),
     ):
@@ -228,12 +324,9 @@ def test_build_item_title_falls_back_to_url() -> None:
 def test_build_item_thin_summary_suppressed() -> None:
     """No body extracted + thin fallback summary → None (suppressed)."""
     config = _make_config()
-    with (
-        patch("influx.sources.inbox.download_archive", return_value=_failed_archive()),
-        patch(
-            "influx.sources.inbox.extract_article",
-            side_effect=NetworkError("boom", url=_URL, kind="timeout"),
-        ),
+    with patch(
+        "influx.sources.inbox.download_archive_autodetect",
+        return_value=_failed_archive(),
     ):
         acquired = acquire_inbox_bytes(_URL, config=config, summary_hint="tiny")
 

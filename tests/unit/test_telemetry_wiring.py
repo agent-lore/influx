@@ -1472,10 +1472,13 @@ class TestInfluxArchiveDownloadSpan:
                         ok=True,
                         rel_posix_path="blog/2024/06/test.html",
                         error="",
+                        content_type="text/html",
+                        content_type_family="html",
+                        body=b"<html>article</html>",
                     ),
                 ),
                 patch(
-                    "influx.sources.rss.extract_article",
+                    "influx.sources.rss.extract_article_from_html",
                     return_value=MagicMock(text="Extracted text", source_tag="html"),
                 ),
             ):
@@ -1558,10 +1561,13 @@ class TestInfluxArchiveDownloadSpan:
                     ok=True,
                     rel_posix_path="blog/2024/06/test.html",
                     error="",
+                    content_type="text/html",
+                    content_type_family="html",
+                    body=b"<html>article</html>",
                 ),
             ) as mock_download,
             patch(
-                "influx.sources.rss.extract_article",
+                "influx.sources.rss.extract_article_from_html",
                 return_value=MagicMock(text="Extracted text", source_tag="html"),
             ),
         ):

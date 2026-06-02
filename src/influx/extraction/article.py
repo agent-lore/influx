@@ -17,7 +17,11 @@ from influx.errors import ExtractionError
 from influx.extraction.html import _clean_html_fragments, _strip_tags
 from influx.http_client import guarded_fetch
 
-__all__ = ["ArticleExtractionResult", "extract_article"]
+__all__ = [
+    "ArticleExtractionResult",
+    "extract_article",
+    "extract_article_from_html",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +30,80 @@ class ArticleExtractionResult:
 
     text: str
     source: Literal["article"]
+
+
+def extract_article_from_html(
+    html_body: str,
+    *,
+    url: str,
+    min_web_chars: int | None = None,
+    strip_tags: list[str] | None = None,
+) -> ArticleExtractionResult:
+    """Extract article text from an already-fetched HTML body.
+
+    This is the network-free core of :func:`extract_article`: it strips
+    dangerous tags, runs trafilatura, cleans residual fragments, and
+    enforces the minimum length.  Callers that already hold the HTML
+    bytes (e.g. an archive download that returns the response body) use
+    this to avoid a second fetch (issue #200).
+
+    Parameters
+    ----------
+    html_body:
+        The raw HTML markup to extract from.
+    url:
+        The source URL, used only for :class:`ExtractionError` context.
+    min_web_chars:
+        Minimum character count for the extracted text.  Below this an
+        ``ExtractionError`` is raised.  ``None`` resolves to the
+        :class:`~influx.config.ExtractionConfig` default (AC-X-1).
+    strip_tags:
+        HTML tag names whose elements are stripped before extraction.
+        ``None`` resolves to the
+        :class:`~influx.config.ExtractionConfig` default.
+
+    Returns
+    -------
+    ArticleExtractionResult
+        On success with extracted text >= *min_web_chars*.
+
+    Raises
+    ------
+    ExtractionError
+        When extraction fails or extracted text is below *min_web_chars*.
+    """
+    if min_web_chars is None or strip_tags is None:
+        _extraction_defaults = ExtractionConfig()
+        if min_web_chars is None:
+            min_web_chars = _extraction_defaults.min_web_chars
+        if strip_tags is None:
+            strip_tags = list(_extraction_defaults.strip_tags)
+
+    # Strip dangerous tags before extraction
+    html_body = _strip_tags(html_body, strip_tags)
+
+    extracted = trafilatura.extract(html_body, favor_recall=True)
+
+    if extracted is None:
+        raise ExtractionError(
+            "trafilatura returned no content",
+            url=url,
+            stage="extract",
+            detail="trafilatura.extract() returned None",
+        )
+
+    # Verify no HTML fragments remain
+    extracted = _clean_html_fragments(extracted)
+
+    if len(extracted) < min_web_chars:
+        raise ExtractionError(
+            f"Extracted text too short ({len(extracted)} < {min_web_chars} chars)",
+            url=url,
+            stage="min_length",
+            detail=f"Got {len(extracted)} chars, need {min_web_chars}",
+        )
+
+    return ArticleExtractionResult(text=extracted, source="article")
 
 
 def extract_article(
@@ -74,12 +152,6 @@ def extract_article(
     NetworkError
         When the HTTP fetch fails (propagated from guarded_fetch).
     """
-    if min_web_chars is None or strip_tags is None:
-        _extraction_defaults = ExtractionConfig()
-        if min_web_chars is None:
-            min_web_chars = _extraction_defaults.min_web_chars
-        if strip_tags is None:
-            strip_tags = list(_extraction_defaults.strip_tags)
     if max_download_bytes is None or timeout_seconds is None:
         _storage_defaults = StorageConfig()
         if max_download_bytes is None:
@@ -97,28 +169,9 @@ def extract_article(
 
     html_body = result.body.decode("utf-8", errors="replace")
 
-    # Strip dangerous tags before extraction
-    html_body = _strip_tags(html_body, strip_tags)
-
-    extracted = trafilatura.extract(html_body, favor_recall=True)
-
-    if extracted is None:
-        raise ExtractionError(
-            "trafilatura returned no content",
-            url=url,
-            stage="extract",
-            detail="trafilatura.extract() returned None",
-        )
-
-    # Verify no HTML fragments remain
-    extracted = _clean_html_fragments(extracted)
-
-    if len(extracted) < min_web_chars:
-        raise ExtractionError(
-            f"Extracted text too short ({len(extracted)} < {min_web_chars} chars)",
-            url=url,
-            stage="min_length",
-            detail=f"Got {len(extracted)} chars, need {min_web_chars}",
-        )
-
-    return ArticleExtractionResult(text=extracted, source="article")
+    return extract_article_from_html(
+        html_body,
+        url=url,
+        min_web_chars=min_web_chars,
+        strip_tags=strip_tags,
+    )
