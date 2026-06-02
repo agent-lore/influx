@@ -55,7 +55,7 @@ _Avoid_: job, task (Lithos has its own `lithos_task_*`), tick.
 The data-driven specification a Run executes: profile, kind, date window, `skip_repair`, `skip_cache_hits`, `notify`, ledger ID, request ID. Built once per request type by the scheduler.
 
 **RunKind**:
-One of `scheduled`, `manual`, `backfill`. Carried as a tag for ledger and metric labels even though behaviour is driven by the boolean flags on the RunPlan.
+One of `scheduled`, `manual`, `backfill`, `inbox`. Carried as a tag for ledger and metric labels even though behaviour is driven by the boolean flags on the RunPlan. `inbox` marks the per-(item, Profile) Runs an InboxTick dispatches; it is excluded from the scheduled-only stall heuristics.
 
 **RunOutcome**:
 The post-execution record: `sources_checked`, `ingested`, `error`, `degraded`, `degraded_reasons`, `source_acquisition_errors`, plus the items needed for post-run notification dispatch.
@@ -71,6 +71,20 @@ The post-write step that calls `lithos_retrieve` for related notes, upserts `rel
 
 **RunService**:
 The collaborator that owns "build RunPlan → execute Run → dispatch notifications → record outcome" for one request. The scheduler's three entry points (scheduled tick, `POST /runs`, `POST /backfills`) are thin RunPlan builders that hand off to RunService. Lives in `src/influx/run_service.py` as `RunService.execute()`.
+
+### Domain — Inbox (manual submission)
+
+**InboxTask**:
+A Lithos task tagged `influx:inbox` carrying submission metadata (`kind="url"`, `url`, `submitted_by`, optional `title`/`summary`/`source_tag`). Created by external agents via `lithos_task_create`; consumed by the InboxTick. Each task is one candidate URL. See `docs/plans/inbox.md`.
+
+**InboxTick**:
+One execution of the inbox-tick scheduler entry (`influx-inbox-tick`, registered only when `[inbox] enabled`). Claims pending InboxTasks, acquires each URL once, scores it against every enabled Profile, and dispatches a real single-Profile `RunKind.INBOX` Run for each Profile that clears threshold (merging into one canonical note), then completes the task with an outcome string + `cited_nodes`. NOT itself a `Run` — an orchestrator above the Run layer. Lives in `src/influx/inbox.py` as `InboxTick.execute()`.
+
+**Submitter**:
+The external agent that creates an InboxTask, identified by the `submitted_by` metadata field (sanitised into a `submitter:<id>` note tag).
+
+**Cache-hit replay**:
+On a resubmitted URL the InboxTick re-scores only the *complement* of Profiles — enabled minus those already in the note's `## Profile Relevance` minus operator-suppressed (`influx:rejected:<profile>`) — so a Profile skipped earlier (e.g. busy) is picked up on a later tick. Best-effort: a read/parse failure falls back to replaying all Profiles (the write merge dedupes).
 
 ### Domain — Lithos integration
 
@@ -89,7 +103,7 @@ The recovery strategy when `lithos_write` returns `slug_collision`. Influx reads
 ### Operational state
 
 **RunLedger**:
-The local persistent record of Run history. Lives under `storage.state_dir` as `active-runs.json` (in-flight) plus `runs.jsonl` (terminal). Owns the `ingestion_stall` heuristic (consecutive zero-ingestion scheduled runs for the same Profile, backfills excluded). Not stored in Lithos — operational state, not knowledge.
+The local persistent record of Run history. Lives under `storage.state_dir` as `active-runs.json` (in-flight) plus `runs.jsonl` (terminal). Owns the `ingestion_stall` heuristic (consecutive zero-ingestion scheduled runs for the same Profile; non-scheduled kinds — backfill, inbox — excluded). Not stored in Lithos — operational state, not knowledge.
 
 **Degraded reasons**:
 The structured list on a Run's ledger entry explaining why it was marked `degraded`. Current values: `source_acquisition` (a source-fetch error was swallowed), `ingestion_stall` (this and the prior scheduled run both ingested zero with `sources_checked > 0`).

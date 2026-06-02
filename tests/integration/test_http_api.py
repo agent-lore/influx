@@ -26,6 +26,7 @@ from influx.config import (
 )
 from influx.coordinator import Coordinator
 from influx.http_api import install_exception_handlers, router
+from influx.inbox import InboxStatus
 from influx.probes import ProbeLoop
 from influx.run_ledger import RunLedger
 from influx.scheduler import InfluxScheduler
@@ -76,6 +77,7 @@ def app_with_state(fake_lithos_sse_url: str, tmp_path: Path) -> FastAPI:
     app.state.scheduler = scheduler
     app.state.probe_loop = probe_loop
     app.state.run_ledger = RunLedger(Path(config.storage.state_dir))
+    app.state.inbox_status = InboxStatus(enabled=config.inbox.enabled)
 
     return app
 
@@ -1120,3 +1122,44 @@ class TestBackfillObservability:
         assert request_level_completed == [], [
             r.message for r in request_level_completed
         ]
+
+
+class TestStatusInboxSection:
+    """``GET /status`` exposes the inbox section from cached state (§13.6)."""
+
+    def test_inbox_section_present_from_default_state(self, client: TestClient) -> None:
+        body = client.get("/status").json()
+        assert "inbox" in body
+        assert body["inbox"]["enabled"] is False
+
+    def test_inbox_section_reads_cached_state_no_task_list(
+        self, app_with_state: FastAPI
+    ) -> None:
+        # Populate the cached snapshot the tick would have written.  A fresh
+        # lithos_task_list against the empty fake server would yield pending=0,
+        # so pending=7 here proves /status reads the cache, not a live list
+        # (FR-HTTP-7).
+        app_with_state.state.inbox_status = InboxStatus(
+            enabled=True,
+            pending=7,
+            in_flight=2,
+            last_tick_at="2026-06-02T12:00:00+00:00",
+            last_tick_outcome="success",
+        )
+        body = TestClient(app_with_state).get("/status").json()
+        assert body["inbox"] == {
+            "enabled": True,
+            "pending": 7,
+            "in_flight": 2,
+            "last_tick_at": "2026-06-02T12:00:00+00:00",
+            "last_tick_outcome": "success",
+        }
+
+    def test_inbox_section_omitted_when_state_absent(
+        self, app_with_state: FastAPI
+    ) -> None:
+        # Back-compat: a deployment without inbox_status wired returns no
+        # inbox key rather than erroring.
+        delattr(app_with_state.state, "inbox_status")
+        body = TestClient(app_with_state).get("/status").json()
+        assert "inbox" not in body

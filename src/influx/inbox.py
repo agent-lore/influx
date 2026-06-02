@@ -33,6 +33,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -193,6 +194,31 @@ async def dispatch_profile(
 # ── Orchestrator ────────────────────────────────────────────────────
 
 
+@dataclass
+class InboxStatus:
+    """Mutable snapshot of inbox-tick state for the ``/status`` endpoint.
+
+    Written by the tick, read by the ``/status`` handler — so ``/status``
+    never issues a per-request ``lithos_task_list`` (FR-HTTP-7, §13.6).
+    ``pending`` is the open-task count as of the last tick's list call.
+    """
+
+    enabled: bool = False
+    pending: int = 0
+    in_flight: int = 0
+    last_tick_at: str | None = None
+    last_tick_outcome: str | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "pending": self.pending,
+            "in_flight": self.in_flight,
+            "last_tick_at": self.last_tick_at,
+            "last_tick_outcome": self.last_tick_outcome,
+        }
+
+
 @dataclass(frozen=True)
 class _ItemOutcome:
     """Internal per-item result used to build the task completion."""
@@ -241,6 +267,9 @@ class InboxTick:
     probe_loop: Any | None = None
     ledger: RunLedger | None = None
     client_factory: Callable[[], LithosClient] | None = None
+    # Shared snapshot the /status handler reads (FR-HTTP-7); the tick writes
+    # pending / in_flight / last_tick_* here so /status never lists tasks.
+    status: InboxStatus | None = None
 
     def _make_client(self) -> LithosClient:
         if self.client_factory is not None:
@@ -258,14 +287,21 @@ class InboxTick:
         dispatch.  Per-item failures are isolated — one bad item never
         aborts the rest of the tick.
         """
+        status = self.status
+        if status is not None:
+            status.last_tick_at = datetime.now(UTC).isoformat()
+
         probe = self.probe_loop
         circuit_open = getattr(probe, "lithos_circuit_open", None)
         if circuit_open is not None and circuit_open():
             logger.info("inbox tick skipped: lithos circuit open")
+            if status is not None:
+                status.last_tick_outcome = "skipped: lithos circuit open"
             return
 
         metrics.inbox_tick_started().add(1)
         client = self._make_client()
+        tick_outcome = "success"
         try:
             try:
                 body = await client.task_list_body(
@@ -274,22 +310,35 @@ class InboxTick:
                 )
             except (LithosError, LCMAError):
                 logger.warning("inbox task_list failed; skipping tick", exc_info=True)
+                if status is not None:
+                    status.last_tick_outcome = "error: task_list failed"
                 return
 
-            tasks = list(body.get("tasks", []))[: self.config.inbox.max_items_per_tick]
+            all_tasks = list(body.get("tasks", []))
+            if status is not None:
+                status.pending = len(all_tasks)
+            tasks = all_tasks[: self.config.inbox.max_items_per_tick]
             metrics.inbox_tasks_listed().add(len(tasks))
 
             for task in tasks:
+                if status is not None:
+                    status.in_flight += 1
                 try:
                     await self._process_task(task, client)
                 except Exception:  # noqa: BLE001 — per-item failure isolation (§5.5)
                     # A crash before _complete leaves the claim to expire and
                     # the task ``open``; a later tick re-claims it.  Re-ingest
                     # is safe because ``lithos_write`` dedupes on source_url.
+                    tick_outcome = "error"
                     logger.exception(
                         "inbox item processing crashed task_id=%s",
                         task.get("id") if isinstance(task, dict) else "<?>",
                     )
+                finally:
+                    if status is not None:
+                        status.in_flight -= 1
+            if status is not None:
+                status.last_tick_outcome = tick_outcome
         finally:
             await client.close()
 

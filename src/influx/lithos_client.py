@@ -1649,12 +1649,21 @@ class LithosClient:
         title: str,
         agent: str,
         tags: list[str],
+        description: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> mcp_types.CallToolResult:
-        """Call ``lithos_task_create`` (FR-LCMA-5)."""
-        return await self._call_lcma_tool(
-            "lithos_task_create",
-            {"title": title, "agent": agent, "tags": tags},
-        )
+        """Call ``lithos_task_create`` (FR-LCMA-5).
+
+        ``description`` + ``metadata`` (inbox submission, ``docs/plans/inbox.md``
+        §3) are omitted from the RPC when ``None`` so existing per-Run task
+        callers are unaffected.
+        """
+        args: dict[str, Any] = {"title": title, "agent": agent, "tags": tags}
+        if description is not None:
+            args["description"] = description
+        if metadata is not None:
+            args["metadata"] = metadata
+        return await self._call_lcma_tool("lithos_task_create", args)
 
     async def task_create_body(
         self,
@@ -1662,10 +1671,18 @@ class LithosClient:
         title: str,
         agent: str,
         tags: list[str],
+        description: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run ``task_create`` and decode the JSON body."""
         return self._result_json_dict(
-            await self.task_create(title=title, agent=agent, tags=tags),
+            await self.task_create(
+                title=title,
+                agent=agent,
+                tags=tags,
+                description=description,
+                metadata=metadata,
+            ),
             operation="task_create",
         )
 

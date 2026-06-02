@@ -233,6 +233,13 @@ async def status(request: Request) -> JSONResponse:
         },
         "profiles": profiles,
     }
+
+    # Inbox section (§13.6) — sourced from the cached InboxStatus the tick
+    # writes; never a per-request lithos_task_list (FR-HTTP-7).
+    inbox_status = getattr(request.app.state, "inbox_status", None)
+    if inbox_status is not None:
+        body["inbox"] = inbox_status.snapshot()
+
     return JSONResponse(body, status_code=200)
 
 
