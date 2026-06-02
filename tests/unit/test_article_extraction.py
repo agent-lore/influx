@@ -317,6 +317,10 @@ class TestTitleRecovery:
         html = '<meta name="og:title" content="Via Name Attr">'
         assert _recover_html_title(html) == "Via Name Attr"
 
+    def test_og_title_tolerates_whitespace_around_equals(self) -> None:
+        html = '<meta property = "og:title" content = "Spaced Attrs">'
+        assert _recover_html_title(html) == "Spaced Attrs"
+
     def test_cdata_title_recovered(self) -> None:
         html = "<title><![CDATA[CDATA Title & More]]></title>"
         assert _recover_html_title(html) == "CDATA Title & More"
