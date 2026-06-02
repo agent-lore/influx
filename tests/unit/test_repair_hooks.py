@@ -189,3 +189,61 @@ class TestTier3ExtractHookSubstitution:
         hook: Tier3ExtractHook = _fake_tier3_raises
         with pytest.raises(ExtractionError):
             hook({"id": "n1"})
+
+
+class TestNoteSourceUrlResolution:
+    """Regression for #218.
+
+    The repair sweep must read ``source_url`` from the doc-level
+    ``lithos_read`` envelope (top-level, or nested under ``metadata``),
+    NOT from a ``source_url:`` line embedded in the content body. The
+    content-body shape was the pre-fix legacy zombie shape; reading it
+    stranded every correctly-written ``influx:archive-missing`` note
+    with ``ExtractionError: no source_url in frontmatter`` even though
+    the URL was present at the doc level.
+    """
+
+    def test_reads_top_level_source_url(self) -> None:
+        from influx.repair_hooks import _note_source_url
+
+        note: dict[str, object] = {
+            "id": "rss-some-item",
+            "source_url": "https://example.com/article",
+            "content": "# Title\n\n## Archive\n",  # no embedded frontmatter
+        }
+        assert _note_source_url(note) == "https://example.com/article"
+
+    def test_falls_back_to_metadata_nested_source_url(self) -> None:
+        from influx.repair_hooks import _note_source_url
+
+        note: dict[str, object] = {
+            "id": "rss-some-item",
+            "metadata": {"source_url": "https://example.com/nested"},
+            "content": "# Title\n\n## Archive\n",
+        }
+        assert _note_source_url(note) == "https://example.com/nested"
+
+    def test_does_not_read_content_body_frontmatter(self) -> None:
+        # The removed legacy shape: source_url ONLY in the content body.
+        # The sweep must NOT resurrect it — doc-level is the only source.
+        from influx.repair_hooks import _note_source_url
+
+        note: dict[str, object] = {
+            "id": "rss-some-item",
+            "content": ("---\nsource_url: https://example.com/in-body\n---\n# Title\n"),
+        }
+        assert _note_source_url(note) is None
+
+    def test_returns_none_when_absent_everywhere(self) -> None:
+        from influx.repair_hooks import _note_source_url
+
+        note: dict[str, object] = {"id": "rss-x", "content": "# Title\n"}
+        assert _note_source_url(note) is None
+
+    def test_ignores_non_string_source_url(self) -> None:
+        from influx.repair_hooks import _note_source_url
+
+        none_url: dict[str, object] = {"id": "rss-x", "source_url": None}
+        empty_url: dict[str, object] = {"id": "rss-x", "source_url": ""}
+        assert _note_source_url(none_url) is None
+        assert _note_source_url(empty_url) is None

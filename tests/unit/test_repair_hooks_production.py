@@ -966,25 +966,14 @@ def _make_rss_archive_missing_note(
     note_id = (
         f"{feed_slug}-{url_hash}" if omit_id_prefix else f"rss-{feed_slug}-{url_hash}"
     )
-    fm_url = "" if omit_source_url else source_url
-    content = _rss_note_content(
-        source_url=fm_url if fm_url else "https://example.com/article-42"
-    )
-    if omit_source_url:
-        # Strip the source_url frontmatter line so the resolver hits the
-        # missing-field branch.
-        content = (
-            "\n".join(
-                line
-                for line in content.splitlines()
-                if not line.startswith("source_url:")
-            )
-            + "\n"
-        )
+    content = _rss_note_content(source_url=source_url)
+    # The repair sweep reads source_url from the doc-level field (#218), so
+    # ``omit_source_url`` clears that field to exercise the resolve-raise
+    # branch. The content body is irrelevant to resolution and is left intact.
     return {
         "id": note_id,
         "title": "RSS Article Title",
-        "source_url": source_url,
+        "source_url": "" if omit_source_url else source_url,
         "path": note_path,
         "content": content,
         "tags": [
@@ -1261,7 +1250,11 @@ class TestInferNoteSource:
         }
         assert infer_note_source(note) == "hackernews"
 
-    def test_infers_arxiv_from_source_url_when_tag_missing(self) -> None:
+    def test_does_not_infer_from_content_body_source_url(self) -> None:
+        """#218: a ``source_url:`` line in the content body is the removed
+        legacy shape; inference must NOT read it. Doc-level inference is
+        covered by ``test_infers_arxiv_from_top_level_source_url_*``.
+        """
         from influx.repair_hooks import infer_note_source
 
         body = (
@@ -1273,11 +1266,12 @@ class TestInferNoteSource:
         )
         note = {
             "tags": [],
-            "content": body,
+            "content": body,  # source_url only in the body — must be ignored
             "path": "",
             "id": "",
         }
-        assert infer_note_source(note) == "arxiv"
+        # No doc-level source_url and no tag/path/id signal -> cannot infer.
+        assert infer_note_source(note) is None
 
     def test_infers_arxiv_from_canonical_path(self) -> None:
         from influx.repair_hooks import infer_note_source
@@ -1353,10 +1347,10 @@ class TestInferNoteSource:
     def test_returns_none_when_url_is_non_arxiv_and_other_signals_empty(self) -> None:
         from influx.repair_hooks import infer_note_source
 
-        body = "---\nsource_url: https://example.com/something\ntags: []\n---\n"
         note = {
             "tags": [],
-            "content": body,
+            "content": "# Paper\n\nBody text only.\n",
+            "source_url": "https://example.com/something",  # doc-level, non-arxiv
             "path": "",
             "id": "",
         }
