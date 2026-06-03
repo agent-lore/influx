@@ -1625,6 +1625,352 @@ def cmd_rewrite_legacy_notes(args: argparse.Namespace) -> int:
     return 0 if counts.get(_LEGACY_OUTCOME_FAILED, 0) == 0 else 1
 
 
+# ── strip-embedded-frontmatter (#225) ───────────────────────────────
+#
+# Distinct from rewrite-legacy-notes (#176).  Those notes have EMPTY
+# doc-level metadata and recover the values FROM the embedded block.
+# These ~1,241 notes (created 2026-05-01 → 2026-05-24) have VALID
+# doc-level metadata — the embedded block is redundant content bloat.
+# The writer stopped emitting this shape after ~2026-05-24, so the
+# population is fixed.  This job strips the block and leaves doc-level
+# metadata untouched: a pure content rewrite via the Lithos write path.
+
+_EMBEDDED_FM_OUTCOME_PLANNED = "would_strip"
+_EMBEDDED_FM_OUTCOME_SKIPPED_ALREADY_CLEAN = "skipped_already_clean"
+_EMBEDDED_FM_OUTCOME_REFUSED_NON_INFLUX = "refused_non_influx_authored"
+_EMBEDDED_FM_OUTCOME_STRIPPED = "stripped"
+_EMBEDDED_FM_OUTCOME_FAILED = "failed"
+
+
+def strip_embedded_frontmatter_block(content: str) -> str | None:
+    """Strip a leading embedded ``---`` frontmatter block from read_note content.
+
+    Legacy notes (#225) carry — after Lithos strips the one ``# Title``
+    it prepended on save — a content body that *starts* with a redundant
+    ``---``-fenced YAML block duplicating the doc-level metadata,
+    followed by the renderer's ``# Title`` heading and the ``## ``
+    section body::
+
+        ---
+        note_type: summary
+        source_url: ...
+        tags: [...]
+        ---
+        # Title
+
+        ## Archive
+        ...
+
+    Returns the content with that leading fenced block removed (leaving
+    ``# Title\\n\\n## Archive ...`` — byte-identical to a current,
+    post-05-24 note's read shape), or ``None`` when *content* does not
+    start with a frontmatter fence (an already-clean / current-shape
+    note, which the caller skips).
+
+    The fence split delegates to :func:`influx.notes._split_frontmatter`,
+    which is line-anchored: a naive ``content.find("---")`` would match a
+    ``---`` inside a YAML value.  The renderer title heading and every
+    ``## `` section (``## Archive``, ``## Summary``, ``## User Notes``,
+    …) are preserved byte-for-byte.
+    """
+    from influx.notes import NoteParseError, _split_frontmatter
+
+    try:
+        _frontmatter, body = _split_frontmatter(content)
+    except NoteParseError:
+        return None
+    return body.lstrip("\n")
+
+
+def _select_embedded_frontmatter_doc_ids_from_corpus(
+    articles_path: Path,
+) -> list[str]:
+    """Scan the on-disk corpus for Influx-authored docs with an embedded fm block.
+
+    Walks ``articles_path`` recursively and returns the ids of
+    ``author == 'influx'`` docs whose content body — after the single
+    ``# Title`` Lithos prepends on save — begins with a redundant
+    ``---``-fenced frontmatter block (the #225 legacy shape).  The
+    per-doc processor re-validates authoritatively via ``read_note`` +
+    :func:`strip_embedded_frontmatter_block`; this selector only narrows
+    the candidate set so dry-run output isn't dominated by healthy docs.
+
+    Both the outer (doc-level) fence and the inner ``# Title`` heading
+    are split with the line-anchored helpers from :mod:`influx.notes`,
+    so a ``---`` embedded in a frontmatter VALUE is never mistaken for a
+    fence.  Files without an outer fence, parse failures, and
+    non-influx-authored docs are silently skipped — the per-doc guards
+    are the authoritative refusals.
+    """
+    import yaml
+
+    from influx.notes import NoteParseError, _split_frontmatter, _split_title
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    if not articles_path.exists():
+        return ids
+    for md in articles_path.rglob("*.md"):
+        try:
+            text = md.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        try:
+            frontmatter_raw, after_outer = _split_frontmatter(text)
+        except NoteParseError:
+            continue
+        try:
+            meta = yaml.safe_load(frontmatter_raw)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(meta, dict) or meta.get("author") != "influx":
+            continue
+        # Mirror Lithos's read path: it strips the one title it prepended
+        # on save.  An embedded fm block is present iff the body then
+        # begins with a fence.
+        try:
+            _title, body = _split_title(after_outer)
+        except NoteParseError:
+            continue
+        if not body.lstrip("\n").startswith("---"):
+            continue
+        doc_id = meta.get("id")
+        if not isinstance(doc_id, str) or not doc_id or doc_id in seen:
+            continue
+        seen.add(doc_id)
+        ids.append(doc_id)
+    return ids
+
+
+async def _process_one_embedded_frontmatter_doc(
+    *,
+    client: Any,
+    doc_id: str,
+    apply: bool,
+) -> tuple[str, str, dict[str, Any] | None]:
+    """Read one doc, strip its embedded fm block, and rewrite when ``apply=True``.
+
+    Doc-level metadata (tags, source_url, confidence, title, path) is
+    written back unchanged — only ``content`` is rewritten.  Returns
+    ``(outcome, reason, plan)`` where ``plan`` carries the byte delta
+    for the operator line and is ``None`` for skip/refuse outcomes.
+    """
+    try:
+        doc = await client.read_note(note_id=doc_id)
+    except BaseException as exc:  # noqa: BLE001
+        return (
+            _EMBEDDED_FM_OUTCOME_FAILED,
+            f"read failed: {_format_exception_chain(exc)}",
+            None,
+        )
+
+    metadata = doc.get("metadata") or {}
+    author = metadata.get("author") or doc.get("author") or ""
+    if author != "influx":
+        return (
+            _EMBEDDED_FM_OUTCOME_REFUSED_NON_INFLUX,
+            f"doc.author={author!r} — refusing to touch a non-influx-authored doc",
+            None,
+        )
+
+    content = str(doc.get("content") or "")
+    new_content = strip_embedded_frontmatter_block(content)
+    if new_content is None:
+        return (
+            _EMBEDDED_FM_OUTCOME_SKIPPED_ALREADY_CLEAN,
+            "content has no embedded frontmatter block — already current shape",
+            None,
+        )
+
+    plan: dict[str, Any] = {
+        "old_content_len": len(content),
+        "new_content_len": len(new_content),
+    }
+    if not apply:
+        return (
+            _EMBEDDED_FM_OUTCOME_PLANNED,
+            "ready to strip embedded frontmatter",
+            plan,
+        )
+
+    # Content-only rewrite: every doc-level field is read back from the
+    # note envelope unchanged (mirrors influx.repair's proven write
+    # contract — see _build_sweep_write_args).  Only ``content`` differs.
+    conf_raw = doc.get("confidence")
+    if conf_raw is None:
+        conf_raw = metadata.get("confidence", 1.0)
+    try:
+        confidence = float(conf_raw)
+    except (TypeError, ValueError):
+        confidence = 1.0
+
+    write_args: dict[str, Any] = {
+        "id": doc_id,
+        "title": str(doc.get("title") or metadata.get("title") or ""),
+        "content": new_content,
+        "agent": "influx",
+        "path": str(doc.get("path") or metadata.get("path") or ""),
+        "source_url": str(doc.get("source_url") or metadata.get("source_url") or ""),
+        "tags": list(doc.get("tags") or metadata.get("tags") or []),
+        "confidence": confidence,
+        "note_type": str(
+            doc.get("note_type") or metadata.get("note_type") or "summary"
+        ),
+        "namespace": str(
+            doc.get("namespace") or metadata.get("namespace") or "influx"
+        ),
+    }
+    version = doc.get("version")
+    if version is None:
+        version = metadata.get("version")
+    if version is not None:
+        write_args["expected_version"] = version
+
+    try:
+        result = await client.call_tool("lithos_write", write_args)
+    except BaseException as exc:  # noqa: BLE001
+        return (
+            _EMBEDDED_FM_OUTCOME_FAILED,
+            f"write failed: {_format_exception_chain(exc)}",
+            plan,
+        )
+
+    try:
+        body = json.loads(result.content[0].text)
+    except (AttributeError, IndexError, json.JSONDecodeError, TypeError) as exc:
+        return (
+            _EMBEDDED_FM_OUTCOME_FAILED,
+            f"could not decode lithos_write response: {exc!r}",
+            plan,
+        )
+
+    status = body.get("status", "")
+    if status in {"updated", "created"}:
+        return _EMBEDDED_FM_OUTCOME_STRIPPED, f"write status={status}", plan
+    return (
+        _EMBEDDED_FM_OUTCOME_FAILED,
+        f"unexpected write status: {status!r} (body={body!r})",
+        plan,
+    )
+
+
+def cmd_strip_embedded_frontmatter(args: argparse.Namespace) -> int:
+    """Strip redundant embedded frontmatter from legacy note bodies (#225).
+
+    Candidates come from ``--id <doc-id>`` (repeatable) or, by default,
+    a scan of the on-disk Lithos ``articles/`` subtree for
+    Influx-authored docs carrying an embedded frontmatter block.  Each
+    candidate is read via ``lithos_read``; legacy-shape docs have the
+    block stripped and the (unchanged) doc-level metadata written back
+    via ``lithos_write``.  Already-clean and non-influx-authored docs
+    are skipped or refused.  Dry-run by default; ``--apply`` requires an
+    explicit confirmation flag.
+    """
+    env = _load_env(args.env)
+
+    id_list = list(getattr(args, "id", None) or [])
+
+    # Early validation: --apply without confirmation is rejected before
+    # any corpus scan, so the failure mode is obvious to the operator.
+    if args.apply and not id_list and not args.yes and not args.yes_to_all:
+        sys.exit(
+            "--apply requires at least one --yes <doc-id> "
+            "(or --yes-to-all, or --id <doc-id>).  Aborted."
+        )
+
+    # ── Candidate selection ──
+    if id_list:
+        seen: set[str] = set()
+        doc_ids: list[str] = []
+        for doc_id in id_list:
+            if doc_id not in seen:
+                seen.add(doc_id)
+                doc_ids.append(doc_id)
+    else:
+        articles = _resolve_corpus_articles_path(env)
+        doc_ids = _select_embedded_frontmatter_doc_ids_from_corpus(articles)
+
+    limit = getattr(args, "limit", None)
+    if limit is not None and limit >= 0:
+        doc_ids = doc_ids[:limit]
+
+    if not doc_ids:
+        print(
+            "No candidate doc ids — the corpus scan found no Influx-authored "
+            "docs with an embedded frontmatter block."
+        )
+        return 0
+
+    # ── Apply-mode subset narrowing ──
+    if args.apply:
+        if id_list:
+            # --id names the targets explicitly; no extra --yes required.
+            confirmed: set[str] = set(doc_ids)
+        else:
+            confirmed = set(args.yes or [])
+            if args.yes_to_all:
+                confirmed.update(doc_ids)
+            unknown = confirmed - set(doc_ids)
+            if unknown:
+                print(
+                    "Warning: --yes ids not present in the candidate set: "
+                    + ", ".join(sorted(unknown))
+                )
+                confirmed -= unknown
+            if not confirmed:
+                sys.exit("No matching --yes ids; nothing to strip.")
+        doc_ids = [d for d in doc_ids if d in confirmed]
+
+    # ── Re-exec under uv if needed (lithos_client imports mcp) ──
+    _ensure_project_runtime_or_reexec()
+    lithos_url = _read_lithos_url(args, env)
+
+    mode = "Apply" if args.apply else "Dry-run"
+    suffix = "+lithos_write" if args.apply else " (no writes)"
+    print(
+        f"{mode} mode: processing {len(doc_ids)} doc id(s) via "
+        f"lithos_read{suffix} on {lithos_url}\n"
+    )
+
+    import asyncio
+
+    counts: dict[str, int] = {}
+
+    async def _drive() -> None:
+        client = _make_lithos_client(lithos_url)
+        try:
+            for doc_id in doc_ids:
+                outcome, reason, plan = await _process_one_embedded_frontmatter_doc(
+                    client=client,
+                    doc_id=doc_id,
+                    apply=args.apply,
+                )
+                counts[outcome] = counts.get(outcome, 0) + 1
+                line = f"{outcome:>30}  doc_id={doc_id}  {reason}"
+                if plan is not None:
+                    line += (
+                        f"  content_bytes={plan['old_content_len']}"
+                        f"→{plan['new_content_len']}"
+                    )
+                print(line)
+        finally:
+            await client.close()
+
+    asyncio.run(_drive())
+
+    print()
+    print("Summary: " + " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    if not args.apply:
+        print(
+            "\nTo strip these docs, re-run with:\n"
+            "    --apply --yes-to-all       (strip every 'would_strip' doc)\n"
+            "    --apply --yes <doc-id>     (strip specific docs, repeatable)\n"
+            "    --apply --id <doc-id>      (skip corpus scan, repeatable)"
+        )
+    # Exit non-zero only on genuine failures.
+    return 0 if counts.get(_EMBEDDED_FM_OUTCOME_FAILED, 0) == 0 else 1
+
+
 async def _fetch_invalid_source_notes(
     *,
     lithos_url: str,
@@ -2155,6 +2501,60 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_rewrite.set_defaults(func=cmd_rewrite_legacy_notes)
+
+    p_strip = sub.add_parser(
+        "strip-embedded-frontmatter",
+        help=(
+            "strip the redundant embedded YAML frontmatter block from legacy "
+            "Influx note bodies whose doc-level metadata is already valid "
+            "(issue #225).  Distinct from rewrite-legacy-notes, which recovers "
+            "EMPTY doc-level metadata.  Default mode is read-only / audit; "
+            "--apply rewrites content via lithos_write."
+        ),
+    )
+    p_strip.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "actually strip the embedded block (default: dry-run / audit).  "
+            "Must be combined with --yes <doc-id>, --yes-to-all, or --id."
+        ),
+    )
+    p_strip.add_argument(
+        "--yes",
+        action="append",
+        metavar="DOC_ID",
+        help=(
+            "confirm strip of a specific doc (repeatable).  Required with "
+            "--apply unless --yes-to-all or --id is set."
+        ),
+    )
+    p_strip.add_argument(
+        "--yes-to-all",
+        action="store_true",
+        help="strip every candidate listed in the read-only plan.",
+    )
+    p_strip.add_argument(
+        "--id",
+        action="append",
+        metavar="DOC_ID",
+        help=(
+            "act on a known doc-id directly, bypassing the corpus scan "
+            "(repeatable).  Without --apply, reports a planned strip line; "
+            "with --apply, strips without an extra --yes."
+        ),
+    )
+    p_strip.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="cap the number of candidate docs processed (staged rollout).",
+    )
+    p_strip.add_argument(
+        "--lithos-url",
+        help="override LITHOS_URL from the env file.",
+    )
+    p_strip.set_defaults(func=cmd_strip_embedded_frontmatter)
 
     p_invalid = sub.add_parser(
         "invalid-source",
