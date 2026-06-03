@@ -1243,9 +1243,15 @@ def _content_for_note_parse(note: dict[str, Any]) -> str:
     ``content`` — prepending the title into the persisted body would
     compound the existing duplicate-``# Title`` shape.
     """
-    content = str(note.get("content", ""))
-    if any(line.startswith("# ") for line in content.splitlines()):
-        return content
+    content = str(note.get("content") or "")
+    # Mirror parse_note / _split_title title detection exactly: strip the
+    # line and exclude ``## `` headings. A bare ``line.startswith("# ")``
+    # would miss an indented H1 that _split_title *would* accept, causing a
+    # second title to be prepended and shifting the parsed title.
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            return content
     title = _doc_title(note)
     if not title:
         return content

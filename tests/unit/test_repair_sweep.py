@@ -1645,3 +1645,33 @@ class TestContentForNoteParse:
         assert _doc_title({"metadata": {"title": "nested"}}) == "nested"
         assert _doc_title({"title": "", "metadata": {"title": "nested"}}) == "nested"
         assert _doc_title({"id": "x"}) == ""
+
+    def test_recognises_indented_h1_like_split_title(self) -> None:
+        # _split_title strips the line, so an indented '# Title' IS a title.
+        # The reattach check must agree and NOT prepend a second one.
+        from influx.repair import _content_for_note_parse
+
+        note: dict[str, Any] = {
+            "id": "rss-x",
+            "title": "Doc Title",
+            "content": "   # Indented Title\n\n## Archive\n",
+        }
+        assert _content_for_note_parse(note) == "   # Indented Title\n\n## Archive\n"
+
+    def test_excludes_h2_when_detecting_title(self) -> None:
+        # A '## ' heading is not a title — reattach should still fire.
+        from influx.repair import _content_for_note_parse
+
+        note: dict[str, Any] = {
+            "id": "rss-x",
+            "title": "Doc Title",
+            "content": "## Archive\n## Summary\n",
+        }
+        assert _content_for_note_parse(note).startswith("# Doc Title\n\n")
+
+    def test_none_content_does_not_become_literal_none(self) -> None:
+        from influx.repair import _content_for_note_parse
+
+        note: dict[str, Any] = {"id": "rss-x", "title": "T", "content": None}
+        # str(None) would yield "None"; must coerce to "" first.
+        assert _content_for_note_parse(note) == "# T\n\n"
