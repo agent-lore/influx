@@ -189,18 +189,13 @@ class TestStripEmbeddedFrontmatterBlock:
     def test_returns_none_when_no_fence(self) -> None:
         # Current-shape note: starts with the title heading, not a fence.
         assert (
-            _DIAGNOSE.strip_embedded_frontmatter_block(
-                "# Title\n\n## Archive\nbody\n"
-            )
+            _DIAGNOSE.strip_embedded_frontmatter_block("# Title\n\n## Archive\nbody\n")
             is None
         )
 
     def test_idempotent_on_cleaned_content(self) -> None:
         # Re-running over an already-cleaned note is a no-op (returns None).
-        assert (
-            _DIAGNOSE.strip_embedded_frontmatter_block(CLEANED_READ_CONTENT)
-            is None
-        )
+        assert _DIAGNOSE.strip_embedded_frontmatter_block(CLEANED_READ_CONTENT) is None
 
     def test_preserves_user_notes_byte_for_byte(self) -> None:
         out = _DIAGNOSE.strip_embedded_frontmatter_block(LEGACY_READ_CONTENT)
@@ -262,15 +257,24 @@ class TestSelectEmbeddedFrontmatterDocIds:
     ) -> None:
         articles = tmp_path / "articles"
         _write_note(
-            articles, "a.md", doc_id="legacy-1", author="influx",
+            articles,
+            "a.md",
+            doc_id="legacy-1",
+            author="influx",
             body=_LEGACY_DISK_BODY,
         )
         _write_note(
-            articles, "b.md", doc_id="clean-1", author="influx",
+            articles,
+            "b.md",
+            doc_id="clean-1",
+            author="influx",
             body=_CLEAN_DISK_BODY,
         )
         _write_note(
-            articles, "c.md", doc_id="other-1", author="someone-else",
+            articles,
+            "c.md",
+            doc_id="other-1",
+            author="someone-else",
             body=_LEGACY_DISK_BODY,
         )
         ids = _DIAGNOSE._select_embedded_frontmatter_doc_ids_from_corpus(articles)
@@ -285,11 +289,17 @@ class TestSelectEmbeddedFrontmatterDocIds:
     def test_deduplicates_repeated_ids(self, tmp_path: Path) -> None:
         articles = tmp_path / "articles"
         _write_note(
-            articles, "a.md", doc_id="dup", author="influx",
+            articles,
+            "a.md",
+            doc_id="dup",
+            author="influx",
             body=_LEGACY_DISK_BODY,
         )
         _write_note(
-            articles, "nested/a.md", doc_id="dup", author="influx",
+            articles,
+            "nested/a.md",
+            doc_id="dup",
+            author="influx",
             body=_LEGACY_DISK_BODY,
         )
         ids = _DIAGNOSE._select_embedded_frontmatter_doc_ids_from_corpus(articles)
@@ -306,10 +316,8 @@ class TestProcessOneEmbeddedFrontmatterDoc:
         client.read_note = AsyncMock(return_value=_legacy_doc())
         client.call_tool = AsyncMock()
 
-        outcome, _reason, plan = (
-            await _DIAGNOSE._process_one_embedded_frontmatter_doc(
-                client=client, doc_id="legacy-225-id", apply=False
-            )
+        outcome, _reason, plan = await _DIAGNOSE._process_one_embedded_frontmatter_doc(
+            client=client, doc_id="legacy-225-id", apply=False
         )
         assert outcome == _DIAGNOSE._EMBEDDED_FM_OUTCOME_PLANNED
         assert plan is not None
@@ -324,10 +332,8 @@ class TestProcessOneEmbeddedFrontmatterDoc:
         client.read_note = AsyncMock(return_value=_legacy_doc())
         client.call_tool = AsyncMock(return_value=_write_ok_result())
 
-        outcome, _reason, _plan = (
-            await _DIAGNOSE._process_one_embedded_frontmatter_doc(
-                client=client, doc_id="legacy-225-id", apply=True
-            )
+        outcome, _reason, _plan = await _DIAGNOSE._process_one_embedded_frontmatter_doc(
+            client=client, doc_id="legacy-225-id", apply=True
         )
         assert outcome == _DIAGNOSE._EMBEDDED_FM_OUTCOME_STRIPPED
 
@@ -357,10 +363,8 @@ class TestProcessOneEmbeddedFrontmatterDoc:
         client.read_note = AsyncMock(return_value=_clean_doc())
         client.call_tool = AsyncMock()
 
-        outcome, _reason, plan = (
-            await _DIAGNOSE._process_one_embedded_frontmatter_doc(
-                client=client, doc_id="clean-id", apply=True
-            )
+        outcome, _reason, plan = await _DIAGNOSE._process_one_embedded_frontmatter_doc(
+            client=client, doc_id="clean-id", apply=True
         )
         assert outcome == _DIAGNOSE._EMBEDDED_FM_OUTCOME_SKIPPED_ALREADY_CLEAN
         assert plan is None
@@ -375,10 +379,8 @@ class TestProcessOneEmbeddedFrontmatterDoc:
         client.read_note = AsyncMock(return_value=doc)
         client.call_tool = AsyncMock()
 
-        outcome, _reason, _plan = (
-            await _DIAGNOSE._process_one_embedded_frontmatter_doc(
-                client=client, doc_id="legacy-225-id", apply=True
-            )
+        outcome, _reason, _plan = await _DIAGNOSE._process_one_embedded_frontmatter_doc(
+            client=client, doc_id="legacy-225-id", apply=True
         )
         assert outcome == _DIAGNOSE._EMBEDDED_FM_OUTCOME_REFUSED_NON_INFLUX
         client.call_tool.assert_not_called()
@@ -387,10 +389,8 @@ class TestProcessOneEmbeddedFrontmatterDoc:
     async def test_read_failure_is_reported(self) -> None:
         client = MagicMock()
         client.read_note = AsyncMock(side_effect=RuntimeError("boom"))
-        outcome, reason, _plan = (
-            await _DIAGNOSE._process_one_embedded_frontmatter_doc(
-                client=client, doc_id="legacy-225-id", apply=True
-            )
+        outcome, reason, _plan = await _DIAGNOSE._process_one_embedded_frontmatter_doc(
+            client=client, doc_id="legacy-225-id", apply=True
         )
         assert outcome == _DIAGNOSE._EMBEDDED_FM_OUTCOME_FAILED
         assert "read failed" in reason
@@ -403,10 +403,8 @@ class TestProcessOneEmbeddedFrontmatterDoc:
         client.read_note = AsyncMock(return_value=_legacy_doc())
         client.call_tool = AsyncMock(return_value=result)
 
-        outcome, reason, _plan = (
-            await _DIAGNOSE._process_one_embedded_frontmatter_doc(
-                client=client, doc_id="legacy-225-id", apply=True
-            )
+        outcome, reason, _plan = await _DIAGNOSE._process_one_embedded_frontmatter_doc(
+            client=client, doc_id="legacy-225-id", apply=True
         )
         assert outcome == _DIAGNOSE._EMBEDDED_FM_OUTCOME_FAILED
         assert "rejected" in reason

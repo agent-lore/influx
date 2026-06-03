@@ -1816,9 +1816,7 @@ async def _process_one_embedded_frontmatter_doc(
         "note_type": str(
             doc.get("note_type") or metadata.get("note_type") or "summary"
         ),
-        "namespace": str(
-            doc.get("namespace") or metadata.get("namespace") or "influx"
-        ),
+        "namespace": str(doc.get("namespace") or metadata.get("namespace") or "influx"),
     }
     version = doc.get("version")
     if version is None:
