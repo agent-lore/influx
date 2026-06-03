@@ -1583,3 +1583,95 @@ class TestSweepEnvelopeNormalisation:
             "content": args["content"],
         }
         assert infer_note_source(rewritten) == "rss"
+
+
+class TestContentForNoteParse:
+    """#220: ``read_note`` strips the ``# {title}`` heading from ``content``
+    (title is doc-level metadata), but ``parse_note`` requires it. The sweep
+    must reattach the doc-level title for parsing so archive-path /
+    profile-relevance extraction works — without it the archive path (present
+    in the body) is silently lost and stage selection runs blind.
+    """
+
+    def test_reattaches_title_so_archive_path_parses(self) -> None:
+        from influx.notes import parse_archive_path, parse_note
+        from influx.repair import _content_for_note_parse
+
+        # The real read_note body shape: no leading '# Title'.
+        note: dict[str, Any] = {
+            "id": "rss-x",
+            "title": "Some Paper",
+            "content": (
+                "## Archive\npath: arxiv/2026/05/2605.20049.pdf\n\n## Summary\nx\n"
+            ),
+        }
+        parsed = parse_note(_content_for_note_parse(note))
+        assert parsed.title == "Some Paper"
+        assert parse_archive_path(parsed) == "arxiv/2026/05/2605.20049.pdf"
+
+    def test_leaves_content_unchanged_when_title_present(self) -> None:
+        from influx.repair import _content_for_note_parse
+
+        note: dict[str, Any] = {
+            "id": "rss-x",
+            "title": "Doc Title",
+            "content": "# Inner Title\n\n## Archive\n",
+        }
+        # Already has a '# ' heading — must not double-prepend.
+        assert _content_for_note_parse(note) == "# Inner Title\n\n## Archive\n"
+
+    def test_falls_back_to_metadata_title(self) -> None:
+        from influx.repair import _content_for_note_parse
+
+        note: dict[str, Any] = {
+            "id": "rss-x",
+            "metadata": {"title": "Nested Title"},
+            "content": "## Archive\n",
+        }
+        assert _content_for_note_parse(note).startswith("# Nested Title\n\n")
+
+    def test_returns_content_unchanged_when_no_title_available(self) -> None:
+        from influx.repair import _content_for_note_parse
+
+        note: dict[str, Any] = {"id": "rss-x", "content": "## Archive\n"}
+        # No doc-level title to reattach — leave content as-is (caller's
+        # try/except still handles the NoteParseError gracefully).
+        assert _content_for_note_parse(note) == "## Archive\n"
+
+    def test_doc_title_resolution_order(self) -> None:
+        from influx.repair import _doc_title
+
+        assert _doc_title({"title": "top"}) == "top"
+        assert _doc_title({"metadata": {"title": "nested"}}) == "nested"
+        assert _doc_title({"title": "", "metadata": {"title": "nested"}}) == "nested"
+        assert _doc_title({"id": "x"}) == ""
+
+    def test_recognises_indented_h1_like_split_title(self) -> None:
+        # _split_title strips the line, so an indented '# Title' IS a title.
+        # The reattach check must agree and NOT prepend a second one.
+        from influx.repair import _content_for_note_parse
+
+        note: dict[str, Any] = {
+            "id": "rss-x",
+            "title": "Doc Title",
+            "content": "   # Indented Title\n\n## Archive\n",
+        }
+        assert _content_for_note_parse(note) == "   # Indented Title\n\n## Archive\n"
+
+    def test_excludes_h2_when_detecting_title(self) -> None:
+        # A '## ' heading is not a title — reattach should still fire.
+        from influx.repair import _content_for_note_parse
+
+        note: dict[str, Any] = {
+            "id": "rss-x",
+            "title": "Doc Title",
+            "content": "## Archive\n## Summary\n",
+        }
+        assert _content_for_note_parse(note).startswith("# Doc Title\n\n")
+
+    def test_none_content_does_not_become_literal_none(self) -> None:
+        from influx.repair import _content_for_note_parse
+
+        note: dict[str, Any] = {"id": "rss-x", "title": "T", "content": None}
+        # str(None) would yield "None"; must coerce to "" first.
+        assert _content_for_note_parse(note) == "# T\n\n"

@@ -348,7 +348,7 @@ class TestTier2EnrichRollback:
                 "content": (
                     "## Archive\npath: a.pdf\n"
                     "## Profile Relevance\n"
-                    "- profile: p, score: 9\n"
+                    "### p\nScore: 9/10\n"
                 ),
                 "tags": [
                     "influx:repair-needed",
@@ -395,7 +395,7 @@ class TestTier3ExtractRollback:
                 "content": (
                     "## Archive\npath: a.pdf\n"
                     "## Profile Relevance\n"
-                    "- profile: p, score: 9\n"
+                    "### p\nScore: 9/10\n"
                 ),
                 "tags": [
                     "influx:repair-needed",

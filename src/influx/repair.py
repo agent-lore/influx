@@ -1215,6 +1215,49 @@ def _run_tier_retry(
         return new_tags
 
 
+def _doc_title(note: dict[str, Any]) -> str:
+    """Return the note's doc-level title (top-level, then ``metadata``)."""
+    direct = note.get("title")
+    if isinstance(direct, str) and direct:
+        return direct
+    meta = note.get("metadata")
+    if isinstance(meta, dict):
+        nested = meta.get("title")
+        if isinstance(nested, str) and nested:
+            return nested
+    return ""
+
+
+def _content_for_note_parse(note: dict[str, Any]) -> str:
+    """Return note content shaped for :func:`influx.notes.parse_note`.
+
+    ``read_note`` serves note ``content`` with the ``# {title}`` heading
+    stripped — the title is a doc-level metadata field. ``parse_note``
+    requires that heading (``_split_title`` raises ``NoteParseError``
+    without it), even though the archive-path / profile-relevance data
+    the sweep needs live in the body *below* the title. Reattach the
+    doc-level title when the body has no ``# `` heading so parsing
+    succeeds.
+
+    Parse-input only: the rewrite path must keep using the unmodified
+    ``content`` — prepending the title into the persisted body would
+    compound the existing duplicate-``# Title`` shape.
+    """
+    content = str(note.get("content") or "")
+    # Mirror parse_note / _split_title title detection exactly: strip the
+    # line and exclude ``## `` headings. A bare ``line.startswith("# ")``
+    # would miss an indented H1 that _split_title *would* accept, causing a
+    # second title to be prepended and shifting the parsed title.
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            return content
+    title = _doc_title(note)
+    if not title:
+        return content
+    return f"# {title}\n\n{content}"
+
+
 async def _process_sweep_note(
     note: dict[str, Any],
     *,
@@ -1230,13 +1273,14 @@ async def _process_sweep_note(
     from influx.notes import parse_archive_path, parse_note, parse_profile_relevance
 
     tags: list[str] = list(note.get("tags", []))
-    content: str = note.get("content", "")
 
-    # Parse note structure for stage selection inputs.
+    # Parse note structure for stage selection inputs. ``read_note`` strips
+    # the doc-level title from ``content``; reattach it for parsing only so
+    # archive-path / profile-relevance extraction works (#220).
     archive_path: str | None = None
     max_profile_score: int = 0
     try:
-        parsed = parse_note(content)
+        parsed = parse_note(_content_for_note_parse(note))
         archive_path = parse_archive_path(parsed)
         entries = parse_profile_relevance(parsed)
         if entries:
