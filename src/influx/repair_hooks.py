@@ -647,7 +647,7 @@ def _resolve_rss_download_args(
     source_url = _note_source_url(note)
     if not source_url:
         raise ExtractionError(
-            "Cannot retry archive download: no source_url in frontmatter",
+            "Cannot retry archive download: no doc-level source_url on note",
             stage="resolve",
             detail=f"note id={note.get('id', '?')}",
         )
@@ -878,7 +878,7 @@ def _run_rss_text_extraction(note: dict[str, object], config: AppConfig) -> str:
     source_url = _note_source_url(note)
     if not source_url:
         raise ExtractionError(
-            "Cannot retry text extraction: no source_url in frontmatter",
+            "Cannot retry text extraction: no doc-level source_url on note",
             stage="resolve",
             detail=f"note id={note.get('id', '?')}",
         )
