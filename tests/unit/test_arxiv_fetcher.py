@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from influx.config import ArxivSourceConfig, ResilienceConfig
-from influx.errors import NetworkError
+from influx.errors import ConfigError, NetworkError
 from influx.http_client import FetchResult
 from influx.sources.arxiv import (
     ArxivItem,
@@ -537,6 +537,43 @@ class TestFetchRetry:
             )
         assert mock_fetch.call_count == 1
         mock_sleep.assert_not_called()
+
+    def test_arxiv_api_timeout_default_is_60(self) -> None:
+        assert ResilienceConfig().arxiv_api_timeout_seconds == 60
+
+    def test_arxiv_api_timeout_must_be_positive(self) -> None:
+        for bad in (0, -1):
+            with pytest.raises(ConfigError, match="arxiv_api_timeout_seconds"):
+                ResilienceConfig(arxiv_api_timeout_seconds=bad)
+
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_timeout_defaults_to_arxiv_api_timeout(self, mock_fetch: MagicMock) -> None:
+        """The discovery fetch uses resilience.arxiv_api_timeout_seconds
+        when no explicit timeout_seconds is passed (#165 follow-up) —
+        NOT the shared storage download timeout."""
+        mock_fetch.return_value = _make_fetch_result(_load_fixture("empty_feed.atom"))
+        resilience = ResilienceConfig(arxiv_api_timeout_seconds=90)
+        fetch_arxiv(
+            arxiv_config=ArxivSourceConfig(categories=["cs.AI"]),
+            resilience=resilience,
+        )
+        _, kwargs = mock_fetch.call_args
+        assert kwargs["timeout_seconds"] == 90
+
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_explicit_timeout_seconds_overrides_default(
+        self, mock_fetch: MagicMock
+    ) -> None:
+        """An explicit timeout_seconds still wins over the resilience
+        default (the per-day backfill path passes one explicitly)."""
+        mock_fetch.return_value = _make_fetch_result(_load_fixture("empty_feed.atom"))
+        fetch_arxiv(
+            arxiv_config=ArxivSourceConfig(categories=["cs.AI"]),
+            resilience=ResilienceConfig(arxiv_api_timeout_seconds=90),
+            timeout_seconds=15,
+        )
+        _, kwargs = mock_fetch.call_args
+        assert kwargs["timeout_seconds"] == 15
 
     @patch("influx.sources.arxiv.guarded_fetch")
     def test_content_type_not_passed_to_guarded_fetch(

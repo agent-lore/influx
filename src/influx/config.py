@@ -679,6 +679,16 @@ class ResilienceConfig(BaseModel):
     rss_timeout_cooldown_threshold: int = 3
     rss_timeout_cooldown_seconds: int = 1800
     lithos_write_conflict_max_retries: int = 1
+    # Issue #165 follow-up: dedicated timeout for the arXiv API
+    # *discovery* fetch (``export.arxiv.org/api/query``), independent of
+    # ``storage.download_timeout_seconds`` which governs PDF/archive
+    # downloads.  The arXiv query endpoint is materially slower than a
+    # CDN PDF fetch and was the dominant driver of ``source_acquisition``
+    # timeout degradations at the shared 30s value.  A longer, separate
+    # timeout lets a slow-but-responsive query complete instead of
+    # exhausting the retry budget on read timeouts, without making PDF
+    # downloads wait as long.  Applies to connect+read+write+pool.
+    arxiv_api_timeout_seconds: int = 60
 
     @field_validator(
         "max_retries",
@@ -699,6 +709,15 @@ class ResilienceConfig(BaseModel):
             raise ConfigError(
                 "resilience.* retry and backoff fields must be non-negative"
             )
+        return v
+
+    @field_validator("arxiv_api_timeout_seconds")
+    @classmethod
+    def _positive_timeout(cls, v: int) -> int:
+        # A zero/negative read timeout would make every arXiv discovery
+        # fetch fail instantly — require a real, positive value.
+        if v <= 0:
+            raise ConfigError("resilience.arxiv_api_timeout_seconds must be positive")
         return v
 
 
