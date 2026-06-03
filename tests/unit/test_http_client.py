@@ -413,14 +413,15 @@ class TestContentTypeFamilyMismatch:
 
 
 class TestContentTypeCheckIsSuccessPathOnly:
-    """The content-type guard is a 2xx success-path validation (#227).
+    """The content-type guard only runs on non-error responses (#227).
 
-    A non-2xx response (notably arXiv's HTTP 429 rate-limit page, which
-    is served as ``text/html`` even when a PDF was requested) must NOT
-    be reported as ``content_type_mismatch`` — the status code is the
-    real signal.  ``guarded_fetch`` returns the ``FetchResult`` so the
-    caller's status handling (e.g. ``download_archive``) can classify it
-    as ``http_429`` / ``rate_limited``.
+    On an HTTP error (status >= 400) — notably arXiv's HTTP 429
+    rate-limit page, served as ``text/html`` even when a PDF was
+    requested — the content-type must NOT be reported as
+    ``content_type_mismatch``; the status code is the real signal.
+    ``guarded_fetch`` returns the ``FetchResult`` so the caller's status
+    handling (e.g. ``download_archive``) can classify it as ``http_429``
+    / ``rate_limited``.
     """
 
     @respx.mock
