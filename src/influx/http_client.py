@@ -283,7 +283,15 @@ def guarded_fetch(
             reason=str(exc),
         ) from exc
 
-    if expected_content_type is not None:
+    # The content-type guard only runs on a non-error response
+    # (status < 400).  On an HTTP error (>= 400) the status code is the
+    # real signal: an error body's content-type is meaningless (arXiv
+    # serves its HTTP 429 rate-limit page as text/html even when a PDF
+    # was requested).  Checking it here would mask the status as a
+    # content_type_mismatch and lose the rate-limit signal — so we skip
+    # the check and return the FetchResult for the caller's status
+    # handling (#227).
+    if expected_content_type is not None and status_code < 400:
         _check_content_type(content_type, expected_content_type, final_url)
 
     return FetchResult(

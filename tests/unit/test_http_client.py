@@ -412,6 +412,71 @@ class TestContentTypeFamilyMismatch:
             assert err.kind == "content_type_mismatch"
 
 
+class TestContentTypeCheckIsSuccessPathOnly:
+    """The content-type guard only runs on non-error responses (#227).
+
+    On an HTTP error (status >= 400) — notably arXiv's HTTP 429
+    rate-limit page, served as ``text/html`` even when a PDF was
+    requested — the content-type must NOT be reported as
+    ``content_type_mismatch``; the status code is the real signal.
+    ``guarded_fetch`` returns the ``FetchResult`` so the caller's status
+    handling (e.g. ``download_archive``) can classify it as ``http_429``
+    / ``rate_limited``.
+    """
+
+    @respx.mock
+    def test_expected_pdf_got_429_html_returns_result(self) -> None:
+        url = "http://export.arxiv.org/pdf/2605.10310.pdf"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                429,
+                content=b"<html>rate exceeded</html>",
+                headers={"content-type": "text/html"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(url, expected_content_type="pdf")
+        assert isinstance(result, FetchResult)
+        assert result.status_code == 429
+        assert "text/html" in result.content_type
+
+    @respx.mock
+    def test_expected_pdf_got_503_html_returns_result(self) -> None:
+        url = "http://example.com/file.pdf"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                503,
+                content=b"<html>unavailable</html>",
+                headers={"content-type": "text/html"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(url, expected_content_type="pdf")
+        assert result.status_code == 503
+
+    @respx.mock
+    def test_2xx_wrong_content_type_still_raises(self) -> None:
+        # Regression guard: a 200 with the wrong content-type must still
+        # raise content_type_mismatch — the success-path check is intact.
+        url = "http://example.com/file.pdf"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"<html>",
+                headers={"content-type": "text/html"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with (
+            patch(_PATCH_GAI, fake),
+            pytest.raises(NetworkError) as exc_info,
+        ):
+            guarded_fetch(url, expected_content_type="pdf")
+        assert exc_info.value.kind == "content_type_mismatch"
+
+
 # ── Redirect re-validation (US-005) ──────────────────────────────────
 
 
