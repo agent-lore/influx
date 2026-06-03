@@ -42,6 +42,7 @@ from influx.repair import (
 )
 from influx.schemas import Tier3Extraction
 from influx.storage import download_archive
+from influx.urls import url_hash
 
 __all__ = ["DefaultSweepHooks", "make_default_sweep_hooks"]
 
@@ -197,6 +198,12 @@ def _extract_from_archive(
 
 _ARXIV_ID_TAG_PREFIX = "arxiv-id:"
 _SOURCE_TAG_PREFIX = "source:"
+_FEED_SLUG_TAG_PREFIX = "feed-slug:"
+# Modern arxiv ids encode the publication YYMM in their first four digits
+# (e.g. ``2605.10178`` → 2026-05), matching acquisition's published_year/month.
+_ARXIV_ID_YYMM_RE = re.compile(r"^(?P<yy>\d{2})(?P<mm>\d{2})\.")
+# Leading ``YYYY-MM`` of an ISO-8601 ``created_at`` timestamp.
+_ISO_YEAR_MONTH_RE = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})")
 _NOTE_PATH_RE = re.compile(
     r"(?:papers|articles)/(?P<source>[^/]+)/(?P<year>\d{4})/(?P<month>\d{2})"
 )
@@ -497,6 +504,58 @@ def _parse_year_month_from_note_path(note_path: str) -> tuple[int, int] | None:
         return None
 
 
+def _year_month_from_arxiv_id(arxiv_id: str) -> tuple[int, int] | None:
+    """Derive ``(year, month)`` from a modern arxiv id's ``YYMM`` prefix."""
+    m = _ARXIV_ID_YYMM_RE.match(arxiv_id)
+    if not m:
+        return None
+    month = int(m.group("mm"))
+    if not 1 <= month <= 12:
+        return None
+    return 2000 + int(m.group("yy")), month
+
+
+def _year_month_from_iso(timestamp: str) -> tuple[int, int] | None:
+    """Derive ``(year, month)`` from the leading ``YYYY-MM`` of an ISO timestamp."""
+    m = _ISO_YEAR_MONTH_RE.match(timestamp)
+    if not m:
+        return None
+    month = int(m.group("month"))
+    if not 1 <= month <= 12:
+        return None
+    return int(m.group("year")), month
+
+
+def _year_month_from_note(
+    note: dict[str, object], *, arxiv_id: str | None = None
+) -> tuple[int, int] | None:
+    """Resolve the archive ``(year, month)`` bucket for a note.
+
+    ``read_note`` does not preserve the Influx note ``path``
+    (``papers|articles/<source>/YYYY/MM``), so the path-based parse fails
+    for every sweep candidate. Fall back to the publication date encoded in
+    the arxiv id (``YYMM``), then to the note's ``created_at``. The retry
+    archive path may differ from the original bucket — that is acceptable
+    (see :func:`_rss_item_id_from_note`); it only needs to be deterministic.
+    """
+    ym = _parse_year_month_from_note_path(str(note.get("path") or ""))
+    if ym is not None:
+        return ym
+    if arxiv_id:
+        ym = _year_month_from_arxiv_id(arxiv_id)
+        if ym is not None:
+            return ym
+    created_at = note.get("created_at")
+    if not isinstance(created_at, str) or not created_at:
+        meta = note.get("metadata")
+        if isinstance(meta, dict):
+            meta_created = meta.get("created_at")
+            created_at = meta_created if isinstance(meta_created, str) else ""
+        else:
+            created_at = ""
+    return _year_month_from_iso(created_at) if created_at else None
+
+
 def _classify_download_kind(error: str) -> str:
     """Return the ``kind`` discriminator from an ``ArchiveResult.error`` string.
 
@@ -553,12 +612,25 @@ def _rss_item_id_from_note(note: dict[str, object]) -> str | None:
     component that is not recoverable from the persisted note); this is
     fine because acquisition failed and no archive currently lives on
     disk for the original path.
+
+    ``read_note`` (the repair sweep's only note source) returns a Lithos
+    UUID as ``id``, not the Influx ``rss-<feed-slug>-<url-hash>`` form, so
+    the prefix strip yields nothing. In that case reconstruct the exact
+    same ``{feed-slug}-{url-hash}`` item_id from the ``feed-slug:`` tag and
+    ``source_url`` — acquisition builds the note id as
+    ``rss-{feed_slug}-{url_hash(url)}`` (``influx.sources.rss``), and
+    ``url_hash`` normalises internally, so this matches byte-for-byte.
     """
     note_id = str(note.get("id", ""))
-    if not note_id.startswith(_RSS_NOTE_ID_PREFIX):
-        return None
-    item_id = note_id[len(_RSS_NOTE_ID_PREFIX) :]
-    return item_id or None
+    if note_id.startswith(_RSS_NOTE_ID_PREFIX):
+        item_id = note_id[len(_RSS_NOTE_ID_PREFIX) :]
+        if item_id:
+            return item_id
+    feed_slug = _find_tag(_note_tags(note), _FEED_SLUG_TAG_PREFIX)
+    source_url = _note_source_url(note)
+    if feed_slug and source_url:
+        return f"{feed_slug}-{url_hash(source_url)}"
+    return None
 
 
 def _resolve_rss_download_args(
@@ -575,24 +647,24 @@ def _resolve_rss_download_args(
     source_url = _note_source_url(note)
     if not source_url:
         raise ExtractionError(
-            "Cannot retry archive download: no source_url in frontmatter",
+            "Cannot retry archive download: no doc-level source_url on note",
             stage="resolve",
             detail=f"note id={note.get('id', '?')}",
         )
     item_id = _rss_item_id_from_note(note)
     if not item_id:
         raise ExtractionError(
-            "Cannot retry archive download: note id missing 'rss-' prefix",
+            "Cannot retry archive download: cannot recover RSS item_id "
+            "(no 'rss-' id, and no feed-slug tag + source_url to reconstruct)",
             stage="resolve",
             detail=f"note id={note.get('id', '?')}",
         )
-    note_path = str(note.get("path", ""))
-    ym = _parse_year_month_from_note_path(note_path)
+    ym = _year_month_from_note(note)
     if ym is None:
         raise ExtractionError(
-            "Cannot retry archive download: note path missing year/month",
+            "Cannot retry archive download: no year/month from path or created_at",
             stage="resolve",
-            detail=f"path={note_path!r}",
+            detail=f"note id={note.get('id', '?')}",
         )
     year, month = ym
     return {
@@ -647,13 +719,13 @@ def _resolve_arxiv_download_args(
             stage="resolve",
             detail=f"note id={note.get('id', '?')}",
         )
-    note_path = str(note.get("path", ""))
-    ym = _parse_year_month_from_note_path(note_path)
+    ym = _year_month_from_note(note, arxiv_id=arxiv_id)
     if ym is None:
         raise ExtractionError(
-            "Cannot retry archive download: note path missing year/month",
+            "Cannot retry archive download: no year/month from path, "
+            "arxiv id, or created_at",
             stage="resolve",
-            detail=f"path={note_path!r}",
+            detail=f"note id={note.get('id', '?')}",
         )
     year, month = ym
     pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
@@ -806,7 +878,7 @@ def _run_rss_text_extraction(note: dict[str, object], config: AppConfig) -> str:
     source_url = _note_source_url(note)
     if not source_url:
         raise ExtractionError(
-            "Cannot retry text extraction: no source_url in frontmatter",
+            "Cannot retry text extraction: no doc-level source_url on note",
             stage="resolve",
             detail=f"note id={note.get('id', '?')}",
         )
