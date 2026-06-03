@@ -495,3 +495,42 @@ class TestDownloadArchiveAutodetect:
         ):
             _autodetect(tmp_path, item_id="../../etc/passwd")
         mock_fetch.assert_not_called()
+
+
+class TestArchive429HtmlEndToEnd:
+    """End-to-end via the real guarded_fetch: a 429 PDF request that
+    arXiv answers with an HTML rate-limit page must classify as
+    ``http_429`` (or ``rate_limited`` under policy), NOT
+    ``content_type_mismatch`` (#227).
+    """
+
+    def _fake_getaddrinfo(self, ip: str = "93.184.216.34"):
+        import socket
+
+        def _gai(host: str, *args: object, **kwargs: object):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+        return _gai
+
+    def test_arxiv_429_html_pdf_classifies_http_429(self, tmp_path: Path) -> None:
+        import httpx
+        import respx
+
+        with respx.mock:
+            respx.get(_URL).mock(
+                return_value=httpx.Response(
+                    429,
+                    content=b"<html><body>rate exceeded</body></html>",
+                    headers={"content-type": "text/html"},
+                )
+            )
+            with patch(
+                "influx.http_client.socket.getaddrinfo",
+                self._fake_getaddrinfo(),
+            ):
+                result = _dl(tmp_path)
+
+        assert result.ok is False
+        assert result.failure_kind == "http_429"
+        # No archive file is written for a rate-limited response.
+        assert not any(tmp_path.rglob("*.pdf"))
