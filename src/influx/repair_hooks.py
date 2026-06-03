@@ -204,7 +204,6 @@ _NOTE_PATH_SOURCE_RE = re.compile(r"(?:^|/)(?:papers|articles)/(?P<source>[^/]+)
 _RSS_NOTE_ID_PREFIX = "rss-"
 _ARXIV_NOTE_ID_PREFIX = "arxiv-"
 _ARXIV_HOSTNAMES: frozenset[str] = frozenset({"arxiv.org", "www.arxiv.org"})
-_SOURCE_URL_FRONTMATTER_KEY = "source_url:"
 
 
 def _find_tag(tags: list[str], prefix: str) -> str | None:
@@ -410,7 +409,7 @@ def infer_note_source(note: dict[str, object]) -> str | None:
     if resolved is not None:
         return resolved
 
-    source_url = _parse_source_url_from_note(note) or ""
+    source_url = _note_source_url(note) or ""
     inferred = _infer_source_from_url(source_url)
     if inferred is not None:
         return inferred
@@ -513,22 +512,31 @@ def _classify_download_kind(error: str) -> str:
     return head or "archive_failed"
 
 
-def _parse_source_url_from_note(note: dict[str, object]) -> str | None:
-    """Return the ``source_url`` value from the note's YAML frontmatter, if any.
+def _note_source_url(note: dict[str, object]) -> str | None:
+    """Return the note's doc-level ``source_url`` (top-level or ``metadata``).
 
-    Reuses :func:`influx.notes.parse_note` so the sweep does not carry
-    its own YAML parser.  Returns ``None`` when the note cannot be
-    parsed or the field is absent.
+    The repair sweep operates on the ``lithos_read`` envelope, where
+    ``source_url`` is a structured doc-level field — hoisted to the top
+    level by the #187 read-envelope normalisation, with ``metadata`` as
+    the fallback location.  Mirrors
+    :func:`influx.lithos_client._doc_source_url`.
+
+    This deliberately does NOT parse a ``source_url:`` line out of the
+    content body.  That was the pre-fix legacy shape (empty doc-level
+    metadata, populated content-body frontmatter); those notes have been
+    cleaned up and the writer no longer produces them, so reading the
+    content body would only reintroduce a dependency on a removed shape.
+    Returns ``None`` when no doc-level source_url is present — callers
+    treat that as a transient "needs operator hand-fix" signal.
     """
-    content = str(note.get("content", ""))
-    try:
-        parsed = parse_note(content)
-    except Exception:
-        return None
-    for line in parsed.frontmatter_raw.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(_SOURCE_URL_FRONTMATTER_KEY):
-            return stripped[len(_SOURCE_URL_FRONTMATTER_KEY) :].strip() or None
+    direct = note.get("source_url")
+    if isinstance(direct, str) and direct:
+        return direct
+    meta = note.get("metadata")
+    if isinstance(meta, dict):
+        nested = meta.get("source_url")
+        if isinstance(nested, str) and nested:
+            return nested
     return None
 
 
@@ -564,7 +572,7 @@ def _resolve_rss_download_args(
     transient so an operator hand-fix lands the next pass.
     """
     source = _note_source_tag(note)
-    source_url = _parse_source_url_from_note(note)
+    source_url = _note_source_url(note)
     if not source_url:
         raise ExtractionError(
             "Cannot retry archive download: no source_url in frontmatter",
@@ -795,7 +803,7 @@ def _run_rss_text_extraction(note: dict[str, object], config: AppConfig) -> str:
     fix can repair, and it should keep surfacing through the sweep's
     failure-logging path until corrected.
     """
-    source_url = _parse_source_url_from_note(note)
+    source_url = _note_source_url(note)
     if not source_url:
         raise ExtractionError(
             "Cannot retry text extraction: no source_url in frontmatter",
