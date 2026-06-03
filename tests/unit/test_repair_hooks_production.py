@@ -707,10 +707,17 @@ class TestArchiveDownloadHookMetadataRecovery:
         assert exc_info.value.stage == "resolve"
         assert classify_failure(exc_info.value) == "transient"
 
-    def test_missing_year_month_in_path_raises_resolve(self, tmp_path: Path) -> None:
+    def test_unresolvable_year_month_raises_resolve(self, tmp_path: Path) -> None:
+        # #223: year/month now falls back to the arxiv id's YYMM, then
+        # created_at. It only raises when NONE resolve: a legacy-format
+        # arxiv id (no YYMM prefix), a path without year/month, and no
+        # created_at on the note.
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
-        note = _make_archive_missing_note(note_path="papers/arxiv/")
+        note = _make_archive_missing_note(
+            arxiv_id="math.GT/0309136", note_path="papers/arxiv/"
+        )
+        note.pop("created_at", None)
 
         assert hooks.archive_download is not None
         with pytest.raises(ExtractionError) as exc_info:
@@ -1075,10 +1082,14 @@ class TestArchiveDownloadHookRssMetadataRecovery:
         assert exc_info.value.stage == "resolve"
         assert classify_failure(exc_info.value) == "transient"
 
-    def test_missing_id_prefix_raises_resolve(self, tmp_path: Path) -> None:
+    def test_unresolvable_item_id_raises_resolve(self, tmp_path: Path) -> None:
+        # #223: a non-``rss-`` id now reconstructs item_id from the
+        # feed-slug tag + source_url. It only raises when reconstruction is
+        # also impossible — here the feed-slug tag is stripped.
         config = _make_config(tmp_path)
         hooks = make_default_sweep_hooks(config)
         note = _make_rss_archive_missing_note(omit_id_prefix=True)
+        note["tags"] = [t for t in note["tags"] if not t.startswith("feed-slug:")]
 
         assert hooks.archive_download is not None
         with pytest.raises(ExtractionError) as exc_info:
@@ -1721,3 +1732,119 @@ class TestArchiveDownloadHookPolicyRegistry:
         # arxiv.org has no built-in policy entry, so it resolves to the
         # no-op ``attempt`` policy.
         assert registry.policy_for("https://arxiv.org/pdf/x.pdf").mode == "attempt"
+
+
+class TestYearMonthResolution:
+    """#223: year/month must resolve when the read_note envelope has no path."""
+
+    def test_year_month_from_arxiv_id(self) -> None:
+        from influx.repair_hooks import _year_month_from_arxiv_id
+
+        assert _year_month_from_arxiv_id("2605.10178") == (2026, 5)
+        assert _year_month_from_arxiv_id("2412.00001") == (2024, 12)
+        assert _year_month_from_arxiv_id("2613.00001") is None  # month 13
+        assert _year_month_from_arxiv_id("not-an-id") is None
+
+    def test_year_month_from_iso(self) -> None:
+        from influx.repair_hooks import _year_month_from_iso
+
+        assert _year_month_from_iso("2026-05-31T09:22:58+00:00") == (2026, 5)
+        assert _year_month_from_iso("2026-13-01") is None  # month 13
+        assert _year_month_from_iso("garbage") is None
+
+    def test_prefers_path_then_arxiv_id_then_created_at(self) -> None:
+        from influx.repair_hooks import _year_month_from_note
+
+        # path wins
+        assert _year_month_from_note(
+            {"path": "papers/arxiv/2024/03", "created_at": "2026-05-01"},
+            arxiv_id="2605.10178",
+        ) == (2024, 3)
+        # no path -> arxiv id YYMM
+        assert _year_month_from_note(
+            {"path": None, "created_at": "2026-01-01"}, arxiv_id="2605.10178"
+        ) == (2026, 5)
+        # no path, no arxiv id -> created_at
+        assert _year_month_from_note(
+            {"path": None, "created_at": "2026-05-31T09:22:58+00:00"}
+        ) == (2026, 5)
+        # created_at nested under metadata
+        assert _year_month_from_note(
+            {"metadata": {"created_at": "2026-04-02T00:00:00+00:00"}}
+        ) == (2026, 4)
+        # nothing -> None
+        assert _year_month_from_note({"id": "x"}) is None
+
+
+class TestRssItemIdReconstruction:
+    """#223: reconstruct the RSS archive item_id from the read_note envelope."""
+
+    def test_strips_rss_prefix_when_present(self) -> None:
+        from influx.repair_hooks import _rss_item_id_from_note
+
+        assert _rss_item_id_from_note({"id": "rss-techcrunch-abc123"}) == (
+            "techcrunch-abc123"
+        )
+
+    def test_reconstructs_from_feed_slug_and_source_url(self) -> None:
+        from influx.repair_hooks import _rss_item_id_from_note
+        from influx.urls import url_hash
+
+        url = "https://www.alignmentforum.org/posts/Cmk/advice"
+        note = {
+            "id": "4c9c8175-605e-41fe-807c-5438ca40d1d7",  # Lithos UUID, no rss-
+            "source_url": url,
+            "tags": ["source:rss", "feed-slug:ai-alignment-forum"],
+        }
+        # Matches acquisition's id == rss-{feed_slug}-{url_hash(url)}.
+        assert _rss_item_id_from_note(note) == f"ai-alignment-forum-{url_hash(url)}"
+
+    def test_none_when_no_prefix_and_no_reconstruction_inputs(self) -> None:
+        from influx.repair_hooks import _rss_item_id_from_note
+
+        # UUID id, no feed-slug tag -> cannot reconstruct.
+        assert _rss_item_id_from_note({"id": "uuid", "tags": ["source:rss"]}) is None
+
+    def test_resolve_rss_args_from_envelope_shape(self, tmp_path: Path) -> None:
+        from influx.repair_hooks import _resolve_rss_download_args
+        from influx.urls import url_hash
+
+        config = _make_config(tmp_path)
+        url = "https://www.alignmentforum.org/posts/Cmk/advice"
+        note = {
+            "id": "4c9c8175-605e-41fe-807c-5438ca40d1d7",
+            "source_url": url,
+            "path": None,
+            "created_at": "2026-05-31T09:22:58+00:00",
+            "tags": [
+                "source:rss",
+                "feed-slug:ai-alignment-forum",
+                "influx:archive-missing",
+                "influx:repair-needed",
+            ],
+        }
+        args = _resolve_rss_download_args(note, config)
+        assert args["url"] == url
+        assert args["item_id"] == f"ai-alignment-forum-{url_hash(url)}"
+        assert args["published_year"] == 2026
+        assert args["published_month"] == 5
+        assert args["ext"] == ".html"
+
+    def test_resolve_arxiv_args_from_envelope_shape(self, tmp_path: Path) -> None:
+        from influx.repair_hooks import _resolve_arxiv_download_args
+
+        config = _make_config(tmp_path)
+        note = {
+            "id": "56868609-29d7-46c2-9325-2dc56fb1f108",
+            "source_url": "https://arxiv.org/abs/2605.10178",
+            "path": None,
+            "created_at": "2026-05-12T02:24:14+00:00",
+            "tags": ["arxiv-id:2605.10178", "source:arxiv", "influx:repair-needed"],
+        }
+        args = _resolve_arxiv_download_args(note, config)
+        assert args["url"] == "https://arxiv.org/pdf/2605.10178.pdf"
+        assert args["item_id"] == "2605.10178"
+        # year/month from the arxiv id's YYMM, since path is absent.
+        assert args["published_year"] == 2026
+        assert args["published_month"] == 5
+        assert args["ext"] == ".pdf"
