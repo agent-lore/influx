@@ -654,9 +654,29 @@ class LithosClient:
                 self._session = session
                 logger.info("Lithos SSE connection established to %s", self._url)
                 return session
-            except Exception:
+            except (LithosError, LCMAError, McpError):
+                # Already-typed errors propagate unchanged.  An McpError
+                # raised during agent-register is normalised to LCMAError
+                # downstream by _call_lcma_tool.
                 await stack.aclose()
                 raise
+            except Exception as exc:
+                # A transport/connection failure (httpx.ConnectError, OSError,
+                # or the anyio TaskGroup's ExceptionGroup wrapping them when
+                # Lithos is unreachable) would otherwise leak raw to callers.
+                # The fire-and-forget inbox tick catches (LithosError,
+                # LCMAError) but not a bare ExceptionGroup, so the exception
+                # escaped as an unretrieved task error (#231).  Normalise it
+                # to a LithosError so every caller handles "Lithos
+                # unreachable" through one typed path.  ``except Exception``
+                # (not BaseException) lets CancelledError / KeyboardInterrupt
+                # propagate untouched.
+                await stack.aclose()
+                raise LithosError(
+                    "connection_failed",
+                    operation="connect",
+                    detail=f"could not connect to Lithos at {self._url}: {exc!r}",
+                ) from exc
 
     async def reconnect(self) -> None:
         """Drop the current SSE connection and re-establish it.
