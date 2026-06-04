@@ -663,3 +663,73 @@ class TestReadNoteEnvelopeNormalisation:
         note["tags"].append("mutated")
 
         assert note["metadata"]["tags"] == ["source:rss"]
+
+
+class TestEnsureConnectedNormalisesConnectionErrors:
+    """A transport/connection failure is normalised to LithosError (#231).
+
+    When Lithos is unreachable the SSE TaskGroup raises an
+    ``ExceptionGroup`` wrapping a connect error.  Left raw, it escaped
+    the fire-and-forget inbox tick (which catches ``LithosError`` /
+    ``LCMAError``) as an unretrieved task exception.  ``_ensure_connected``
+    now wraps it so every caller has one typed failure path.
+    """
+
+    @staticmethod
+    def _boom_cm(exc: BaseException):
+        class _CM:
+            async def __aenter__(self) -> object:
+                raise exc
+
+            async def __aexit__(self, *_a: object) -> bool:
+                return False
+
+        return lambda _url: _CM()
+
+    async def test_exception_group_connect_error_wrapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = LithosClient(url="http://localhost:1234/sse")
+        eg = ExceptionGroup(
+            "unhandled errors in a TaskGroup",
+            [ConnectionError("All connection attempts failed")],
+        )
+        monkeypatch.setattr("influx.lithos_client.sse_client", self._boom_cm(eg))
+        with pytest.raises(LithosError) as ei:
+            await client._ensure_connected()
+        assert ei.value.operation == "connect"
+        assert "could not connect to Lithos" in ei.value.detail
+
+    async def test_bare_connection_error_wrapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = LithosClient(url="http://localhost:1234/sse")
+        monkeypatch.setattr(
+            "influx.lithos_client.sse_client",
+            self._boom_cm(ConnectionError("connection refused")),
+        )
+        with pytest.raises(LithosError):
+            await client._ensure_connected()
+
+    async def test_already_typed_lithos_error_not_rewrapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = LithosClient(url="http://localhost:1234/sse")
+        sentinel = LithosError("already_typed", operation="prior")
+        monkeypatch.setattr("influx.lithos_client.sse_client", self._boom_cm(sentinel))
+        with pytest.raises(LithosError) as ei:
+            await client._ensure_connected()
+        assert ei.value is sentinel
+
+    async def test_cancelled_error_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        client = LithosClient(url="http://localhost:1234/sse")
+        monkeypatch.setattr(
+            "influx.lithos_client.sse_client",
+            self._boom_cm(asyncio.CancelledError()),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await client._ensure_connected()
