@@ -760,8 +760,11 @@ def fetch_arxiv(
         place this tunable lives is config-parsing code (AC-X-1).
     timeout_seconds:
         Connect + read timeout in seconds for the underlying
-        ``guarded_fetch``.  ``None`` resolves to the
-        :class:`~influx.config.StorageConfig` field default (AC-X-1).
+        ``guarded_fetch``.  ``None`` resolves to
+        ``resilience.arxiv_api_timeout_seconds`` — the arXiv query
+        endpoint is slower than a PDF download, so it has a dedicated
+        timeout independent of ``storage.download_timeout_seconds``
+        (#165 follow-up).
 
     Returns
     -------
@@ -816,9 +819,11 @@ def _fetch_with_retry(
     """Fetch *url* with 429 backoff and exponential retry (FR-RES-1/2).
 
     ``max_download_bytes`` and ``timeout_seconds`` default to ``None``;
-    when omitted they are resolved from the pydantic
-    :class:`~influx.config.StorageConfig` field defaults so the only
-    place these tunable defaults live is config-parsing code (AC-X-1).
+    when omitted, ``max_download_bytes`` resolves to the
+    :class:`~influx.config.StorageConfig` default and ``timeout_seconds``
+    to ``resilience.arxiv_api_timeout_seconds`` — the arXiv query
+    endpoint has a dedicated timeout, separate from PDF downloads
+    (#165 follow-up).
 
     Issue #129 hardening:
 
@@ -837,12 +842,13 @@ def _fetch_with_retry(
       so the run ledger surfaces "we hit 429 N times but recovered"
       distinct from the swallowed-error list.
     """
-    if max_download_bytes is None or timeout_seconds is None:
-        _storage_defaults = StorageConfig()
-        if max_download_bytes is None:
-            max_download_bytes = _storage_defaults.max_download_bytes
-        if timeout_seconds is None:
-            timeout_seconds = _storage_defaults.download_timeout_seconds
+    if max_download_bytes is None:
+        max_download_bytes = StorageConfig().max_download_bytes
+    if timeout_seconds is None:
+        # The discovery fetch defaults to the arXiv-API timeout, not the
+        # shared storage download timeout — the query endpoint is slower
+        # than a PDF download (#165 follow-up).
+        timeout_seconds = resilience.arxiv_api_timeout_seconds
 
     max_retries = resilience.max_retries
     backoff_base = resilience.backoff_base_seconds
@@ -1613,7 +1619,7 @@ async def _fetch_arxiv_items(
             resilience=config.resilience,
             backfill_range=backfill_range,
             max_download_bytes=config.storage.max_download_bytes,
-            timeout_seconds=config.storage.download_timeout_seconds,
+            timeout_seconds=config.resilience.arxiv_api_timeout_seconds,
         )
 
     n_categories = max(len(arxiv_cfg.categories), 1)
@@ -1652,7 +1658,7 @@ async def _fetch_arxiv_items(
                 resilience=config.resilience,
                 backfill_range=day_range,
                 max_download_bytes=config.storage.max_download_bytes,
-                timeout_seconds=config.storage.download_timeout_seconds,
+                timeout_seconds=config.resilience.arxiv_api_timeout_seconds,
             )
         except NetworkError:
             _log.warning(
