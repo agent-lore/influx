@@ -31,6 +31,10 @@ Subcommands
                     configurable severity policy (issue #165); exits
                     0 on PASS / 1 on FAIL so a CI promotion step can
                     consume it directly
+    feed-yield      Notes-ingested-per-RSS-feed from the on-disk corpus
+                    (joins influx.toml feeds against feed-slug: note
+                    tags); surfaces dead/broken, silent, and
+                    top-producing feeds for curation (issue #233)
     cancel          Print the curl line for cancelling an in-flight run
                     (this script never sends destructive HTTP itself)
 
