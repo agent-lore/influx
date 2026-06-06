@@ -1,29 +1,57 @@
-# Influx Staging Operator Runbook
+# Influx Operator Runbook
 
-**Audience:** anyone diagnosing a failed or partial scheduled run on
-`influx-staging` without reading the source.
+**Audience:** anyone diagnosing a failed or partial scheduled run, or
+running the routine health review, on either `influx-staging` or the
+production `influx` deployment — without reading the source.
 
 **Bar:** find the failure in under ten minutes, decide whether to
 intervene or wait for the next sweep.
 
 **Tooling:** `scripts/influx-diagnose.py` wraps every recipe in this
-document. Run `./scripts/influx-diagnose.py --help` for the full
-subcommand list.
+document. Every subcommand takes `--env staging|prod` (default
+`staging`) and reads `docker/.env.<env>`, so the same recipes work
+against both environments — just pass the right `--env`. Run
+`./scripts/influx-diagnose.py --help` for the full subcommand list.
+
+> **Proactive vs reactive:** §1–§10 are the reactive troubleshooting
+> reference. For the routine sweep once Influx is in production, start at
+> [§11 Weekly operational review](#11-weekly-operational-review).
+
+---
+
+## Quick navigation: symptom → section
+
+| Symptom | Go to |
+| --- | --- |
+| Routine weekly health check | [§11 Weekly operational review](#11-weekly-operational-review) |
+| Promotion gate FAILs | [§8c Promotion gate](#8c-promotion-gate-issue-165) |
+| A run failed / degraded / didn't run | [§2 Decide if there is a problem](#2-decide-if-there-is-a-problem), [§3 Drill into one run](#3-drill-into-one-run) |
+| Unexpected exception / new ERROR in logs | [§4 Common log shapes](#4-common-log-shapes) |
+| A feed produces nothing / a feed went silent | [§8g Feed yield](#8g-feed-yield--per-feed-note-production-issue-233) |
+| arXiv 429 / timeout storms | [§9 Scheduling stagger](#9-scheduling-stagger-issue-87) |
+| Slug-collision squatters / zombie notes | [§8 Cleaning up slug-collision squatters](#8-cleaning-up-slug-collision-squatters) |
+| Notes with empty/invalid source metadata | [§8b Invalid-source notes](#8b-cleaning-up-invalid-source-metadata-notes-issue-162) |
+| Lithos unreachable / inbox-tick errors | [§4 Common log shapes](#4-common-log-shapes) (connection failures surface as `LithosError`) |
 
 ---
 
 ## 1. Environment quick-reference
 
-| Item                  | Where it lives                                                        |
-| --------------------- | --------------------------------------------------------------------- |
-| Container name        | `influx-staging` (set via `INFLUX_CONTAINER_NAME` in `docker/.env.staging`) |
-| Run ledger (history)  | `${INFLUX_STATE_PATH}/runs.jsonl` — append-only JSONL.                |
-| Active runs           | `${INFLUX_STATE_PATH}/active-runs.json` — keyed by `run_id`.          |
-| Admin HTTP API        | `http://${INFLUX_ADMIN_BIND_HOST}:${INFLUX_ADMIN_HOST_PORT}` (default `127.0.0.1:18080`). |
-| Logs                  | `docker logs influx-staging` — JSON-per-line via `InfluxJsonFormatter`. |
+`scripts/influx-diagnose.py` reads `docker/.env.<env>` for every value
+below, so switching environments is just `--env staging` / `--env prod`.
 
-`scripts/influx-diagnose.py` reads `docker/.env.<env>` for these
-values, so substituting environments is `--env dev` / `--env staging`.
+| Item | `--env staging` | `--env prod` |
+| --- | --- | --- |
+| Container (`INFLUX_CONTAINER_NAME`) | `influx-staging` | `influx` |
+| Admin host port (`INFLUX_ADMIN_HOST_PORT`) | `18081` | `18080` |
+| Run ledger (history) | `${INFLUX_STATE_PATH}/runs.jsonl` (append-only JSONL) | ″ (per-env `INFLUX_STATE_PATH`) |
+| Active runs | `${INFLUX_STATE_PATH}/active-runs.json` (keyed by `run_id`) | ″ |
+| Config | `${INFLUX_DATA_PATH}/influx.toml` | ″ |
+| Corpus (notes on disk) | `<knowledge>/articles/**.md` | ″ |
+| Logs | `docker logs influx-staging` (JSON-per-line) | `docker logs influx` |
+
+All commands below show `--env staging`; substitute `--env prod` for the
+production deployment.
 
 ## 2. Decide if there is a problem
 
@@ -725,6 +753,85 @@ one of `--yes <doc-id>`, `--yes-to-all`, or `--id <doc-id>` (the
 explicitly). Idempotent — re-running after `--apply` is a no-op for
 already-fixed docs.
 
+## 8g. Feed yield — per-feed note production (issue #233)
+
+`feed-yield` answers "which RSS feeds are actually earning their place?"
+by joining the configured feed list (`influx.toml`) against the
+`feed-slug:` tag the writer stamps on every note in the corpus. It is
+read-only (corpus + config; no Lithos / docker / HTTP) and is the
+primary tool for ongoing feed curation.
+
+```bash
+# All feeds, dead-weight first (default sort = yield ascending).
+./scripts/influx-diagnose.py --env staging feed-yield
+
+# One profile; 7-day recent window; machine-readable.
+./scripts/influx-diagnose.py --env staging feed-yield \
+    --profile retro-computing --since-days 7 --json
+
+# Most-active first.
+./scripts/influx-diagnose.py --env staging feed-yield --sort recent
+```
+
+Columns: `tot` (all-time notes), `recent` (notes created within
+`--since-days`, default 30), `latest` (most recent note date), `F`
+(forum-feed flag), `profile`, `feed`. A trailing summary counts
+zero-yield and silent feeds, and lists **orphan** slugs (notes from
+feeds no longer in the config — removed/renamed sources).
+
+### Reading the four signals
+
+| Signal | Meaning | Action |
+| --- | --- | --- |
+| **zero-yield** (`tot=0`) | configured but never produced a note | Disambiguate before cutting — see below. |
+| **silent** (`tot>0`, `recent=0`) | produced before, stopped | **Newly broken** — feed went dead/changed, or upstream went quiet. The clearest "something just broke" alarm. |
+| **top producer** | high volume | Sanity-check it is *quality*, not noise — especially forums. High yield ≠ high value. |
+| **orphan** | notes from a feed no longer in config | Informational (historical contributor). |
+
+### zero-yield ≠ broken (the key subtlety)
+
+A feed whose URL works fine but whose items all fail the relevance
+filter also shows `tot=0`. **Always disambiguate before cutting:**
+
+```bash
+# 1. Does the feed URL return a real feed with items?
+curl -sSL -A "Mozilla/5.0" "<feed-url>" | grep -ciE "<item|<entry"
+
+# 2. Is Influx fetching it and dropping every item at the filter?
+./scripts/influx-diagnose.py --env staging warnings \
+  | grep "feed='<Feed Name>'"        # 'article inspected ... decision=drop reason=...'
+```
+
+- URL **404 / anti-bot wall / empty / wrong content-type** → genuinely
+  broken: find a replacement URL (try RSS autodiscovery — fetch the
+  site homepage and grep for `application/rss+xml` / `atom+xml`), else
+  cut the `[[profiles.sources.rss]]` block from `influx.toml`.
+- URL **200 with items, but all `not_returned_by_filter` /
+  `below_relevance`** → not broken: the scorer judges the content
+  not relevant. This is a curation/threshold call, not a fix. Such a
+  feed causes **no degradation** (a fetched-then-filtered feed is not a
+  `source_acquisition` failure) — the only cost is wasted filter calls.
+
+### Forum feeds and the durable-knowledge bar
+
+Forum feeds (flagged `F`) can be top producers but mix genuine signal
+(release announcements, technical write-ups) with chatter (help/support
+threads, opinion polls, "Re:" replies). High yield from a forum is a
+prompt to **sample the content**, not to assume value:
+
+```bash
+# Eyeball recent titles + summaries for one feed-slug.
+grep -rl "feed-slug:<slug>" "<knowledge>/articles" | head -10 | \
+  xargs -I{} sh -c 'echo "== {} =="; sed -n "/^title:/p;/^## Summary/,+3p" {}'
+```
+
+If a forum's notes are mostly chatter, the fix is to tighten the
+profile's scoring `description` (teach the scorer to score chatter low)
+rather than raising the relevance threshold — see the retro-computing
+profile's `DURABLE-KNOWLEDGE BAR` block for the pattern. Re-run
+`feed-yield` over the following cycles to confirm the tuning reduced the
+low-value volume while keeping the substantive notes.
+
 ## 9. Scheduling stagger (issue #87)
 
 Profiles share a single global `[schedule].cron` expression. Within
@@ -821,3 +928,84 @@ next levers are operator-side: raise `arxiv_429_max_retries`, raise
 - Terminal cap rationale and prior incident notes: PR #11 (initial
   data layer), PR #15 (archive cap), PR #25 (archive_download hook),
   PR #26 (text_extraction_retry hook).
+
+## 11. Weekly operational review
+
+A ~15-minute proactive sweep to run once a week while Influx is in
+production (and worth running on staging too). Tiered: top-line health
+first, so you can stop early if everything is green. All steps are local
+reads (ledger + corpus + logs) — run them from the host with
+`--env prod`.
+
+### 1. Top-line health (~5 min, the must-do)
+
+```bash
+./scripts/influx-diagnose.py --env prod promotion-gate
+./scripts/influx-diagnose.py --env prod recent --limit 12
+./scripts/influx-diagnose.py --env prod failures --limit 20
+```
+
+- **Healthy:** gate `PASS`; `unexpected_failure=0`; `expected_lossy`
+  ratio at/under the cap (0.50); every profile ran its scheduled cycle
+  and `status=completed`.
+- **Escalate:** any `unexpected_failure` run. That bucket is real data
+  integrity — `slug_collision`, `content_too_large`, `version_conflict`,
+  `invalid_input` — not tolerated upstream noise. → [§8c](#8c-promotion-gate-issue-165),
+  [§3](#3-drill-into-one-run). Distinguish from `expected_lossy`
+  (arXiv/upstream blips), which is normal.
+
+### 2. Error / exception scan
+
+```bash
+./scripts/influx-diagnose.py --env prod warnings | grep -i error
+```
+
+- **Healthy:** only known-benign lines (empty-HTML-tree extraction, OTEL
+  deprecation warnings).
+- **Escalate:** any **new exception class or traceback** (this is how
+  the inbox-tick `ExceptionGroup`-on-Lithos-unreachable bug, #231, was
+  found). → [§4](#4-common-log-shapes).
+
+### 3. Feed health
+
+```bash
+./scripts/influx-diagnose.py --env prod feed-yield --since-days 7
+```
+
+- **Healthy:** no *newly* silent feeds; the zero-yield set is unchanged
+  from last week.
+- **Escalate:** a previously-producing feed now silent → a feed broke
+  upstream; disambiguate and fix/cut per [§8g](#8g-feed-yield--per-feed-note-production-issue-233).
+- **Monthly:** sample a top forum feed's content to confirm the
+  durable-knowledge bar still holds; tune the profile `description` if
+  chatter is creeping in.
+
+### 4. Corpus hygiene (regression catch)
+
+```bash
+./scripts/influx-diagnose.py --env prod invalid-source          # read-only audit
+./scripts/influx-diagnose.py --env prod slug-collision-backlog
+```
+
+- **Healthy:** counts roughly flat week-over-week (a few/week is the
+  known empty-source trickle).
+- **Escalate:** a spike in either → a writer/ingestion regression. →
+  [§8](#8-cleaning-up-slug-collision-squatters),
+  [§8b](#8b-cleaning-up-invalid-source-metadata-notes-issue-162).
+
+### 5. Volume sanity
+
+From the `recent` output (step 1), eyeball `ingested=` per profile.
+
+- **Healthy:** volumes roughly stable run-over-run.
+- **Escalate:** a cliff (e.g. a profile that usually ingests 5–15
+  dropping to 0) signals a pipeline or upstream breakage even when
+  nothing logged an error — cross-check with feed-yield (step 3).
+
+### Automation
+
+Steps 1–2 are the cheap-and-critical pair and lend themselves to a
+weekly cron that emails/pings only on a regression (the staging
+promotion-gate already runs as a local cron — extend it to bundle the
+error scan and a feed-yield diff). Steps 3–5 benefit from a human eye,
+so keep those manual.
