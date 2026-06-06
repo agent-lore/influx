@@ -1969,6 +1969,219 @@ def cmd_strip_embedded_frontmatter(args: argparse.Namespace) -> int:
     return 0 if counts.get(_EMBEDDED_FM_OUTCOME_FAILED, 0) == 0 else 1
 
 
+# ── feed-yield (operational: notes ingested per RSS feed) ────────────
+
+
+def _resolve_config_path(env: dict[str, str]) -> Path:
+    """Resolve the on-disk ``influx.toml`` path.
+
+    ``${INFLUX_DATA_PATH}/influx.toml`` is the convention the env files
+    already use for the ``[lithos] url`` lookup in ``_read_lithos_url``.
+    """
+    data_path = env.get("INFLUX_DATA_PATH")
+    if not data_path:
+        sys.exit(
+            "Cannot resolve influx.toml: set $INFLUX_DATA_PATH in the env "
+            "file (the directory containing influx.toml)."
+        )
+    path = Path(data_path) / "influx.toml"
+    if not path.exists():
+        sys.exit(f"influx.toml not found at {path}")
+    return path
+
+
+_FORUM_FEED_MARKERS = ("forum", "new topics", "latest forum")
+
+
+def _is_forum_feed(name: str, url: str) -> bool:
+    """Heuristic: does this feed publish discussion/forum threads?"""
+    blob = f"{name} {url}".lower()
+    return any(marker in blob for marker in _FORUM_FEED_MARKERS)
+
+
+def _configured_rss_feeds(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map ``feed-slug`` → ``{profile, name, url, forum}`` for every RSS feed.
+
+    The slug is derived from the feed NAME via the same
+    :func:`influx.slugs.slugify_feed_name` the writer tags notes with
+    (``feed-slug:<slug>``), so the result joins directly against the
+    corpus scan.
+    """
+    from influx.slugs import slugify_feed_name
+
+    feeds: dict[str, dict[str, Any]] = {}
+    profiles = config.get("profiles")
+    if not isinstance(profiles, list):
+        return feeds
+    for prof in profiles:
+        if not isinstance(prof, dict):
+            continue
+        pname = str(prof.get("name", "?"))
+        sources = prof.get("sources")
+        rss = (sources or {}).get("rss") if isinstance(sources, dict) else None
+        if not isinstance(rss, list):
+            continue
+        for entry in rss:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", ""))
+            url = str(entry.get("url", ""))
+            slug = slugify_feed_name(name)
+            if not slug:
+                continue
+            feeds[slug] = {
+                "profile": pname,
+                "name": name,
+                "url": url,
+                "forum": _is_forum_feed(name, url),
+            }
+    return feeds
+
+
+def _scan_feed_yield(
+    articles_path: Path, *, since_iso: str | None = None
+) -> dict[str, dict[str, Any]]:
+    """Count notes per ``feed-slug:`` tag across the on-disk corpus.
+
+    Returns ``slug → {count, recent, latest}`` where *count* is the
+    all-time note total, *recent* is the count with ``created_at`` on or
+    after *since_iso* (when provided), and *latest* is the most recent
+    ``created_at`` date (``YYYY-MM-DD``).  Date comparison is on the
+    ``YYYY-MM-DD`` prefix, which is lexicographically ordered.
+    """
+    import yaml
+
+    from influx.notes import NoteParseError, _split_frontmatter
+
+    fs_re = re.compile(r"feed-slug:([a-z0-9-]+)")
+    out: dict[str, dict[str, Any]] = {}
+    if not articles_path.exists():
+        return out
+    for md in articles_path.rglob("*.md"):
+        try:
+            text = md.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        try:
+            fm_raw, _rest = _split_frontmatter(text)
+        except NoteParseError:
+            continue
+        try:
+            meta = yaml.safe_load(fm_raw)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        tags = meta.get("tags") or []
+        if not isinstance(tags, list):
+            continue
+        created = str(meta.get("created_at", "") or "")[:10]
+        for tag in tags:
+            match = fs_re.fullmatch(str(tag))
+            if not match:
+                continue
+            slug = match.group(1)
+            rec = out.setdefault(slug, {"count": 0, "recent": 0, "latest": ""})
+            rec["count"] += 1
+            if created > rec["latest"]:
+                rec["latest"] = created
+            if since_iso is not None and created >= since_iso:
+                rec["recent"] += 1
+    return out
+
+
+def cmd_feed_yield(args: argparse.Namespace) -> int:
+    """Report notes-ingested-per-RSS-feed from the on-disk corpus.
+
+    Joins the configured feed list (``influx.toml``) against per-feed
+    note counts (the ``feed-slug:`` tag the writer stamps on every
+    note), so an operator can see which feeds earn their place, which
+    produce nothing (broken/dead), and which have gone silent recently.
+    Pure read of on-disk notes + config — no Lithos / docker / HTTP.
+    """
+    import datetime as _dt
+    import tomllib
+
+    env = _load_env(args.env)
+    cfg_path = _resolve_config_path(env)
+    articles = _resolve_corpus_articles_path(env)
+
+    with cfg_path.open("rb") as fh:
+        config = tomllib.load(fh)
+
+    feeds = _configured_rss_feeds(config)
+    since_days = int(getattr(args, "since_days", 30) or 30)
+    since_iso = (
+        (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=since_days)).date().isoformat()
+    )
+    yields = _scan_feed_yield(articles, since_iso=since_iso)
+
+    for slug, meta in feeds.items():
+        y = yields.get(slug, {})
+        meta["count"] = int(y.get("count", 0))
+        meta["recent"] = int(y.get("recent", 0))
+        meta["latest"] = str(y.get("latest", "") or "")
+
+    rows = list(feeds.values())
+    profile_filter = getattr(args, "profile", None)
+    if profile_filter:
+        rows = [r for r in rows if r["profile"] == profile_filter]
+
+    sort_key = getattr(args, "sort", "yield")
+    if sort_key == "recent":
+        rows.sort(key=lambda r: (r["recent"], r["count"], r["profile"]))
+    elif sort_key == "name":
+        rows.sort(key=lambda r: (r["profile"], r["name"].lower()))
+    else:  # "yield" — ascending so dead weight surfaces first
+        rows.sort(key=lambda r: (r["count"], r["recent"], r["profile"]))
+
+    orphans = {s: y for s, y in yields.items() if s not in feeds}
+
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "since_days": since_days,
+                    "feeds": rows,
+                    "orphans": [
+                        {"slug": s, **y}
+                        for s, y in sorted(
+                            orphans.items(), key=lambda x: -x[1]["count"]
+                        )
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(
+        f"Feed yield (notes per RSS feed) — corpus={articles}  "
+        f"recent window={since_days}d\n"
+    )
+    print(f"{'tot':>5} {'recent':>6} {'latest':>10} {'F':1} {'profile':16} feed")
+    print("-" * 86)
+    for r in rows:
+        print(
+            f"{r['count']:>5} {r['recent']:>6} "
+            f"{(r['latest'] or '  never'):>10} "
+            f"{'F' if r['forum'] else ' '} {r['profile']:16} {r['name'][:36]}"
+        )
+
+    zero = [r for r in rows if r["count"] == 0]
+    silent = [r for r in rows if r["count"] > 0 and r["recent"] == 0]
+    print()
+    print(
+        f"Summary: {len(rows)} feeds | zero-yield (never produced): "
+        f"{len(zero)} | silent (no notes in {since_days}d): {len(silent)}"
+    )
+    if orphans:
+        print("\nfeed-slugs in corpus NOT in current config (removed/renamed feeds):")
+        for s, y in sorted(orphans.items(), key=lambda x: -x[1]["count"]):
+            print(f"  {y['count']:>5}  latest {y['latest']}  {s}")
+    return 0
+
+
 async def _fetch_invalid_source_notes(
     *,
     lithos_url: str,
@@ -2553,6 +2766,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="override LITHOS_URL from the env file.",
     )
     p_strip.set_defaults(func=cmd_strip_embedded_frontmatter)
+
+    p_yield = sub.add_parser(
+        "feed-yield",
+        help=(
+            "notes-ingested-per-RSS-feed from the on-disk corpus — joins "
+            "influx.toml feeds against the feed-slug: note tags to surface "
+            "dead/broken feeds (zero-yield), gone-silent feeds, and the "
+            "real top producers.  Read-only."
+        ),
+    )
+    p_yield.add_argument("--profile", help="filter to a single profile")
+    p_yield.add_argument(
+        "--since-days",
+        type=int,
+        default=30,
+        dest="since_days",
+        help="recent-window size in days for the 'recent' column (default: 30)",
+    )
+    p_yield.add_argument(
+        "--sort",
+        choices=["yield", "recent", "name"],
+        default="yield",
+        help="sort order (default: yield — ascending, dead weight first)",
+    )
+    p_yield.add_argument(
+        "--json", action="store_true", help="emit JSON instead of a table"
+    )
+    p_yield.set_defaults(func=cmd_feed_yield)
 
     p_invalid = sub.add_parser(
         "invalid-source",
