@@ -81,6 +81,13 @@ _UNEXPECTED_FAILURE_REASONS: frozenset[str] = frozenset(
         "fetch_stall",
         "filter_stall",
         "filter_error",
+        # #234: the pre-acquire dedup helper swallowed at least one
+        # per-candidate ``cache_lookup`` LithosError.  Unexpected like
+        # ``filter_error`` — pipeline-infrastructure execution failed
+        # (Lithos-side tool error), not expected upstream lossiness —
+        # and immediately actionable: check Lithos health / server
+        # logs, not the feed.
+        "dedup_cache_lookup",
     }
 )
 
@@ -292,6 +299,7 @@ def build_degradation_summary(
     invalid_url_rejections_total: int | None,
     cache_hits_total: int | None,
     write_outcomes: WriteOutcomeCounts | None = None,
+    dedup_lookup_errors: list[dict[str, str]] | None = None,
     top_n: int = _DEGRADATION_SUMMARY_TOP_N,
 ) -> dict[str, Any]:
     """Build the bounded ``degradation_summary`` block for one run (#152).
@@ -374,6 +382,7 @@ def build_degradation_summary(
     archive = archive_failures or []
     retries = source_retry_counts or {}
     writes = write_outcomes or {}
+    lookup_errors = dedup_lookup_errors or []
 
     archive_by_kind: dict[str, int] = {}
     archive_by_domain: dict[str, int] = {}
@@ -391,6 +400,14 @@ def build_degradation_summary(
         source_by_kind[kind] = source_by_kind.get(kind, 0) + 1
         source = str(err.get("source") or "unknown")
         source_by_source[source] = source_by_source.get(source, 0) + 1
+
+    # #234: swallowed pre-acquire cache_lookup failures, bucketed by the
+    # bounded source label.  Kept out of ``source_acquisition.*`` so the
+    # Lithos-side failure mode never masquerades as an upstream one.
+    dedup_lookup_by_source: dict[str, int] = {}
+    for err in lookup_errors:
+        source = str(err.get("source") or "unknown")
+        dedup_lookup_by_source[source] = dedup_lookup_by_source.get(source, 0) + 1
 
     retries_by_kind: dict[str, int] = {}
     retries_by_source: dict[str, int] = {}
@@ -448,6 +465,8 @@ def build_degradation_summary(
             # degraded-reasons list.
             "writes": writes_total,
             "invalid_note_state": invalid_note_state_total,
+            # #234: swallowed pre-acquire cache_lookup failures.
+            "dedup_lookup_errors": len(lookup_errors),
         },
         "archive": {
             "by_kind": _renamed(_top_n_by_count(archive_by_kind, n=top_n), "kind"),
@@ -485,6 +504,14 @@ def build_degradation_summary(
             ),
             "by_source": _renamed(
                 _top_n_by_count(invalid_note_state_by_source, n=top_n), "source"
+            ),
+        },
+        # #234: swallowed pre-acquire cache_lookup failures, by bounded
+        # source label.  When the total is non-zero, the caller appends
+        # ``dedup_cache_lookup`` to the degraded reasons.
+        "dedup_lookup": {
+            "by_source": _renamed(
+                _top_n_by_count(dedup_lookup_by_source, n=top_n), "source"
             ),
         },
     }
@@ -610,6 +637,7 @@ class RunLedger:
         empty_source_writes_total: int | None = None,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         source_cooldown_skips: list[dict[str, str]] | None = None,
+        dedup_lookup_errors: list[dict[str, str]] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
         tier3_fallbacks: dict[str, int] | None = None,
         archive_failures: list[ArchiveFailureRecord] | None = None,
@@ -630,6 +658,13 @@ class RunLedger:
           call upstream rather than tried and lost.  Single-run
           signal — like ``filter_error`` — so operators see the skip
           immediately even on the first cooldown-suppressed run.
+        - ``"dedup_cache_lookup"`` (issue #234) — the pre-acquire
+          dedup helper swallowed at least one per-candidate
+          ``cache_lookup`` :class:`~influx.errors.LithosError` and
+          skipped that candidate for this run.  Single-run signal —
+          like ``filter_error`` — because a Lithos-side tool failure
+          is immediately actionable (check Lithos health / server
+          logs, not the upstream feed).
         - ``"filter_error"`` (issue #85 review) — the LLM filter
           scorer raised :class:`FilterScorerError` (transport, parse,
           or provider failure) at least once during this run.  Single-
@@ -708,6 +743,7 @@ class RunLedger:
         """
         errors = list(source_acquisition_errors or [])
         cooldown_skips = list(source_cooldown_skips or [])
+        lookup_errors = list(dedup_lookup_errors or [])
         reasons: list[str] = []
         if errors:
             reasons.append("source_acquisition")
@@ -718,6 +754,13 @@ class RunLedger:
         # network failure) — the run-level summary surfaces both.
         if cooldown_skips:
             reasons.append("source_cooldown_skip")
+        # #234: at least one pre-acquire ``cache_lookup`` LithosError
+        # was swallowed (candidate skipped this run).  Separate reason
+        # from ``source_acquisition`` because the failed call is
+        # Influx→Lithos, not Influx→upstream — operators should check
+        # Lithos health, not the feed.
+        if lookup_errors:
+            reasons.append("dedup_cache_lookup")
 
         # #85 review: filter_error fires immediately on any
         # FilterScorerError catch, regardless of run kind.  Operators
@@ -899,6 +942,7 @@ class RunLedger:
             invalid_url_rejections_total=invalid_url_rejections_total,
             cache_hits_total=cache_hits_total,
             write_outcomes=write_outcomes,
+            dedup_lookup_errors=lookup_errors,
         )
 
         self._finish(
@@ -916,6 +960,7 @@ class RunLedger:
             degraded=bool(reasons),
             source_acquisition_errors=errors,
             source_cooldown_skips=cooldown_skips,
+            dedup_lookup_errors=lookup_errors,
             degraded_reasons=reasons,
             source_retry_counts=source_retry_counts,
             tier3_fallbacks=tier3_fallbacks,
@@ -1274,6 +1319,7 @@ class RunLedger:
         degraded: bool = False,
         source_acquisition_errors: list[dict[str, str]] | None = None,
         source_cooldown_skips: list[dict[str, str]] | None = None,
+        dedup_lookup_errors: list[dict[str, str]] | None = None,
         degraded_reasons: list[str] | None = None,
         source_retry_counts: dict[str, dict[str, int]] | None = None,
         tier3_fallbacks: dict[str, int] | None = None,
@@ -1334,6 +1380,10 @@ class RunLedger:
                     # ``source_acquisition_errors`` so the same JSONL
                     # consumers can read both lists with the same shape.
                     "source_cooldown_skips": list(source_cooldown_skips or []),
+                    # #234: persist swallowed pre-acquire cache_lookup
+                    # failures with the same source/kind/detail shape so
+                    # JSONL consumers can scan a uniform schema.
+                    "dedup_lookup_errors": list(dedup_lookup_errors or []),
                     # #129: deep-copy the per-source retry-count dict so
                     # later mutations of the contextvar bucket do not
                     # leak into the persisted ledger entry.

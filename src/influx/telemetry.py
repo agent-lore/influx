@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "DedupLookupError",
     "InfluxMeter",
     "InfluxTracer",
     "SourceAcquisitionError",
@@ -36,6 +37,7 @@ __all__ = [
     "WriteOutcomeCounts",
     "current_archive_terminal_arxiv_ids",
     "current_cache_hits",
+    "current_dedup_lookup_errors",
     "current_empty_source_writes",
     "current_fetched_total",
     "current_filter_errors",
@@ -50,6 +52,7 @@ __all__ = [
     "get_meter",
     "get_tracer",
     "record_cache_hit",
+    "record_dedup_lookup_error",
     "record_empty_source_write",
     "record_fetched_items",
     "record_filter_error",
@@ -164,6 +167,52 @@ def record_source_cooldown_skip(
         return
     skips.append(
         SourceCooldownSkip(
+            {
+                "source": source,
+                "kind": kind,
+                "detail": detail[:300],
+            }
+        )
+    )
+
+
+# Issue #234: a per-candidate ``cache_lookup`` failure swallowed by the
+# pre-acquire dedup helper is recorded *separately* from the
+# source-acquisition path: the failure is Lithos-side (server error on
+# the lookup tool), not an upstream-feed problem, so the run ledger
+# marks the run degraded with ``dedup_cache_lookup`` and operators are
+# pointed at Lithos health rather than the feed.  Same shape as
+# :data:`SourceAcquisitionError` (source / kind / detail dicts) so
+# existing JSONL consumers can scan a uniform schema.
+DedupLookupError = dict[str, str]
+
+
+current_dedup_lookup_errors: ContextVar[list[DedupLookupError] | None] = ContextVar(
+    "current_dedup_lookup_errors",
+    default=None,
+)
+
+
+def record_dedup_lookup_error(
+    *,
+    source: str,
+    kind: str,
+    detail: str,
+) -> None:
+    """Append a swallowed pre-acquire ``cache_lookup`` failure (#234).
+
+    Distinct from :func:`record_source_acquisition_error`: the failed
+    call is Influx→Lithos, not Influx→upstream — the candidate is
+    skipped this run (re-checked next scheduled run) and the ledger
+    fires the dedicated ``dedup_cache_lookup`` degraded reason.  Safe
+    to call outside a run context — silently no-ops when
+    :data:`current_dedup_lookup_errors` is unset.
+    """
+    errors = current_dedup_lookup_errors.get()
+    if errors is None:
+        return
+    errors.append(
+        DedupLookupError(
             {
                 "source": source,
                 "kind": kind,

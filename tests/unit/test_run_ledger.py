@@ -181,6 +181,70 @@ class TestLedgerEntrySeverityField:
         assert entry["degradation_severity"] == "unexpected_failure"
 
 
+class TestDedupCacheLookupReason:
+    """#234: swallowed pre-acquire cache_lookup failures degrade the run."""
+
+    def test_dedup_lookup_errors_fire_reason(self, tmp_path: Path) -> None:
+        ledger = RunLedger(tmp_path / "state")
+        ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+        reasons = ledger.complete(
+            run_id="r-1",
+            sources_checked=3,
+            ingested=2,
+            fetched_total=3,
+            dedup_lookup_errors=[
+                {"source": "rss", "kind": "cache_lookup", "detail": "server exploded"},
+            ],
+        )
+        assert reasons == ["dedup_cache_lookup"]
+        entry = ledger.recent()[0]
+        assert entry["degraded"] is True
+        assert entry["degraded_reasons"] == ["dedup_cache_lookup"]
+        assert entry["dedup_lookup_errors"] == [
+            {"source": "rss", "kind": "cache_lookup", "detail": "server exploded"},
+        ]
+
+    def test_severity_is_unexpected_failure(self) -> None:
+        # Lithos-side tool failure is pipeline infrastructure breaking,
+        # like filter_error — not expected upstream lossiness.
+        assert (
+            classify_degradation_severity(["dedup_cache_lookup"])
+            == "unexpected_failure"
+        )
+
+    def test_summary_by_source_populated(self, tmp_path: Path) -> None:
+        ledger = RunLedger(tmp_path / "state")
+        ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+        ledger.complete(
+            run_id="r-1",
+            sources_checked=3,
+            ingested=2,
+            fetched_total=3,
+            dedup_lookup_errors=[
+                {"source": "rss", "kind": "cache_lookup", "detail": "a"},
+                {"source": "rss", "kind": "cache_lookup", "detail": "b"},
+                {"source": "arxiv", "kind": "cache_lookup", "detail": "c"},
+            ],
+        )
+        summary = ledger.recent()[0]["degradation_summary"]
+        assert summary["totals"]["dedup_lookup_errors"] == 3
+        assert summary["dedup_lookup"]["by_source"] == [
+            {"source": "rss", "count": 2},
+            {"source": "arxiv", "count": 1},
+        ]
+
+    def test_clean_run_defaults_empty(self, tmp_path: Path) -> None:
+        ledger = RunLedger(tmp_path / "state")
+        ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
+        reasons = ledger.complete(
+            run_id="r-1", sources_checked=3, ingested=2, fetched_total=3
+        )
+        assert "dedup_cache_lookup" not in reasons
+        entry = ledger.recent()[0]
+        assert entry["dedup_lookup_errors"] == []
+        assert entry["degradation_summary"]["dedup_lookup"]["by_source"] == []
+
+
 def test_run_ledger_records_completed_run(tmp_path: Path) -> None:
     ledger = RunLedger(tmp_path / "state")
 
@@ -1953,6 +2017,9 @@ def test_degradation_summary_distinguishes_all_failure_classes(
         # downstream consumers don't need to defend against absence.
         "writes": 0,
         "invalid_note_state": 0,
+        # #234: no dedup lookup failures in this run — key present so
+        # downstream consumers don't need to defend against absence.
+        "dedup_lookup_errors": 0,
     }
 
 

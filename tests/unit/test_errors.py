@@ -133,7 +133,10 @@ class TestFormatExceptionForLedger:
         err = LithosError(
             "cache_lookup failed",
             operation="cache_lookup",
-            detail="TypeError: '<' not supported between instances of 'NoneType' and 'float'",
+            detail=(
+                "TypeError: '<' not supported between instances "
+                "of 'NoneType' and 'float'"
+            ),
         )
         text = format_exception_for_ledger(err)
         assert text.startswith("LithosError: cache_lookup failed")
@@ -147,7 +150,8 @@ class TestFormatExceptionForLedger:
         assert "status=409" in text
 
     def test_lithos_error_without_context_is_plain(self) -> None:
-        assert format_exception_for_ledger(LithosError("generic")) == "LithosError: generic"
+        text = format_exception_for_ledger(LithosError("generic"))
+        assert text == "LithosError: generic"
 
     def test_detail_truncated(self) -> None:
         err = LithosError("op failed", detail="x" * 2000)

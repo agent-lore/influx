@@ -42,6 +42,7 @@ from influx.telemetry import (
     current_fetched_total,
     current_filter_errors,
     current_source_acquisition_errors,
+    record_dedup_lookup_error,
     record_tier3_fallback,
 )
 
@@ -229,6 +230,71 @@ async def test_body_exception_marks_ledger_failed_and_propagates(
     assert "RuntimeError" in entry["error"]
 
 
+async def test_dedup_lookup_errors_propagate_to_ledger_entry(
+    tmp_path: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A run body that records dedup lookup errors lands them on the
+    ledger entry and degrades the run with ``dedup_cache_lookup`` (#234).
+
+    Uses :func:`record_dedup_lookup_error` from inside the patched body
+    so we exercise the real contextvar wiring inside
+    ``ledger_lifecycle`` rather than mocking the bucket directly.
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    async def body_with_lookup_errors(*args: Any, **kwargs: Any) -> RunOutcome:
+        record_dedup_lookup_error(
+            source="rss",
+            kind="cache_lookup",
+            detail="TypeError: '<' not supported",
+        )
+        return RunOutcome(sources_checked=4, ingested=4)
+
+    with (
+        patch("influx.run.Run.execute", new=body_with_lookup_errors),
+        caplog.at_level(logging.WARNING, logger="influx.run_service"),
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = ledger.recent()[0]
+    assert entry["degraded"] is True
+    assert entry["degraded_reasons"] == ["dedup_cache_lookup"]
+    assert entry["degradation_severity"] == "unexpected_failure"
+    assert entry["dedup_lookup_errors"] == [
+        {
+            "source": "rss",
+            "kind": "cache_lookup",
+            "detail": "TypeError: '<' not supported",
+        },
+    ]
+    flagged = [
+        r for r in caplog.records if "run flagged dedup_cache_lookup" in r.getMessage()
+    ]
+    assert flagged, "expected a 'run flagged dedup_cache_lookup' WARNING"
+    assert "lookup_errors=1" in flagged[0].getMessage()
+
+
+async def test_dedup_lookup_errors_default_empty(tmp_path: Any) -> None:
+    """A clean run lands ``dedup_lookup_errors == []`` on the entry."""
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    with patch(
+        "influx.run.Run.execute",
+        new_callable=AsyncMock,
+        return_value=RunOutcome(sources_checked=1, ingested=1),
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = ledger.recent()[0]
+    assert entry["dedup_lookup_errors"] == []
+    assert "dedup_cache_lookup" not in entry["degraded_reasons"]
+
+
 async def test_failed_run_ledger_error_carries_lithos_detail(
     tmp_path: Any,
     caplog: pytest.LogCaptureFixture,
@@ -247,7 +313,10 @@ async def test_failed_run_ledger_error_carries_lithos_detail(
         raise LithosError(
             "cache_lookup failed",
             operation="cache_lookup",
-            detail="TypeError: '<' not supported between instances of 'NoneType' and 'float'",
+            detail=(
+                "TypeError: '<' not supported between instances "
+                "of 'NoneType' and 'float'"
+            ),
         )
 
     with (

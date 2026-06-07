@@ -20,6 +20,17 @@ log line for each hit it decides — those signals move out of the Ingest
 stage with the lookup itself.  The defensive source-URL fallback (#128)
 stays in Ingest and only fires when ``cache_hit=False`` reaches the write
 path.
+
+Error handling (#234): a per-candidate :class:`~influx.errors.LithosError`
+from the lookup is caught — the candidate is skipped this run (recorded
+via :func:`~influx.telemetry.record_dedup_lookup_error`, surfaced as the
+``dedup_cache_lookup`` degraded reason) and the rest of the batch
+processes.  Skipping is recoverable: scheduled runs re-fetch the same
+lookback window, so the candidate is re-checked next run.  If *every*
+attempted lookup fails the helper raises instead (Lithos fully down —
+post-#232 connection failures arrive as ``LithosError`` too, and a
+silently-empty "degraded" run would be indistinguishable from a quiet
+feed window).  Non-Lithos exceptions always propagate.
 """
 
 from __future__ import annotations
@@ -30,8 +41,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from influx import metrics
+from influx.errors import LithosError
 from influx.lithos_client import LithosClient
 from influx.source import BoundScoredCandidate
+from influx.telemetry import record_dedup_lookup_error
 
 __all__ = [
     "DedupDecision",
@@ -78,10 +91,16 @@ class DedupDecision:
 
 @dataclass(frozen=True, slots=True)
 class DedupOutcome:
-    """Partitioned dedup result for a batch of scored candidates."""
+    """Partitioned dedup result for a batch of scored candidates.
+
+    ``lookup_errors`` counts candidates skipped because their
+    ``cache_lookup`` raised :class:`~influx.errors.LithosError` (#234)
+    — those candidates land in *neither* partition.
+    """
 
     to_acquire: tuple[DedupDecision, ...]
     hits_to_skip: tuple[DedupDecision, ...]
+    lookup_errors: int = 0
 
 
 async def dedup_scored_candidates(
@@ -97,20 +116,56 @@ async def dedup_scored_candidates(
     candidate, classifies each result per the matrix in this module's
     docstring, and returns a :class:`DedupOutcome`.
 
-    Errors from ``cache_lookup_for_item_body`` propagate — matching the
-    pre-#125 Ingest behaviour, which had no surrounding try/except.
+    A per-candidate :class:`LithosError` is caught and the candidate
+    skipped this run (#234) — recorded via
+    :func:`record_dedup_lookup_error` so the ledger fires the
+    ``dedup_cache_lookup`` degraded reason.  Deliberately *not* treated
+    as a cache miss: acquiring on an unverified lookup risks exactly the
+    duplicate-note / duplicate-cost harm dedup exists to prevent.  If
+    every attempted lookup fails, raises :class:`LithosError` (Lithos
+    fully down must still fail the run).  Non-Lithos exceptions
+    propagate — matching the pre-#125 Ingest behaviour.
     """
     to_acquire: list[DedupDecision] = []
     hits_to_skip: list[DedupDecision] = []
+    lookup_errors = 0
+    last_lookup_error: LithosError | None = None
 
     for bound in bounds:
         candidate = bound.scored.candidate
         abstract = candidate.abstract or None
-        body = await client.cache_lookup_for_item_body(
-            title=candidate.title,
-            source_url=candidate.source_url,
-            abstract_or_summary=abstract,
-        )
+        try:
+            body = await client.cache_lookup_for_item_body(
+                title=candidate.title,
+                source_url=candidate.source_url,
+                abstract_or_summary=abstract,
+            )
+        except LithosError as exc:
+            # #234: one poisoned candidate must not abort the whole
+            # run.  Skip it (re-checked next scheduled run), record the
+            # Lithos-side detail, and keep processing the batch.
+            lookup_errors += 1
+            last_lookup_error = exc
+            logger.warning(
+                "dedup cache_lookup failed profile=%s source_url=%s "
+                "title=%r operation=%s detail=%s source=%s "
+                "— skipping candidate this run",
+                profile,
+                candidate.source_url,
+                candidate.title,
+                exc.operation or "cache_lookup",
+                exc.detail or str(exc),
+                bound.source_label,
+            )
+            record_dedup_lookup_error(
+                source=_metric_source(bound.source_label),
+                kind=exc.operation or "cache_lookup",
+                detail=exc.detail or str(exc),
+            )
+            metrics.dedup_lookup_errors().add(
+                1, {"profile": profile, "source": _metric_source(bound.source_label)}
+            )
+            continue
         hit = bool(body.get("hit"))
 
         if hit:
@@ -147,7 +202,21 @@ async def dedup_scored_candidates(
                 )
             )
 
+    # #234 safeguard: every attempted lookup failing means Lithos is
+    # effectively down (post-#232 connection failures are LithosError
+    # too) — fail the run rather than emit a silently-empty "degraded"
+    # outcome indistinguishable from a quiet feed window.
+    attempted = len(bounds)
+    if attempted > 0 and lookup_errors == attempted:
+        assert last_lookup_error is not None
+        raise LithosError(
+            f"cache_lookup failed for all {attempted} candidates",
+            operation="cache_lookup",
+            detail=last_lookup_error.detail or str(last_lookup_error),
+        ) from last_lookup_error
+
     return DedupOutcome(
         to_acquire=tuple(to_acquire),
         hits_to_skip=tuple(hits_to_skip),
+        lookup_errors=lookup_errors,
     )
