@@ -20,11 +20,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from influx.errors import LithosError
 from influx.run_dedup import (
     DedupOutcome,
     dedup_scored_candidates,
 )
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
+from influx.telemetry import current_dedup_lookup_errors
 
 
 def _make_bound(
@@ -235,8 +237,10 @@ async def test_mixed_batch_partitions_correctly() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_error_propagates() -> None:
-    """Lookup errors propagate — helper does not swallow exceptions."""
+async def test_non_lithos_error_propagates() -> None:
+    """Non-Lithos lookup errors propagate — only ``LithosError`` is
+    treated as a recoverable per-candidate failure (#234).  Anything
+    else (e.g. a bug in our own partition code) must surface."""
     bound = _make_bound()
     client = MagicMock()
     client.cache_lookup_for_item_body = AsyncMock(side_effect=RuntimeError("boom"))
@@ -248,6 +252,181 @@ async def test_client_error_propagates() -> None:
             profile="p1",
             skip_cache_hits=False,
         )
+
+
+# ── #234: per-candidate LithosError degrades instead of aborting ───
+
+
+def _lithos_error(detail: str = "TypeError: '<' not supported") -> LithosError:
+    return LithosError("cache_lookup failed", operation="cache_lookup", detail=detail)
+
+
+@pytest.mark.asyncio
+async def test_lithos_error_skips_candidate_and_continues() -> None:
+    """One candidate's LithosError no longer aborts the batch (#234).
+
+    The errored candidate lands in *neither* partition (recoverable —
+    re-checked next scheduled run); the rest of the batch processes.
+    """
+    bounds = [
+        _make_bound(item_id="ok-1", title="First"),
+        _make_bound(item_id="poisoned", title="Poisoned"),
+        _make_bound(item_id="ok-2", title="Third"),
+    ]
+    client = MagicMock()
+    client.cache_lookup_for_item_body = AsyncMock(
+        side_effect=[{"hit": False}, _lithos_error(), {"hit": False}]
+    )
+
+    outcome = await dedup_scored_candidates(
+        bounds,
+        client=client,
+        profile="p1",
+        skip_cache_hits=False,
+    )
+
+    assert [d.bound.scored.candidate.item_id for d in outcome.to_acquire] == [
+        "ok-1",
+        "ok-2",
+    ]
+    assert outcome.hits_to_skip == ()
+    assert outcome.lookup_errors == 1
+    assert client.cache_lookup_for_item_body.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_lithos_error_records_dedup_lookup_error() -> None:
+    """The skipped candidate is recorded on the run's telemetry list
+    with the bounded source label and the Lithos ``detail`` text."""
+    errors: list[dict[str, str]] = []
+    token = current_dedup_lookup_errors.set(errors)
+    try:
+        bound = _make_bound(source_label="rss:Mozilla Hacks")
+        ok_bound = _make_bound(item_id="ok", source_label="arxiv")
+        client = MagicMock()
+        client.cache_lookup_for_item_body = AsyncMock(
+            side_effect=[_lithos_error("server exploded"), {"hit": False}]
+        )
+
+        await dedup_scored_candidates(
+            [bound, ok_bound],
+            client=client,
+            profile="p1",
+            skip_cache_hits=False,
+        )
+    finally:
+        current_dedup_lookup_errors.reset(token)
+
+    assert errors == [
+        {"source": "rss", "kind": "cache_lookup", "detail": "server exploded"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lithos_error_increments_metric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``metrics.dedup_lookup_errors()`` ticks once per skipped candidate
+    with bounded labels."""
+    counter = MagicMock()
+    monkeypatch.setattr("influx.metrics.dedup_lookup_errors", lambda: counter)
+
+    bounds = [_make_bound(item_id="bad", source_label="rss:Feed"), _make_bound()]
+    client = MagicMock()
+    client.cache_lookup_for_item_body = AsyncMock(
+        side_effect=[_lithos_error(), {"hit": False}]
+    )
+
+    await dedup_scored_candidates(
+        bounds,
+        client=client,
+        profile="p1",
+        skip_cache_hits=False,
+    )
+
+    counter.add.assert_called_once_with(1, {"profile": "p1", "source": "rss"})
+
+
+@pytest.mark.asyncio
+async def test_all_lookups_failed_raises() -> None:
+    """Total failure still fails the run (#234 safeguard).
+
+    Post-#232 connection failures are normalised to ``LithosError``, so
+    a fully-down Lithos would otherwise produce a silently-empty
+    "degraded" run indistinguishable from a quiet feed window.
+    """
+    bounds = [_make_bound(item_id="a"), _make_bound(item_id="b")]
+    client = MagicMock()
+    client.cache_lookup_for_item_body = AsyncMock(
+        side_effect=[_lithos_error("first"), _lithos_error("second")]
+    )
+
+    with pytest.raises(LithosError, match="all 2 candidates") as excinfo:
+        await dedup_scored_candidates(
+            bounds,
+            client=client,
+            profile="p1",
+            skip_cache_hits=False,
+        )
+    assert isinstance(excinfo.value.__cause__, LithosError)
+    assert excinfo.value.detail == "second"
+
+
+@pytest.mark.asyncio
+async def test_all_lookups_failed_emits_no_swallowed_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A total outage raises WITHOUT recording skip-and-degrade signals.
+
+    The telemetry record / metric / per-candidate warning all describe a
+    *swallowed* skip; when the helper aborts the run instead, emitting
+    them would overcount degradations that were never recovered from.
+    """
+    counter = MagicMock()
+    monkeypatch.setattr("influx.metrics.dedup_lookup_errors", lambda: counter)
+    errors: list[dict[str, str]] = []
+    token = current_dedup_lookup_errors.set(errors)
+    try:
+        bounds = [_make_bound(item_id="a"), _make_bound(item_id="b")]
+        client = MagicMock()
+        client.cache_lookup_for_item_body = AsyncMock(
+            side_effect=[_lithos_error("first"), _lithos_error("second")]
+        )
+
+        with pytest.raises(LithosError, match="all 2 candidates"):
+            await dedup_scored_candidates(
+                bounds,
+                client=client,
+                profile="p1",
+                skip_cache_hits=False,
+            )
+    finally:
+        current_dedup_lookup_errors.reset(token)
+
+    assert errors == []
+    counter.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_all_lookups_failed_propagates_underlying_operation() -> None:
+    """The all-failed summary error carries the underlying operation —
+    e.g. ``connect`` when Lithos was unreachable (#232) — so the
+    formatted ledger error points operators at what actually failed."""
+    bound = _make_bound()
+    client = MagicMock()
+    client.cache_lookup_for_item_body = AsyncMock(
+        side_effect=LithosError(
+            "connection_failed", operation="connect", detail="refused"
+        )
+    )
+
+    with pytest.raises(LithosError, match="all 1 candidates") as excinfo:
+        await dedup_scored_candidates(
+            [bound],
+            client=client,
+            profile="p1",
+            skip_cache_hits=False,
+        )
+    assert excinfo.value.operation == "connect"
+    assert excinfo.value.detail == "refused"
 
 
 @pytest.mark.asyncio

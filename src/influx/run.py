@@ -422,10 +422,12 @@ async def _run_acquire_stage(
             skip_cache_hits=plan.skip_cache_hits,
         )
         logger.info(
-            "pre-acquire dedup completed profile=%s to_acquire=%d hits_skipped=%d",
+            "pre-acquire dedup completed profile=%s to_acquire=%d hits_skipped=%d "
+            "lookup_errors=%d",
             plan.profile,
             len(outcome.to_acquire),
             len(outcome.hits_to_skip),
+            outcome.lookup_errors,
         )
 
         items: list[ProfileItem] = []

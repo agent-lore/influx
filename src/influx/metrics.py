@@ -45,6 +45,7 @@ __all__ = [
     "cache_hits",
     "cache_hits_via_url_fallback",
     "candidates_fetched",
+    "dedup_lookup_errors",
     "lithos_writes",
     "llm_validation_failures",
     "repair_candidates",
@@ -663,6 +664,25 @@ def source_acquisition_errors() -> Any:
     return get_meter().counter(
         "influx_source_acquisition_errors_total",
         description="Swallowed source-acquisition errors per run.",
+    )
+
+
+def dedup_lookup_errors() -> Any:
+    """Counter of swallowed pre-acquire ``cache_lookup`` failures (#234).
+
+    Mirrors the ledger's ``dedup_cache_lookup`` degraded reason: every
+    increment corresponds to one entry written through
+    :func:`~influx.telemetry.record_dedup_lookup_error`.  Distinct from
+    :func:`source_acquisition_errors` because the failed call is
+    Influx→Lithos (the lookup tool errored server-side), not
+    Influx→upstream — operators should look at Lithos health, not the
+    feed.
+
+    Labels: ``profile``, ``source``.
+    """
+    return get_meter().counter(
+        "influx_dedup_lookup_errors_total",
+        description="Swallowed pre-acquire cache_lookup failures per run.",
     )
 
 

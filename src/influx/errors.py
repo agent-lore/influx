@@ -85,6 +85,46 @@ class LCMAError(InfluxError):
         self.detail = detail
 
 
+#: Cap on the ``detail`` fragment in ledger-bound error strings.  The
+#: per-item telemetry lists truncate to 300 (``influx.telemetry``); the
+#: single run-level error string can afford a little more without
+#: bloating ``runs.jsonl``.
+_LEDGER_DETAIL_MAX_CHARS = 500
+
+
+def format_exception_for_ledger(exc: BaseException) -> str:
+    """Render an exception for the run-failure log and ledger ``error`` field.
+
+    ``str(exc)`` is only the message; structured errors in this module
+    (``LithosError``, ``LCMAError``, ``ExtractionError``) carry the
+    server-supplied failure text in a ``detail`` attribute that was
+    previously dropped (#234) — diagnosing a Lithos-side crash required
+    reading the Lithos container logs.  Appends any non-empty
+    ``operation``/``status_code``/``detail`` context, truncating
+    ``detail`` to :data:`_LEDGER_DETAIL_MAX_CHARS`.
+
+    Deliberately NOT ``LithosError.__str__``: callers parse raw
+    ``.detail`` strings (slug-collision recovery) and tests match exact
+    messages, so the message itself must stay untouched.
+    """
+    base = f"{type(exc).__name__}: {exc}"
+    parts: list[str] = []
+    operation = getattr(exc, "operation", "")
+    if operation:
+        parts.append(f"operation={operation}")
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        parts.append(f"status={status_code}")
+    detail = getattr(exc, "detail", "")
+    if detail:
+        if len(detail) > _LEDGER_DETAIL_MAX_CHARS:
+            detail = detail[:_LEDGER_DETAIL_MAX_CHARS] + "…"
+        parts.append(f"detail={detail}")
+    if not parts:
+        return base
+    return f"{base} ({', '.join(parts)})"
+
+
 class ExtractionError(InfluxError):
     """Raised when content extraction from a fetched document fails.
 

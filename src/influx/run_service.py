@@ -34,6 +34,7 @@ from typing import Any
 
 from influx import metrics
 from influx.config import AppConfig
+from influx.errors import format_exception_for_ledger
 from influx.notifications import ProfileRunResult
 from influx.run import (
     ItemProvider,
@@ -46,6 +47,7 @@ from influx.run import (
 from influx.run_ledger import RunLedger
 from influx.telemetry import (
     current_cache_hits,
+    current_dedup_lookup_errors,
     current_empty_source_writes,
     current_fetched_total,
     current_filter_errors,
@@ -169,6 +171,13 @@ async def ledger_lifecycle(
     # upstream failure — the run-ledger entry tags it as
     # ``source_cooldown_skip`` so operators can tell the two apart.
     source_cooldown_skips_token = current_source_cooldown_skips.set([])
+    # #234: per-run list of swallowed pre-acquire cache_lookup failures.
+    # Distinct from ``current_source_acquisition_errors`` because the
+    # failed call is Influx→Lithos (the lookup tool errored server-side),
+    # not Influx→upstream — the run-ledger entry tags it as
+    # ``dedup_cache_lookup`` so operators check Lithos health, not the
+    # feed.
+    dedup_lookup_errors_token = current_dedup_lookup_errors.set([])
     # #85: per-run pre-filter fetched-count.  A list-of-ints so source
     # adapters increment a shared mutable container; reads at run-end
     # land the value into the run-ledger entry for the
@@ -280,6 +289,7 @@ async def ledger_lifecycle(
         elapsed = (datetime.now(UTC) - started_at).total_seconds()
         source_errors = current_source_acquisition_errors.get() or []
         source_cooldown_skips = current_source_cooldown_skips.get() or []
+        dedup_lookup_errors = current_dedup_lookup_errors.get() or []
 
         if session.skip_reason is not None:
             ledger.skip(run_id=run_id, reason=session.skip_reason)
@@ -383,6 +393,10 @@ async def ledger_lifecycle(
             # from swallowed acquisition errors — the ledger fires the
             # ``source_cooldown_skip`` reason on a non-empty list.
             source_cooldown_skips=source_cooldown_skips,
+            # #234: swallowed pre-acquire cache_lookup failures — the
+            # ledger fires the ``dedup_cache_lookup`` reason on a
+            # non-empty list.
+            dedup_lookup_errors=dedup_lookup_errors,
             # #129: surface recovered retry counts so the ledger entry
             # carries "we hit arXiv 429 twice but recovered" alongside
             # the swallowed-error list, letting an operator distinguish
@@ -483,6 +497,28 @@ async def ledger_lifecycle(
                 plan.kind.value,
                 run_id,
                 filter_errors_total,
+            )
+        if "dedup_cache_lookup" in degraded_reasons:
+            # #234: at least one pre-acquire cache_lookup LithosError
+            # was swallowed and the candidate skipped for this run.
+            # The failed call is Influx→Lithos, so operators triaging
+            # this reason check Lithos health and the Lithos server
+            # logs for cache_lookup tool errors — NOT the upstream
+            # feed.  Skipped candidates are re-checked next scheduled
+            # run.
+            if run_outcome == "success":
+                run_outcome = "degraded"
+            logger.warning(
+                "run flagged dedup_cache_lookup profile=%s kind=%s run_id=%s "
+                "lookup_errors=%d "
+                "(Lithos cache_lookup failed for these candidates; they were "
+                "skipped pre-acquire and will be re-checked next run — "
+                "check Lithos health / cache_lookup server errors, not "
+                "the upstream feed)",
+                profile,
+                plan.kind.value,
+                run_id,
+                len(dedup_lookup_errors),
             )
         if "archive_acquisition" in degraded_reasons:
             if run_outcome == "success":
@@ -711,16 +747,22 @@ async def ledger_lifecycle(
         # The body raised — finalise as failure.
         elapsed = (datetime.now(UTC) - started_at).total_seconds()
         exc = session.error
+        # #234: format via the structured-error helper so the Lithos
+        # ``detail`` (the actual server-side failure text) reaches both
+        # the log line and the ledger ``error`` field instead of being
+        # collapsed into a bare "<operation> failed".
+        error_text = format_exception_for_ledger(exc) if exc is not None else "unknown"
         logger.exception(
-            "run failed profile=%s kind=%s run_id=%s duration=%.1fs",
+            "run failed profile=%s kind=%s run_id=%s duration=%.1fs error=%s",
             profile,
             plan.kind.value,
             run_id,
             elapsed,
+            error_text,
         )
         ledger.fail(
             run_id=run_id,
-            error=f"{type(exc).__name__}: {exc}" if exc is not None else "unknown",
+            error=error_text,
         )
         metrics.run_duration().record(elapsed, metric_attrs)
         # Issue #164 review: failure path also carries the ``severity``
@@ -742,6 +784,7 @@ async def ledger_lifecycle(
         current_run_id.reset(run_id_token)
         current_source_acquisition_errors.reset(source_errors_token)
         current_source_cooldown_skips.reset(source_cooldown_skips_token)
+        current_dedup_lookup_errors.reset(dedup_lookup_errors_token)
         current_fetched_total.reset(fetched_total_token)
         current_filter_errors.reset(filter_errors_token)
         current_invalid_url_rejections.reset(invalid_url_rejections_token)
