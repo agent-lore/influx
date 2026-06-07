@@ -30,7 +30,10 @@ lookback window, so the candidate is re-checked next run.  If *every*
 attempted lookup fails the helper raises instead (Lithos fully down —
 post-#232 connection failures arrive as ``LithosError`` too, and a
 silently-empty "degraded" run would be indistinguishable from a quiet
-feed window).  Non-Lithos exceptions always propagate.
+feed window); in that case no skip-and-degrade signals are emitted —
+they are buffered during the loop and flushed only when the batch
+partially succeeded, so a total outage doesn't overcount swallowed
+skips.  Non-Lithos exceptions always propagate.
 """
 
 from __future__ import annotations
@@ -53,6 +56,11 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+#: Cap on the ``detail`` fragment in the per-candidate skip WARNING —
+#: matches the 300-char bound :func:`record_dedup_lookup_error` applies
+#: to the persisted telemetry record.
+_DETAIL_LOG_MAX_CHARS = 300
 
 
 def _metric_source(source_label: str) -> str:
@@ -123,13 +131,17 @@ async def dedup_scored_candidates(
     as a cache miss: acquiring on an unverified lookup risks exactly the
     duplicate-note / duplicate-cost harm dedup exists to prevent.  If
     every attempted lookup fails, raises :class:`LithosError` (Lithos
-    fully down must still fail the run).  Non-Lithos exceptions
-    propagate — matching the pre-#125 Ingest behaviour.
+    fully down must still fail the run) — in that case the per-candidate
+    failures are NOT recorded as swallowed degradations: the
+    skip-and-degrade telemetry/metrics/warnings are buffered during the
+    loop and flushed only once the batch is known to have partially
+    succeeded, so a total outage produces one failed run, not a failed
+    run plus N misleading "skipped candidate" signals.  Non-Lithos
+    exceptions propagate — matching the pre-#125 Ingest behaviour.
     """
     to_acquire: list[DedupDecision] = []
     hits_to_skip: list[DedupDecision] = []
-    lookup_errors = 0
-    last_lookup_error: LithosError | None = None
+    failed: list[tuple[BoundScoredCandidate, LithosError]] = []
 
     for bound in bounds:
         candidate = bound.scored.candidate
@@ -142,29 +154,12 @@ async def dedup_scored_candidates(
             )
         except LithosError as exc:
             # #234: one poisoned candidate must not abort the whole
-            # run.  Skip it (re-checked next scheduled run), record the
-            # Lithos-side detail, and keep processing the batch.
-            lookup_errors += 1
-            last_lookup_error = exc
-            logger.warning(
-                "dedup cache_lookup failed profile=%s source_url=%s "
-                "title=%r operation=%s detail=%s source=%s "
-                "— skipping candidate this run",
-                profile,
-                candidate.source_url,
-                candidate.title,
-                exc.operation or "cache_lookup",
-                exc.detail or str(exc),
-                bound.source_label,
-            )
-            record_dedup_lookup_error(
-                source=_metric_source(bound.source_label),
-                kind=exc.operation or "cache_lookup",
-                detail=exc.detail or str(exc),
-            )
-            metrics.dedup_lookup_errors().add(
-                1, {"profile": profile, "source": _metric_source(bound.source_label)}
-            )
+            # run.  Buffer the failure and keep processing the batch —
+            # the skip-and-degrade signals are flushed after the loop,
+            # and only in the partial-failure case (a total outage
+            # raises instead, and recording "swallowed" degradations
+            # for a run that then fails would overcount).
+            failed.append((bound, exc))
             continue
         hit = bool(body.get("hit"))
 
@@ -205,18 +200,52 @@ async def dedup_scored_candidates(
     # #234 safeguard: every attempted lookup failing means Lithos is
     # effectively down (post-#232 connection failures are LithosError
     # too) — fail the run rather than emit a silently-empty "degraded"
-    # outcome indistinguishable from a quiet feed window.
+    # outcome indistinguishable from a quiet feed window.  Raised
+    # *before* the buffered skip-and-degrade signals are flushed: a
+    # total outage must not record per-candidate "swallowed" telemetry
+    # or metrics for failures that were not, in fact, swallowed.
     attempted = len(bounds)
-    if attempted > 0 and lookup_errors == attempted:
-        assert last_lookup_error is not None
+    if attempted > 0 and len(failed) == attempted:
+        _, last_lookup_error = failed[-1]
         raise LithosError(
             f"cache_lookup failed for all {attempted} candidates",
-            operation="cache_lookup",
+            # Propagate the underlying operation (e.g. "connect" when
+            # Lithos was unreachable) so the formatted ledger error
+            # points operators at what actually failed.
+            operation=last_lookup_error.operation or "cache_lookup",
             detail=last_lookup_error.detail or str(last_lookup_error),
         ) from last_lookup_error
+
+    # Partial failure (or none): the run continues, so each buffered
+    # failure really is a swallowed skip — emit the WARNING, the
+    # run-ledger telemetry record, and the metric tick now.
+    for bound, exc in failed:
+        candidate = bound.scored.candidate
+        detail = exc.detail or str(exc)
+        logger.warning(
+            "dedup lookup failed profile=%s source_url=%s "
+            "title=%r operation=%s detail=%s source=%s "
+            "— skipping candidate this run",
+            profile,
+            candidate.source_url,
+            candidate.title,
+            exc.operation or "cache_lookup",
+            # Bound the logged detail like the persisted telemetry —
+            # Lithos tool error payloads can carry stack traces.
+            detail[:_DETAIL_LOG_MAX_CHARS],
+            bound.source_label,
+        )
+        record_dedup_lookup_error(
+            source=_metric_source(bound.source_label),
+            kind=exc.operation or "cache_lookup",
+            detail=detail,
+        )
+        metrics.dedup_lookup_errors().add(
+            1, {"profile": profile, "source": _metric_source(bound.source_label)}
+        )
 
     return DedupOutcome(
         to_acquire=tuple(to_acquire),
         hits_to_skip=tuple(hits_to_skip),
-        lookup_errors=lookup_errors,
+        lookup_errors=len(failed),
     )

@@ -371,6 +371,65 @@ async def test_all_lookups_failed_raises() -> None:
 
 
 @pytest.mark.asyncio
+async def test_all_lookups_failed_emits_no_swallowed_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A total outage raises WITHOUT recording skip-and-degrade signals.
+
+    The telemetry record / metric / per-candidate warning all describe a
+    *swallowed* skip; when the helper aborts the run instead, emitting
+    them would overcount degradations that were never recovered from.
+    """
+    counter = MagicMock()
+    monkeypatch.setattr("influx.metrics.dedup_lookup_errors", lambda: counter)
+    errors: list[dict[str, str]] = []
+    token = current_dedup_lookup_errors.set(errors)
+    try:
+        bounds = [_make_bound(item_id="a"), _make_bound(item_id="b")]
+        client = MagicMock()
+        client.cache_lookup_for_item_body = AsyncMock(
+            side_effect=[_lithos_error("first"), _lithos_error("second")]
+        )
+
+        with pytest.raises(LithosError, match="all 2 candidates"):
+            await dedup_scored_candidates(
+                bounds,
+                client=client,
+                profile="p1",
+                skip_cache_hits=False,
+            )
+    finally:
+        current_dedup_lookup_errors.reset(token)
+
+    assert errors == []
+    counter.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_all_lookups_failed_propagates_underlying_operation() -> None:
+    """The all-failed summary error carries the underlying operation —
+    e.g. ``connect`` when Lithos was unreachable (#232) — so the
+    formatted ledger error points operators at what actually failed."""
+    bound = _make_bound()
+    client = MagicMock()
+    client.cache_lookup_for_item_body = AsyncMock(
+        side_effect=LithosError(
+            "connection_failed", operation="connect", detail="refused"
+        )
+    )
+
+    with pytest.raises(LithosError, match="all 1 candidates") as excinfo:
+        await dedup_scored_candidates(
+            [bound],
+            client=client,
+            profile="p1",
+            skip_cache_hits=False,
+        )
+    assert excinfo.value.operation == "connect"
+    assert excinfo.value.detail == "refused"
+
+
+@pytest.mark.asyncio
 async def test_metric_incremented_per_hit(monkeypatch: pytest.MonkeyPatch) -> None:
     """``metrics.cache_hits()`` is incremented exactly once per cache hit
     (skip path and merge path both count)."""
