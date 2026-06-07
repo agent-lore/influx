@@ -10,6 +10,7 @@ from influx.errors import (
     LCMAError,
     LithosError,
     NetworkError,
+    format_exception_for_ledger,
 )
 
 
@@ -114,6 +115,49 @@ class TestExtractionError:
         assert err.url == ""
         assert err.stage == ""
         assert err.detail == ""
+
+
+class TestFormatExceptionForLedger:
+    """format_exception_for_ledger surfaces structured error context (#234).
+
+    ``str(LithosError)`` is only the message — the server-supplied
+    ``detail`` (the actual Lithos-side failure) was dropped from the
+    "run failed" log and the run-ledger ``error`` field, forcing
+    operators to read the Lithos container logs to diagnose failures.
+    """
+
+    def test_plain_exception_unchanged(self) -> None:
+        assert format_exception_for_ledger(RuntimeError("boom")) == "RuntimeError: boom"
+
+    def test_lithos_error_includes_operation_and_detail(self) -> None:
+        err = LithosError(
+            "cache_lookup failed",
+            operation="cache_lookup",
+            detail="TypeError: '<' not supported between instances of 'NoneType' and 'float'",
+        )
+        text = format_exception_for_ledger(err)
+        assert text.startswith("LithosError: cache_lookup failed")
+        assert "operation=cache_lookup" in text
+        assert "'<' not supported" in text
+
+    def test_lithos_error_includes_status_code(self) -> None:
+        err = LithosError("write conflict", operation="lithos_write", status_code=409)
+        text = format_exception_for_ledger(err)
+        assert "operation=lithos_write" in text
+        assert "status=409" in text
+
+    def test_lithos_error_without_context_is_plain(self) -> None:
+        assert format_exception_for_ledger(LithosError("generic")) == "LithosError: generic"
+
+    def test_detail_truncated(self) -> None:
+        err = LithosError("op failed", detail="x" * 2000)
+        text = format_exception_for_ledger(err)
+        assert len(text) < 700
+        assert text.endswith("…)")
+
+    def test_lcma_error_detail_surfaced(self) -> None:
+        err = LCMAError("rate limited", detail="429 Too Many Requests")
+        assert "429 Too Many Requests" in format_exception_for_ledger(err)
 
 
 class TestAllSubclassesCatchable:

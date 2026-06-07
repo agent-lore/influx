@@ -34,6 +34,7 @@ from influx.config import (
     ScheduleConfig,
 )
 from influx.coordinator import RunKind
+from influx.errors import LithosError
 from influx.run import RunOutcome, RunPlan
 from influx.run_ledger import RunLedger
 from influx.run_service import RunService, run_via_service
@@ -226,6 +227,44 @@ async def test_body_exception_marks_ledger_failed_and_propagates(
     entry = ledger.recent()[0]
     assert entry["status"] == "failed"
     assert "RuntimeError" in entry["error"]
+
+
+async def test_failed_run_ledger_error_carries_lithos_detail(
+    tmp_path: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#234: LithosError ``detail`` reaches the ledger error and log line.
+
+    Previously only ``str(exc)`` ("cache_lookup failed") was recorded,
+    so diagnosing the underlying Lithos-side crash required reading the
+    Lithos container logs.
+    """
+    config = _make_config()
+    ledger = RunLedger(tmp_path)
+    service = RunService(config=config, ledger=ledger)
+
+    async def boom(*args: Any, **kwargs: Any) -> RunOutcome:
+        raise LithosError(
+            "cache_lookup failed",
+            operation="cache_lookup",
+            detail="TypeError: '<' not supported between instances of 'NoneType' and 'float'",
+        )
+
+    with (
+        patch("influx.run.Run.execute", side_effect=boom),
+        caplog.at_level(logging.ERROR, logger="influx.run_service"),
+        pytest.raises(LithosError, match="cache_lookup failed"),
+    ):
+        await service.execute(_scheduled_plan())
+
+    entry = ledger.recent()[0]
+    assert entry["status"] == "failed"
+    assert "operation=cache_lookup" in entry["error"]
+    assert "'<' not supported" in entry["error"]
+
+    failed_records = [r for r in caplog.records if "run failed" in r.getMessage()]
+    assert failed_records, "expected a 'run failed' ERROR record"
+    assert "'<' not supported" in failed_records[0].getMessage()
 
 
 # ── run_via_service: kind → RunPlan flag mapping ───────────────────

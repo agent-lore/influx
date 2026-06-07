@@ -34,6 +34,7 @@ from typing import Any
 
 from influx import metrics
 from influx.config import AppConfig
+from influx.errors import format_exception_for_ledger
 from influx.notifications import ProfileRunResult
 from influx.run import (
     ItemProvider,
@@ -711,16 +712,22 @@ async def ledger_lifecycle(
         # The body raised — finalise as failure.
         elapsed = (datetime.now(UTC) - started_at).total_seconds()
         exc = session.error
+        # #234: format via the structured-error helper so the Lithos
+        # ``detail`` (the actual server-side failure text) reaches both
+        # the log line and the ledger ``error`` field instead of being
+        # collapsed into a bare "<operation> failed".
+        error_text = format_exception_for_ledger(exc) if exc is not None else "unknown"
         logger.exception(
-            "run failed profile=%s kind=%s run_id=%s duration=%.1fs",
+            "run failed profile=%s kind=%s run_id=%s duration=%.1fs error=%s",
             profile,
             plan.kind.value,
             run_id,
             elapsed,
+            error_text,
         )
         ledger.fail(
             run_id=run_id,
-            error=f"{type(exc).__name__}: {exc}" if exc is not None else "unknown",
+            error=error_text,
         )
         metrics.run_duration().record(elapsed, metric_attrs)
         # Issue #164 review: failure path also carries the ``severity``
