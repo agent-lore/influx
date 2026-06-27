@@ -178,6 +178,51 @@ class TestFetchResult:
         assert result.final_url == url
 
 
+# ── Browser User-Agent on archive fetches ────────────────────────────
+
+
+class TestBrowserUserAgent:
+    """guarded_fetch presents a browser UA so publisher anti-bot defences
+    don't return 403/429/anti-bot pages instead of the document."""
+
+    @respx.mock
+    def test_sends_browser_user_agent(self) -> None:
+        url = "http://example.com/paper.pdf"
+        route = respx.get(url).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"%PDF-1.7",
+                headers={"content-type": "application/pdf"},
+            )
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            guarded_fetch(url, expected_content_type="pdf")
+        sent_ua = route.calls.last.request.headers.get("user-agent", "")
+        assert "Mozilla/5.0" in sent_ua
+        assert "python-httpx" not in sent_ua
+
+    @respx.mock
+    def test_user_agent_preserved_across_redirect(self) -> None:
+        start = "http://example.com/start"
+        final = "http://example.com/final.pdf"
+        respx.get(start).mock(
+            return_value=httpx.Response(302, headers={"location": final}),
+        )
+        final_route = respx.get(final).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"%PDF-1.7",
+                headers={"content-type": "application/pdf"},
+            )
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            guarded_fetch(start, expected_content_type="pdf")
+        sent_ua = final_route.calls.last.request.headers.get("user-agent", "")
+        assert "Mozilla/5.0" in sent_ua
+
+
 # ── DNS resolution failure ───────────────────────────────────────────
 
 

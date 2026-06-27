@@ -40,6 +40,18 @@ _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 _MAX_REDIRECTS = 20
 
+# Browser-like User-Agent for outbound archive fetches.  httpx's default
+# ``python-httpx/<version>`` UA trips publisher anti-bot defences, which
+# return 403/429/anti-bot challenge pages instead of the document — the
+# request never had a chance.  Presenting a mainstream browser UA lets a
+# chunk of those "stuck" notes (publisher PDFs/articles) acquire on the
+# next sweep with no other change.  Set on the GET ``httpx.Client`` so it
+# is preserved across every redirect hop.
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 ContentTypeFamily = Literal["html", "pdf", "xml"]
 
 _CONTENT_TYPE_FAMILIES: dict[ContentTypeFamily, frozenset[str]] = {
@@ -221,7 +233,11 @@ def guarded_fetch(
     current_url = url
 
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+            headers={"User-Agent": _BROWSER_USER_AGENT},
+        ) as client:
             for _hop in range(_MAX_REDIRECTS + 1):
                 with client.stream("GET", current_url) as response:
                     if response.is_redirect:
