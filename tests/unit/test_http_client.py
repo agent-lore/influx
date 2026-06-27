@@ -66,22 +66,6 @@ def _fake_getaddrinfo(ip: str):
     return _inner
 
 
-def _multi_resolve(mapping: dict[str, str]):
-    """Return a getaddrinfo fake resolving hosts per *mapping*."""
-
-    def _inner(
-        host: str,
-        port: Any,
-        family: int = 0,
-        type: int = 0,
-        **kw: Any,
-    ):
-        ip = mapping.get(host, "93.184.216.34")
-        return [(2, 1, 6, "", (ip, 0))]
-
-    return _inner
-
-
 _PATCH_GAI = "influx.http_client.socket.getaddrinfo"
 
 
@@ -216,15 +200,167 @@ class TestDNSFailure:
             assert exc_info.value.kind == "dns"
 
 
-# ── Content-type guard ───────────────────────────────────────────────
+# ── Streaming size cap (US-003) ──────────────────────────────────────
 
 
-class TestContentTypeGuard:
-    """guarded_fetch raises NetworkError on unexpected content type."""
+class TestStreamingSizeCap:
+    """The guarded client must abort mid-stream when body exceeds limit."""
 
     @respx.mock
-    def test_passes_for_matching_content_type(self) -> None:
-        url = "http://example.com/doc.pdf"
+    def test_oversize_response_raises_network_error(self) -> None:
+        """AC-02-B: body exceeding max_download_bytes raises oversize."""
+        url = "http://example.com/big"
+        # 100 bytes body, limit to 50
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=b"x" * 100),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, max_download_bytes=50)
+            err = exc_info.value
+            assert err.kind == "oversize"
+            assert err.url == url
+
+    @respx.mock
+    def test_oversize_no_body_returned(self) -> None:
+        """AC-02-B: partial body is NOT returned to the caller."""
+        url = "http://example.com/big2"
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=b"y" * 200),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake), pytest.raises(NetworkError):
+            guarded_fetch(url, max_download_bytes=100)
+            # No FetchResult is returned — the exception is the only outcome
+
+    @respx.mock
+    def test_body_at_exact_limit_succeeds(self) -> None:
+        """Body exactly at limit should succeed (not exceed)."""
+        url = "http://example.com/exact"
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=b"z" * 50),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(url, max_download_bytes=50)
+        assert result.body == b"z" * 50
+
+    @respx.mock
+    def test_body_under_limit_succeeds(self) -> None:
+        """Body under limit returns normally."""
+        url = "http://example.com/small"
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=b"abc"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(url, max_download_bytes=1000)
+        assert result.body == b"abc"
+
+
+# ── Timeout (US-003) ──────────────────────────────────────────────────
+
+
+class TestTimeout:
+    """Connect and read timeouts raise NetworkError with kind='timeout'."""
+
+    def test_connect_timeout_raises_network_error(self) -> None:
+        """FR-RES-4: connect timeout raises NetworkError."""
+        url = "http://example.com/slow"
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with (
+            patch(_PATCH_GAI, fake),
+            patch(
+                "influx.http_client.httpx.Client",
+            ) as mock_client_cls,
+        ):
+            ctx = mock_client_cls.return_value.__enter__.return_value
+            ctx.stream.side_effect = httpx.ConnectTimeout("timed out")
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, timeout_seconds=1)
+            err = exc_info.value
+            assert err.kind == "timeout"
+            assert err.url == url
+
+    def test_read_timeout_raises_network_error(self) -> None:
+        """FR-RES-4: read timeout raises NetworkError."""
+        url = "http://example.com/stall"
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with (
+            patch(_PATCH_GAI, fake),
+            patch(
+                "influx.http_client.httpx.Client",
+            ) as mock_client_cls,
+        ):
+            ctx = mock_client_cls.return_value.__enter__.return_value
+            ctx.stream.side_effect = httpx.ReadTimeout("read timed out")
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, timeout_seconds=1)
+            err = exc_info.value
+            assert err.kind == "timeout"
+            assert err.url == url
+
+
+# ── Content-type family check (US-004) ───────────────────────────────
+
+
+class TestContentTypeFamilyPositive:
+    """Positive cases: response content-type matches expected family."""
+
+    @respx.mock
+    @pytest.mark.parametrize(
+        "ct,family",
+        [
+            ("text/html", "html"),
+            ("text/html; charset=utf-8", "html"),
+            ("application/xhtml+xml", "html"),
+            ("application/pdf", "pdf"),
+            ("text/xml", "xml"),
+            ("application/xml", "xml"),
+            ("application/atom+xml", "xml"),
+            ("application/rss+xml", "xml"),
+        ],
+    )
+    def test_matching_content_type_succeeds(self, ct: str, family: str) -> None:
+        url = "http://example.com/doc"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200, content=b"data", headers={"content-type": ct}
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(
+                url,
+                expected_content_type=family,  # type: ignore[arg-type]
+            )
+        assert result.body == b"data"
+
+    @respx.mock
+    def test_no_family_check_when_none(self) -> None:
+        """When expected_content_type is None, any content-type passes."""
+        url = "http://example.com/any"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"ok",
+                headers={"content-type": "application/octet-stream"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(url)
+        assert result.body == b"ok"
+
+
+class TestContentTypeFamilyMismatch:
+    """Mismatch cases: response content-type does NOT match expected."""
+
+    @respx.mock
+    def test_expected_html_got_pdf(self) -> None:
+        """AC-02-D: expected HTML, received application/pdf."""
+        url = "http://example.com/page"
         respx.get(url).mock(
             return_value=httpx.Response(
                 200,
@@ -234,12 +370,16 @@ class TestContentTypeGuard:
         )
         fake = _fake_getaddrinfo("93.184.216.34")
         with patch(_PATCH_GAI, fake):
-            result = guarded_fetch(url, expected_content_type="pdf")
-        assert result.status_code == 200
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, expected_content_type="html")
+            err = exc_info.value
+            assert err.kind == "content_type_mismatch"
+            assert err.url == url
+            assert "application/pdf" in err.reason
 
     @respx.mock
-    def test_rejects_mismatched_content_type(self) -> None:
-        url = "http://example.com/not-pdf"
+    def test_expected_pdf_got_html(self) -> None:
+        url = "http://example.com/file.pdf"
         respx.get(url).mock(
             return_value=httpx.Response(
                 200,
@@ -251,112 +391,113 @@ class TestContentTypeGuard:
         with patch(_PATCH_GAI, fake):
             with pytest.raises(NetworkError) as exc_info:
                 guarded_fetch(url, expected_content_type="pdf")
-            assert exc_info.value.kind == "content_type_mismatch"
+            err = exc_info.value
+            assert err.kind == "content_type_mismatch"
 
     @respx.mock
-    def test_does_not_check_content_type_on_error(self) -> None:
-        """Issue #227: HTTP error responses (>=400) skip content-type check."""
-        url = "http://example.com/rate-limited"
+    def test_expected_xml_got_html(self) -> None:
+        url = "http://example.com/feed"
         respx.get(url).mock(
             return_value=httpx.Response(
-                429,
-                content=b"<html>too fast</html>",
+                200,
+                content=b"<html>",
                 headers={"content-type": "text/html"},
             ),
         )
-        result = guarded_fetch(url, expected_content_type="pdf")
-        assert result.status_code == 429
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            with pytest.raises(NetworkError) as exc_info:
+                guarded_fetch(url, expected_content_type="xml")
+            err = exc_info.value
+            assert err.kind == "content_type_mismatch"
 
 
-# ── Oversize guard ───────────────────────────────────────────────────
+class TestContentTypeCheckIsSuccessPathOnly:
+    """The content-type guard only runs on non-error responses (#227).
 
-
-class TestOversizeGuard:
-    """guarded_fetch raises NetworkError when body exceeds limit."""
+    On an HTTP error (status >= 400) — notably arXiv's HTTP 429
+    rate-limit page, served as ``text/html`` even when a PDF was
+    requested — the content-type must NOT be reported as
+    ``content_type_mismatch``; the status code is the real signal.
+    ``guarded_fetch`` returns the ``FetchResult`` so the caller's status
+    handling (e.g. ``download_archive``) can classify it as ``http_429``
+    / ``rate_limited``.
+    """
 
     @respx.mock
-    def test_raises_when_body_exceeds_limit(self) -> None:
-        url = "http://example.com/big.pdf"
+    def test_expected_pdf_got_429_html_returns_result(self) -> None:
+        url = "http://export.arxiv.org/pdf/2605.10310.pdf"
         respx.get(url).mock(
             return_value=httpx.Response(
-                200,
-                content=b"x" * 100,
-                headers={"content-type": "application/pdf"},
+                429,
+                content=b"<html>rate exceeded</html>",
+                headers={"content-type": "text/html"},
             ),
-        )
-        with pytest.raises(NetworkError) as exc_info:
-            guarded_fetch(url, max_download_bytes=50)
-        assert exc_info.value.kind == "oversize"
-
-    @respx.mock
-    def test_passes_for_body_under_limit(self) -> None:
-        url = "http://example.com/small.pdf"
-        respx.get(url).mock(
-            return_value=httpx.Response(
-                200,
-                content=b"x" * 30,
-                headers={"content-type": "application/pdf"},
-            ),
-        )
-        result = guarded_fetch(url, max_download_bytes=50)
-        assert result.status_code == 200
-        assert result.body == b"x" * 30
-
-    @respx.mock
-    def test_defaults_to_storage_config_limit(self) -> None:
-        """When max_download_bytes is None, StorageConfig default is used."""
-        url = "http://example.com/big-default.pdf"
-        # 60 MB — above StorageConfig default (50 MB) — uncomment to test:
-        # respx.get(url).mock(...)
-        # For now, verify a small fetch succeeds with the default.
-        respx.get(url).mock(
-            return_value=httpx.Response(
-                200,
-                content=b"x" * 100,
-                headers={"content-type": "application/pdf"},
-            ),
-        )
-        result = guarded_fetch(url, max_download_bytes=200)
-        assert result.status_code == 200
-
-
-# ── Timeout guard ────────────────────────────────────────────────────
-
-
-class TestTimeout:
-    """guarded_fetch translates httpx timeouts to NetworkError."""
-
-    @respx.mock
-    def test_connect_timeout(self) -> None:
-        url = "http://example.com/slow"
-        respx.get(url).mock(side_effect=httpx.ConnectTimeout("slow"))
-        with pytest.raises(NetworkError) as exc_info:
-            guarded_fetch(url)
-        assert exc_info.value.kind == "timeout"
-
-
-# ── Redirect re-validation ───────────────────────────────────────────
-
-
-class TestRedirectRevalidation:
-    """guarded_fetch re-validates scheme + SSRF on every redirect hop."""
-
-    @respx.mock
-    def test_follows_one_redirect(self) -> None:
-        start = "http://example.com/start"
-        target = "http://example.com/target"
-        respx.get(start).mock(
-            return_value=httpx.Response(302, headers={"location": target}),
-        )
-        respx.get(target).mock(
-            return_value=httpx.Response(200, text="ok"),
         )
         fake = _fake_getaddrinfo("93.184.216.34")
         with patch(_PATCH_GAI, fake):
-            result = guarded_fetch(start)
-        assert result.status_code == 200
-        assert result.body == b"ok"
-        assert result.final_url == target
+            result = guarded_fetch(url, expected_content_type="pdf")
+        assert isinstance(result, FetchResult)
+        assert result.status_code == 429
+        assert "text/html" in result.content_type
+
+    @respx.mock
+    def test_expected_pdf_got_503_html_returns_result(self) -> None:
+        url = "http://example.com/file.pdf"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                503,
+                content=b"<html>unavailable</html>",
+                headers={"content-type": "text/html"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(url, expected_content_type="pdf")
+        assert result.status_code == 503
+
+    @respx.mock
+    def test_2xx_wrong_content_type_still_raises(self) -> None:
+        # Regression guard: a 200 with the wrong content-type must still
+        # raise content_type_mismatch — the success-path check is intact.
+        url = "http://example.com/file.pdf"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"<html>",
+                headers={"content-type": "text/html"},
+            ),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with (
+            patch(_PATCH_GAI, fake),
+            pytest.raises(NetworkError) as exc_info,
+        ):
+            guarded_fetch(url, expected_content_type="pdf")
+        assert exc_info.value.kind == "content_type_mismatch"
+
+
+# ── Redirect re-validation (US-005) ──────────────────────────────────
+
+
+def _multi_resolve(mapping: dict[str, str]):
+    """Return a getaddrinfo fake resolving hosts per *mapping*."""
+
+    def _inner(
+        host: str,
+        port: Any,
+        family: int = 0,
+        type: int = 0,
+        **kw: Any,
+    ):
+        ip = mapping.get(host, "93.184.216.34")
+        return [(2, 1, 6, "", (ip, 0))]
+
+    return _inner
+
+
+class TestRedirectRevalidation:
+    """US-005: scheme + SSRF re-validation at every redirect hop."""
 
     @respx.mock
     def test_redirect_to_private_ip_raises(self) -> None:
@@ -432,104 +573,6 @@ class TestRedirectRevalidation:
         assert result.body == b"ok"
 
 
-# ── Default browser headers (Issue #239) ────────────────────────────
-
-
-class TestDefaultBrowserHeaders:
-    """guarded_fetch sends browser-like User-Agent, Accept, Accept-Language."""
-
-    @respx.mock
-    def test_sends_browser_user_agent(self) -> None:
-        """AC: User-Agent header is present and contains a browser token."""
-        url = "http://example.com/page"
-        route = respx.get(url).mock(
-            return_value=httpx.Response(200, text="ok"),
-        )
-        fake = _fake_getaddrinfo("93.184.216.34")
-        with patch(_PATCH_GAI, fake):
-            guarded_fetch(url)
-        request = route.calls.last.request
-        ua = request.headers.get("User-Agent", "")
-        assert "Mozilla/5.0" in ua, f"Expected browser UA, got {ua!r}"
-        assert "Chrome" in ua, f"Expected Chrome in UA, got {ua!r}"
-
-    @respx.mock
-    def test_sends_accept_header(self) -> None:
-        """AC: Accept header is present with HTML types."""
-        url = "http://example.com/page"
-        route = respx.get(url).mock(
-            return_value=httpx.Response(200, text="ok"),
-        )
-        fake = _fake_getaddrinfo("93.184.216.34")
-        with patch(_PATCH_GAI, fake):
-            guarded_fetch(url)
-        request = route.calls.last.request
-        accept = request.headers.get("Accept", "")
-        assert "text/html" in accept, f"Expected text/html in Accept, got {accept!r}"
-
-    @respx.mock
-    def test_sends_accept_language(self) -> None:
-        """AC: Accept-Language header is present."""
-        url = "http://example.com/page"
-        route = respx.get(url).mock(
-            return_value=httpx.Response(200, text="ok"),
-        )
-        fake = _fake_getaddrinfo("93.184.216.34")
-        with patch(_PATCH_GAI, fake):
-            guarded_fetch(url)
-        request = route.calls.last.request
-        al = request.headers.get("Accept-Language", "")
-        assert "en-US" in al, f"Expected en-US in Accept-Language, got {al!r}"
-
-    @respx.mock
-    def test_headers_do_not_break_redirects(self) -> None:
-        """AC: Headers on redirect hops do not cause errors."""
-        start = "http://example.com/start"
-        target = "http://example.com/target"
-        respx.get(start).mock(
-            return_value=httpx.Response(302, headers={"location": target}),
-        )
-        respx.get(target).mock(
-            return_value=httpx.Response(200, text="redirected"),
-        )
-        fake = _fake_getaddrinfo("93.184.216.34")
-        with patch(_PATCH_GAI, fake):
-            result = guarded_fetch(start)
-        assert result.status_code == 200
-        assert result.body == b"redirected"
-        # Verify the redirect target also got the headers
-        target_request = respx.get(target).calls.last.request
-        ua = target_request.headers.get("User-Agent", "")
-        assert "Mozilla/5.0" in ua
-
-    @respx.mock
-    def test_headers_do_not_break_ssrf_guard(self) -> None:
-        """AC: Setting default headers does not bypass SSRF guard."""
-        url = "http://10.0.0.1/secret"
-        respx.get(url).mock(
-            return_value=httpx.Response(200, text="nope"),
-        )
-        with patch(_PATCH_GAI, _fake_getaddrinfo("10.0.0.1")):
-            with pytest.raises(NetworkError) as exc_info:
-                guarded_fetch(url)
-            assert exc_info.value.kind == "ssrf"
-
-    @respx.mock
-    def test_headers_do_not_break_oversize_guard(self) -> None:
-        """AC: Setting default headers does not affect oversize guard."""
-        url = "http://example.com/big"
-        respx.get(url).mock(
-            return_value=httpx.Response(
-                200,
-                content=b"x" * 100,
-                headers={"content-type": "text/html"},
-            ),
-        )
-        with pytest.raises(NetworkError) as exc_info:
-            guarded_fetch(url, max_download_bytes=50)
-        assert exc_info.value.kind == "oversize"
-
-
 # ── guarded_post_json (status-only fire-and-forget POST) ─────────────
 
 
@@ -602,3 +645,85 @@ class TestGuardedOutboundPost:
         with pytest.raises(NetworkError) as exc_info:
             _run()
         assert exc_info.value.kind == "timeout"
+
+
+# ── Default browser headers (Issue #239) ────────────────────────────
+
+
+class TestDefaultBrowserHeaders:
+    """guarded_fetch sends browser-like User-Agent, Accept, Accept-Language."""
+
+    @respx.mock
+    def test_sends_browser_user_agent(self) -> None:
+        """AC: User-Agent header is present and contains a browser token."""
+        url = "http://example.com/page"
+        route = respx.get(url).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            guarded_fetch(url)
+        request = route.calls.last.request
+        ua = request.headers.get("User-Agent", "")
+        assert "Mozilla/5.0" in ua, f"Expected browser UA, got {ua!r}"
+        assert "Chrome" in ua, f"Expected Chrome in UA, got {ua!r}"
+
+    @respx.mock
+    def test_sends_accept_header(self) -> None:
+        """AC: Accept header is present with HTML types."""
+        url = "http://example.com/page"
+        route = respx.get(url).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            guarded_fetch(url)
+        request = route.calls.last.request
+        accept = request.headers.get("Accept", "")
+        assert "text/html" in accept, f"Expected text/html in Accept, got {accept!r}"
+
+    @respx.mock
+    def test_sends_accept_language(self) -> None:
+        """AC: Accept-Language header is present."""
+        url = "http://example.com/page"
+        route = respx.get(url).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            guarded_fetch(url)
+        request = route.calls.last.request
+        al = request.headers.get("Accept-Language", "")
+        assert "en-US" in al, f"Expected en-US in Accept-Language, got {al!r}"
+
+    @respx.mock
+    def test_headers_do_not_break_redirects(self) -> None:
+        """AC: Headers on redirect hops do not cause errors."""
+        start = "http://example.com/start"
+        target = "http://example.com/target"
+        respx.get(start).mock(
+            return_value=httpx.Response(302, headers={"location": target}),
+        )
+        respx.get(target).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(start)
+        assert result.status_code == 200
+        # Verify the redirect target also got the headers
+        target_request = respx.get(target).calls.last.request
+        ua = target_request.headers.get("User-Agent", "")
+        assert "Mozilla/5.0" in ua
+
+    @respx.mock
+    def test_headers_do_not_break_ssrf_guard(self) -> None:
+        """AC: Setting default headers does not bypass SSRF guard."""
+        url = "http://example.com/evil"
+        respx.get(url).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("10.0.0.1")  # private IP
+        with patch(_PATCH_GAI, fake), pytest.raises(NetworkError) as exc_info:
+            guarded_fetch(url)
+        assert exc_info.value.kind == "ssrf"

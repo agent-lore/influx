@@ -36,8 +36,14 @@ __all__ = [
     "guarded_post_json_fetch",
 ]
 
+# Browser-like headers to avoid publisher 403/429 from anti-bot stubs
+# that block the default python-httpx User-Agent (Issue #239).
 _DEFAULT_BROWSER_HEADERS: dict[str, str] = {
-    "User-Agent": StorageConfig().archive_user_agent,
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
 }
