@@ -645,3 +645,85 @@ class TestGuardedOutboundPost:
         with pytest.raises(NetworkError) as exc_info:
             _run()
         assert exc_info.value.kind == "timeout"
+
+
+# ── Default browser headers (Issue #239) ────────────────────────────
+
+
+class TestDefaultBrowserHeaders:
+    """guarded_fetch sends browser-like User-Agent, Accept, Accept-Language."""
+
+    @respx.mock
+    def test_sends_browser_user_agent(self) -> None:
+        """AC: User-Agent header is present and contains a browser token."""
+        url = "http://example.com/page"
+        route = respx.get(url).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            guarded_fetch(url)
+        request = route.calls.last.request
+        ua = request.headers.get("User-Agent", "")
+        assert "Mozilla/5.0" in ua, f"Expected browser UA, got {ua!r}"
+        assert "Chrome" in ua, f"Expected Chrome in UA, got {ua!r}"
+
+    @respx.mock
+    def test_sends_accept_header(self) -> None:
+        """AC: Accept header is present with HTML types."""
+        url = "http://example.com/page"
+        route = respx.get(url).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            guarded_fetch(url)
+        request = route.calls.last.request
+        accept = request.headers.get("Accept", "")
+        assert "text/html" in accept, f"Expected text/html in Accept, got {accept!r}"
+
+    @respx.mock
+    def test_sends_accept_language(self) -> None:
+        """AC: Accept-Language header is present."""
+        url = "http://example.com/page"
+        route = respx.get(url).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            guarded_fetch(url)
+        request = route.calls.last.request
+        al = request.headers.get("Accept-Language", "")
+        assert "en-US" in al, f"Expected en-US in Accept-Language, got {al!r}"
+
+    @respx.mock
+    def test_headers_do_not_break_redirects(self) -> None:
+        """AC: Headers on redirect hops do not cause errors."""
+        start = "http://example.com/start"
+        target = "http://example.com/target"
+        respx.get(start).mock(
+            return_value=httpx.Response(302, headers={"location": target}),
+        )
+        respx.get(target).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("93.184.216.34")
+        with patch(_PATCH_GAI, fake):
+            result = guarded_fetch(start)
+        assert result.status_code == 200
+        # Verify the redirect target also got the headers
+        target_request = respx.get(target).calls.last.request
+        ua = target_request.headers.get("User-Agent", "")
+        assert "Mozilla/5.0" in ua
+
+    @respx.mock
+    def test_headers_do_not_break_ssrf_guard(self) -> None:
+        """AC: Setting default headers does not bypass SSRF guard."""
+        url = "http://example.com/evil"
+        respx.get(url).mock(
+            return_value=httpx.Response(200, text="ok"),
+        )
+        fake = _fake_getaddrinfo("10.0.0.1")  # private IP
+        with patch(_PATCH_GAI, fake), pytest.raises(NetworkError) as exc_info:
+            guarded_fetch(url)
+        assert exc_info.value.kind == "ssrf"
