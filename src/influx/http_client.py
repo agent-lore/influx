@@ -234,7 +234,8 @@ def guarded_fetch(
 
     try:
         with httpx.Client(
-            timeout=timeout, follow_redirects=False,
+            timeout=timeout,
+            follow_redirects=False,
             headers=_DEFAULT_BROWSER_HEADERS,
         ) as client:
             for _hop in range(_MAX_REDIRECTS + 1):
