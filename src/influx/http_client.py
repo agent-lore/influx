@@ -36,6 +36,12 @@ __all__ = [
     "guarded_post_json_fetch",
 ]
 
+_DEFAULT_BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": StorageConfig().archive_user_agent,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 _MAX_REDIRECTS = 20
@@ -221,7 +227,10 @@ def guarded_fetch(
     current_url = url
 
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        with httpx.Client(
+            timeout=timeout, follow_redirects=False,
+            headers=_DEFAULT_BROWSER_HEADERS,
+        ) as client:
             for _hop in range(_MAX_REDIRECTS + 1):
                 with client.stream("GET", current_url) as response:
                     if response.is_redirect:

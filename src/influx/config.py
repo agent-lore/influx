@@ -216,6 +216,14 @@ class StorageConfig(BaseModel):
     retain_days: int = 3650
     max_download_bytes: int = 52_428_800
     download_timeout_seconds: int = 30
+    # Issue #239: User-Agent header sent on archive fetches.
+    # A realistic browser UA avoids publisher 403/429/anti-bot stubs
+    # from hosts that block the default python-httpx UA.
+    archive_user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    )
     # Issue #149: per-domain archive acquisition policy overrides.
     # Defaults to an empty override set plus the built-in staging
     # offender list; see :class:`ArchivePolicyConfig` for the shape.
