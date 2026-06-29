@@ -1,4 +1,4 @@
-.PHONY: install fmt lint typecheck test check docker-build \
+.PHONY: install fmt lint typecheck test check diagrams docker-build \
 	docker-up-dev docker-up-prod docker-down-dev docker-down-prod
 
 install:
@@ -18,6 +18,12 @@ test:
 	uv run pytest
 
 check: lint typecheck test
+
+# Regenerate the architecture & domain diagrams under docs/generated/.
+# Run after changing code/models and commit the result; CI fails if the
+# committed diagrams drift from the code (see .github/workflows/ci.yml).
+diagrams:
+	uv run pytest tests/meta/ -q
 
 docker-build:
 	docker build -t influx:dev -f docker/Dockerfile .

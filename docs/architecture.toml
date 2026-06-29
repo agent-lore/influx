@@ -1,0 +1,40 @@
+# Architecture model for the "diagrams as tests" guardrail.
+#
+# Single source of truth for:
+#   - the generated component diagram (tests/meta/test_architecture_diagram.py)
+#   - which modules are scanned for the domain class diagram
+#
+# The directional layering contract lives in pyproject.toml
+# ([tool.importlinter]); the tiers below document that intent (dependencies must
+# only point downward, Entrypoints -> Core -> Foundation) and group the diagram.
+#
+# `component_of()` matches a module to a component by LONGEST module-prefix, so
+# "influx.sources" also captures "influx.sources.arxiv" etc.
+
+[components]
+Entrypoint    = ["influx.main", "influx.__main__"]
+HttpApi       = ["influx.http_api", "influx.service", "influx.backfill"]
+Orchestration = ["influx.scheduler", "influx.run_service", "influx.run", "influx.inbox", "influx.audit_invalid_source"]
+Sources       = ["influx.source", "influx.sources", "influx.extraction"]
+Filter        = ["influx.filter"]
+Enrich        = ["influx.enrich", "influx.cascade"]
+Repair        = ["influx.repair", "influx.repair_hooks", "influx.repair_counters", "influx.archive_policy", "influx.promotion_gate"]
+Storage       = ["influx.storage"]
+LithosBridge  = ["influx.lithos_client", "influx.lcma", "influx.lcma_wiring", "influx.dedup", "influx.notes", "influx.renderer", "influx.urls"]
+Feedback      = ["influx.feedback", "influx.rejection_rate", "influx.run_dedup"]
+Notifications = ["influx.notifications"]
+Config        = ["influx.config", "influx.probes", "influx.slugs", "influx.prompts"]
+Observability = ["influx.telemetry", "influx.metrics", "influx.logging_config"]
+Schemas       = ["influx.schemas"]
+Common        = ["influx.errors", "influx.coordinator", "influx.run_ledger", "influx.thin_summary", "influx.http_client", "influx.source_kind"]
+
+[tiers]
+Entrypoints = ["Entrypoint", "HttpApi", "Orchestration"]
+Core        = ["Sources", "Filter", "Enrich", "Repair", "Storage", "LithosBridge", "Feedback", "Notifications"]
+Foundation  = ["Config", "Observability", "Schemas", "Common"]
+
+# Domain class diagram: the LLM extraction contracts (schemas) and the run-cycle
+# data types. Config/settings models are configuration, not domain entities.
+[domain]
+include_modules = ["influx.schemas", "influx.run", "influx.lcma_wiring"]
+exclude_modules = ["influx.config"]

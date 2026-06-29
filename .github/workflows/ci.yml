@@ -19,3 +19,25 @@ jobs:
       - run: uv sync --locked
 
       - run: make check
+
+  diagrams:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - run: uv sync --locked
+
+      - name: Regenerate architecture & domain diagrams
+        run: make diagrams
+
+      - name: Fail if diagrams are stale
+        run: |
+          if ! git diff --quiet docs/generated; then
+            echo "::error::docs/generated is out of date. Run 'make diagrams' and commit the result."
+            git --no-pager diff -- docs/generated
+            exit 1
+          fi
