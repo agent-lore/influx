@@ -52,6 +52,8 @@ dev = [
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp-proto-http>=1.20",
+    "grimp>=3.14",
+    "import-linter>=2.12",
 ]
 
 [tool.ruff]
@@ -66,6 +68,110 @@ pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"
 typeCheckingMode = "standard"
+
+[tool.importlinter]
+# Directional architecture contract: dependencies must only point downward,
+# Entrypoints -> Core -> Foundation. Expressed as `forbidden` contracts (not
+# `layers`) because the orchestration entrypoints import each other and some
+# core modules legitimately import siblings, which a strict layers contract
+# would reject.
+root_package = "influx"
+
+[[tool.importlinter.contracts]]
+name = "Foundation must not import Core or Entrypoints"
+type = "forbidden"
+source_modules = [
+    "influx.config",
+    "influx.probes",
+    "influx.slugs",
+    "influx.prompts",
+    "influx.telemetry",
+    "influx.metrics",
+    "influx.logging_config",
+    "influx.schemas",
+    "influx.errors",
+    "influx.coordinator",
+    "influx.run_ledger",
+    "influx.thin_summary",
+    "influx.http_client",
+    "influx.source_kind",
+]
+forbidden_modules = [
+    "influx.source",
+    "influx.sources",
+    "influx.extraction",
+    "influx.filter",
+    "influx.enrich",
+    "influx.cascade",
+    "influx.repair",
+    "influx.repair_hooks",
+    "influx.repair_counters",
+    "influx.archive_policy",
+    "influx.promotion_gate",
+    "influx.storage",
+    "influx.lithos_client",
+    "influx.lcma",
+    "influx.lcma_wiring",
+    "influx.dedup",
+    "influx.notes",
+    "influx.renderer",
+    "influx.urls",
+    "influx.feedback",
+    "influx.rejection_rate",
+    "influx.run_dedup",
+    "influx.notifications",
+    "influx.main",
+    "influx.__main__",
+    "influx.http_api",
+    "influx.service",
+    "influx.backfill",
+    "influx.scheduler",
+    "influx.run_service",
+    "influx.run",
+    "influx.inbox",
+    "influx.audit_invalid_source",
+]
+
+[[tool.importlinter.contracts]]
+name = "Core must not import Entrypoints"
+type = "forbidden"
+source_modules = [
+    "influx.source",
+    "influx.sources",
+    "influx.extraction",
+    "influx.filter",
+    "influx.enrich",
+    "influx.cascade",
+    "influx.repair",
+    "influx.repair_hooks",
+    "influx.repair_counters",
+    "influx.archive_policy",
+    "influx.promotion_gate",
+    "influx.storage",
+    "influx.lithos_client",
+    "influx.lcma",
+    "influx.lcma_wiring",
+    "influx.dedup",
+    "influx.notes",
+    "influx.renderer",
+    "influx.urls",
+    "influx.feedback",
+    "influx.rejection_rate",
+    "influx.run_dedup",
+    "influx.notifications",
+]
+forbidden_modules = [
+    "influx.main",
+    "influx.__main__",
+    "influx.http_api",
+    "influx.service",
+    "influx.backfill",
+    "influx.scheduler",
+    "influx.run_service",
+    "influx.run",
+    "influx.inbox",
+    "influx.audit_invalid_source",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
