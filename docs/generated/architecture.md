@@ -5,7 +5,7 @@
 
 ```mermaid
 graph TD
-  subgraph Core
+  subgraph tier_Core["Core"]
     Enrich
     Feedback
     Filter
@@ -15,12 +15,12 @@ graph TD
     Sources
     Storage
   end
-  subgraph Entrypoints
+  subgraph tier_Entrypoints["Entrypoints"]
     Entrypoint
     HttpApi
     Orchestration
   end
-  subgraph Foundation
+  subgraph tier_Foundation["Foundation"]
     Common
     Config
     Observability
