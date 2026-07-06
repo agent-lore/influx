@@ -8,9 +8,9 @@ helper correctly replaces the ``## Profile Relevance`` section.
 
 from __future__ import annotations
 
+from influx.canonical_note import replace_profile_relevance_section
 from influx.lithos_client import (
     _merge_profile_relevance_in_content,
-    _replace_profile_relevance_section,
 )
 from influx.notes import (
     merge_tags,
@@ -419,11 +419,11 @@ class TestContentLevelProfileRelevanceMerge:
         assert merged == new_content
 
 
-# ── _replace_profile_relevance_section ───────────────────────────────
+# ── replace_profile_relevance_section (canonical_note) ───────────────
 
 
 class TestReplaceProfileRelevanceSection:
-    """_replace_profile_relevance_section() correctly replaces the section body."""
+    """replace_profile_relevance_section() correctly replaces the section body."""
 
     def test_replaces_single_entry_with_two(self) -> None:
         """Replace one entry with two merged entries."""
@@ -457,7 +457,7 @@ class TestReplaceProfileRelevanceSection:
             ),
         ]
 
-        result = _replace_profile_relevance_section(original, merged_entries)
+        result = replace_profile_relevance_section(original, merged_entries)
 
         parsed = parse_note(result)
         entries = parse_profile_relevance(parsed)

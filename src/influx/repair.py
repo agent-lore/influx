@@ -24,6 +24,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from influx import metrics
+from influx.canonical_note import (
+    drop_tier2,
+    drop_tier2_and_tier3,
+    graft_user_notes,
+)
 from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.notes import merge_tags
 from influx.repair_counters import (
@@ -812,10 +817,6 @@ async def _sweep_resolve_version_conflict(
     Returns the retry's response ``status``.  Raises
     :class:`SweepWriteError` on unresolved conflict or transport failure.
     """
-    # Late import to avoid circular dependency (lithos_client → repair
-    # is unidirectional, but the sweep needs lithos_client's helpers).
-    from influx.lithos_client import _preserve_user_notes
-
     logger.info(
         "sweep rewrite version_conflict for note %s; re-reading and retrying once",
         note_id,
@@ -841,7 +842,7 @@ async def _sweep_resolve_version_conflict(
     # the refreshed note — never overwrite pending edits with refreshed
     # body content.
     pending_content: str = args.get("content", "")
-    merged_content = _preserve_user_notes(refreshed_content, pending_content)
+    merged_content = graft_user_notes(refreshed_content, pending_content)
 
     retry_args = {
         **args,
@@ -926,9 +927,6 @@ async def _rewrite_sweep_note(
         only) returned ``content_too_large`` — the chronic-oversize
         repair-path exemption (§5.4 failure mode 2, AC-X-8).
     """
-    # Late import to avoid circular dependency.
-    from influx.lithos_client import _drop_tier2, _drop_tier2_and_tier3
-
     note_id: str = note.get("id", "")
     base_args: dict[str, Any] = {
         "id": note_id,
@@ -954,7 +952,7 @@ async def _rewrite_sweep_note(
         return
 
     # Attempt 2: drop ## Full Text (Tier 2) and retry.
-    tier2_args = {**base_args, "content": _drop_tier2(base_args["content"])}
+    tier2_args = {**base_args, "content": drop_tier2(base_args["content"])}
     status = await _attempt_sweep_write(
         client, tier2_args, pending_tags=list(tags), note_id=note_id
     )
@@ -968,7 +966,7 @@ async def _rewrite_sweep_note(
         repair_tags.append("influx:repair-needed")
     tier1_args = {
         **base_args,
-        "content": _drop_tier2_and_tier3(base_args["content"]),
+        "content": drop_tier2_and_tier3(base_args["content"]),
         "tags": repair_tags,
     }
     status = await _attempt_sweep_write(

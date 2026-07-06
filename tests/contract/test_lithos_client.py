@@ -2155,6 +2155,52 @@ class TestWriteEnvelopeContentTooLarge:
         finally:
             await client.close()
 
+    async def test_first_retry_preserves_user_notes_bytes(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Tier-2 trim preserves the ``## User Notes`` region byte-exactly.
+
+        PR 3 routed the oversize trim through ``canonical_note.drop_tier2``,
+        which drops the legacy whole-document ``rstrip()``. Trailing spaces
+        and blank lines in User Notes now survive the retry (the byte-exact
+        User Notes invariant now holds on the trim path, not just on write).
+        """
+        content = (
+            "# Summary\nTransformer paper.\n\n"
+            "## Full Text\n\nbody text\n\n"
+            "## Claims\n- Claim 1\n\n"
+            "## User Notes\nKeep this.  \n\n"
+        )
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "content_too_large"}',
+                '{"status": "created"}',
+            ]
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await client.write_note(
+                title="Big Paper",
+                content=content,
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.50002",
+                tags=["profile:ml-research"],
+                confidence=0.9,
+            )
+            write_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
+            ]
+            retry_content = write_calls[1][1]["content"]
+            assert "## Full Text" not in retry_content
+            # Trailing spaces + blank lines preserved verbatim (legacy rstrip
+            # would have truncated to "Keep this.").
+            assert retry_content.endswith("## User Notes\nKeep this.  \n\n")
+        finally:
+            await client.close()
+
     async def test_create_path_skip_on_second_content_too_large(
         self,
         fake_lithos_url: str,
