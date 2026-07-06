@@ -136,6 +136,9 @@ _H2_RE = re.compile(r"^## ([^\r\n]+)(?=\r?\n|$)", re.MULTILINE)
 _NEXT_H2_RE = re.compile(r"^## ", re.MULTILINE)
 _TITLE_RE = re.compile(r"^# ([^\r\n]+)", re.MULTILINE)
 _CLOSING_FENCE_RE = re.compile(r"\r?\n---(?:[ \t]*)(?=\r?\n|$)")
+# A ``path:`` line anywhere in the ``## Archive`` body — used to keep
+# :func:`upsert_archive_path` idempotent regardless of where the line sits.
+_PATH_LINE_RE = re.compile(r"^path:", re.MULTILINE)
 
 # The canonical ``## User Notes`` matcher: the heading as a whole line,
 # CRLF- and trailing-space-tolerant.  This is the single definition of
@@ -430,12 +433,16 @@ def _split_sections(body: str) -> tuple[list[Section], str | None]:
 def serialize(note: CanonicalNote) -> str:
     """Serialise a :class:`CanonicalNote` back to canonical note text.
 
-    The inverse of :func:`parse` for notes already in canonical form:
-    ``serialize(parse(text)) == text`` for renderer-produced (single blank
-    line between sections, trailing-stripped bodies) notes.  Sections are
-    emitted in their stored order, joined by a single blank line; the
-    ``## User Notes`` region is appended byte-exactly (or an empty
-    ``## User Notes`` heading when absent).
+    The inverse of :func:`parse` for notes already in **canonical LF form**
+    — i.e. renderer-produced output (single blank line between sections,
+    trailing-stripped bodies, LF line endings): ``serialize(parse(text)) ==
+    text`` holds there.  It does **not** promise byte-identity for CRLF or
+    legacy hand-authored notes: fences are emitted with ``---\\n`` and
+    sections are joined with LF, so a CRLF note round-trips with its
+    separators normalised to LF (the ``## User Notes`` region alone is
+    preserved byte-exactly by :func:`parse`).  Sections are emitted in
+    their stored order; the ``## User Notes`` region is appended
+    byte-exactly, or an empty ``## User Notes`` heading when absent.
     """
     pieces = [f"# {note.title}"]
     for section in note.sections:
@@ -501,11 +508,16 @@ def insert_tier3_sections(content: str, tier3: Tier3Extraction) -> str:
 
 
 def _drop_section(content: str, heading: str) -> str:
-    """Remove one section (heading to next ``## ``) with historical joins.
+    """Remove one section (heading to the next ``## `` heading).
 
-    Trailing-strips the preceding content, then rejoins to the next heading
-    with a blank line — matching the legacy ``rstrip() + "\\n\\n"`` splice.
-    A trailing section (no following ``## ``) drops to end-of-content.
+    Trailing-strips the preceding content, then rejoins to the following
+    section with a single blank line.  The tail — including any trailing
+    ``## User Notes`` region — is preserved **byte-exactly**: this module
+    owns that invariant, so the drop ops deliberately do *not* apply the
+    legacy whole-document ``rstrip()`` that trimmed user-note trailing
+    whitespace (an intended fix that reaches production when PR 3 migrates
+    the oversize-trim path onto these helpers).  A trailing section (no
+    following ``## ``) drops to end-of-content.
     """
     match = _heading_line_re(heading).search(content)
     if match is None:
@@ -513,10 +525,10 @@ def _drop_section(content: str, heading: str) -> str:
     before = content[: match.start()].rstrip()
     rest = content[match.end() :]
     next_heading = _NEXT_H2_RE.search(rest)
-    if next_heading is not None:
-        after = rest[next_heading.start() :]
-        return (before + "\n\n" + after).rstrip()
-    return before
+    if next_heading is None:
+        return before
+    after = rest[next_heading.start() :]
+    return before + "\n\n" + after
 
 
 def drop_tier2(content: str) -> str:
@@ -533,12 +545,18 @@ def drop_tier2_and_tier3(content: str) -> str:
 
 
 def extract_section_body(content: str, heading: str) -> str:
-    """Return the trailing-stripped body of *heading*, or ``""`` if absent."""
+    """Return the trailing-stripped body of *heading*, or ``""`` if absent.
+
+    CRLF-tolerant: skips a ``\\r\\n`` or ``\\n`` line ending after the
+    heading before reading the body.
+    """
     match = _heading_line_re(heading).search(content)
     if match is None:
         return ""
     body_start = match.end()
-    if body_start < len(content) and content[body_start] == "\n":
+    if content[body_start : body_start + 2] == "\r\n":
+        body_start += 2
+    elif body_start < len(content) and content[body_start] == "\n":
         body_start += 1
     next_match = _NEXT_H2_RE.search(content, body_start)
     if next_match is not None:
@@ -550,19 +568,24 @@ def upsert_archive_path(content: str, archive_path: str) -> str:
     """Set the ``## Archive`` ``path:`` line, idempotently.
 
     Inserts ``path: {archive_path}`` immediately below the ``## Archive``
-    heading when the section has no ``path:`` line yet; a no-op when a
-    ``path:`` line is already present or the section is absent.
+    heading when the section has no ``path:`` line yet; a no-op when the
+    section already contains a ``path:`` line *anywhere* in its body (not
+    just as the first line, so a hand-edited section carrying other
+    metadata is never given a duplicate ``path:``) or when the section is
+    absent.
     """
     match = _heading_line_re(ARCHIVE).search(content)
     if match is None:
+        return content
+    next_h2 = _NEXT_H2_RE.search(content, match.end())
+    section_end = next_h2.start() if next_h2 is not None else len(content)
+    if _PATH_LINE_RE.search(content, match.end(), section_end):
         return content
     insert_pos = match.end()
     if content[insert_pos : insert_pos + 2] == "\r\n":
         insert_pos += 2
     elif insert_pos < len(content) and content[insert_pos] == "\n":
         insert_pos += 1
-    if content[insert_pos:].startswith("path:"):
-        return content
     return content[:insert_pos] + f"path: {archive_path}\n" + content[insert_pos:]
 
 

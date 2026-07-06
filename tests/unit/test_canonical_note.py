@@ -106,6 +106,20 @@ class TestRoundTrip:
         for section in note.sections:
             assert "\r" not in section.heading
 
+    def test_serialize_normalizes_crlf_to_lf_intentionally(self) -> None:
+        # serialize() promises identity only for canonical LF renderer
+        # output; a CRLF/legacy note round-trips with separators normalised
+        # to LF (documented, not a byte-identity guarantee).
+        legacy_crlf = (
+            "---\r\nnote_type: summary\r\n---\r\n# T\r\n\r\n"
+            "## Archive\r\npath: x\r\n\r\n## User Notes\r\nkeep\r\n"
+        )
+        note = cn.parse(legacy_crlf)
+        idx = cn.find_user_notes_start(legacy_crlf)
+        assert idx is not None
+        assert note.user_notes == legacy_crlf[idx:]  # region preserved on parse
+        assert cn.serialize(note) != legacy_crlf  # separators normalised to LF
+
 
 # ── Parse / parse_lenient ────────────────────────────────────────────
 
@@ -220,16 +234,12 @@ class TestOpsPreserveUserNotes:
         assert idx is not None
         return content[idx:]
 
-    # The drop ops end with a whole-content ``.rstrip()`` (legacy oversize-trim
-    # behavior, byte-preserved from lithos_client), so a trailing User Notes
-    # region can lose a trailing newline. Assert content identity, not the
-    # trailing whitespace, to pin the op's real guarantee.
     def test_drop_tier2_preserves_user_notes(self) -> None:
         note = self._note()
         original = self._region(note)
         result = cn.drop_tier2(note)
         assert "## Full Text" not in result
-        assert self._region(result).rstrip() == original.rstrip()
+        assert self._region(result) == original
 
     def test_drop_tier2_and_tier3_preserves_user_notes(self) -> None:
         note = self._note()
@@ -237,7 +247,19 @@ class TestOpsPreserveUserNotes:
         result = cn.drop_tier2_and_tier3(note)
         assert "## Full Text" not in result
         assert "## Claims" not in result
-        assert self._region(result).rstrip() == original.rstrip()
+        assert self._region(result) == original
+
+    def test_drop_preserves_user_notes_trailing_whitespace_byte_exact(self) -> None:
+        # The drop ops own the byte-exact invariant: user-note trailing
+        # spaces/blank lines survive (unlike the legacy whole-doc rstrip).
+        note = (
+            "# T\n\n## Full Text\nbody\n\n"
+            "## Profile Relevance\n### p\nScore: 5/10\nr\n\n"
+            "## User Notes\nnote with trailing spaces  \n\n\n"
+        )
+        original = self._region(note)
+        result = cn.drop_tier2(note)
+        assert self._region(result) == original
 
     def test_insert_full_text_preserves_user_notes(self) -> None:
         note = _read("tier3_full.md")  # has no Full Text yet
@@ -260,6 +282,23 @@ class TestOpsPreserveUserNotes:
         assert self._region(result) == original
 
 
+# ── extract_section_body ────────────────────────────────────────────
+
+
+class TestExtractSectionBody:
+    def test_lf_body(self) -> None:
+        content = "# T\n\n## Full Text\nhello\nworld\n\n## User Notes\n"
+        assert cn.extract_section_body(content, FULL_TEXT) == "hello\nworld"
+
+    def test_crlf_skips_leading_line_ending(self) -> None:
+        content = "# T\r\n\r\n## Full Text\r\nhello\r\nworld\r\n\r\n## User Notes\r\n"
+        # Leading \r\n after the heading is skipped (not returned as body).
+        assert cn.extract_section_body(content, FULL_TEXT) == "hello\r\nworld"
+
+    def test_absent_section(self) -> None:
+        assert cn.extract_section_body("# T\n\n## Summary\ns\n", FULL_TEXT) == ""
+
+
 # ── upsert_archive_path idempotence / CRLF ──────────────────────────
 
 
@@ -272,6 +311,30 @@ class TestUpsertArchivePath:
     def test_idempotent_when_path_present(self) -> None:
         content = "# T\n\n## Archive\npath: existing.pdf\n\n## User Notes\n"
         assert cn.upsert_archive_path(content, "new.pdf") == content
+
+    def test_idempotent_when_path_below_other_metadata(self) -> None:
+        # A path: line anywhere in the Archive body counts — never duplicate.
+        content = (
+            "# T\n\n## Archive\ncreated: 2026\npath: existing.pdf\n\n## User Notes\n"
+        )
+        result = cn.upsert_archive_path(content, "new.pdf")
+        assert result == content
+        assert result.count("path:") == 1
+
+    def test_inserts_once_when_metadata_but_no_path(self) -> None:
+        content = "# T\n\n## Archive\ncreated: 2026\n\n## User Notes\n"
+        result = cn.upsert_archive_path(content, "new.pdf")
+        assert result.count("path:") == 1
+        assert "## Archive\npath: new.pdf\ncreated: 2026" in result
+
+    def test_does_not_match_path_in_a_later_section(self) -> None:
+        # A ``path:`` line outside the Archive section must not suppress insert.
+        content = (
+            "# T\n\n## Archive\n\n"
+            "## Full Text\npath: not-an-archive-path\n\n## User Notes\n"
+        )
+        result = cn.upsert_archive_path(content, "real.pdf")
+        assert "## Archive\npath: real.pdf" in result
 
     def test_noop_when_archive_absent(self) -> None:
         content = "# T\n\n## Summary\ns\n"
@@ -374,3 +437,78 @@ def test_constants_are_section_headings() -> None:
     assert FULL_TEXT in SECTION_ORDER
     assert PROFILE_RELEVANCE in SECTION_ORDER
     assert SECTION_ORDER[-1] == USER_NOTES
+
+
+# ── Transitional parity with the legacy helpers ─────────────────────
+#
+# The canonical ops that PRs 2-5 swap the existing helpers onto must be
+# byte-identical to those helpers on canonical inputs — that is what makes
+# each migration a no-op for production bytes. These assertions pin that
+# equivalence and are deleted as each legacy helper is removed in its
+# migration PR. NOTE: drop_tier2 / drop_tier2_and_tier3 / upsert_archive_path
+# are deliberately excluded — they intentionally *diverge* from the legacy
+# helpers (byte-exact User Notes; whole-section path: idempotence), a fix
+# that lands with the PR 3/PR 4 migrations.
+
+
+class TestLegacyParityTransitional:
+    def _canonical_note(self) -> str:
+        return _read("golden_lf.md")
+
+    def test_render_tier3_matches_repair_hooks(self) -> None:
+        from influx import repair_hooks as rh
+
+        assert cn.render_tier3_sections(TIER3) == rh._render_tier3_sections(TIER3)
+
+    def test_insert_full_text_matches_repair_hooks(self) -> None:
+        from influx import repair_hooks as rh
+
+        note = _read("tier3_full.md")
+        assert cn.insert_full_text_section(note, "ft") == rh._insert_full_text_section(
+            note, "ft"
+        )
+
+    def test_insert_tier3_matches_repair_hooks(self) -> None:
+        from influx import repair_hooks as rh
+
+        note = _read("no_user_notes.md")
+        assert cn.insert_tier3_sections(note, TIER3) == rh._insert_tier3_sections(
+            note, TIER3
+        )
+
+    def test_insertion_point_matches_repair_hooks(self) -> None:
+        from influx import repair_hooks as rh
+
+        note = self._canonical_note()
+        assert cn.insertion_point(note) == rh._find_insertion_point(note)
+
+    def test_graft_user_notes_matches_lithos_client(self) -> None:
+        from influx import lithos_client as lc
+
+        existing = self._canonical_note()
+        new = _read("tier3_full.md")
+        assert cn.graft_user_notes(existing, new) == lc._preserve_user_notes(
+            existing, new
+        )
+
+    def test_replace_profile_relevance_matches_lithos_client(self) -> None:
+        from influx import lithos_client as lc
+
+        note = self._canonical_note()
+        entries = [
+            ProfileRelevanceEntry("a", 8, "r1"),
+            ProfileRelevanceEntry("b", 4, "r2"),
+        ]
+        assert cn.replace_profile_relevance_section(
+            note, entries
+        ) == lc._replace_profile_relevance_section(note, entries)
+
+    def test_upsert_repair_matches_repair_counters(self) -> None:
+        from influx import repair_counters as rc
+
+        note = _read("tier3_full.md")
+        counters = rc.RepairCounters(tier2_attempts=1, tier2_last_stage="parse")
+        rendered = rc.render_repair_section(counters)
+        assert cn.upsert_section_text(
+            note, REPAIR, rendered
+        ) == rc.upsert_repair_section(note, counters)
