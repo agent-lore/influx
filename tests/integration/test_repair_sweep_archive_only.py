@@ -302,6 +302,77 @@ class TestArchiveOnlyRepairFlow:
             # Path spliced directly below the CRLF ## Archive heading (the
             # inserted line itself is LF-terminated, matching the canonical op).
             assert f"## Archive\r\npath: {_ARCHIVE_PATH}\n" in written_content
+            # archive-missing clears now that a path is stored (as for LF).
+            assert "influx:archive-missing" not in write_calls[0][1]["tags"]
+        finally:
+            await client.close()
+
+    async def test_title_stripped_note_parses_archive_path_and_clears_tag(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """The sweep parse composition extracts a body archive path.
+
+        ``read_note`` strips the ``# {title}`` heading, so the sweep must
+        parse via ``parse_lenient(..., fallback_title=_doc_title(note))`` to
+        see the archive ``path:`` living in the body. With no archive-download
+        hook the archive stage is skipped, so ``influx:archive-missing`` is
+        dropped *only* because ``compute_clearing`` saw the parsed
+        (non-``None``) archive path. Pins the *caller* composition: dropping
+        ``_doc_title`` (or calling ``parse`` directly) would make the parse
+        raise, leave ``archive_path`` ``None``, and keep the tag set.
+        """
+        stored_path = "papers/arxiv/2026/04/already-here.pdf"
+        # Real read_note body shape: NO leading '# Title'; path in the body.
+        content = (
+            "## Archive\n"
+            f"path: {stored_path}\n\n"
+            "## Summary\nA summary.\n\n"
+            "## Profile Relevance\n### ai-robotics\nScore: 5/10\nRelevant.\n\n"
+            "## User Notes\n"
+        )
+        note: dict[str, Any] = {
+            "id": "note-title-stripped",
+            "title": "Doc Title",  # doc-level title _doc_title() must supply
+            "content": content,
+            "tags": [
+                "profile:ai-robotics",
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "ingested-by:influx",
+                "source:arxiv",
+                "text:html",
+            ],
+            "version": 1,
+            "source_url": "https://arxiv.org/abs/2601.00099",
+            "path": "papers/arxiv/2026/04",
+            "confidence": 0.9,
+            "note_type": "summary",
+            "namespace": "influx",
+        }
+        _queue_single_note(fake_lithos, note)
+
+        config = _make_config(lithos_url=fake_lithos_url)
+        # No archive_download hook: the archive stage is skipped, so the only
+        # way influx:archive-missing clears is via the parsed body path.
+        hooks = SweepHooks()
+
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await sweep(
+                "ai-robotics",
+                client=client,
+                config=config,
+                hooks=hooks,
+            )
+            write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+            assert len(write_calls) == 1
+            payload = write_calls[0][1]
+            # Parsed body path ⇒ archive-missing cleared (composition works).
+            assert "influx:archive-missing" not in payload["tags"]
+            # Body path preserved verbatim (no duplicate splice).
+            assert payload["content"].count(f"path: {stored_path}") == 1
         finally:
             await client.close()
 
