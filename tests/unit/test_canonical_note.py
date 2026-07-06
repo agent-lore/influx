@@ -321,6 +321,14 @@ class TestUpsertArchivePath:
         assert result == content
         assert result.count("path:") == 1
 
+    def test_idempotent_when_path_is_indented(self) -> None:
+        # parse_archive_path strips the body, so an indented lone path: is a
+        # valid archive path — upsert must treat it as present, not duplicate.
+        content = "# T\n\n## Archive\n  path: existing.pdf\n\n## User Notes\n"
+        result = cn.upsert_archive_path(content, "new.pdf")
+        assert result == content
+        assert result.count("path:") == 1
+
     def test_inserts_once_when_metadata_but_no_path(self) -> None:
         content = "# T\n\n## Archive\ncreated: 2026\n\n## User Notes\n"
         result = cn.upsert_archive_path(content, "new.pdf")

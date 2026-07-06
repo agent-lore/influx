@@ -21,12 +21,28 @@ seam that owns:
 - the **string-level section operations** the rewrite paths use to edit a
   persisted note without a full re-render (insert / drop / upsert / graft).
 
-The string-level ops are deliberately byte-conservative: they touch only the
-spliced region and preserve the historical ``rstrip() + "\\n\\n"`` join
-semantics, so migrating a caller onto them does not change the bytes written
-for any canonical note.  What tightens is the *locator* — every op finds a
-heading as a whole line (``^## <heading>`` at the start of a line, CRLF- and
-trailing-space-tolerant) rather than as an unanchored substring.
+Most string-level ops are byte-conservative: they touch only the spliced
+region and preserve the historical ``rstrip() + "\\n\\n"`` join semantics, so
+migrating a caller onto them does not change the bytes written for a
+canonical note.  What tightens across the board is the *locator* — every op
+finds a heading as a whole line (``^## <heading>`` at the start of a line,
+CRLF- and trailing-space-tolerant) rather than as an unanchored substring,
+which only diverges from the legacy helpers on pathological input (a mid-line
+``## User Notes`` literal, a ``### User Notes`` H3).
+
+Three ops **intentionally** fix known legacy edge behaviour when a caller
+migrates onto them, rather than preserving it byte-for-byte:
+
+- :func:`drop_tier2` / :func:`drop_tier2_and_tier3` preserve a trailing
+  ``## User Notes`` region byte-exactly instead of applying the legacy
+  whole-document ``rstrip()`` that trimmed user-note trailing whitespace.
+- :func:`upsert_archive_path` treats a ``path:`` line anywhere in the
+  ``## Archive`` body as "already present" (not only as the first line), so a
+  hand-edited section never gets a duplicate ``path:``.
+
+These divergences reach production only when the corresponding call site
+migrates (PR 3 / PR 4) and are excluded from the transitional legacy-parity
+tests.
 
 This module imports only Foundation (:mod:`influx.errors`,
 :mod:`influx.schemas`); ``notes``, ``renderer``, ``lithos_client`` and the
@@ -138,7 +154,10 @@ _TITLE_RE = re.compile(r"^# ([^\r\n]+)", re.MULTILINE)
 _CLOSING_FENCE_RE = re.compile(r"\r?\n---(?:[ \t]*)(?=\r?\n|$)")
 # A ``path:`` line anywhere in the ``## Archive`` body — used to keep
 # :func:`upsert_archive_path` idempotent regardless of where the line sits.
-_PATH_LINE_RE = re.compile(r"^path:", re.MULTILINE)
+# Leading whitespace is allowed so detection matches ``parse_archive_path``'s
+# tolerance, which strips the section body before matching (an indented lone
+# ``path:`` line is a valid archive path).
+_PATH_LINE_RE = re.compile(r"^[ \t]*path:", re.MULTILINE)
 
 # The canonical ``## User Notes`` matcher: the heading as a whole line,
 # CRLF- and trailing-space-tolerant.  This is the single definition of
