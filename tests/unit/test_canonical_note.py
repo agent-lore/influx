@@ -533,30 +533,9 @@ class TestLegacyParityTransitional:
     def _canonical_note(self) -> str:
         return _read("golden_lf.md")
 
-    # NOTE: the repair_hooks parity cases (render_tier3 / insert_full_text /
-    # insert_tier3 / insertion_point) were removed in PR 2 when those helpers
-    # were deleted in favour of the canonical ops.
-
-    def test_graft_user_notes_matches_lithos_client(self) -> None:
-        from influx import lithos_client as lc
-
-        existing = self._canonical_note()
-        new = _read("tier3_full.md")
-        assert cn.graft_user_notes(existing, new) == lc._preserve_user_notes(
-            existing, new
-        )
-
-    def test_replace_profile_relevance_matches_lithos_client(self) -> None:
-        from influx import lithos_client as lc
-
-        note = self._canonical_note()
-        entries = [
-            ProfileRelevanceEntry("a", 8, "r1"),
-            ProfileRelevanceEntry("b", 4, "r2"),
-        ]
-        assert cn.replace_profile_relevance_section(
-            note, entries
-        ) == lc._replace_profile_relevance_section(note, entries)
+    # NOTE: the repair_hooks parity cases (PR 2) and the lithos_client parity
+    # cases — graft_user_notes / replace_profile_relevance (PR 3) — were removed
+    # as those legacy helpers were deleted in favour of the canonical ops.
 
     def test_upsert_repair_matches_repair_counters(self) -> None:
         from influx import repair_counters as rc

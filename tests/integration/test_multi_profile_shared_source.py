@@ -456,15 +456,15 @@ class TestPreservationOnSingleProfileRun:
             tags=both_tags,
         )
         # Manually fix: add Profile B's entry too
-        from influx.lithos_client import (
-            _replace_profile_relevance_section,
+        from influx.canonical_note import (
+            replace_profile_relevance_section,
         )
         from influx.notes import (
             parse_note,
             parse_profile_relevance,
         )
 
-        existing_content = _replace_profile_relevance_section(
+        existing_content = replace_profile_relevance_section(
             existing_content,
             [
                 ProfileRelevanceEntry(PROFILE_A, 8, "AI robotics."),

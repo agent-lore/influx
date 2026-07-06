@@ -25,6 +25,12 @@ from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 from mcp.shared.exceptions import McpError
 
+from influx.canonical_note import (
+    drop_tier2,
+    drop_tier2_and_tier3,
+    graft_user_notes,
+    replace_profile_relevance_section,
+)
 from influx.dedup import compose_dedup_query
 from influx.errors import ConfigError, LCMAError, LithosError
 from influx.notes import (
@@ -36,11 +42,7 @@ from influx.notes import (
     merge_tags as _canonical_merge_tags,
 )
 from influx.renderer import (
-    ProfileRelevanceEntry,
     merge_profile_relevance_union,
-)
-from influx.renderer import (
-    _render_profile_relevance_body as _render_pr_body,
 )
 from influx.urls import normalise_url
 
@@ -435,29 +437,6 @@ def _merge_tags(existing_tags: list[str], new_tags: list[str]) -> list[str]:
     return _canonical_merge_tags(existing_tags=existing_tags, new_tags=new_tags)
 
 
-_USER_NOTES_MARKER = "## User Notes"
-
-
-def _preserve_user_notes(existing_content: str, new_content: str) -> str:
-    """Merge content, preserving ``## User Notes`` from the existing note.
-
-    The ``## User Notes`` section and everything beneath it in
-    *existing_content* replaces any ``## User Notes`` already present
-    in *new_content* (AC-05-E).
-    """
-    idx = existing_content.find(_USER_NOTES_MARKER)
-    if idx == -1:
-        return new_content
-    user_notes_block = existing_content[idx:]
-
-    new_idx = new_content.find(_USER_NOTES_MARKER)
-    base = new_content[:new_idx].rstrip() if new_idx != -1 else new_content.rstrip()
-    return base + "\n\n" + user_notes_block
-
-
-_PROFILE_RELEVANCE_MARKER = "## Profile Relevance"
-
-
 def _merge_profile_relevance_in_content(
     existing_content: str,
     new_content: str,
@@ -492,88 +471,7 @@ def _merge_profile_relevance_in_content(
     )
 
     # Replace the ## Profile Relevance section in new_content
-    return _replace_profile_relevance_section(new_content, merged_entries)
-
-
-def _replace_profile_relevance_section(
-    content: str,
-    entries: list[ProfileRelevanceEntry],
-) -> str:
-    """Replace the ``## Profile Relevance`` section body in *content*."""
-    pr_idx = content.find(_PROFILE_RELEVANCE_MARKER)
-    if pr_idx == -1:
-        return content
-
-    # Find the end of the Profile Relevance section: the next ## heading
-    after_heading = pr_idx + len(_PROFILE_RELEVANCE_MARKER)
-    next_h2 = content.find("\n## ", after_heading)
-
-    pr_body = _render_pr_body(entries)
-    marker = _PROFILE_RELEVANCE_MARKER
-    replacement = f"{marker}\n{pr_body}\n" if pr_body else f"{marker}\n"
-
-    if next_h2 != -1:
-        # Replace up to but not including the next ## heading's newline
-        return content[:pr_idx] + replacement + "\n" + content[next_h2 + 1 :]
-    else:
-        # Profile Relevance is the last section — replace to end
-        return content[:pr_idx] + replacement
-
-
-_TIER2_MARKER = "## Full Text"
-
-# Tier 3 section headings (master PRD §7.3).
-_TIER3_MARKERS = (
-    "## Claims",
-    "## Datasets & Benchmarks",
-    "## Builds On",
-    "## Open Questions",
-)
-
-
-def _drop_tier2(content: str) -> str:
-    """Remove the ``## Full Text`` (Tier 2) section from *content*.
-
-    Keeps Tier 1 and Tier 3 sections intact (master PRD §9.7 step 1).
-    The Tier 2 section spans from ``## Full Text`` to the next ``##``
-    heading (exclusive) or the ``## User Notes`` marker or end-of-string.
-    """
-    idx = content.find(_TIER2_MARKER)
-    if idx == -1:
-        return content
-    before = content[:idx].rstrip()
-    # Find the next ## heading after Tier 2.
-    rest = content[idx + len(_TIER2_MARKER) :]
-    next_heading = re.search(r"^## ", rest, re.MULTILINE)
-    if next_heading is not None:
-        after = rest[next_heading.start() :]
-        return (before + "\n\n" + after).rstrip()
-    return before
-
-
-def _drop_tier2_and_tier3(content: str) -> str:
-    """Remove Tier 2 (``## Full Text``) AND Tier 3 sections from *content*.
-
-    Keeps only Tier 1 sections + ``## User Notes`` (master PRD §9.7
-    repair path).  Tier 3 headings: ``## Claims``,
-    ``## Datasets & Benchmarks``, ``## Builds On``, ``## Open Questions``.
-    """
-    # First drop Tier 2.
-    result = _drop_tier2(content)
-    # Then drop each Tier 3 section.
-    for marker in _TIER3_MARKERS:
-        idx = result.find(marker)
-        if idx == -1:
-            continue
-        before = result[:idx].rstrip()
-        rest = result[idx + len(marker) :]
-        next_heading = re.search(r"^## ", rest, re.MULTILINE)
-        if next_heading is not None:
-            after = rest[next_heading.start() :]
-            result = (before + "\n\n" + after).rstrip()
-        else:
-            result = before
-    return result
+    return replace_profile_relevance_section(new_content, merged_entries)
 
 
 logger = logging.getLogger(__name__)
@@ -1232,7 +1130,7 @@ class LithosClient:
         existing_tags: list[str] = existing.get("tags", [])
         merged_tags = _merge_tags(existing_tags, original_tags)
         existing_content: str = existing.get("content", "")
-        merged_content = _preserve_user_notes(existing_content, args["content"])
+        merged_content = graft_user_notes(existing_content, args["content"])
         # Multi-profile merge: union-merge Profile Relevance entries (FR-NOTE-6)
         merged_content = _merge_profile_relevance_in_content(
             existing_content, merged_content, merged_tags
@@ -1289,7 +1187,7 @@ class LithosClient:
         - **Repair path** (existing note): handled by US-011.
         """
         # Step 1: drop Tier 2 and retry.
-        trimmed = _drop_tier2(args["content"])
+        trimmed = drop_tier2(args["content"])
         retry_args = {**args, "content": trimmed}
         result = await self.call_tool("lithos_write", retry_args)
         parsed = self._parse_write_response(result, source_url=source_url)
@@ -1332,7 +1230,7 @@ class LithosClient:
         once.  If that also fails: leave existing note untouched, count +
         log, no abort, no ``updated_at`` advance.
         """
-        tier1_content = _drop_tier2_and_tier3(args["content"])
+        tier1_content = drop_tier2_and_tier3(args["content"])
         existing_tags: list[str] = existing.get("tags", [])
         merged_tags = _merge_tags(
             existing_tags, [*original_tags, "influx:repair-needed"]

@@ -506,3 +506,84 @@ class TestChronicOversizeExemption:
             assert "influx:repair-needed" not in normal_write[0][1]["tags"]
         finally:
             await client.close()
+
+    async def test_trim_retries_preserve_user_notes_bytes(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Sweep Tier-2 and Tier-1-only trims preserve ``## User Notes`` bytes.
+
+        Regression guard for the PR 3 migration: ``_rewrite_sweep_note`` now
+        trims via ``canonical_note.drop_tier2`` / ``drop_tier2_and_tier3``,
+        which (unlike the legacy whole-document ``rstrip()``) keep trailing
+        whitespace and blank lines in the final ``## User Notes`` section. With
+        default ``SweepHooks()`` no stage mutates the content, so the trim runs
+        on the note's content verbatim.
+        """
+        user_notes_tail = "## User Notes\nKeep verbatim.  \n\n\n"
+        content = (
+            "---\n"
+            "note_type: summary\n"
+            "namespace: influx\n"
+            "source_url: https://arxiv.org/abs/2601.chronic-un\n"
+            "tags:\n"
+            "  - profile:ai-robotics\n"
+            "  - ingested-by:influx\n"
+            "  - source:arxiv\n"
+            "confidence: 0.9\n"
+            "---\n"
+            "# Test Paper chronic-un\n\n"
+            "## Archive\n"
+            f"path: {_ARCHIVE_PATH}\n\n"
+            "## Summary\nA summary.\n\n"
+            "## Full Text\nBig body text.\n\n"
+            "## Claims\n- A claim.\n\n"
+            "## Profile Relevance\n### ai-robotics\nScore: 5/10\nRelevant.\n\n"
+            f"{user_notes_tail}"
+        )
+        chronic: dict[str, Any] = {
+            "id": "chronic-un",
+            "title": "Test Paper chronic-un",
+            "content": content,
+            "tags": list(_CHRONIC_TAGS),
+            "version": 1,
+            "source_url": "https://arxiv.org/abs/2601.chronic-un",
+            "path": "papers/arxiv/2026/04",
+            "confidence": 0.9,
+            "note_type": "summary",
+            "namespace": "influx",
+        }
+        fake_lithos.list_responses.append(
+            json.dumps({"items": [{"id": chronic["id"], "title": chronic["title"]}]})
+        )
+        fake_lithos.read_responses.append(json.dumps(chronic))
+        for _ in range(_CHRONIC_TRIM_ATTEMPTS):
+            fake_lithos.write_responses.append('{"status": "content_too_large"}')
+
+        config = _make_config(lithos_url=fake_lithos_url, max_items=10)
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await sweep(
+                "ai-robotics",
+                client=client,
+                config=config,
+                hooks=SweepHooks(),
+            )
+
+            write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+            assert len(write_calls) == _CHRONIC_TRIM_ATTEMPTS
+
+            # Attempt 2: Tier 2 dropped, Tier 3 kept, User Notes byte-exact.
+            tier2_dropped = write_calls[1][1]["content"]
+            assert "## Full Text" not in tier2_dropped
+            assert "## Claims" in tier2_dropped
+            assert tier2_dropped.endswith(user_notes_tail)
+
+            # Attempt 3: Tier 2 + Tier 3 dropped, User Notes still byte-exact.
+            tier1_only = write_calls[2][1]["content"]
+            assert "## Full Text" not in tier1_only
+            assert "## Claims" not in tier1_only
+            assert tier1_only.endswith(user_notes_tail)
+        finally:
+            await client.close()
