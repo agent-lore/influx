@@ -1,39 +1,45 @@
-"""Canonical Lithos note parser and rewrite-merge helpers (FR-NOTE-1..9).
+"""Rewrite-merge helpers and semantic parsers for canonical Lithos notes.
 
-Parses the canonical note format used by Influx:
+The canonical note *shape* — section order, the parse ↔ serialize
+round-trip, the byte-exact ``## User Notes`` region, and the string-level
+section operations — is owned by :mod:`influx.canonical_note`.  This module
+layers the rewrite-time semantics on top of it:
 
-    ---
-    <YAML frontmatter>
-    ---
-    # <Title>
+- :func:`merge_tags` / :func:`recompute_confidence` — the FR-NOTE-5/6/7/8
+  tag-merge and confidence rules applied on every rewrite.
+- :func:`parse_archive_path` / :func:`parse_profile_relevance` — semantic
+  parsers over the already-parsed :class:`CanonicalNote` sections.
 
-    ## Archive
-    ...
-    ## Summary
-    ...
-    ## User Notes
-    <user content preserved byte-identically>
-
-The ``## User Notes`` region is everything from the ``## User Notes``
-heading to end-of-file, preserved byte-exactly across parse/rewrite
-cycles (FR-NOTE-4, R-5).
-
-Rendering of canonical notes lives in :mod:`influx.renderer`.
+:func:`parse_note`, :class:`ParsedNote`, and :class:`ParsedSection` are
+kept as thin re-exports of the :mod:`influx.canonical_note` primitives so
+existing callers are undisturbed.  Rendering lives in :mod:`influx.renderer`.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 
-from influx.errors import InfluxError
-from influx.renderer import ProfileRelevanceEntry
+from influx.canonical_note import (
+    CanonicalNote,
+    NoteParseError,
+    ProfileRelevanceEntry,
+    Section,
+    parse,
+)
+
+# Thin compatibility aliases — the canonical primitives now live in
+# :mod:`influx.canonical_note`.  Kept so the many ``from influx.notes
+# import ...`` call sites are undisturbed.
+ParsedNote = CanonicalNote
+ParsedSection = Section
+parse_note = parse
 
 __all__ = [
     "ArchiveParseError",
     "NoteParseError",
     "ParsedNote",
     "ParsedSection",
+    "ProfileRelevanceEntry",
     "merge_tags",
     "parse_archive_path",
     "parse_note",
@@ -41,221 +47,12 @@ __all__ = [
     "recompute_confidence",
 ]
 
+
 # ── Exceptions ───────────────────────────────────────────────────────
-
-
-class NoteParseError(InfluxError):
-    """Raised when a note cannot be parsed."""
 
 
 class ArchiveParseError(NoteParseError):
     """Raised when the ``## Archive`` section body is malformed."""
-
-
-# ── Data structures ──────────────────────────────────────────────────
-
-_FRONTMATTER_FENCE = "---"
-_USER_NOTES_HEADING = "## User Notes"
-# Heading captures stop at CR or LF so CRLF notes don't capture a trailing \r.
-# A lookahead (not $) terminates the match so CRLF endings are tolerated;
-# re.MULTILINE's $ only matches before \n, not before \r.
-_H2_RE = re.compile(r"^## ([^\r\n]+)(?=\r?\n|$)", re.MULTILINE)
-
-
-@dataclass(frozen=True)
-class ParsedSection:
-    """One ``## <heading>`` section from the Influx-owned body."""
-
-    heading: str
-    body: str
-
-
-@dataclass(frozen=True)
-class ParsedNote:
-    """Result of parsing a canonical Lithos note.
-
-    Attributes
-    ----------
-    frontmatter_raw:
-        The raw YAML text between the ``---`` fences (excluding the
-        fences themselves).  Includes tags, confidence, namespace, etc.
-    title:
-        The ``# <Title>`` text (without the ``# `` prefix).
-    sections:
-        Influx-owned ``## <heading>`` sections found above ``## User
-        Notes``, in document order.  Does NOT include ``## User Notes``.
-    user_notes:
-        The byte-exact content of the ``## User Notes`` region
-        (everything from the ``## User Notes`` line to EOF, inclusive).
-        ``None`` when the heading is absent.
-    """
-
-    frontmatter_raw: str
-    title: str
-    sections: tuple[ParsedSection, ...] = field(default_factory=tuple)
-    user_notes: str | None = None
-
-
-# ── Parser ───────────────────────────────────────────────────────────
-
-
-def parse_note(text: str) -> ParsedNote:
-    """Parse a canonical Lithos note into its constituent parts.
-
-    Accepts two shapes:
-
-    * **Body-only** (the post-#178 renderer output, and what
-      ``lithos_read`` returns for any new doc): text starts with the
-      ``# {title}`` heading and runs through the ``## ...`` sections
-      and optional ``## User Notes`` region.  ``frontmatter_raw`` is
-      empty in this case.
-    * **Legacy frontmatter-prefixed** (the pre-#178 renderer output,
-      still found on disk for any pre-#178 Influx write that was
-      never rewritten): text starts with a ``---``-fenced YAML
-      frontmatter block, followed by the title heading and body.
-      ``frontmatter_raw`` carries the YAML between the fences.
-
-    Parameters
-    ----------
-    text:
-        The note text — either body-only or legacy-prefixed.
-
-    Returns
-    -------
-    ParsedNote
-        Structured representation with frontmatter (legacy only,
-        empty for body-only input), title, Influx-owned sections,
-        and the ``## User Notes`` region.
-
-    Raises
-    ------
-    NoteParseError
-        When the note lacks a title heading, or when a legacy-shape
-        input has an unclosed frontmatter fence.
-    """
-    if text.startswith(_FRONTMATTER_FENCE):
-        frontmatter_raw, after_frontmatter = _split_frontmatter(text)
-    else:
-        frontmatter_raw = ""
-        after_frontmatter = text
-    title, body = _split_title(after_frontmatter)
-    sections, user_notes = _split_sections(body)
-
-    return ParsedNote(
-        frontmatter_raw=frontmatter_raw,
-        title=title,
-        sections=tuple(sections),
-        user_notes=user_notes,
-    )
-
-
-# ── Internal helpers ─────────────────────────────────────────────────
-
-
-_CLOSING_FENCE_RE = re.compile(r"\r?\n---(?:[ \t]*)(?=\r?\n|$)")
-
-
-def _split_frontmatter(text: str) -> tuple[str, str]:
-    """Return ``(frontmatter_raw, rest)`` by splitting on ``---`` fences.
-
-    Tolerates both LF and CRLF line endings without normalising them; the
-    returned *rest* is sliced from the original text so downstream
-    byte-exact preservation of the ``## User Notes`` region is retained
-    regardless of newline style.
-
-    Raises ``NoteParseError`` if fences are missing.
-    """
-    if not text.startswith(_FRONTMATTER_FENCE):
-        raise NoteParseError("Note does not start with frontmatter fence '---'")
-
-    # Find end of opening fence line (either \n or \r\n).
-    nl_idx = text.find("\n")
-    if nl_idx == -1:
-        raise NoteParseError("No closing frontmatter fence '---' found")
-    after_open = nl_idx + 1
-
-    close_match = _CLOSING_FENCE_RE.search(text, after_open - 1)
-    if close_match is None:
-        raise NoteParseError("No closing frontmatter fence '---' found")
-
-    # frontmatter_raw is the YAML between the fences. Exclude the leading
-    # CR if present so callers see clean YAML content.
-    fm_end = close_match.start()
-    frontmatter_raw = text[after_open:fm_end]
-
-    # Skip past the closing fence line, including any trailing newline.
-    rest_start = close_match.end()
-    if rest_start < len(text) and text[rest_start] == "\r":
-        rest_start += 1
-    if rest_start < len(text) and text[rest_start] == "\n":
-        rest_start += 1
-    rest = text[rest_start:]
-    return frontmatter_raw, rest
-
-
-def _split_title(text: str) -> tuple[str, str]:
-    """Return ``(title, body)`` from the text after frontmatter.
-
-    The title is the first ``# <text>`` line.  Everything after the
-    title line (with leading blank lines consumed) is the body.
-
-    Raises ``NoteParseError`` if no title heading is found.
-    """
-    for i, line in enumerate(text.split("\n")):
-        stripped = line.strip()
-        if stripped.startswith("# ") and not stripped.startswith("## "):
-            title = stripped[2:]
-            # Body is everything after the title line
-            remaining_lines = text.split("\n")[i + 1 :]
-            body = "\n".join(remaining_lines)
-            return title, body
-
-    raise NoteParseError("No title heading '# ...' found in note")
-
-
-def _split_sections(body: str) -> tuple[list[ParsedSection], str | None]:
-    """Split the body into Influx-owned sections and the User Notes region.
-
-    Returns ``(sections, user_notes)`` where *user_notes* is ``None``
-    when ``## User Notes`` is absent.
-
-    The User Notes region is captured byte-exactly: everything from the
-    ``## User Notes`` line (inclusive) to EOF.
-    """
-    # Find ## User Notes position in the original body
-    user_notes: str | None = None
-    influx_body = body
-
-    # Search for ## User Notes — we need byte-exact preservation.
-    # Tolerate trailing CR (CRLF line endings) without consuming it.
-    un_pattern = re.compile(r"^## User Notes[ \t]*(?=\r?\n|$)", re.MULTILINE)
-    un_match = un_pattern.search(body)
-    if un_match is not None:
-        user_notes = body[un_match.start() :]
-        influx_body = body[: un_match.start()]
-
-    # Parse ## sections from the Influx-owned body
-    sections: list[ParsedSection] = []
-    matches = list(_H2_RE.finditer(influx_body))
-
-    for idx, match in enumerate(matches):
-        heading = match.group(1)
-        body_start = match.end()
-        if idx + 1 < len(matches):
-            body_end = matches[idx + 1].start()
-        else:
-            body_end = len(influx_body)
-        section_body = influx_body[body_start:body_end]
-        # Strip single leading newline (LF or CRLF) after heading.
-        if section_body.startswith("\r\n"):
-            section_body = section_body[2:]
-        elif section_body.startswith("\n"):
-            section_body = section_body[1:]
-        # Strip trailing whitespace/newlines between sections
-        section_body = section_body.rstrip("\r\n")
-        sections.append(ParsedSection(heading=heading, body=section_body))
-
-    return sections, user_notes
 
 
 # ── Tag-merging (FR-NOTE-5/6/7/8) ──────────────────────────────────
