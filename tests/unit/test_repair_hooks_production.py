@@ -28,11 +28,7 @@ from influx.repair import (
 )
 from influx.repair_hooks import (
     DefaultSweepHooks,
-    _extract_full_text_body,
     _extract_title,
-    _insert_full_text_section,
-    _insert_tier3_sections,
-    _render_tier3_sections,
     make_default_sweep_hooks,
 )
 from influx.schemas import Tier3Extraction
@@ -464,72 +460,10 @@ class TestExtractTitle:
         assert _extract_title("no title here") == ""
 
 
-class TestExtractFullTextBody:
-    def test_extracts_body(self) -> None:
-        content = (
-            "## Summary\nsum\n\n"
-            "## Full Text\nThe full text body.\n\n"
-            "## Profile Relevance\n"
-        )
-        assert _extract_full_text_body(content) == "The full text body."
-
-    def test_returns_empty_on_no_section(self) -> None:
-        content = "## Summary\nsum\n\n## Profile Relevance\n"
-        assert _extract_full_text_body(content) == ""
-
-
-class TestInsertFullTextSection:
-    def test_inserts_before_profile_relevance(self) -> None:
-        content = "## Summary\nsum\n\n## Profile Relevance\npr\n"
-        result = _insert_full_text_section(content, "Extracted text.")
-        assert "## Full Text" in result
-        ft_pos = result.find("## Full Text")
-        pr_pos = result.find("## Profile Relevance")
-        assert ft_pos < pr_pos
-
-
-class TestInsertTier3Sections:
-    def test_inserts_before_profile_relevance(self) -> None:
-        content = "## Full Text\ntext\n\n## Profile Relevance\npr\n"
-        tier3 = Tier3Extraction(
-            claims=["C1"],
-            datasets=["D1"],
-            builds_on=["B1"],
-            open_questions=["Q1"],
-        )
-        result = _insert_tier3_sections(content, tier3)
-        assert "## Claims" in result
-        claims_pos = result.find("## Claims")
-        pr_pos = result.find("## Profile Relevance")
-        assert claims_pos < pr_pos
-
-
-class TestRenderTier3Sections:
-    def test_renders_all_four_sections(self) -> None:
-        tier3 = Tier3Extraction(
-            claims=["C1", "C2"],
-            datasets=["D1"],
-            builds_on=["B1"],
-            open_questions=["Q1"],
-        )
-        rendered = _render_tier3_sections(tier3)
-        assert "## Claims" in rendered
-        assert "- C1" in rendered
-        assert "- C2" in rendered
-        assert "## Datasets & Benchmarks" in rendered
-        assert "- D1" in rendered
-        assert "## Builds On" in rendered
-        assert "- B1" in rendered
-        assert "## Open Questions" in rendered
-        assert "- Q1" in rendered
-
-    def test_empty_optional_lists(self) -> None:
-        tier3 = Tier3Extraction(claims=["C1"])
-        rendered = _render_tier3_sections(tier3)
-        assert "## Claims" in rendered
-        assert "## Datasets & Benchmarks" in rendered
-        assert "## Builds On" in rendered
-        assert "## Open Questions" in rendered
+# NOTE: the ## Full Text / Tier 3 section-shape helpers moved to
+# influx.canonical_note in PR 2; their behaviour is covered by
+# tests/unit/test_canonical_note.py (extract_section_body, insert_full_text_
+# section, insert_tier3_sections, render_tier3_sections).
 
 
 # ── Sweep hooks injection seam preserved ─────────────────────────────

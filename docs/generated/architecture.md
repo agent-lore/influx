@@ -77,7 +77,6 @@ graph TD
   Repair --> Enrich
   Repair --> LithosBridge
   Repair --> Observability
-  Repair --> Schemas
   Repair --> Sources
   Repair --> Storage
   Sources --> Common

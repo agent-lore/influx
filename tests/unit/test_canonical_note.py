@@ -414,7 +414,7 @@ class TestStructuredOps:
         assert headings == ["Archive", "Full Text", "Profile Relevance"]
 
 
-# ── render_tier3_sections ───────────────────────────────────────────
+# ── render_tier3_sections / section inserts ─────────────────────────
 
 
 def test_render_tier3_sections_shape() -> None:
@@ -423,6 +423,76 @@ def test_render_tier3_sections_shape() -> None:
     assert "## Datasets & Benchmarks\n- d1\n" in rendered
     assert "## Builds On\n- b1\n" in rendered
     assert rendered.endswith("## Open Questions\n- q1\n")
+
+
+def test_render_tier3_sections_emits_all_four_headings_when_lists_empty() -> None:
+    rendered = cn.render_tier3_sections(Tier3Extraction(claims=["c1"]))
+    for heading in (
+        "## Claims",
+        "## Datasets & Benchmarks",
+        "## Builds On",
+        "## Open Questions",
+    ):
+        assert heading in rendered
+
+
+class TestSectionInsertBytes:
+    """Exact-byte splice behaviour for the section-insert ops.
+
+    Pins the precise inserted bytes and blank-line shape (byte-identical to
+    the legacy repair_hooks helpers PR 2 replaced), the insertion-point
+    fallback chain (before Profile Relevance → before User Notes → EOF), and
+    byte-exact preservation of the surrounding note incl. ``## User Notes``.
+    """
+
+    def test_insert_full_text_before_profile_relevance(self) -> None:
+        content = (
+            "# T\n\n## Summary\ns\n\n## Profile Relevance\npr\n\n## User Notes\nMINE\n"
+        )
+        assert cn.insert_full_text_section(content, "FT") == (
+            "# T\n\n## Summary\ns\n\n\n## Full Text\nFT\n\n"
+            "## Profile Relevance\npr\n\n## User Notes\nMINE\n"
+        )
+
+    def test_insert_full_text_fallback_before_user_notes(self) -> None:
+        content = "# T\n\n## Summary\ns\n\n## User Notes\nMINE\n"
+        result = cn.insert_full_text_section(content, "FT")
+        assert result == (
+            "# T\n\n## Summary\ns\n\n\n## Full Text\nFT\n\n## User Notes\nMINE\n"
+        )
+        # User Notes region preserved byte-exactly.
+        idx = cn.find_user_notes_start(result)
+        assert result[idx:] == "## User Notes\nMINE\n"
+
+    def test_insert_full_text_fallback_eof(self) -> None:
+        content = "# T\n\n## Summary\ns\n"
+        assert cn.insert_full_text_section(content, "FT") == (
+            "# T\n\n## Summary\ns\n\n## Full Text\nFT\n\n"
+        )
+
+    def test_insert_tier3_before_profile_relevance(self) -> None:
+        content = (
+            "# T\n\n## Full Text\ntext\n\n"
+            "## Profile Relevance\npr\n\n## User Notes\nMINE\n"
+        )
+        tier3 = Tier3Extraction(
+            claims=["C1"], datasets=["D1"], builds_on=["B1"], open_questions=["Q1"]
+        )
+        assert cn.insert_tier3_sections(content, tier3) == (
+            "# T\n\n## Full Text\ntext\n\n\n"
+            "## Claims\n- C1\n\n## Datasets & Benchmarks\n- D1\n\n"
+            "## Builds On\n- B1\n\n## Open Questions\n- Q1\n\n"
+            "## Profile Relevance\npr\n\n## User Notes\nMINE\n"
+        )
+
+    def test_insert_tier3_preserves_user_notes_region(self) -> None:
+        content = (
+            "# T\n\n## Full Text\ntext\n\n## Profile Relevance\npr\n\n"
+            "## User Notes\nMINE  \n\n\n"
+        )
+        result = cn.insert_tier3_sections(content, TIER3)
+        idx = cn.find_user_notes_start(result)
+        assert result[idx:] == "## User Notes\nMINE  \n\n\n"
 
 
 # ── ProfileRelevanceEntry identity across modules ───────────────────
@@ -463,32 +533,9 @@ class TestLegacyParityTransitional:
     def _canonical_note(self) -> str:
         return _read("golden_lf.md")
 
-    def test_render_tier3_matches_repair_hooks(self) -> None:
-        from influx import repair_hooks as rh
-
-        assert cn.render_tier3_sections(TIER3) == rh._render_tier3_sections(TIER3)
-
-    def test_insert_full_text_matches_repair_hooks(self) -> None:
-        from influx import repair_hooks as rh
-
-        note = _read("tier3_full.md")
-        assert cn.insert_full_text_section(note, "ft") == rh._insert_full_text_section(
-            note, "ft"
-        )
-
-    def test_insert_tier3_matches_repair_hooks(self) -> None:
-        from influx import repair_hooks as rh
-
-        note = _read("no_user_notes.md")
-        assert cn.insert_tier3_sections(note, TIER3) == rh._insert_tier3_sections(
-            note, TIER3
-        )
-
-    def test_insertion_point_matches_repair_hooks(self) -> None:
-        from influx import repair_hooks as rh
-
-        note = self._canonical_note()
-        assert cn.insertion_point(note) == rh._find_insertion_point(note)
+    # NOTE: the repair_hooks parity cases (render_tier3 / insert_full_text /
+    # insert_tier3 / insertion_point) were removed in PR 2 when those helpers
+    # were deleted in favour of the canonical ops.
 
     def test_graft_user_notes_matches_lithos_client(self) -> None:
         from influx import lithos_client as lc
