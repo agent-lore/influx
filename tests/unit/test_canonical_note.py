@@ -531,32 +531,8 @@ def test_constants_are_section_headings() -> None:
     assert SECTION_ORDER[-1] == USER_NOTES
 
 
-# ── Transitional parity with the legacy helpers ─────────────────────
-#
-# The canonical ops that PRs 2-5 swap the existing helpers onto must be
-# byte-identical to those helpers on canonical inputs — that is what makes
-# each migration a no-op for production bytes. These assertions pin that
-# equivalence and are deleted as each legacy helper is removed in its
-# migration PR. NOTE: drop_tier2 / drop_tier2_and_tier3 / upsert_archive_path
-# are deliberately excluded — they intentionally *diverge* from the legacy
-# helpers (byte-exact User Notes; whole-section path: idempotence), a fix
-# that lands with the PR 3/PR 4 migrations.
-
-
-class TestLegacyParityTransitional:
-    def _canonical_note(self) -> str:
-        return _read("golden_lf.md")
-
-    # NOTE: the repair_hooks parity cases (PR 2) and the lithos_client parity
-    # cases — graft_user_notes / replace_profile_relevance (PR 3) — were removed
-    # as those legacy helpers were deleted in favour of the canonical ops.
-
-    def test_upsert_repair_matches_repair_counters(self) -> None:
-        from influx import repair_counters as rc
-
-        note = _read("tier3_full.md")
-        counters = rc.RepairCounters(tier2_attempts=1, tier2_last_stage="parse")
-        rendered = rc.render_repair_section(counters)
-        assert cn.upsert_section_text(
-            note, REPAIR, rendered
-        ) == rc.upsert_repair_section(note, counters)
+# NOTE: the transitional legacy-parity suite (repair_hooks / lithos_client /
+# repair_counters helpers vs the canonical ops) was retired across PRs 2-5 as
+# each legacy helper was deleted in favour of the shared canonical_note op. The
+# per-op byte-exactness those cases guarded is now pinned directly by the
+# canonical-op tests above and each migrated module's own suite.

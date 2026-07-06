@@ -145,6 +145,34 @@ class TestRecordCountedFailureBelowCap:
         assert "influx:tier2-terminal" in result.new_tags
 
 
+# ── parse_repair_section: section location ─────────────────────────
+
+
+class TestParseRepairSectionLocation:
+    """The read side locates ## Repair via canonical_note.extract_section_body."""
+
+    def test_parses_counters_from_crlf_note(self) -> None:
+        # CRLF regression: the legacy ^## Repair[ \t]*\n heading regex never
+        # matched a "## Repair\r\n" heading and silently returned zero
+        # counters; the canonical anchored matcher is CRLF-tolerant.
+        content = (
+            "# Paper\n\n## Repair\n"
+            "- tier2_attempts: 2\n"
+            '- tier2_last_stage: "parse"\n'
+            "- tier3_attempts: 1\n\n"
+            "## Profile Relevance\n### r\nScore: 9/10\nReason\n\n"
+            "## User Notes\n"
+        ).replace("\n", "\r\n")
+        counters = parse_repair_section(content)
+        assert counters.tier2_attempts == 2
+        assert counters.tier2_last_stage == "parse"
+        assert counters.tier3_attempts == 1
+
+    def test_absent_section_returns_zero_defaults(self) -> None:
+        counters = parse_repair_section(_BASE_NOTE)
+        assert counters == RepairCounters()
+
+
 # ── record_counted_failure: cap-reach and idempotence ──────────────
 
 
