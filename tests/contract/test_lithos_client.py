@@ -2010,6 +2010,65 @@ class TestWriteEnvelopeVersionConflict:
         finally:
             await client.close()
 
+    async def test_version_conflict_locator_ignores_midline_user_notes(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Conflict merge is protected against an impostor ``## User Notes``.
+
+        PR 3 grafts User Notes via ``canonical_note.graft_user_notes``, whose
+        line-anchored matcher (vs the legacy unanchored ``str.find``) means a
+        mid-line ``## User Notes`` literal in the incoming body no longer
+        truncates the note, and the existing region is grafted byte-exactly
+        including trailing whitespace.
+        """
+        import json as _json
+
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "version_conflict", "note_id": "note-046"}',
+                '{"status": "updated"}',
+            ]
+        )
+        # Existing note's User Notes carry trailing spaces + blank lines.
+        existing_region = "## User Notes\nKeep verbatim.  \n\n\n"
+        fake_lithos_server.read_responses.append(
+            _json.dumps(
+                {
+                    "id": "note-046",
+                    "content": f"# Summary\nOld.\n\n{existing_region}",
+                    "tags": ["profile:ml-research"],
+                    "version": 7,
+                }
+            )
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            # Incoming body mentions "## User Notes" mid-sentence, before the
+            # real heading — the legacy str.find would truncate here.
+            await client.write_note(
+                title="Paper Y",
+                content=(
+                    "# Summary\nSee the ## User Notes section below.\n\n## User Notes\n"
+                ),
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.33333",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+            write_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
+            ]
+            retry_content = write_calls[1][1]["content"]
+            # Mid-line literal survived (not truncated at the impostor).
+            assert "See the ## User Notes section below." in retry_content
+            # Existing region grafted byte-exactly, trailing whitespace intact.
+            assert retry_content.endswith(existing_region)
+        finally:
+            await client.close()
+
     async def test_second_version_conflict_skips(
         self,
         fake_lithos_url: str,
