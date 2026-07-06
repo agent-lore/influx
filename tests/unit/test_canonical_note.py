@@ -436,16 +436,63 @@ def test_render_tier3_sections_emits_all_four_headings_when_lists_empty() -> Non
         assert heading in rendered
 
 
-def test_insert_full_text_before_profile_relevance() -> None:
-    content = "# T\n\n## Summary\ns\n\n## Profile Relevance\npr\n\n## User Notes\n"
-    result = cn.insert_full_text_section(content, "extracted")
-    assert result.index("## Full Text") < result.index("## Profile Relevance")
+class TestSectionInsertBytes:
+    """Exact-byte splice behaviour for the section-insert ops.
 
+    Pins the precise inserted bytes and blank-line shape (byte-identical to
+    the legacy repair_hooks helpers PR 2 replaced), the insertion-point
+    fallback chain (before Profile Relevance → before User Notes → EOF), and
+    byte-exact preservation of the surrounding note incl. ``## User Notes``.
+    """
 
-def test_insert_tier3_before_profile_relevance() -> None:
-    content = "# T\n\n## Full Text\ntext\n\n## Profile Relevance\npr\n\n## User Notes\n"
-    result = cn.insert_tier3_sections(content, TIER3)
-    assert result.index("## Claims") < result.index("## Profile Relevance")
+    def test_insert_full_text_before_profile_relevance(self) -> None:
+        content = (
+            "# T\n\n## Summary\ns\n\n## Profile Relevance\npr\n\n## User Notes\nMINE\n"
+        )
+        assert cn.insert_full_text_section(content, "FT") == (
+            "# T\n\n## Summary\ns\n\n\n## Full Text\nFT\n\n"
+            "## Profile Relevance\npr\n\n## User Notes\nMINE\n"
+        )
+
+    def test_insert_full_text_fallback_before_user_notes(self) -> None:
+        content = "# T\n\n## Summary\ns\n\n## User Notes\nMINE\n"
+        result = cn.insert_full_text_section(content, "FT")
+        assert result == (
+            "# T\n\n## Summary\ns\n\n\n## Full Text\nFT\n\n## User Notes\nMINE\n"
+        )
+        # User Notes region preserved byte-exactly.
+        idx = cn.find_user_notes_start(result)
+        assert result[idx:] == "## User Notes\nMINE\n"
+
+    def test_insert_full_text_fallback_eof(self) -> None:
+        content = "# T\n\n## Summary\ns\n"
+        assert cn.insert_full_text_section(content, "FT") == (
+            "# T\n\n## Summary\ns\n\n## Full Text\nFT\n\n"
+        )
+
+    def test_insert_tier3_before_profile_relevance(self) -> None:
+        content = (
+            "# T\n\n## Full Text\ntext\n\n"
+            "## Profile Relevance\npr\n\n## User Notes\nMINE\n"
+        )
+        tier3 = Tier3Extraction(
+            claims=["C1"], datasets=["D1"], builds_on=["B1"], open_questions=["Q1"]
+        )
+        assert cn.insert_tier3_sections(content, tier3) == (
+            "# T\n\n## Full Text\ntext\n\n\n"
+            "## Claims\n- C1\n\n## Datasets & Benchmarks\n- D1\n\n"
+            "## Builds On\n- B1\n\n## Open Questions\n- Q1\n\n"
+            "## Profile Relevance\npr\n\n## User Notes\nMINE\n"
+        )
+
+    def test_insert_tier3_preserves_user_notes_region(self) -> None:
+        content = (
+            "# T\n\n## Full Text\ntext\n\n## Profile Relevance\npr\n\n"
+            "## User Notes\nMINE  \n\n\n"
+        )
+        result = cn.insert_tier3_sections(content, TIER3)
+        idx = cn.find_user_notes_start(result)
+        assert result[idx:] == "## User Notes\nMINE  \n\n\n"
 
 
 # ── ProfileRelevanceEntry identity across modules ───────────────────
