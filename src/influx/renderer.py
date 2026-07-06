@@ -21,8 +21,10 @@ Public surface:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
+from influx.canonical_note import (
+    ProfileRelevanceEntry,
+    render_profile_relevance_body,
+)
 from influx.errors import InfluxError
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 
@@ -38,6 +40,12 @@ __all__ = [
     "validate_archive_tag_invariant",
 ]
 
+# ``ProfileRelevanceEntry`` and the profile-relevance body renderer now live
+# in :mod:`influx.canonical_note` (the CanonicalNote shape owner).  Re-export
+# the value type and keep the private-name alias so existing callers that
+# import ``_render_profile_relevance_body`` from the renderer are undisturbed.
+_render_profile_relevance_body = render_profile_relevance_body
+
 
 # ── Exceptions ───────────────────────────────────────────────────────
 
@@ -48,18 +56,6 @@ class ArchiveInvariantError(InfluxError):
 
 class MissingIngestedByTagError(InfluxError):
     """Raised when an Influx-authored note lacks ``ingested-by:influx`` (FR-RES-6)."""
-
-
-# ── Profile relevance entry ─────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class ProfileRelevanceEntry:
-    """One profile's relevance data for the ``## Profile Relevance`` section."""
-
-    profile_name: str
-    score: int
-    reason: str
 
 
 # ── Archive section render / invariant (FR-NOTE-9) ──────────────────
@@ -109,21 +105,6 @@ def validate_archive_tag_invariant(
             "Cannot write both a path: line and influx:archive-missing "
             "tag on the same note"
         )
-
-
-# ── Profile-relevance body helpers ──────────────────────────────────
-
-
-def _render_profile_relevance_body(
-    entries: list[ProfileRelevanceEntry],
-) -> str:
-    """Render the body of the ``## Profile Relevance`` section."""
-    parts: list[str] = []
-    for entry in entries:
-        parts.append(
-            f"### {entry.profile_name}\nScore: {entry.score}/10\n{entry.reason}"
-        )
-    return "\n\n".join(parts)
 
 
 # ── Full canonical renderer (FR-NOTE-1..8, US-007) ──────────────────

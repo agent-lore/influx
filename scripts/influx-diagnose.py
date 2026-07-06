@@ -1179,7 +1179,7 @@ def parse_legacy_note_frontmatter(content: str) -> ParsedLegacyFrontmatter | Non
     """
     import yaml
 
-    from influx.notes import NoteParseError, _split_frontmatter
+    from influx.canonical_note import NoteParseError, _split_frontmatter
 
     try:
         frontmatter_raw, _body = _split_frontmatter(content)
@@ -1219,7 +1219,7 @@ def strip_legacy_frontmatter(content: str) -> str:
     the rewrite lands.  Section content (``## Archive``, ``## Summary``,
     ``## User Notes``, etc.) is preserved byte-for-byte.
     """
-    from influx.notes import _split_frontmatter, _split_title
+    from influx.canonical_note import _split_frontmatter, _split_title
 
     _frontmatter, after_fm = _split_frontmatter(content)
     _title, body = _split_title(after_fm)
@@ -1282,7 +1282,7 @@ def _select_legacy_doc_ids_from_corpus(articles_path: Path) -> list[str]:
     regardless of collision history (#181).
 
     The closing-fence parser delegates to
-    :func:`influx.notes._split_frontmatter`, which line-anchors the
+    :func:`influx.canonical_note._split_frontmatter`, which line-anchors the
     fence match.  A naive ``text.find("---", 4)`` would stop at the
     first ``---`` substring anywhere in the file, including inside a
     frontmatter VALUE like ``title: Foo --- Bar`` — and yaml.safe_load
@@ -1300,7 +1300,7 @@ def _select_legacy_doc_ids_from_corpus(articles_path: Path) -> list[str]:
     """
     import yaml
 
-    from influx.notes import NoteParseError, _split_frontmatter
+    from influx.canonical_note import NoteParseError, _split_frontmatter
 
     ids: list[str] = []
     seen: set[str] = set()
@@ -1671,13 +1671,13 @@ def strip_embedded_frontmatter_block(content: str) -> str | None:
     start with a frontmatter fence (an already-clean / current-shape
     note, which the caller skips).
 
-    The fence split delegates to :func:`influx.notes._split_frontmatter`,
+    The fence split delegates to :func:`influx.canonical_note._split_frontmatter`,
     which is line-anchored: a naive ``content.find("---")`` would match a
     ``---`` inside a YAML value.  The renderer title heading and every
     ``## `` section (``## Archive``, ``## Summary``, ``## User Notes``,
     …) are preserved byte-for-byte.
     """
-    from influx.notes import NoteParseError, _split_frontmatter
+    from influx.canonical_note import NoteParseError, _split_frontmatter
 
     try:
         _frontmatter, body = _split_frontmatter(content)
@@ -1708,7 +1708,7 @@ def _select_embedded_frontmatter_doc_ids_from_corpus(
     """
     import yaml
 
-    from influx.notes import NoteParseError, _split_frontmatter, _split_title
+    from influx.canonical_note import NoteParseError, _split_frontmatter, _split_title
 
     ids: list[str] = []
     seen: set[str] = set()
@@ -2055,7 +2055,7 @@ def _scan_feed_yield(
     """
     import yaml
 
-    from influx.notes import NoteParseError, _split_frontmatter
+    from influx.canonical_note import NoteParseError, _split_frontmatter
 
     fs_re = re.compile(r"feed-slug:([a-z0-9-]+)")
     out: dict[str, dict[str, Any]] = {}
