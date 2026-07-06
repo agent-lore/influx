@@ -259,6 +259,52 @@ class TestArchiveOnlyRepairFlow:
         finally:
             await client.close()
 
+    async def test_archive_download_splices_path_into_crlf_note(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """A CRLF-shaped ``## Archive`` heading still receives the path.
+
+        PR 4 routed the splice through ``canonical_note.upsert_archive_path``,
+        whose anchored matcher is CRLF-tolerant. The legacy
+        ``find("## Archive\\n")`` never matched a ``## Archive\\r\\n`` heading,
+        so a CRLF note's freshly downloaded archive path was silently dropped.
+        """
+        tags = [
+            "profile:ai-robotics",
+            "influx:repair-needed",
+            "influx:archive-missing",
+            "ingested-by:influx",
+            "source:arxiv",
+            "text:html",
+        ]
+        note = _make_note_dict(tags=tags)
+        # Rewrite the body with CRLF line endings — the shape legacy missed.
+        note["content"] = note["content"].replace("\n", "\r\n")
+        assert "## Archive\r\n" in note["content"]
+        _queue_single_note(fake_lithos, note)
+
+        config = _make_config(lithos_url=fake_lithos_url)
+        hooks = SweepHooks(archive_download=_fake_archive_download)
+
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            await sweep(
+                "ai-robotics",
+                client=client,
+                config=config,
+                hooks=hooks,
+            )
+            write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+            assert len(write_calls) == 1
+            written_content = write_calls[0][1]["content"]
+            # Path spliced directly below the CRLF ## Archive heading (the
+            # inserted line itself is LF-terminated, matching the canonical op).
+            assert f"## Archive\r\npath: {_ARCHIVE_PATH}\n" in written_content
+        finally:
+            await client.close()
+
     async def test_archive_repair_with_text_html_does_not_select_text_stage(
         self,
         fake_lithos: FakeLithosServer,

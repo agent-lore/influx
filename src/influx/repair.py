@@ -28,6 +28,8 @@ from influx.canonical_note import (
     drop_tier2,
     drop_tier2_and_tier3,
     graft_user_notes,
+    parse_lenient,
+    upsert_archive_path,
 )
 from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.notes import merge_tags
@@ -1018,20 +1020,13 @@ def _run_archive_retry(
             span_name="influx.repair.archive",
         ):
             downloaded_path = hook(note)
-        # Patch ## Archive with the freshly downloaded path (idempotent —
-        # only inserts when no path: line is already present).
-        content = str(note.get("content", ""))
-        marker = "## Archive\n"
-        idx = content.find(marker)
-        if idx >= 0:
-            insert_pos = idx + len(marker)
-            rest = content[insert_pos:]
-            if not rest.startswith("path:"):
-                note["content"] = (
-                    content[:insert_pos]
-                    + f"path: {downloaded_path}\n"
-                    + content[insert_pos:]
-                )
+        # Patch ## Archive with the freshly downloaded path. Idempotent,
+        # CRLF-tolerant, and scans the whole section for an existing
+        # ``path:`` line — canonical_note owns the splice (a no-op when the
+        # section is absent or already carries a path).
+        note["content"] = upsert_archive_path(
+            str(note.get("content", "")), downloaded_path
+        )
         return current_tags, downloaded_path, True
     except (ExtractionError, LithosError) as exc:
         failure_stage = (
@@ -1226,36 +1221,6 @@ def _doc_title(note: dict[str, Any]) -> str:
     return ""
 
 
-def _content_for_note_parse(note: dict[str, Any]) -> str:
-    """Return note content shaped for :func:`influx.notes.parse_note`.
-
-    ``read_note`` serves note ``content`` with the ``# {title}`` heading
-    stripped — the title is a doc-level metadata field. ``parse_note``
-    requires that heading (``_split_title`` raises ``NoteParseError``
-    without it), even though the archive-path / profile-relevance data
-    the sweep needs live in the body *below* the title. Reattach the
-    doc-level title when the body has no ``# `` heading so parsing
-    succeeds.
-
-    Parse-input only: the rewrite path must keep using the unmodified
-    ``content`` — prepending the title into the persisted body would
-    compound the existing duplicate-``# Title`` shape.
-    """
-    content = str(note.get("content") or "")
-    # Mirror parse_note / _split_title title detection exactly: strip the
-    # line and exclude ``## `` headings. A bare ``line.startswith("# ")``
-    # would miss an indented H1 that _split_title *would* accept, causing a
-    # second title to be prepended and shifting the parsed title.
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("# ") and not stripped.startswith("## "):
-            return content
-    title = _doc_title(note)
-    if not title:
-        return content
-    return f"# {title}\n\n{content}"
-
-
 async def _process_sweep_note(
     note: dict[str, Any],
     *,
@@ -1268,7 +1233,7 @@ async def _process_sweep_note(
 
     Raises :class:`SweepWriteError` on terminal write failure.
     """
-    from influx.notes import parse_archive_path, parse_note, parse_profile_relevance
+    from influx.notes import parse_archive_path, parse_profile_relevance
 
     tags: list[str] = list(note.get("tags", []))
 
@@ -1278,7 +1243,9 @@ async def _process_sweep_note(
     archive_path: str | None = None
     max_profile_score: int = 0
     try:
-        parsed = parse_note(_content_for_note_parse(note))
+        parsed = parse_lenient(
+            str(note.get("content") or ""), fallback_title=_doc_title(note)
+        )
         archive_path = parse_archive_path(parsed)
         entries = parse_profile_relevance(parsed)
         if entries:

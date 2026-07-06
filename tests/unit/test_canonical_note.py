@@ -153,6 +153,20 @@ class TestParse:
         with pytest.raises(NoteParseError):
             cn.parse_lenient("## Archive\npath: x\n")
 
+    def test_has_title_heading_recognises_indented_h1(self) -> None:
+        # _split_title strips the line, so an indented "# Title" IS a title;
+        # the lenient detector must agree and not reattach a second one.
+        assert cn._has_title_heading("   # Indented Title\n\n## Archive\n")
+        body = "   # Indented Title\n\n## Archive\npath: p\n"
+        note = cn.parse_lenient(body, fallback_title="Doc Title")
+        assert note.title == "Indented Title"
+
+    def test_has_title_heading_excludes_h2(self) -> None:
+        # A "## " heading is not a title — the fallback must still fire.
+        assert not cn._has_title_heading("## Archive\n## Summary\n")
+        note = cn.parse_lenient("## Archive\n## Summary\n", fallback_title="Doc")
+        assert note.title == "Doc"
+
 
 # ── User Notes matcher semantics (§3 divergence matrix) ─────────────
 
