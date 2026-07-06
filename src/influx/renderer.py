@@ -24,6 +24,7 @@ from __future__ import annotations
 from influx.canonical_note import (
     ProfileRelevanceEntry,
     render_profile_relevance_body,
+    render_tier3_sections,
 )
 from influx.errors import InfluxError
 from influx.schemas import Tier1Enrichment, Tier3Extraction
@@ -218,20 +219,11 @@ def render_note(
     if full_text:
         output += f"\n## Full Text\n{full_text}\n"
 
-    # Tier 3 sections (US-012) — omitted entirely when absent (FR-ENR-6)
+    # Tier 3 sections (US-012) — omitted entirely when absent (FR-ENR-6).
+    # The section block is owned by canonical_note (shared with the repair
+    # sweep); the leading blank-line separator is added here.
     if tier3_extraction is not None:
-        output += "\n## Claims\n"
-        for claim in tier3_extraction.claims:
-            output += f"- {claim}\n"
-        output += "\n## Datasets & Benchmarks\n"
-        for ds in tier3_extraction.datasets:
-            output += f"- {ds}\n"
-        output += "\n## Builds On\n"
-        for item in tier3_extraction.builds_on:
-            output += f"- {item}\n"
-        output += "\n## Open Questions\n"
-        for q in tier3_extraction.open_questions:
-            output += f"- {q}\n"
+        output += "\n" + render_tier3_sections(tier3_extraction)
 
     # Profile Relevance section — always emitted to keep the canonical
     # note shape stable (US-007); body is empty when no entries are given.

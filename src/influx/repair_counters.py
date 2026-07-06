@@ -224,7 +224,7 @@ def upsert_repair_section(content: str, counters: RepairCounters) -> str:
 
     Replaces an existing section in place; otherwise inserts the new
     section before ``## Profile Relevance`` (canonical placement,
-    matching ``repair_hooks._find_insertion_point``), or before
+    matching ``canonical_note.insertion_point``), or before
     ``## User Notes``, or at end of content when neither is present.
     """
     rendered = render_repair_section(counters)

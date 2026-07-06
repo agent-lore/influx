@@ -22,6 +22,12 @@ import trafilatura
 from influx.archive_policy import (
     registry_from_config as _archive_policy_registry_from_config,
 )
+from influx.canonical_note import (
+    FULL_TEXT,
+    extract_section_body,
+    insert_full_text_section,
+    insert_tier3_sections,
+)
 from influx.config import AppConfig
 from influx.enrich import tier3_extract as _tier3_extract
 from influx.errors import ExtractionError, LCMAError, NetworkError
@@ -40,7 +46,6 @@ from influx.repair import (
     Tier2EnrichHook,
     Tier3ExtractHook,
 )
-from influx.schemas import Tier3Extraction
 from influx.storage import download_archive
 from influx.urls import url_hash
 
@@ -49,77 +54,13 @@ __all__ = ["DefaultSweepHooks", "make_default_sweep_hooks"]
 _log = logging.getLogger(__name__)
 
 # ── Content manipulation helpers ────────────────────────────────────
+#
+# The section-shape ops (insert Full Text / Tier 3, find the insertion point,
+# extract a section body) are owned by :mod:`influx.canonical_note` and
+# imported above.  Only ``_extract_title`` — a title locator with no canonical
+# equivalent — remains local.
 
-_PROFILE_RELEVANCE_RE = re.compile(r"^## Profile Relevance\b", re.MULTILINE)
-_USER_NOTES_RE = re.compile(r"^## User Notes\b", re.MULTILINE)
-_FULL_TEXT_HEADING_RE = re.compile(r"^## Full Text[ \t]*$", re.MULTILINE)
-_NEXT_H2_RE = re.compile(r"^## ", re.MULTILINE)
 _TITLE_RE = re.compile(r"^# ([^\r\n]+)", re.MULTILINE)
-
-
-def _find_insertion_point(content: str) -> int:
-    """Find the position to insert new sections before Profile Relevance.
-
-    Falls back to before ``## User Notes`` or end-of-string.
-    """
-    m = _PROFILE_RELEVANCE_RE.search(content)
-    if m:
-        return m.start()
-    m = _USER_NOTES_RE.search(content)
-    if m:
-        return m.start()
-    return len(content)
-
-
-def _insert_full_text_section(content: str, full_text: str) -> str:
-    """Insert ``## Full Text`` section at the canonical position."""
-    pos = _find_insertion_point(content)
-    section = f"\n## Full Text\n{full_text}\n"
-    return content[:pos] + section + "\n" + content[pos:]
-
-
-def _render_tier3_sections(tier3: Tier3Extraction) -> str:
-    """Render the four Tier 3 sections as markdown."""
-    parts: list[str] = []
-
-    parts.append("## Claims")
-    for claim in tier3.claims:
-        parts.append(f"- {claim}")
-
-    parts.append("\n## Datasets & Benchmarks")
-    for ds in tier3.datasets:
-        parts.append(f"- {ds}")
-
-    parts.append("\n## Builds On")
-    for item in tier3.builds_on:
-        parts.append(f"- {item}")
-
-    parts.append("\n## Open Questions")
-    for q in tier3.open_questions:
-        parts.append(f"- {q}")
-
-    return "\n".join(parts) + "\n"
-
-
-def _insert_tier3_sections(content: str, tier3: Tier3Extraction) -> str:
-    """Insert Tier 3 sections at the canonical position."""
-    pos = _find_insertion_point(content)
-    section_text = "\n" + _render_tier3_sections(tier3)
-    return content[:pos] + section_text + "\n" + content[pos:]
-
-
-def _extract_full_text_body(content: str) -> str:
-    """Extract the ``## Full Text`` section body from note content."""
-    start_match = _FULL_TEXT_HEADING_RE.search(content)
-    if not start_match:
-        return ""
-    body_start = start_match.end()
-    if body_start < len(content) and content[body_start] == "\n":
-        body_start += 1
-    next_match = _NEXT_H2_RE.search(content, body_start)
-    if next_match:
-        return content[body_start : next_match.start()].rstrip()
-    return content[body_start:].rstrip()
 
 
 def _extract_title(content: str) -> str:
@@ -1061,7 +1002,7 @@ def _make_tier2_enrich_hook(config: AppConfig) -> Tier2EnrichHook:
         )
 
         # Insert ## Full Text section into content.
-        note["content"] = _insert_full_text_section(content, extracted_text)
+        note["content"] = insert_full_text_section(content, extracted_text)
 
         # Add full-text tag.
         if "full-text" not in tags:
@@ -1084,7 +1025,7 @@ def _make_tier3_extract_hook(config: AppConfig) -> Tier3ExtractHook:
         tags: list[str] = _note_tags(note)
 
         # Extract full text from note content.
-        full_text = _extract_full_text_body(content)
+        full_text = extract_section_body(content, FULL_TEXT)
         if not full_text:
             raise ExtractionError(
                 "No ## Full Text section found in note",
@@ -1105,7 +1046,7 @@ def _make_tier3_extract_hook(config: AppConfig) -> Tier3ExtractHook:
             raise  # Propagate — the sweep treats LCMAError as stage failure.
 
         # Insert Tier 3 sections into content.
-        note["content"] = _insert_tier3_sections(content, tier3_result)
+        note["content"] = insert_tier3_sections(content, tier3_result)
 
         # Add influx:deep-extracted tag.
         if "influx:deep-extracted" not in tags:
