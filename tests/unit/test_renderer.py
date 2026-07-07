@@ -5,7 +5,9 @@ The Renderer module owns the canonical Markdown shape from spec §9.
 it wraps a single-profile :class:`ProfileRelevanceEntry` and delegates
 to :func:`render_note`. These tests cover:
 
-- Frontmatter shape (note_type, namespace, source_url, tags, confidence)
+- Body-only output (no frontmatter fence): Lithos owns note_type /
+  namespace / source_url / tags / confidence as ``lithos_write`` API
+  parameters (#178), so the renderer must not emit them
 - Section ordering: ``## Archive``, ``## Summary``, ``## Full Text``,
   ``## Claims``, ``## Datasets & Benchmarks``, ``## Builds On``,
   ``## Open Questions``, ``## Profile Relevance``, ``## User Notes``
@@ -321,11 +323,13 @@ class TestRenderFacadeParity:
 
 class TestRenderNoteCanonicalNormalization:
     """``render_note`` composes a :class:`CanonicalNote` and ``serialize()``s
-    it, so its output is always canonical — single blank-line separators,
-    trailing-stripped bodies.  Bodies without trailing whitespace are
-    byte-identical to the historical imperative rendering (pinned by the
-    suites above); a body that *does* carry trailing whitespace is normalised
-    rather than emitted as a double blank line.
+    it, so its output is always canonical — single blank-line separators, with
+    bodies stripped of trailing line endings (``\\r``/``\\n``).  Trailing
+    spaces/tabs are preserved (matching the parser's canonical form).  Bodies
+    that do not end in a newline are byte-identical to the historical
+    imperative rendering (pinned by the suites above); a body that *does* end
+    in one or more newlines is normalised rather than emitted as a double
+    blank line.
     """
 
     _BASE = {
@@ -361,9 +365,19 @@ class TestRenderNoteCanonicalNormalization:
             "## Summary\nA summary.\n\n## Profile Relevance\n\n## User Notes\n"
         )
 
-    def test_clean_and_trailing_whitespace_converge_to_same_bytes(self) -> None:
+    def test_clean_and_trailing_newline_converge_to_same_bytes(self) -> None:
         # The normalisation target IS the clean-input rendering: a trailing
-        # newline is collapsed toward the no-trailing-whitespace form.
+        # newline is collapsed toward the no-trailing-newline form.
         assert render_note(**self._BASE, full_text="Body line.") == render_note(
             **self._BASE, full_text="Body line.\n"
         )
+
+    def test_trailing_spaces_on_body_are_preserved(self) -> None:
+        # Only trailing line endings are collapsed — trailing spaces survive
+        # (rstrip("\r\n") matches the parser's canonical body form), so a
+        # space-terminated body still round-trips.
+        out = render_note(**self._BASE, full_text="Body line.  ")
+        assert (
+            "## Full Text\nBody line.  \n\n## Profile Relevance" in out
+        )  # spaces kept, single blank line
+        assert cn.serialize(cn.parse(out)) == out

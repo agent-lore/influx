@@ -226,13 +226,15 @@ def render_note(
         The complete canonical note text.  The note is composed as a
         :class:`~influx.canonical_note.CanonicalNote` and emitted via
         :func:`~influx.canonical_note.serialize`, so the output is always in
-        canonical form — single blank-line separators, trailing-stripped
-        section bodies.  This is byte-identical to the historical imperative
-        rendering for section bodies without trailing whitespace; a body that
-        *does* end in whitespace (e.g. a summary / full-text / reason with a
-        trailing newline) has it normalised away rather than emitted as a
-        double blank line.  The ``## User Notes`` region is still appended
-        byte-exactly.
+        canonical form — single blank-line separators, with section bodies
+        stripped of trailing line endings (``\\r``/``\\n``).  Trailing spaces
+        and tabs are *not* stripped (matching the parser's canonical form, so
+        such bodies still round-trip).  This is byte-identical to the
+        historical imperative rendering for bodies that do not end in a
+        newline; a body that *does* end in one or more newlines (e.g. a
+        summary / full-text / reason with a trailing ``\\n``) has them
+        collapsed rather than emitted as a double blank line.  The
+        ``## User Notes`` region is still appended byte-exactly.
 
     Raises
     ------
@@ -274,9 +276,10 @@ def render_note(
         Section(PROFILE_RELEVANCE, render_profile_relevance_body(profile_entries))
     )
 
-    # Trailing-strip every body so serialize() emits canonical single
-    # blank-line separators (see the Returns note on normalisation).  The
-    # ## User Notes region is appended byte-exactly by serialize().
+    # Strip trailing line endings (\r/\n) from every body — matching the
+    # parser's canonical form — so serialize() emits single blank-line
+    # separators (see the Returns note on normalisation).  Trailing spaces are
+    # preserved; the ## User Notes region is appended byte-exactly.
     note = CanonicalNote(
         frontmatter_raw="",
         title=title,
