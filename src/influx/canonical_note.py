@@ -639,6 +639,12 @@ def upsert_section_text(content: str, heading: str, rendered_section: str) -> st
     place (trimming leading blank lines from the following content so blank
     lines do not accumulate across re-renders); otherwise it is inserted at
     :func:`insertion_point`.
+
+    The touched section is written verbatim from *rendered_section*, i.e. with
+    the LF line endings the Influx renderers emit.  Surrounding bytes are
+    preserved as-is, so on a (non-canonical) CRLF note the replaced/inserted
+    section is LF while the rest of the note keeps its CRLF endings — the ops
+    do not round-trip CRLF for the section they own.
     """
     span = _section_span(content, heading)
     if span is not None:

@@ -372,23 +372,60 @@ class TestUpsertArchivePath:
 
 
 class TestUpsertSectionText:
-    def test_inserts_before_profile_relevance(self) -> None:
+    """Exact-byte insert/replace behaviour the repair_counters ## Repair
+    placement (PR 5) delegates to. Pins the insertion-point fallback chain
+    (before Profile Relevance → before User Notes → EOF) and in-place
+    replacement without blank-line accumulation.
+    """
+
+    _RENDERED = "## Repair\n- tier2_attempts: 1\n"
+
+    def test_insert_before_profile_relevance(self) -> None:
         content = (
             "# T\n\n## Summary\ns\n\n"
             "## Profile Relevance\n### p\nScore: 5/10\nr\n\n## User Notes\n"
         )
-        rendered = "## Repair\n- tier2_attempts: 1\n"
-        result = cn.upsert_section_text(content, REPAIR, rendered)
-        # inserted before Profile Relevance, after Summary
-        assert result.index("## Repair") < result.index("## Profile Relevance")
-        assert result.index("## Summary") < result.index("## Repair")
+        assert cn.upsert_section_text(content, REPAIR, self._RENDERED) == (
+            "# T\n\n## Summary\ns\n\n## Repair\n- tier2_attempts: 1\n\n"
+            "## Profile Relevance\n### p\nScore: 5/10\nr\n\n## User Notes\n"
+        )
 
-    def test_replace_does_not_accumulate_blank_lines(self) -> None:
-        content = "# T\n\n## Summary\ns\n\n## User Notes\n"
-        r1 = cn.upsert_section_text(content, REPAIR, "## Repair\n- tier2_attempts: 1\n")
-        r2 = cn.upsert_section_text(r1, REPAIR, "## Repair\n- tier2_attempts: 2\n")
-        assert "- tier2_attempts: 2" in r2
-        assert "\n\n\n" not in r2
+    def test_insert_fallback_before_user_notes(self) -> None:
+        content = "# T\n\n## Summary\ns\n\n## User Notes\nMINE\n"
+        assert cn.upsert_section_text(content, REPAIR, self._RENDERED) == (
+            "# T\n\n## Summary\ns\n\n## Repair\n- tier2_attempts: 1\n\n"
+            "## User Notes\nMINE\n"
+        )
+
+    def test_insert_fallback_at_eof(self) -> None:
+        content = "# T\n\n## Summary\ns\n"
+        assert cn.upsert_section_text(content, REPAIR, self._RENDERED) == (
+            "# T\n\n## Summary\ns\n\n## Repair\n- tier2_attempts: 1\n"
+        )
+
+    def test_replace_in_place_no_blank_line_accumulation(self) -> None:
+        content = "# T\n\n## Repair\n- tier2_attempts: 1\n\n## User Notes\nMINE\n"
+        result = cn.upsert_section_text(
+            content, REPAIR, "## Repair\n- tier2_attempts: 2\n"
+        )
+        assert result == (
+            "# T\n\n## Repair\n- tier2_attempts: 2\n\n## User Notes\nMINE\n"
+        )
+        assert "\n\n\n" not in result
+
+    def test_crlf_note_touched_section_lf_surrounding_preserved(self) -> None:
+        # Influx-owned sections are written LF (as upsert_archive_path does for
+        # the path: line). On a CRLF note the replaced ## Repair block is LF
+        # and the surrounding CRLF bytes — incl. the User Notes region — are
+        # preserved rather than round-tripped to CRLF.
+        content = (
+            "# T\n\n## Repair\n- tier2_attempts: 1\n\n## User Notes\nMINE\n"
+        ).replace("\n", "\r\n")
+        result = cn.upsert_section_text(
+            content, REPAIR, "## Repair\n- tier2_attempts: 2\n"
+        )
+        assert "## Repair\n- tier2_attempts: 2\n" in result  # touched section LF
+        assert result.endswith("## User Notes\r\nMINE\r\n")  # CRLF tail preserved
 
 
 # ── Structured immutable ops ────────────────────────────────────────
