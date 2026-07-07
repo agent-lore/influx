@@ -44,7 +44,6 @@ class TestGoldenFileRoundTrip:
     def test_render_matches_golden_file(self, golden_text: str) -> None:
         rendered = render_note(
             title="Attention Is All You Need (Redux)",
-            source_url="https://arxiv.org/abs/2601.12345",
             tags=[
                 "source:arxiv",
                 "arxiv-id:2601.12345",
@@ -91,7 +90,6 @@ class TestGoldenFileRoundTrip:
 
         rendered = render_note(
             title=parsed.title,
-            source_url="https://arxiv.org/abs/2601.12345",
             tags=[
                 "source:arxiv",
                 "arxiv-id:2601.12345",
@@ -172,7 +170,6 @@ class TestUserNotesRoundTrip:
 
         rewritten = render_note(
             title=parsed.title,
-            source_url="https://arxiv.org/abs/2601.99999",
             tags=[
                 "source:arxiv",
                 "arxiv-id:2601.99999",
@@ -202,7 +199,6 @@ class TestUserNotesRoundTrip:
         parsed = parse_note(self.ORIGINAL_NOTE)
         rewritten = render_note(
             title=parsed.title,
-            source_url="https://arxiv.org/abs/2601.99999",
             tags=["source:arxiv", "ingested-by:influx", "schema:1"],
             confidence=0.7,
             archive_path="arxiv/2026/01/2601.99999.pdf",
@@ -219,7 +215,6 @@ class TestUserNotesRoundTrip:
         parsed = parse_note(self.ORIGINAL_NOTE)
         rewritten = render_note(
             title=parsed.title,
-            source_url="https://arxiv.org/abs/2601.99999",
             tags=["source:arxiv", "ingested-by:influx", "schema:1"],
             confidence=0.7,
             archive_path="arxiv/2026/01/2601.99999.pdf",
@@ -236,7 +231,6 @@ class TestUserNotesRoundTrip:
         parsed = parse_note(self.ORIGINAL_NOTE)
         rewritten = render_note(
             title=parsed.title,
-            source_url="https://arxiv.org/abs/2601.99999",
             tags=["source:arxiv", "ingested-by:influx", "schema:1"],
             confidence=0.7,
             archive_path="arxiv/2026/01/2601.99999.pdf",
@@ -254,7 +248,6 @@ class TestUserNotesRoundTrip:
         """When User Notes is absent, renderer appends empty heading."""
         rendered = render_note(
             title="No User Notes Yet",
-            source_url="https://arxiv.org/abs/2601.00001",
             tags=["source:arxiv", "ingested-by:influx", "schema:1"],
             confidence=0.7,
             archive_path=None,
@@ -348,7 +341,6 @@ class TestRejectedProfileNotRefreshed:
         )
         rendered = render_note(
             title="Rejection Test",
-            source_url="https://arxiv.org/abs/2601.00001",
             tags=tags,
             confidence=0.7,
             archive_path=None,
@@ -374,7 +366,6 @@ class TestSectionOrdering:
         """US-007: canonical renderer always emits ``## Profile Relevance``."""
         rendered = render_note(
             title="Empty Profiles",
-            source_url="https://arxiv.org/abs/2601.00001",
             tags=["source:arxiv", "ingested-by:influx", "schema:1"],
             confidence=0.7,
             archive_path=None,
@@ -393,7 +384,6 @@ class TestSectionOrdering:
     def test_archive_before_summary(self) -> None:
         rendered = render_note(
             title="Order Test",
-            source_url="https://arxiv.org/abs/2601.00001",
             tags=["source:arxiv", "ingested-by:influx", "schema:1"],
             confidence=0.8,
             archive_path="arxiv/2026/01/2601.00001.pdf",
@@ -420,7 +410,6 @@ class TestSectionOrdering:
     def test_archive_immediately_after_title(self) -> None:
         rendered = render_note(
             title="Order Test",
-            source_url="https://arxiv.org/abs/2601.00001",
             tags=["source:arxiv", "ingested-by:influx", "schema:1"],
             confidence=0.8,
             archive_path="arxiv/2026/01/2601.00001.pdf",
@@ -446,7 +435,6 @@ class TestRendererArchiveInvariant:
         with pytest.raises(ArchiveInvariantError):
             render_note(
                 title="Invariant Test",
-                source_url="https://arxiv.org/abs/2601.00001",
                 tags=[
                     "source:arxiv",
                     "ingested-by:influx",
@@ -480,7 +468,6 @@ class TestIngestedByTagValidation:
         with pytest.raises(MissingIngestedByTagError):
             render_note(
                 title="FM Test",
-                source_url="https://arxiv.org/abs/2601.00001",
                 tags=["source:arxiv"],
                 confidence=0.7,
                 archive_path=None,
@@ -495,7 +482,6 @@ class TestIngestedByTagValidation:
         with pytest.raises(MissingIngestedByTagError):
             render_note(
                 title="FM Test",
-                source_url="https://arxiv.org/abs/2601.00001",
                 tags=[],
                 confidence=0.7,
                 archive_path=None,
@@ -661,7 +647,6 @@ class TestRejectedProfilePreservedOnCRLF:
         )
         rendered = render_note(
             title=parsed.title,
-            source_url="https://arxiv.org/abs/2601.55555",
             tags=tags,
             confidence=0.7,
             archive_path="arxiv/2026/01/2601.55555.pdf",

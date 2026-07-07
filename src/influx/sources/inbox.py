@@ -340,7 +340,6 @@ def build_inbox_note_item(
 
     content = render(
         title=title,
-        source_url=source_url,
         tags=tags,
         confidence=confidence,
         archive_path=acquired.archive_path,

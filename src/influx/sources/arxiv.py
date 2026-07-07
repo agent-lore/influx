@@ -1341,7 +1341,6 @@ def build_arxiv_note_item(
 
     content = render(
         title=item.title,
-        source_url=source_url,
         tags=tags,
         confidence=confidence,
         archive_path=archive_path,

@@ -39,7 +39,6 @@ def _make_note_content(
     """Render a minimal canonical note for testing."""
     return render_note(
         title=title,
-        source_url=source_url,
         tags=tags,
         confidence=0.8,
         archive_path=None,

@@ -15,7 +15,6 @@ from influx.schemas import Tier3Extraction
 _BASE_TAGS = ["source:arxiv", "ingested-by:influx", "schema:1"]
 _BASE_KWARGS = {
     "title": "Test Note",
-    "source_url": "https://arxiv.org/abs/2601.00001",
     "tags": _BASE_TAGS,
     "confidence": 0.8,
     "archive_path": None,

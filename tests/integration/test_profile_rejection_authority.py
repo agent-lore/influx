@@ -97,7 +97,6 @@ def _render_item_content(
     """Render a minimal canonical note for a profile item."""
     return render_note(
         title=SHARED_TITLE,
-        source_url=SHARED_URL,
         tags=tags,
         confidence=0.8,
         archive_path=None,
@@ -259,7 +258,6 @@ def _existing_rejected_note_content() -> str:
     """Content for existing note (Profile Relevance for the rejected profile)."""
     return render_note(
         title=SHARED_TITLE,
-        source_url=SHARED_URL,
         tags=_existing_rejected_note_tags(),
         confidence=0.8,
         archive_path=None,

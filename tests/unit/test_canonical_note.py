@@ -562,6 +562,60 @@ def test_render_profile_relevance_body_empty() -> None:
     assert cn.render_profile_relevance_body([]) == ""
 
 
+class TestReplaceProfileRelevanceSection:
+    """Exact-byte replacement — the section end-boundary was converged onto
+    the shared _section_span helper (PR 6 / #253 review); these pin that the
+    output is byte-identical to the prior find("\\n## ") logic.
+    """
+
+    _ENTRIES = [
+        ProfileRelevanceEntry("a", 8, "r1"),
+        ProfileRelevanceEntry("b", 4, "r2"),
+    ]
+
+    def test_replace_mid_note_before_user_notes(self) -> None:
+        content = (
+            "# T\n\n## Summary\ns\n\n"
+            "## Profile Relevance\n### old\nScore: 1/10\nx\n\n## User Notes\nMINE\n"
+        )
+        assert cn.replace_profile_relevance_section(content, self._ENTRIES) == (
+            "# T\n\n## Summary\ns\n\n## Profile Relevance\n"
+            "### a\nScore: 8/10\nr1\n\n### b\nScore: 4/10\nr2\n\n## User Notes\nMINE\n"
+        )
+
+    def test_replace_followed_by_another_section(self) -> None:
+        content = (
+            "# T\n\n## Profile Relevance\n### old\nScore: 1/10\nx\n\n"
+            "## Repair\n- a: 1\n"
+        )
+        assert cn.replace_profile_relevance_section(content, self._ENTRIES) == (
+            "# T\n\n## Profile Relevance\n"
+            "### a\nScore: 8/10\nr1\n\n### b\nScore: 4/10\nr2\n\n## Repair\n- a: 1\n"
+        )
+
+    def test_replace_last_section_at_eof(self) -> None:
+        content = (
+            "# T\n\n## Summary\ns\n\n## Profile Relevance\n### old\nScore: 1/10\nx\n"
+        )
+        assert cn.replace_profile_relevance_section(content, self._ENTRIES) == (
+            "# T\n\n## Summary\ns\n\n## Profile Relevance\n"
+            "### a\nScore: 8/10\nr1\n\n### b\nScore: 4/10\nr2\n"
+        )
+
+    def test_replace_with_empty_entries_keeps_bare_heading(self) -> None:
+        content = (
+            "# T\n\n## Profile Relevance\n### old\nScore: 1/10\nx\n\n"
+            "## User Notes\nMINE\n"
+        )
+        assert cn.replace_profile_relevance_section(content, []) == (
+            "# T\n\n## Profile Relevance\n\n## User Notes\nMINE\n"
+        )
+
+    def test_noop_when_absent(self) -> None:
+        content = "# T\n\n## Summary\ns\n\n## User Notes\n"
+        assert cn.replace_profile_relevance_section(content, self._ENTRIES) == content
+
+
 def test_constants_are_section_headings() -> None:
     assert ARCHIVE in SECTION_ORDER
     assert FULL_TEXT in SECTION_ORDER

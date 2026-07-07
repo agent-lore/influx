@@ -652,7 +652,6 @@ def _note_content(ingested: list[str]) -> str:
 
     return render_note(
         title="Existing",
-        source_url="https://example.com/article",
         tags=["ingested-by:influx"],
         confidence=1.0,
         archive_path=None,

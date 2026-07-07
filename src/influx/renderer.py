@@ -22,9 +22,19 @@ Public surface:
 from __future__ import annotations
 
 from influx.canonical_note import (
+    ARCHIVE,
+    BUILDS_ON,
+    CLAIMS,
+    DATASETS,
+    FULL_TEXT,
+    OPEN_QUESTIONS,
+    PROFILE_RELEVANCE,
+    SUMMARY,
+    CanonicalNote,
     ProfileRelevanceEntry,
+    Section,
     render_profile_relevance_body,
-    render_tier3_sections,
+    serialize,
 )
 from influx.errors import InfluxError
 from influx.schemas import Tier1Enrichment, Tier3Extraction
@@ -76,9 +86,8 @@ def render_archive_section(archive_path: str | None) -> str:
     str
         The rendered section text starting with ``## Archive\\n``.
     """
-    if archive_path is not None:
-        return f"## Archive\npath: {archive_path}\n"
-    return "## Archive\n"
+    body = _archive_body(archive_path)
+    return f"## {ARCHIVE}\n{body}\n" if body else f"## {ARCHIVE}\n"
 
 
 def validate_archive_tag_invariant(
@@ -108,13 +117,60 @@ def validate_archive_tag_invariant(
         )
 
 
+# ── Section-body builders (compose the CanonicalNote model) ─────────
+
+
+def _archive_body(archive_path: str | None) -> str:
+    """Body of the ``## Archive`` section — the ``path:`` line, or empty."""
+    return f"path: {archive_path}" if archive_path is not None else ""
+
+
+def _summary_body(
+    tier1_enrichment: Tier1Enrichment | None,
+    summary: str,
+    keywords: list[str],
+) -> str | None:
+    """Body of the ``## Summary`` section, or ``None`` to omit it (FR-ENR-6).
+
+    Structured Tier-1 enrichment wins (``### Contributions`` / ``### Method``
+    / ``### Result`` / ``### Relevance``); else the plain *summary* (with a
+    ``Keywords:`` line when present); else the section is omitted.
+    """
+    if tier1_enrichment is not None:
+        parts = ["### Contributions"]
+        parts.extend(f"- {contrib}" for contrib in tier1_enrichment.contributions)
+        parts.append(f"\n### Method\n{tier1_enrichment.method}")
+        parts.append(f"\n### Result\n{tier1_enrichment.result}")
+        parts.append(f"\n### Relevance\n{tier1_enrichment.relevance}")
+        return "\n".join(parts)
+    if summary:
+        body = summary
+        if keywords:
+            body += f"\n\nKeywords: {', '.join(keywords)}"
+        return body
+    return None
+
+
+def _tier3_sections(tier3: Tier3Extraction) -> list[Section]:
+    """The four Tier 3 sections as ``Section`` values (US-012)."""
+
+    def _bullets(items: list[str]) -> str:
+        return "\n".join(f"- {item}" for item in items)
+
+    return [
+        Section(CLAIMS, _bullets(tier3.claims)),
+        Section(DATASETS, _bullets(tier3.datasets)),
+        Section(BUILDS_ON, _bullets(tier3.builds_on)),
+        Section(OPEN_QUESTIONS, _bullets(tier3.open_questions)),
+    ]
+
+
 # ── Full canonical renderer (FR-NOTE-1..8, US-007) ──────────────────
 
 
 def render_note(
     *,
     title: str,
-    source_url: str,
     tags: list[str],
     confidence: float,
     archive_path: str | None,
@@ -132,8 +188,6 @@ def render_note(
     ----------
     title:
         The ``# <Title>`` text (without the ``# `` prefix).
-    source_url:
-        Normalised canonical URL for frontmatter.
     tags:
         The final merged tag list (from ``influx.notes.merge_tags``).
     confidence:
@@ -169,7 +223,16 @@ def render_note(
     Returns
     -------
     str
-        The complete canonical note text.
+        The complete canonical note text.  The note is composed as a
+        :class:`~influx.canonical_note.CanonicalNote` and emitted via
+        :func:`~influx.canonical_note.serialize`, so the output is always in
+        canonical form — single blank-line separators, trailing-stripped
+        section bodies.  This is byte-identical to the historical imperative
+        rendering for section bodies without trailing whitespace; a body that
+        *does* end in whitespace (e.g. a summary / full-text / reason with a
+        trailing newline) has it normalised away rather than emitted as a
+        double blank line.  The ``## User Notes`` region is still appended
+        byte-exactly.
 
     Raises
     ------
@@ -185,63 +248,42 @@ def render_note(
         )
     validate_archive_tag_invariant(archive_path=archive_path, tags=tags)
 
-    archive_section = render_archive_section(archive_path)
+    # Compose the note as a CanonicalNote and serialise it — body-only output
+    # (#178).  Lithos owns the outer YAML frontmatter and persists tags /
+    # source_url / confidence / note_type / namespace as first-class
+    # ``lithos_write`` API parameters (spec §5.1); the renderer never emits a
+    # ``---``-fenced block of its own (LithosClient.write_note enforces this).
+    # The ``# {title}`` H1 is retained as the body's canonical title.
+    sections: list[Section] = [Section(ARCHIVE, _archive_body(archive_path))]
 
-    # Compose note — body-only output (#178).  Lithos owns the outer
-    # YAML frontmatter and persists tags / source_url / confidence /
-    # note_type / namespace as first-class API parameters on
-    # ``lithos_write`` (spec §5.1); the renderer must NOT emit a
-    # ``---``-fenced frontmatter block of its own.  The ``# {title}``
-    # heading is retained — Lithos's ``extract_title_from_content``
-    # strips its own prepended title on read, leaving this one as the
-    # body's canonical H1.  ``LithosClient.write_note`` enforces this
-    # contract via a strict-mode assertion that rejects content
-    # starting with ``---\\n``.
-    output = f"# {title}\n\n"
-    output += archive_section + "\n"
+    summary_body = _summary_body(tier1_enrichment, summary, keywords)
+    if summary_body is not None:
+        sections.append(Section(SUMMARY, summary_body))
 
-    # Summary section: structured Tier1Enrichment → plain summary → omit
-    if tier1_enrichment is not None:
-        output += "## Summary\n"
-        output += "### Contributions\n"
-        for contrib in tier1_enrichment.contributions:
-            output += f"- {contrib}\n"
-        output += f"\n### Method\n{tier1_enrichment.method}\n"
-        output += f"\n### Result\n{tier1_enrichment.result}\n"
-        output += f"\n### Relevance\n{tier1_enrichment.relevance}\n"
-    elif summary:
-        summary_body = summary
-        if keywords:
-            summary_body += f"\n\nKeywords: {', '.join(keywords)}"
-        output += f"## Summary\n{summary_body}\n"
-
-    # Full Text section (Tier 2) — omitted when absent/empty (FR-ENR-6, US-011)
+    # Full Text (Tier 2) — omitted when absent/empty (FR-ENR-6, US-011).
     if full_text:
-        output += f"\n## Full Text\n{full_text}\n"
+        sections.append(Section(FULL_TEXT, full_text))
 
     # Tier 3 sections (US-012) — omitted entirely when absent (FR-ENR-6).
-    # The section block is owned by canonical_note (shared with the repair
-    # sweep); the leading blank-line separator is added here.
     if tier3_extraction is not None:
-        output += "\n" + render_tier3_sections(tier3_extraction)
+        sections.extend(_tier3_sections(tier3_extraction))
 
-    # Profile Relevance section — always emitted to keep the canonical
-    # note shape stable (US-007); body is empty when no entries are given.
-    output += "\n"
-    pr_body = _render_profile_relevance_body(profile_entries)
-    if pr_body:
-        output += f"## Profile Relevance\n{pr_body}\n"
-    else:
-        output += "## Profile Relevance\n"
+    # Profile Relevance — always emitted to keep the shape stable (US-007);
+    # the body is empty when no entries are given.
+    sections.append(
+        Section(PROFILE_RELEVANCE, render_profile_relevance_body(profile_entries))
+    )
 
-    # User Notes — preserved byte-exactly or empty heading appended
-    output += "\n"
-    if user_notes is not None:
-        output += user_notes
-    else:
-        output += "## User Notes\n"
-
-    return output
+    # Trailing-strip every body so serialize() emits canonical single
+    # blank-line separators (see the Returns note on normalisation).  The
+    # ## User Notes region is appended byte-exactly by serialize().
+    note = CanonicalNote(
+        frontmatter_raw="",
+        title=title,
+        sections=tuple(Section(s.heading, s.body.rstrip("\r\n")) for s in sections),
+        user_notes=user_notes,
+    )
+    return serialize(note)
 
 
 # ── High-level facade for source builders ──────────────────────────
@@ -250,7 +292,6 @@ def render_note(
 def render(
     *,
     title: str,
-    source_url: str,
     tags: list[str],
     confidence: float,
     archive_path: str | None,
@@ -274,8 +315,8 @@ def render(
 
     Parameters
     ----------
-    title, source_url, tags, confidence, archive_path, summary,
-    keywords, tier1_enrichment, full_text, tier3_extraction, user_notes:
+    title, tags, confidence, archive_path, summary, keywords,
+    tier1_enrichment, full_text, tier3_extraction, user_notes:
         Forwarded to :func:`render_note`.
     profile_name, score, reason:
         Used to construct a single-entry profile relevance list.
@@ -294,7 +335,6 @@ def render(
     ]
     return render_note(
         title=title,
-        source_url=source_url,
         tags=tags,
         confidence=confidence,
         archive_path=archive_path,

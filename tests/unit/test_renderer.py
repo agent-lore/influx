@@ -17,6 +17,7 @@ to :func:`render_note`. These tests cover:
 
 from __future__ import annotations
 
+from influx import canonical_note as cn
 from influx.notes import parse_note
 from influx.renderer import (
     ProfileRelevanceEntry,
@@ -34,7 +35,6 @@ def _render_minimal(**overrides: object) -> str:
     """Render a minimal note with sensible defaults; *overrides* override kwargs."""
     kwargs: dict[str, object] = {
         "title": "A Paper About Things",
-        "source_url": "https://arxiv.org/abs/2601.00001",
         "tags": list(_BASE_TAGS),
         "confidence": 0.8,
         "archive_path": "papers/arxiv/2026/01/2601.00001.pdf",
@@ -80,12 +80,6 @@ class TestBodyOnlyOutput:
         text = _render_minimal(tags=["source:arxiv", "ingested-by:influx", "favourite"])
         assert "tags:" not in text
         assert "  - favourite" not in text
-
-    def test_does_not_inline_source_url(self) -> None:
-        text = _render_minimal(source_url="https://arxiv.org/abs/2601.00001")
-        # The URL may appear inside section content (it doesn't here),
-        # but never in a ``source_url: …`` YAML key shape.
-        assert "source_url:" not in text
 
 
 # ── Section ordering ────────────────────────────────────────────────
@@ -301,7 +295,6 @@ class TestRenderFacadeParity:
     def test_render_matches_manual_render_note(self) -> None:
         kwargs = {
             "title": "Parity Paper",
-            "source_url": "https://arxiv.org/abs/2601.00099",
             "tags": list(_BASE_TAGS),
             "confidence": 0.7,
             "archive_path": None,
@@ -313,7 +306,6 @@ class TestRenderFacadeParity:
         via_facade = render(**kwargs)  # type: ignore[arg-type]
         via_render_note = render_note(
             title="Parity Paper",
-            source_url="https://arxiv.org/abs/2601.00099",
             tags=list(_BASE_TAGS),
             confidence=0.7,
             archive_path=None,
@@ -322,3 +314,56 @@ class TestRenderFacadeParity:
             profile_entries=[ProfileRelevanceEntry("research", 7, "Worth a look.")],
         )
         assert via_facade == via_render_note
+
+
+# ── Canonical normalization (PR 6 — render composes via serialize) ──
+
+
+class TestRenderNoteCanonicalNormalization:
+    """``render_note`` composes a :class:`CanonicalNote` and ``serialize()``s
+    it, so its output is always canonical — single blank-line separators,
+    trailing-stripped bodies.  Bodies without trailing whitespace are
+    byte-identical to the historical imperative rendering (pinned by the
+    suites above); a body that *does* carry trailing whitespace is normalised
+    rather than emitted as a double blank line.
+    """
+
+    _BASE = {
+        "title": "T",
+        "tags": ["ingested-by:influx"],
+        "confidence": 0.5,
+        "archive_path": "p/x.pdf",
+        "summary": "",
+        "keywords": [],
+        "profile_entries": [],
+    }
+
+    def test_output_always_roundtrips_through_the_model(self) -> None:
+        # Trailing whitespace on every free-text field still yields canonical
+        # output (``serialize(parse(x)) == x``).
+        out = render_note(
+            **{**self._BASE, "summary": "A summary.\n\n"},
+            full_text="Body.\n",
+        )
+        assert cn.serialize(cn.parse(out)) == out
+
+    def test_trailing_newline_full_text_collapses_double_blank_line(self) -> None:
+        out = render_note(**self._BASE, full_text="Body line.\n")
+        assert out == (
+            "# T\n\n## Archive\npath: p/x.pdf\n\n"
+            "## Full Text\nBody line.\n\n## Profile Relevance\n\n## User Notes\n"
+        )
+
+    def test_trailing_newline_summary_collapses_double_blank_line(self) -> None:
+        out = render_note(**{**self._BASE, "summary": "A summary.\n"})
+        assert out == (
+            "# T\n\n## Archive\npath: p/x.pdf\n\n"
+            "## Summary\nA summary.\n\n## Profile Relevance\n\n## User Notes\n"
+        )
+
+    def test_clean_and_trailing_whitespace_converge_to_same_bytes(self) -> None:
+        # The normalisation target IS the clean-input rendering: a trailing
+        # newline is collapsed toward the no-trailing-whitespace form.
+        assert render_note(**self._BASE, full_text="Body line.") == render_note(
+            **self._BASE, full_text="Body line.\n"
+        )
