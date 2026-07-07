@@ -28,6 +28,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
+from influx.canonical_note import REPAIR, extract_section_body, upsert_section_text
 from influx.errors import ExtractionError, LCMAError
 
 __all__ = [
@@ -124,12 +125,8 @@ class RepairCounters:
 # ── Section parser / serializer ─────────────────────────────────────
 
 
-_REPAIR_HEADING_RE = re.compile(r"^## Repair[ \t]*\n", re.MULTILINE)
 _REPAIR_BULLET_RE = re.compile(r"^[ \t]*-\s*(\w+)\s*:\s*(.*)$")
 _QUOTED_RE = re.compile(r'^"(.*)"$')
-_NEXT_HEADING_RE = re.compile(r"^## ", re.MULTILINE)
-_REPAIR_PROFILE_RELEVANCE_RE = re.compile(r"^## Profile Relevance\b", re.MULTILINE)
-_REPAIR_USER_NOTES_RE = re.compile(r"^## User Notes\b", re.MULTILINE)
 
 
 def _collapse_to_single_line(value: str) -> str:
@@ -143,33 +140,18 @@ def _collapse_to_single_line(value: str) -> str:
     return " ".join(value.replace("\r", " ").split())[:300]
 
 
-def _find_repair_section_span(content: str) -> tuple[int, int] | None:
-    """Return (start, end) of the existing ``## Repair`` section, or None."""
-    m = _REPAIR_HEADING_RE.search(content)
-    if not m:
-        return None
-    body_start = m.end()
-    next_h = _NEXT_HEADING_RE.search(content, body_start)
-    end = next_h.start() if next_h else len(content)
-    return m.start(), end
-
-
 def parse_repair_section(content: str) -> RepairCounters:
     """Parse the ``## Repair`` section of *content* into :class:`RepairCounters`.
 
-    Returns zero-defaults when the section is absent.  Unknown bullets
-    are ignored; malformed integer counts default to zero so a hand-edit
-    cannot break the sweep.
+    The section is located by :func:`canonical_note.extract_section_body`
+    (CRLF-tolerant); only the bullet grammar is owned here.  Returns
+    zero-defaults when the section is absent.  Unknown bullets are ignored;
+    malformed integer counts default to zero so a hand-edit cannot break the
+    sweep.
     """
-    span = _find_repair_section_span(content)
-    if span is None:
+    body = extract_section_body(content, REPAIR)
+    if not body:
         return RepairCounters()
-    start, end = span
-    # Skip past the heading line we already matched.
-    body_start = content.find("\n", start)
-    if body_start < 0 or body_start >= end:
-        return RepairCounters()
-    body = content[body_start + 1 : end]
 
     fields: dict[str, Any] = {}
     int_keys = {"tier2_attempts", "tier3_attempts", "archive_attempts"}
@@ -222,35 +204,13 @@ def render_repair_section(counters: RepairCounters) -> str:
 def upsert_repair_section(content: str, counters: RepairCounters) -> str:
     """Return *content* with the ``## Repair`` section set to *counters*.
 
-    Replaces an existing section in place; otherwise inserts the new
-    section before ``## Profile Relevance`` (canonical placement,
-    matching ``canonical_note.insertion_point``), or before
-    ``## User Notes``, or at end of content when neither is present.
+    Placement is delegated to :func:`canonical_note.upsert_section_text`:
+    an existing section is replaced in place (trimming accumulated blank
+    lines); otherwise the section is inserted at
+    :func:`canonical_note.insertion_point` — before ``## Profile Relevance``,
+    else before ``## User Notes``, else at end of content.
     """
-    rendered = render_repair_section(counters)
-    span = _find_repair_section_span(content)
-    if span is not None:
-        start, end = span
-        # Trim leading whitespace from the post-section so we don't
-        # accumulate blank lines on every re-render.
-        tail = content[end:].lstrip("\n")
-        if tail:
-            tail = "\n" + tail
-        head = content[:start].rstrip("\n")
-        separator = "\n\n" if head.strip() else ""
-        return head + separator + rendered + tail
-
-    pr = _REPAIR_PROFILE_RELEVANCE_RE.search(content)
-    if pr:
-        ins = pr.start()
-        return content[:ins] + rendered + "\n" + content[ins:]
-    un = _REPAIR_USER_NOTES_RE.search(content)
-    if un:
-        ins = un.start()
-        return content[:ins] + rendered + "\n" + content[ins:]
-    if content and not content.endswith("\n"):
-        content += "\n"
-    return content + ("\n" if content else "") + rendered
+    return upsert_section_text(content, REPAIR, render_repair_section(counters))
 
 
 # ── Failure classification ──────────────────────────────────────────

@@ -639,6 +639,14 @@ def upsert_section_text(content: str, heading: str, rendered_section: str) -> st
     place (trimming leading blank lines from the following content so blank
     lines do not accumulate across re-renders); otherwise it is inserted at
     :func:`insertion_point`.
+
+    The touched section — and the blank-line separators placed immediately
+    around it — are written with the LF line endings the Influx renderers
+    emit; content *below* the section (e.g. the ``## User Notes`` region) is
+    preserved byte-for-byte.  On a (non-canonical) CRLF note the section and
+    its adjacent separators therefore come out LF — a CRLF blank line just
+    above the section gains a trailing LF — while the region below keeps its
+    CRLF endings.  The ops do not round-trip CRLF for the region they own.
     """
     span = _section_span(content, heading)
     if span is not None:
