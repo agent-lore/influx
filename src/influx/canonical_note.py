@@ -617,17 +617,16 @@ def replace_profile_relevance_section(
     A no-op when the section is absent.  Preserves the blank line before a
     following section.
     """
-    match = _heading_line_re(PROFILE_RELEVANCE).search(content)
-    if match is None:
+    span = _section_span(content, PROFILE_RELEVANCE)
+    if span is None:
         return content
-    pr_idx = match.start()
-    next_h2 = content.find("\n## ", match.end())
+    pr_idx, end = span
 
     pr_body = render_profile_relevance_body(entries)
     marker = f"## {PROFILE_RELEVANCE}"
     replacement = f"{marker}\n{pr_body}\n" if pr_body else f"{marker}\n"
-    if next_h2 != -1:
-        return content[:pr_idx] + replacement + "\n" + content[next_h2 + 1 :]
+    if end < len(content):
+        return content[:pr_idx] + replacement + "\n" + content[end:]
     return content[:pr_idx] + replacement
 
 
