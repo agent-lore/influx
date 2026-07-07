@@ -413,19 +413,20 @@ class TestUpsertSectionText:
         )
         assert "\n\n\n" not in result
 
-    def test_crlf_note_touched_section_lf_surrounding_preserved(self) -> None:
+    def test_crlf_note_section_and_separators_written_lf(self) -> None:
         # Influx-owned sections are written LF (as upsert_archive_path does for
-        # the path: line). On a CRLF note the replaced ## Repair block is LF
-        # and the surrounding CRLF bytes — incl. the User Notes region — are
-        # preserved rather than round-tripped to CRLF.
+        # the path: line). On a CRLF note the replaced ## Repair block AND its
+        # adjacent separators come out LF — note the extra LF where the
+        # preceding CRLF blank line meets the new "\n\n" separator — while the
+        # trailing ## User Notes region keeps its CRLF bytes verbatim.
         content = (
             "# T\n\n## Repair\n- tier2_attempts: 1\n\n## User Notes\nMINE\n"
         ).replace("\n", "\r\n")
-        result = cn.upsert_section_text(
+        assert cn.upsert_section_text(
             content, REPAIR, "## Repair\n- tier2_attempts: 2\n"
+        ) == (
+            "# T\r\n\r\n\n## Repair\n- tier2_attempts: 2\n\n## User Notes\r\nMINE\r\n"
         )
-        assert "## Repair\n- tier2_attempts: 2\n" in result  # touched section LF
-        assert result.endswith("## User Notes\r\nMINE\r\n")  # CRLF tail preserved
 
 
 # ── Structured immutable ops ────────────────────────────────────────
