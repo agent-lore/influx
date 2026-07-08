@@ -104,6 +104,18 @@ uv run pyright src/
 uv run pytest tests/ -q
 ```
 
+After changing code or models, regenerate the architecture docs (component
+diagram, domain model, metrics, and per-component pages under
+[`docs/generated/`](docs/generated/README.md)):
+
+```bash
+make diagrams   # = pytest tests/guardrail/ -q; commit the result
+```
+
+`make test` runs the guardrail tests too, so a normal test run also rewrites
+`docs/generated/`. CI's `diagrams` job fails if the committed views drift from the
+code.
+
 ## Docker
 
 Build and run with the project Docker helpers:

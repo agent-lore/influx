@@ -1,0 +1,445 @@
+{
+  "complexity": {
+    "components": {
+      "Common": {
+        "functions_over_10": 4,
+        "max_complexity": 47,
+        "max_function": "influx.run_ledger.RunLedger.complete"
+      },
+      "Config": {
+        "functions_over_10": 1,
+        "max_complexity": 14,
+        "max_function": "influx.config.NotificationWebhookConfig._validate_type_specific_fields"
+      },
+      "Enrich": {
+        "functions_over_10": 2,
+        "max_complexity": 22,
+        "max_function": "influx.cascade.Cascade.enrich"
+      },
+      "Entrypoint": {
+        "functions_over_10": 2,
+        "max_complexity": 14,
+        "max_function": "influx.main._cmd_backfill"
+      },
+      "Feedback": {
+        "functions_over_10": 1,
+        "max_complexity": 15,
+        "max_function": "influx.run_dedup.dedup_scored_candidates"
+      },
+      "Filter": {
+        "functions_over_10": 1,
+        "max_complexity": 11,
+        "max_function": "influx.filter.make_default_batch_scorer._scorer"
+      },
+      "HttpApi": {
+        "functions_over_10": 3,
+        "max_complexity": 17,
+        "max_function": "influx.http_api.post_backfills"
+      },
+      "LithosBridge": {
+        "functions_over_10": 4,
+        "max_complexity": 17,
+        "max_function": "influx.notes.merge_tags"
+      },
+      "Notifications": {
+        "functions_over_10": 2,
+        "max_complexity": 13,
+        "max_function": "influx.notifications.dispatch_notifications"
+      },
+      "Observability": {
+        "functions_over_10": 0,
+        "max_complexity": 10,
+        "max_function": "influx.logging_config.setup_logging"
+      },
+      "Orchestration": {
+        "functions_over_10": 11,
+        "max_complexity": 52,
+        "max_function": "influx.run_service.ledger_lifecycle"
+      },
+      "Repair": {
+        "functions_over_10": 6,
+        "max_complexity": 26,
+        "max_function": "influx.repair._process_sweep_note"
+      },
+      "Schemas": {
+        "functions_over_10": 1,
+        "max_complexity": 14,
+        "max_function": "influx.schemas._harden_for_openai_strict"
+      },
+      "Sources": {
+        "functions_over_10": 10,
+        "max_complexity": 38,
+        "max_function": "influx.sources.arxiv.build_arxiv_note_item"
+      },
+      "Storage": {
+        "functions_over_10": 2,
+        "max_complexity": 14,
+        "max_function": "influx.storage.download_archive"
+      }
+    },
+    "functions_over_10": 50,
+    "top_functions": [
+      {
+        "complexity": 52,
+        "qualname": "influx.run_service.ledger_lifecycle"
+      },
+      {
+        "complexity": 47,
+        "qualname": "influx.run_ledger.RunLedger.complete"
+      },
+      {
+        "complexity": 38,
+        "qualname": "influx.sources.arxiv.build_arxiv_note_item"
+      },
+      {
+        "complexity": 38,
+        "qualname": "influx.sources.rss.build_rss_note_item"
+      },
+      {
+        "complexity": 31,
+        "qualname": "influx.inbox.InboxTick._ingest_item"
+      },
+      {
+        "complexity": 26,
+        "qualname": "influx.repair._process_sweep_note"
+      },
+      {
+        "complexity": 24,
+        "qualname": "influx.sources.inbox.build_inbox_note_item"
+      },
+      {
+        "complexity": 23,
+        "qualname": "influx.run._run_ingest_stage"
+      },
+      {
+        "complexity": 23,
+        "qualname": "influx.run_ledger.build_degradation_summary"
+      },
+      {
+        "complexity": 22,
+        "qualname": "influx.cascade.Cascade.enrich"
+      }
+    ],
+    "total_functions": 650
+  },
+  "domain": {
+    "associations": 5,
+    "models": 17,
+    "models_without_docstrings": 0
+  },
+  "graph": {
+    "component_cycles": [
+      [
+        "Common",
+        "Config"
+      ],
+      [
+        "Enrich",
+        "Filter",
+        "Repair",
+        "Sources",
+        "Storage"
+      ],
+      [
+        "HttpApi",
+        "Orchestration"
+      ]
+    ],
+    "components": {
+      "Common": {
+        "fan_in": 12,
+        "fan_out": 1,
+        "instability": 0.08
+      },
+      "Config": {
+        "fan_in": 11,
+        "fan_out": 1,
+        "instability": 0.08
+      },
+      "Enrich": {
+        "fan_in": 2,
+        "fan_out": 5,
+        "instability": 0.71
+      },
+      "Entrypoint": {
+        "fan_in": 0,
+        "fan_out": 5,
+        "instability": 1.0
+      },
+      "Feedback": {
+        "fan_in": 1,
+        "fan_out": 5,
+        "instability": 0.83
+      },
+      "Filter": {
+        "fan_in": 3,
+        "fan_out": 5,
+        "instability": 0.62
+      },
+      "HttpApi": {
+        "fan_in": 2,
+        "fan_out": 8,
+        "instability": 0.8
+      },
+      "LithosBridge": {
+        "fan_in": 6,
+        "fan_out": 3,
+        "instability": 0.33
+      },
+      "Notifications": {
+        "fan_in": 2,
+        "fan_out": 2,
+        "instability": 0.5
+      },
+      "Observability": {
+        "fan_in": 9,
+        "fan_out": 0,
+        "instability": 0.0
+      },
+      "Orchestration": {
+        "fan_in": 1,
+        "fan_out": 11,
+        "instability": 0.92
+      },
+      "Repair": {
+        "fan_in": 4,
+        "fan_out": 7,
+        "instability": 0.64
+      },
+      "Schemas": {
+        "fan_in": 3,
+        "fan_out": 0,
+        "instability": 0.0
+      },
+      "Sources": {
+        "fan_in": 5,
+        "fan_out": 8,
+        "instability": 0.62
+      },
+      "Storage": {
+        "fan_in": 3,
+        "fan_out": 3,
+        "instability": 0.5
+      }
+    },
+    "cross_component_edges": 64,
+    "longest_component_chain": 5,
+    "module_cycle_count": 3,
+    "module_cycles": [
+      [
+        "influx.backfill",
+        "influx.http_api",
+        "influx.inbox",
+        "influx.run",
+        "influx.run_service",
+        "influx.scheduler",
+        "influx.service"
+      ],
+      [
+        "influx.filter",
+        "influx.sources",
+        "influx.sources.arxiv",
+        "influx.sources.rss"
+      ],
+      [
+        "influx.repair",
+        "influx.repair_hooks"
+      ]
+    ],
+    "tier_skipping": [
+      "Entrypoint -> Common",
+      "Entrypoint -> Config",
+      "Entrypoint -> Observability",
+      "HttpApi -> Common",
+      "HttpApi -> Config",
+      "HttpApi -> Observability",
+      "Orchestration -> Common",
+      "Orchestration -> Config",
+      "Orchestration -> Observability"
+    ],
+    "tier_skipping_edges": 9
+  },
+  "mcp": {
+    "tools": 0,
+    "tools_without_docstrings": 0
+  },
+  "schema": 1,
+  "size": {
+    "components": {
+      "Common": {
+        "classes": 12,
+        "functions": 58,
+        "largest_module": "influx.run_ledger",
+        "largest_module_lines": 1457,
+        "lines": 2542,
+        "modules": 6,
+        "public_symbols": 24,
+        "sloc": 1852
+      },
+      "Config": {
+        "classes": 28,
+        "functions": 49,
+        "largest_module": "influx.config",
+        "largest_module_lines": 932,
+        "lines": 1567,
+        "modules": 4,
+        "public_symbols": 35,
+        "sloc": 1134
+      },
+      "Enrich": {
+        "classes": 4,
+        "functions": 12,
+        "largest_module": "influx.cascade",
+        "largest_module_lines": 683,
+        "lines": 986,
+        "modules": 2,
+        "public_symbols": 6,
+        "sloc": 798
+      },
+      "Entrypoint": {
+        "classes": 0,
+        "functions": 13,
+        "largest_module": "influx.main",
+        "largest_module_lines": 567,
+        "lines": 573,
+        "modules": 2,
+        "public_symbols": 1,
+        "sloc": 454
+      },
+      "Feedback": {
+        "classes": 2,
+        "functions": 10,
+        "largest_module": "influx.run_dedup",
+        "largest_module_lines": 251,
+        "lines": 571,
+        "modules": 3,
+        "public_symbols": 10,
+        "sloc": 450
+      },
+      "Filter": {
+        "classes": 2,
+        "functions": 13,
+        "largest_module": "influx.filter",
+        "largest_module_lines": 553,
+        "lines": 553,
+        "modules": 1,
+        "public_symbols": 4,
+        "sloc": 469
+      },
+      "HttpApi": {
+        "classes": 4,
+        "functions": 43,
+        "largest_module": "influx.http_api",
+        "largest_module_lines": 1007,
+        "lines": 1541,
+        "modules": 3,
+        "public_symbols": 18,
+        "sloc": 1288
+      },
+      "LithosBridge": {
+        "classes": 13,
+        "functions": 114,
+        "largest_module": "influx.lithos_client",
+        "largest_module_lines": 1780,
+        "lines": 4064,
+        "modules": 8,
+        "public_symbols": 51,
+        "sloc": 3230
+      },
+      "Notifications": {
+        "classes": 5,
+        "functions": 18,
+        "largest_module": "influx.notifications",
+        "largest_module_lines": 581,
+        "lines": 581,
+        "modules": 1,
+        "public_symbols": 8,
+        "sloc": 509
+      },
+      "Observability": {
+        "classes": 6,
+        "functions": 74,
+        "largest_module": "influx.telemetry",
+        "largest_module_lines": 1035,
+        "lines": 1912,
+        "modules": 3,
+        "public_symbols": 51,
+        "sloc": 1401
+      },
+      "Orchestration": {
+        "classes": 20,
+        "functions": 62,
+        "largest_module": "influx.inbox",
+        "largest_module_lines": 1192,
+        "lines": 3732,
+        "modules": 5,
+        "public_symbols": 30,
+        "sloc": 2911
+      },
+      "Repair": {
+        "classes": 19,
+        "functions": 90,
+        "largest_module": "influx.repair",
+        "largest_module_lines": 1485,
+        "lines": 3816,
+        "modules": 5,
+        "public_symbols": 40,
+        "sloc": 2952
+      },
+      "Schemas": {
+        "classes": 4,
+        "functions": 7,
+        "largest_module": "influx.schemas",
+        "largest_module_lines": 240,
+        "lines": 240,
+        "modules": 1,
+        "public_symbols": 5,
+        "sloc": 183
+      },
+      "Sources": {
+        "classes": 18,
+        "functions": 78,
+        "largest_module": "influx.sources.arxiv",
+        "largest_module_lines": 1912,
+        "lines": 4469,
+        "modules": 10,
+        "public_symbols": 34,
+        "sloc": 3418
+      },
+      "Storage": {
+        "classes": 2,
+        "functions": 9,
+        "largest_module": "influx.storage",
+        "largest_module_lines": 720,
+        "lines": 720,
+        "modules": 1,
+        "public_symbols": 7,
+        "sloc": 588
+      }
+    },
+    "max_module": "influx.sources.arxiv",
+    "max_module_lines": 1912,
+    "modules_over_800": [
+      "influx.config",
+      "influx.http_api",
+      "influx.inbox",
+      "influx.lithos_client",
+      "influx.repair",
+      "influx.repair_hooks",
+      "influx.run",
+      "influx.run_ledger",
+      "influx.run_service",
+      "influx.sources.arxiv",
+      "influx.sources.rss",
+      "influx.telemetry"
+    ],
+    "total_lines": 27875,
+    "total_modules": 56,
+    "total_sloc": 21643
+  },
+  "tests": {
+    "ratio": 2.48,
+    "src_lines": 27875,
+    "test_lines": 69087
+  }
+}
