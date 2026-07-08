@@ -18,7 +18,13 @@ import pytest
 
 from influx.config import AppConfig, RepairConfig
 from influx.errors import ExtractionError, LCMAError, LithosError
-from influx.repair import ContentTooLargeSkipped, SweepHooks, SweepWriteError, sweep
+from influx.repair import (
+    ContentTooLargeSkipped,
+    SweepHooks,
+    SweepWriteError,
+    _build_sweep_cascade,
+    sweep,
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -55,6 +61,16 @@ def _make_client(
         client.read_note = AsyncMock(return_value={"id": "", "content": "", "tags": []})
     client.call_tool = AsyncMock(return_value=_make_write_result(write_status))
     return client
+
+
+def _sweep_cascade(config: Any) -> Any:
+    """Real sweep Cascade so Tier 3 routes through ``enrich`` (3a.2).
+
+    Tier 3's model call (``influx.cascade.tier3_extract``) is monkeypatched
+    per test, so this drives the real counter/terminal lifecycle without an
+    LLM — the same seam the create path uses.
+    """
+    return _build_sweep_cascade(config, "ai-robotics")
 
 
 # ── lithos_list called with correct parameters ──────────────────────
@@ -314,7 +330,9 @@ class TestSweepRewriteInvariant:
         assert args["confidence"] == 0.7
         assert args["expected_version"] == 5
 
-    async def test_tier3_lcma_error_is_per_note_failure_not_abort(self) -> None:
+    async def test_tier3_lcma_error_is_per_note_failure_not_abort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Tier-3 model validation errors should not abort the whole sweep."""
         items = [{"id": "n1", "title": "Paper"}]
         note = {
@@ -344,10 +362,11 @@ class TestSweepRewriteInvariant:
             "confidence": 0.9,
         }
 
-        def failing_tier3(note: dict[str, object]) -> None:
-            del note
+        def failing_tier3(*, title: str, full_text: str, config: object) -> None:
+            del title, full_text, config
             raise LCMAError("validation failed", stage="validate")
 
+        monkeypatch.setattr("influx.cascade.tier3_extract", failing_tier3)
         config = _make_config()
         client = _make_client(list_items=items, read_responses=[note])
 
@@ -355,7 +374,8 @@ class TestSweepRewriteInvariant:
             "ai-robotics",
             client=client,
             config=config,
-            hooks=SweepHooks(tier3_extract=failing_tier3),
+            hooks=SweepHooks(),
+            cascade=_sweep_cascade(config),
         )
 
         assert len(result) == 1
@@ -783,17 +803,23 @@ class TestStageFailureLogging:
             "confidence": 0.9,
         }
 
-    async def test_tier3_failure_logs_warning_with_extra_and_exc_info(
+    async def test_tier3_failure_logs_warning_via_cascade(
         self,
+        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """The sweep now runs Tier 3 through the shared Cascade (3a.2), so a
+        Tier-3 failure is logged by ``enrich``.  The sweep re-runs Tier 3
+        without Tier 1, so the fallback is *materially degraded* — a WARNING
+        with the #151 structured fields — and the counted stage survives in
+        the persisted ``## Repair`` counters."""
         import logging
 
         items = [{"id": "n1", "title": "Paper"}]
         note = self._note("n1")
 
-        def failing(note: dict[str, object]) -> None:
-            del note
+        def failing(*, title: str, full_text: str, config: object) -> None:
+            del title, full_text, config
             raise LCMAError(
                 "Tier 3 extraction response failed validation",
                 model="extract",
@@ -801,36 +827,41 @@ class TestStageFailureLogging:
                 detail="missing 'contributions' field",
             )
 
+        monkeypatch.setattr("influx.cascade.tier3_extract", failing)
         config = _make_config()
         client = _make_client(list_items=items, read_responses=[note])
 
-        with caplog.at_level(logging.WARNING, logger="influx.repair"):
+        with caplog.at_level(logging.WARNING, logger="influx.cascade"):
             await sweep(
                 "ai-robotics",
                 client=client,
                 config=config,
-                hooks=SweepHooks(tier3_extract=failing),
+                hooks=SweepHooks(),
+                cascade=_sweep_cascade(config),
             )
 
         matching = [
             r
             for r in caplog.records
             if r.levelname == "WARNING"
-            and getattr(r, "sweep_stage", None) == "tier3_extraction"
+            and getattr(r, "tier3_failure_kind", None) == "lcma_error"
         ]
         assert matching, [
-            (r.levelname, r.getMessage(), getattr(r, "sweep_stage", None))
+            (r.levelname, r.getMessage(), getattr(r, "tier3_failure_kind", None))
             for r in caplog.records
         ]
         rec = matching[0]
-        assert getattr(rec, "note_id", None) == "n1"
+        assert getattr(rec, "item_id", None) == "n1"
         assert getattr(rec, "profile", None) == "ai-robotics"
-        assert getattr(rec, "exc_type", None) == "LCMAError"
-        assert getattr(rec, "model", None) == "extract"
-        assert getattr(rec, "stage", None) == "validate"
-        assert getattr(rec, "detail", None) == "missing 'contributions' field"
-        # ``exc_info`` must be populated so the JSON formatter renders the traceback.
-        assert rec.exc_info is not None
+        assert getattr(rec, "tier", None) == "3"
+        # No Tier 1 in the sweep → materially degraded (not harmless).
+        assert getattr(rec, "effective_extraction_tier", None) == "tier2"
+
+        # The structured failure stage is durably persisted in ## Repair.
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert 'tier3_last_stage: "validate"' in write_calls[-1].args[1]["content"]
 
     async def test_tier2_failure_logs_warning_with_extra(
         self,
@@ -919,15 +950,18 @@ class TestSweepCapCounterAndTerminalFlip:
         args = write_calls[-1].args[1]
         return dict(args)
 
-    async def test_validate_failure_bumps_counter_in_repair_section(self) -> None:
+    async def test_validate_failure_bumps_counter_in_repair_section(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A single counted failure increments tier3_attempts in ## Repair."""
         items = [{"id": "n1", "title": "Paper"}]
         note = self._note_for_tier3("n1")
 
-        def failing(note: dict[str, object]) -> None:
-            del note
+        def failing(*, title: str, full_text: str, config: object) -> None:
+            del title, full_text, config
             raise LCMAError("validation failed", model="extract", stage="validate")
 
+        monkeypatch.setattr("influx.cascade.tier3_extract", failing)
         config = _make_config()
         client = _make_client(list_items=items, read_responses=[note])
 
@@ -935,7 +969,8 @@ class TestSweepCapCounterAndTerminalFlip:
             "ai-robotics",
             client=client,
             config=config,
-            hooks=SweepHooks(tier3_extract=failing),
+            hooks=SweepHooks(),
+            cascade=_sweep_cascade(config),
         )
 
         rewritten = self._last_write_args(client)
@@ -946,15 +981,18 @@ class TestSweepCapCounterAndTerminalFlip:
         # Terminal not yet flipped.
         assert "influx:tier3-terminal" not in rewritten["tags"]
 
-    async def test_http_failure_does_not_bump_counter(self) -> None:
+    async def test_http_failure_does_not_bump_counter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Transient (HTTP) failures must NOT advance the cap counter."""
         items = [{"id": "n1", "title": "Paper"}]
         note = self._note_for_tier3("n1")
 
-        def failing(note: dict[str, object]) -> None:
-            del note
+        def failing(*, title: str, full_text: str, config: object) -> None:
+            del title, full_text, config
             raise LCMAError("connect timeout", model="extract", stage="http")
 
+        monkeypatch.setattr("influx.cascade.tier3_extract", failing)
         config = _make_config()
         client = _make_client(list_items=items, read_responses=[note])
 
@@ -962,7 +1000,8 @@ class TestSweepCapCounterAndTerminalFlip:
             "ai-robotics",
             client=client,
             config=config,
-            hooks=SweepHooks(tier3_extract=failing),
+            hooks=SweepHooks(),
+            cascade=_sweep_cascade(config),
         )
 
         rewritten = self._last_write_args(client)
@@ -974,6 +1013,7 @@ class TestSweepCapCounterAndTerminalFlip:
 
     async def test_third_counted_failure_flips_tier3_terminal(
         self,
+        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """At cap=3, ``influx:tier3-terminal`` is added and a WARNING is logged."""
@@ -996,10 +1036,11 @@ class TestSweepCapCounterAndTerminalFlip:
             ),
         )
 
-        def failing(note: dict[str, object]) -> None:
-            del note
+        def failing(*, title: str, full_text: str, config: object) -> None:
+            del title, full_text, config
             raise LCMAError("schema mismatch", model="extract", stage="validate")
 
+        monkeypatch.setattr("influx.cascade.tier3_extract", failing)
         config = _make_config()
         client = _make_client(list_items=items, read_responses=[note])
 
@@ -1008,7 +1049,8 @@ class TestSweepCapCounterAndTerminalFlip:
                 "ai-robotics",
                 client=client,
                 config=config,
-                hooks=SweepHooks(tier3_extract=failing),
+                hooks=SweepHooks(),
+                cascade=_sweep_cascade(config),
             )
 
         rewritten = self._last_write_args(client)
@@ -1025,19 +1067,22 @@ class TestSweepCapCounterAndTerminalFlip:
         assert getattr(rec, "tier3_attempts", None) == 3
         assert getattr(rec, "stage", None) == "validate"
 
-    async def test_tier3_terminal_present_skips_tier3(self) -> None:
-        """Once ``influx:tier3-terminal`` is set, the hook is not called."""
+    async def test_tier3_terminal_present_skips_tier3(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Once ``influx:tier3-terminal`` is set, Tier 3 is not attempted."""
         items = [{"id": "n1", "title": "Paper"}]
         note = self._note_for_tier3("n1")
         note["tags"] = list(note["tags"]) + ["influx:tier3-terminal"]
 
         call_count = 0
 
-        def spy(note: dict[str, object]) -> None:
+        def spy(*, title: str, full_text: str, config: object) -> None:
             nonlocal call_count
-            del note
+            del title, full_text, config
             call_count += 1
 
+        monkeypatch.setattr("influx.cascade.tier3_extract", spy)
         config = _make_config()
         client = _make_client(list_items=items, read_responses=[note])
 
@@ -1045,7 +1090,8 @@ class TestSweepCapCounterAndTerminalFlip:
             "ai-robotics",
             client=client,
             config=config,
-            hooks=SweepHooks(tier3_extract=spy),
+            hooks=SweepHooks(),
+            cascade=_sweep_cascade(config),
         )
 
         assert call_count == 0

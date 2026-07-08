@@ -13,8 +13,8 @@ The flow exercised here:
   ``## Archive`` populated with ``path:``.
 - Pass 2: feed run-1 written note back → ``re_extract_archive`` returns
   ``UPGRADE`` → ``text:abstract-only`` replaced by ``text:html`` →
-  ``tier2_enrich`` adds ``full-text`` → ``tier3_extract`` adds
-  ``influx:deep-extracted`` → ``influx:repair-needed`` cleared.
+  ``tier2_enrich`` adds ``full-text`` → the shared Cascade's Tier 3
+  adds ``influx:deep-extracted`` → ``influx:repair-needed`` cleared.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from influx.canonical_note import insert_full_text_section
 from influx.config import (
     AppConfig,
     FeedbackConfig,
@@ -45,6 +46,7 @@ from influx.repair import (
     sweep,
 )
 from tests.contract.test_lithos_client import FakeLithosServer
+from tests.integration._cascade_fakes import Tier3SuccessCascade
 
 # ── Fixtures ───────────────────────────────────────────────────────
 
@@ -221,11 +223,11 @@ def _add_tag_in_place(note: dict[str, object], tag: str) -> None:
 
 
 def _tier2_enrich_adds_full_text(note: dict[str, object]) -> None:
+    # Mirror the production Tier 2 hook: insert the ``## Full Text`` section
+    # (not just the tag) so the Cascade's Tier-3 stage has body to read.
+    content = str(note.get("content", ""))
+    note["content"] = insert_full_text_section(content, "Recovered full text body.")
     _add_tag_in_place(note, "full-text")
-
-
-def _tier3_extract_adds_deep_extracted(note: dict[str, object]) -> None:
-    _add_tag_in_place(note, "influx:deep-extracted")
 
 
 # ── Tests ──────────────────────────────────────────────────────────
@@ -323,13 +325,13 @@ class TestRssArchiveRecoveryFlow:
             hooks_p2 = SweepHooks(
                 re_extract_archive=_re_extract_upgrade_html,
                 tier2_enrich=_tier2_enrich_adds_full_text,
-                tier3_extract=_tier3_extract_adds_deep_extracted,
             )
             await sweep(
                 "ai-robotics",
                 client=client,
                 config=config,
                 hooks=hooks_p2,
+                cascade=Tier3SuccessCascade(),  # type: ignore[arg-type]
             )
 
             write_calls_p2 = [c for c in fake_lithos.calls if c[0] == "lithos_write"]

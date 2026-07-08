@@ -1,10 +1,15 @@
 """Unit tests for hook-mutation rollback (finding #1).
 
-Hooks (``archive_download``, ``re_extract_archive``, ``tier2_enrich``,
-``tier3_extract``) receive the live mutable note dict.  When a hook
-raises ``ExtractionError`` / ``LithosError`` the sweep MUST treat that
-as "stage failed this pass" (per US-003 / US-013) and MUST NOT persist
-any partial in-place mutations the hook applied before raising.
+Hooks (``archive_download``, ``re_extract_archive``, ``tier2_enrich``)
+receive the live mutable note dict.  When a hook raises
+``ExtractionError`` / ``LithosError`` the sweep MUST treat that as
+"stage failed this pass" (per US-003 / US-013) and MUST NOT persist any
+partial in-place mutations the hook applied before raising.
+
+(Tier 3 is no longer a hook — it runs through the shared Cascade, which
+returns a value rather than mutating the note in place, so there is no
+partial-mutation to roll back.  The failing-Tier-3 invariant lives in
+``test_repair_sweep.py``.)
 
 Each test below provides a fake hook that mutates ``note["tags"]`` (and
 sometimes ``note["content"]``) and then raises; the sweep is expected
@@ -374,52 +379,4 @@ class TestTier2EnrichRollback:
         # full-text mutation from the failing hook MUST NOT survive.
         assert "full-text" not in args["tags"]
         # Stage failed so influx:repair-needed must remain.
-        assert "influx:repair-needed" in args["tags"]
-
-
-# ── tier3_extract rollback ──────────────────────────────────────────
-
-
-class TestTier3ExtractRollback:
-    """A failing tier3 hook must not leak ``influx:deep-extracted``."""
-
-    async def test_tier3_hook_appends_deep_extracted_then_raises(
-        self,
-    ) -> None:
-        items = [{"id": "n1", "title": "Paper"}]
-        # Score 9 ≥ default deep_extract threshold (9) so tier3 selects.
-        read_notes = [
-            {
-                "id": "n1",
-                "title": "Paper",
-                "content": (
-                    "## Archive\npath: a.pdf\n"
-                    "## Profile Relevance\n"
-                    "### p\nScore: 9/10\n"
-                ),
-                "tags": [
-                    "influx:repair-needed",
-                    "text:html",
-                    "full-text",
-                    "profile:p",
-                ],
-            }
-        ]
-
-        def bad_tier3(note: dict[str, object]) -> None:
-            tags = list(note.get("tags", []))  # type: ignore[arg-type]
-            tags.append("influx:deep-extracted")
-            note["tags"] = tags
-            raise ExtractionError("tier3 failed", stage="deep-extract")
-
-        config = _make_config()
-        client = _make_client(list_items=items, read_responses=read_notes)
-        hooks = SweepHooks(tier3_extract=bad_tier3)
-
-        await sweep("p", client=client, config=config, hooks=hooks)
-
-        args = _last_write_args(client)
-        # influx:deep-extracted from the failing hook MUST NOT survive.
-        assert "influx:deep-extracted" not in args["tags"]
-        # Stage failed, so influx:repair-needed must remain.
         assert "influx:repair-needed" in args["tags"]

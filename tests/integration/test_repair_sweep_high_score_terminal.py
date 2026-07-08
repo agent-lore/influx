@@ -32,6 +32,7 @@ from influx.config import (
 from influx.lithos_client import LithosClient
 from influx.repair import SweepHooks, sweep
 from tests.contract.test_lithos_client import FakeLithosServer
+from tests.integration._cascade_fakes import SpyCascade
 
 # ── Fixtures ───────────────────────────────────────────────────────
 
@@ -341,15 +342,10 @@ class TestHighScoreTerminalClearing:
     ) -> None:
         """Terminal exemption waives Tier 2 and Tier 3 at high score."""
         tier2_calls = 0
-        tier3_calls = 0
 
         def _tier2_spy(note: dict[str, object]) -> None:
             nonlocal tier2_calls
             tier2_calls += 1
-
-        def _tier3_spy(note: dict[str, object]) -> None:
-            nonlocal tier3_calls
-            tier3_calls += 1
 
         tags = [
             "profile:ai-robotics",
@@ -367,9 +363,9 @@ class TestHighScoreTerminalClearing:
         _queue_single_note(fake_lithos, note)
 
         config = _make_config(lithos_url=fake_lithos_url)
+        tier3_cascade = SpyCascade()
         hooks = SweepHooks(
             tier2_enrich=_tier2_spy,  # type: ignore[arg-type]
-            tier3_extract=_tier3_spy,  # type: ignore[arg-type]
         )
 
         client = LithosClient(url=fake_lithos_url)
@@ -379,13 +375,14 @@ class TestHighScoreTerminalClearing:
                 client=client,
                 config=config,
                 hooks=hooks,
+                cascade=tier3_cascade,  # type: ignore[arg-type]
             )
             assert len(visited) == 1
 
             # Terminal note skips Tier 2 and Tier 3 (influx:text-terminal
             # suppresses both stages in stage selection).
             assert tier2_calls == 0
-            assert tier3_calls == 0
+            assert tier3_cascade.calls == 0
 
             # And influx:repair-needed is still cleared.
             write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
