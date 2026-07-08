@@ -357,6 +357,173 @@ class TestRepairCountersIntegration:
         assert sections.full_text == "body"
 
 
+# ── stages selector (3a.1) ─────────────────────────────────────────
+
+
+class TestStagesSelector:
+    """``stages`` restricts which tiers run — the repair sweep passes only
+    the stage(s) it is re-running; the create path uses the default (all).
+    """
+
+    def _tier1(self) -> Tier1Enrichment:
+        return Tier1Enrichment(
+            contributions=["c"], method="m", result="r", relevance="rel"
+        )
+
+    def test_tier1_only_skips_tier2_and_tier3(self) -> None:
+        called: list[Acquired] = []
+
+        def extractor(acq: Acquired) -> Tier2Result:
+            called.append(acq)
+            raise AssertionError("Tier 2 must not run when excluded from stages")
+
+        with (
+            patch("influx.cascade.tier1_enrich", return_value=self._tier1()) as t1,
+            patch("influx.cascade.tier3_extract") as t3,
+        ):
+            sections = _make_cascade(tier2_extractor=extractor).enrich(
+                _make_acquired(), score=10, stages=frozenset({"tier1"})
+            )
+        assert called == []
+        t1.assert_called_once()
+        t3.assert_not_called()
+        assert sections.tier1 is not None
+        assert sections.full_text is None
+        assert sections.tier3 is None
+
+    def test_tier3_only_uses_prepopulated_text_without_reextracting(self) -> None:
+        called: list[Acquired] = []
+
+        def extractor(acq: Acquired) -> Tier2Result:
+            called.append(acq)
+            raise AssertionError("Tier 2 must not run for a Tier-3-only repair")
+
+        tier3 = Tier3Extraction(claims=["claim"], builds_on=["b"])
+        with (
+            patch("influx.cascade.tier1_enrich") as t1,
+            patch("influx.cascade.tier3_extract", return_value=tier3) as t3,
+        ):
+            sections = _make_cascade(tier2_extractor=extractor).enrich(
+                _make_acquired(
+                    extracted_text="existing full text", text_flavour="html"
+                ),
+                score=10,
+                stages=frozenset({"tier3"}),
+            )
+        assert called == []  # no re-extraction
+        t1.assert_not_called()  # ## Summary not regenerated
+        t3.assert_called_once()
+        assert sections.tier3 == tier3
+        assert sections.full_text == "existing full text"
+
+    def test_tier2_only_skips_tier1_and_tier3(self) -> None:
+        def extractor(_acq: Acquired) -> Tier2Result:
+            return Tier2Result(text="body", flavour="html", text_tag="text:html")
+
+        with (
+            patch("influx.cascade.tier1_enrich") as t1,
+            patch("influx.cascade.tier3_extract") as t3,
+        ):
+            sections = _make_cascade(tier2_extractor=extractor).enrich(
+                _make_acquired(), score=10, stages=frozenset({"tier2"})
+            )
+        t1.assert_not_called()
+        t3.assert_not_called()
+        assert sections.full_text == "body"
+        assert sections.tier1 is None
+        assert sections.tier3 is None
+
+
+# ── Counter lifecycle: enrich advances on counted failures (Fork 6) ─
+
+
+class TestCounterLifecycle:
+    """When a caller passes ``counters``, the Cascade owns the full
+    lifecycle: advance on counted failures, emit terminal at the cap, and
+    return the post-enrich counters for the caller to persist.  When no
+    counters are passed (create path) it never advances.
+    """
+
+    def _counted_extractor(self) -> Any:
+        def extractor(_acq: Acquired) -> Tier2Result:
+            raise ExtractionError("model output malformed", url="x", stage="parse")
+
+        return extractor
+
+    def _transient_extractor(self) -> Any:
+        def extractor(_acq: Acquired) -> Tier2Result:
+            raise ExtractionError("upstream 503", url="x", stage="http")
+
+        return extractor
+
+    def test_counted_tier2_failure_advances_counter(self) -> None:
+        counters = RepairCounters(tier2_attempts=1)
+        sections = _make_cascade(tier2_extractor=self._counted_extractor()).enrich(
+            _make_acquired(), score=8, counters=counters
+        )
+        assert sections.counters.tier2_attempts == 2
+        assert sections.counters.tier2_last_stage == "parse"
+        assert "influx:tier2-terminal" not in sections.terminal_flags
+        assert "influx:repair-needed" in sections.repair_flags
+
+    def test_counted_tier2_failure_at_cap_emits_terminal(self) -> None:
+        counters = RepairCounters(tier2_attempts=REPAIR_COUNTED_CAP - 1)
+        sections = _make_cascade(tier2_extractor=self._counted_extractor()).enrich(
+            _make_acquired(), score=8, counters=counters
+        )
+        assert sections.counters.tier2_attempts == REPAIR_COUNTED_CAP
+        assert "influx:tier2-terminal" in sections.terminal_flags
+
+    def test_transient_tier2_failure_does_not_advance(self) -> None:
+        counters = RepairCounters(tier2_attempts=1)
+        sections = _make_cascade(tier2_extractor=self._transient_extractor()).enrich(
+            _make_acquired(), score=8, counters=counters
+        )
+        assert sections.counters.tier2_attempts == 1  # unchanged
+        assert "influx:tier2-terminal" not in sections.terminal_flags
+        assert "influx:repair-needed" in sections.repair_flags
+
+    def test_no_counters_passed_means_no_advance(self) -> None:
+        # Create path: a counted failure must not advance — the returned
+        # counters stay the zero default (byte-exact create-path output).
+        sections = _make_cascade(tier2_extractor=self._counted_extractor()).enrich(
+            _make_acquired(), score=8
+        )
+        assert sections.counters == RepairCounters()
+        assert "influx:repair-needed" in sections.repair_flags
+
+    def test_success_echoes_counters_unchanged(self) -> None:
+        def extractor(_acq: Acquired) -> Tier2Result:
+            return Tier2Result(text="body", flavour="html", text_tag="text:html")
+
+        counters = RepairCounters(tier2_attempts=1)
+        sections = _make_cascade(tier2_extractor=extractor).enrich(
+            _make_acquired(), score=8, counters=counters
+        )
+        assert sections.counters.tier2_attempts == 1
+
+    def test_counted_tier3_failure_advances_and_caps(self) -> None:
+        def extractor(_acq: Acquired) -> Tier2Result:
+            return Tier2Result(text="body", flavour="html", text_tag="text:html")
+
+        counters = RepairCounters(tier3_attempts=REPAIR_COUNTED_CAP - 1)
+        tier1 = Tier1Enrichment(
+            contributions=["c"], method="m", result="r", relevance="rel"
+        )
+        with (
+            patch("influx.cascade.tier1_enrich", return_value=tier1),
+            patch(
+                "influx.cascade.tier3_extract",
+                side_effect=LCMAError("validate fail", stage="validate"),
+            ),
+        ):
+            sections = _make_cascade(tier2_extractor=extractor).enrich(
+                _make_acquired(), score=10, counters=counters
+            )
+        assert sections.counters.tier3_attempts == REPAIR_COUNTED_CAP
+        assert "influx:tier3-terminal" in sections.terminal_flags
+
+
 # ── Result dataclass shape ─────────────────────────────────────────
 
 
@@ -375,6 +542,7 @@ class TestEnrichedSectionsShape:
         assert sections.terminal_flags == ()
         assert sections.effective_extraction_tier == "abstract-only"
         assert sections.fallback_used is False
+        assert sections.counters == RepairCounters()
 
 
 # ── #151: Tier 3 fallback classification ──────────────────────────
