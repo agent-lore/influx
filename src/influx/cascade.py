@@ -163,6 +163,10 @@ class EnrichedSections:
       section), a counted-class Tier 2 / Tier 3 failure advances it; the
       caller persists the result.  On the initial-write path (no
       ``counters`` passed) it is the zero default and no advance happens.
+      Note ``repair_flags`` (``influx:repair-needed``) is emitted for
+      *any* tier failure — transient or counted — but only *counted*
+      failures advance ``counters`` (see
+      :func:`influx.repair_counters.classify_failure`).
     """
 
     tier1: Tier1Enrichment | None = None
@@ -236,8 +240,9 @@ class Cascade:
         -------
         EnrichedSections
             The cascade output.  ``repair_flags`` carries
-            ``influx:repair-needed`` when any tier emitted a counted
-            failure; ``terminal_flags`` carries
+            ``influx:repair-needed`` when any tier failed — *transient or
+            counted* — signalling a repair-sweep retry; counter
+            advancement is counted-only.  ``terminal_flags`` carries
             ``influx:tier{2,3}-terminal`` when a cap was reached (on
             entry or via an advance); ``counters`` carries the
             post-enrich counter state for the caller to persist.

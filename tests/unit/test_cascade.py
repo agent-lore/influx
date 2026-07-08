@@ -523,6 +523,52 @@ class TestCounterLifecycle:
         assert sections.counters.tier3_attempts == REPAIR_COUNTED_CAP
         assert "influx:tier3-terminal" in sections.terminal_flags
 
+    def test_transient_tier3_failure_does_not_advance(self) -> None:
+        def extractor(_acq: Acquired) -> Tier2Result:
+            return Tier2Result(text="body", flavour="html", text_tag="text:html")
+
+        counters = RepairCounters(tier3_attempts=1)
+        tier1 = Tier1Enrichment(
+            contributions=["c"], method="m", result="r", relevance="rel"
+        )
+        with (
+            patch("influx.cascade.tier1_enrich", return_value=tier1),
+            patch(
+                "influx.cascade.tier3_extract",
+                side_effect=LCMAError("upstream 503", stage="http"),
+            ),
+        ):
+            sections = _make_cascade(tier2_extractor=extractor).enrich(
+                _make_acquired(), score=10, counters=counters
+            )
+        assert sections.counters.tier3_attempts == 1  # unchanged
+        assert "influx:tier3-terminal" not in sections.terminal_flags
+        assert "influx:repair-needed" in sections.repair_flags
+
+    def test_unexpected_tier3_exception_does_not_advance(self) -> None:
+        # The defensive ``except Exception`` path feeds a non-LCMA /
+        # non-Extraction error into the lifecycle; classify_failure treats
+        # it as transient, so even at cap-1 it must not advance or cap.
+        def extractor(_acq: Acquired) -> Tier2Result:
+            return Tier2Result(text="body", flavour="html", text_tag="text:html")
+
+        counters = RepairCounters(tier3_attempts=REPAIR_COUNTED_CAP - 1)
+        tier1 = Tier1Enrichment(
+            contributions=["c"], method="m", result="r", relevance="rel"
+        )
+        with (
+            patch("influx.cascade.tier1_enrich", return_value=tier1),
+            patch(
+                "influx.cascade.tier3_extract",
+                side_effect=AttributeError("validator bug"),
+            ),
+        ):
+            sections = _make_cascade(tier2_extractor=extractor).enrich(
+                _make_acquired(), score=10, counters=counters
+            )
+        assert sections.counters.tier3_attempts == REPAIR_COUNTED_CAP - 1  # unchanged
+        assert "influx:tier3-terminal" not in sections.terminal_flags
+
 
 # ── Result dataclass shape ─────────────────────────────────────────
 
