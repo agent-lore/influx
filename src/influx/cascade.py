@@ -33,16 +33,22 @@ from influx import metrics
 from influx.config import AppConfig, ProfileThresholds
 from influx.enrich import tier1_enrich, tier3_extract
 from influx.errors import ExtractionError, LCMAError
-from influx.repair_counters import REPAIR_COUNTED_CAP, RepairCounters
+from influx.repair_counters import (
+    REPAIR_COUNTED_CAP,
+    RepairCounters,
+    classify_failure,
+)
 from influx.schemas import Tier1Enrichment, Tier3Extraction
 from influx.telemetry import current_run_id, get_tracer, record_tier3_fallback
 
 __all__ = [
+    "ALL_TIERS",
     "Acquired",
     "Cascade",
     "EffectiveExtractionTier",
     "EnrichedSections",
     "TextFlavour",
+    "Tier",
     "Tier2Extractor",
     "Tier2Result",
 ]
@@ -51,6 +57,15 @@ logger = logging.getLogger(__name__)
 
 
 TextFlavour = Literal["html", "pdf", "summary-fallback"]
+
+
+# The enrichment tiers a caller can ask ``Cascade.enrich`` to run.  The
+# create path runs all of them (subject to the score gates); the repair
+# sweep passes only the stage(s) it needs to re-run so a Tier-2-only
+# repair doesn't regenerate the ``## Summary`` (see ``enrich``'s
+# ``stages`` parameter).
+Tier = Literal["tier1", "tier2", "tier3"]
+ALL_TIERS: frozenset[Tier] = frozenset(("tier1", "tier2", "tier3"))
 
 
 # ── Acquired bundle ────────────────────────────────────────────────
@@ -139,6 +154,19 @@ class EnrichedSections:
       failed *and* a lower tier still produced acceptable content.  The
       renderer / metrics layer can use this to distinguish "we fell
       back gracefully" from "the note is genuinely degraded".
+
+    Counter state (Fork 6):
+
+    - ``counters`` — the post-enrich :class:`RepairCounters`.  When the
+      caller passed a ``counters`` value (the repair sweep, or the
+      create-path merge onto a note that already has a ``## Repair``
+      section), a counted-class Tier 2 / Tier 3 failure advances it; the
+      caller persists the result.  On the initial-write path (no
+      ``counters`` passed) it is the zero default and no advance happens.
+      Note ``repair_flags`` (``influx:repair-needed``) is emitted for
+      *any* tier failure — transient or counted — but only *counted*
+      failures advance ``counters`` (see
+      :func:`influx.repair_counters.classify_failure`).
     """
 
     tier1: Tier1Enrichment | None = None
@@ -151,6 +179,7 @@ class EnrichedSections:
     terminal_flags: tuple[str, ...] = field(default_factory=tuple)
     effective_extraction_tier: EffectiveExtractionTier = "abstract-only"
     fallback_used: bool = False
+    counters: RepairCounters = field(default_factory=RepairCounters)
 
 
 # ── Cascade ───────────────────────────────────────────────────────
@@ -175,6 +204,7 @@ class Cascade:
         acquired: Acquired,
         score: int,
         *,
+        stages: frozenset[Tier] = ALL_TIERS,
         counters: RepairCounters | None = None,
     ) -> EnrichedSections:
         """Run the score-gated cascade for one Acquired.
@@ -185,21 +215,40 @@ class Cascade:
             The Source's acquired bundle.
         score:
             The 1–10 LLM-filter score for this Candidate.
+        stages:
+            Which tiers may run (still subject to their score gates).
+            The create path uses the default (all tiers); the repair
+            sweep passes only the stage(s) it is re-running, so a
+            Tier-2-only repair does not regenerate the ``## Summary``.
+            The ``full_text`` gate still fires from
+            ``acquired.extracted_text`` when ``"tier2"`` is excluded — a
+            Tier-3-only repair runs against the note's existing full
+            text without re-extracting.
         counters:
-            Optional :class:`RepairCounters` to consult before each
-            tier.  When omitted, defaults to a zero-counter value
-            (initial-write path: counters live on existing notes only).
+            Optional :class:`RepairCounters` to consult.  When provided
+            (repair sweep, or a create-path merge onto a note that
+            already carries a ``## Repair`` section) the Cascade owns the
+            full counter lifecycle: it skips a tier already at the cap
+            (emitting ``influx:tier{2,3}-terminal``), and on a
+            counted-class failure advances the counter and emits the
+            terminal flag when the cap is reached.  When omitted
+            (initial-write path) it defaults to a zero-counter value and
+            no advance happens — counted failures still emit
+            ``influx:repair-needed`` for the first sweep to pick up.
 
         Returns
         -------
         EnrichedSections
             The cascade output.  ``repair_flags`` carries
-            ``influx:repair-needed`` when any tier emitted a counted
-            failure; ``terminal_flags`` carries
-            ``influx:tier{2,3}-terminal`` when the cap had already been
-            reached on entry.
+            ``influx:repair-needed`` when any tier failed — *transient or
+            counted* — signalling a repair-sweep retry; counter
+            advancement is counted-only.  ``terminal_flags`` carries
+            ``influx:tier{2,3}-terminal`` when a cap was reached (on
+            entry or via an advance); ``counters`` carries the
+            post-enrich counter state for the caller to persist.
         """
-        counters = counters or RepairCounters()
+        count_failures = counters is not None
+        counters = counters if counters is not None else RepairCounters()
         repair_flags: list[str] = []
         terminal_flags: list[str] = []
         tier2_failed = False
@@ -211,14 +260,15 @@ class Cascade:
         text_tag = _text_tag_for(text_flavour)
 
         if (
-            score >= self.thresholds.full_text
+            "tier2" in stages
+            and score >= self.thresholds.full_text
             and extracted_text is None
             and self.tier2_extractor is not None
         ):
             if counters.tier2_attempts >= REPAIR_COUNTED_CAP:
                 terminal_flags.append("influx:tier2-terminal")
             else:
-                tier2 = self._run_tier2(acquired)
+                tier2, tier2_failure = self._run_tier2(acquired)
                 if tier2 is not None:
                     extracted_text = tier2.text
                     text_flavour = tier2.flavour
@@ -226,9 +276,17 @@ class Cascade:
                 else:
                     repair_flags.append("influx:repair-needed")
                     tier2_failed = True
+                    if count_failures:
+                        counters, capped = _advance_on_counted(
+                            counters, "tier2", tier2_failure
+                        )
+                        if capped:
+                            terminal_flags.append("influx:tier2-terminal")
 
         # ``full_text`` for the renderer only when extraction succeeded
-        # AND the score crosses the gate (FR-ENR-6, US-011).
+        # AND the score crosses the gate (FR-ENR-6, US-011).  Uses
+        # ``acquired.extracted_text`` untouched when ``"tier2"`` is not in
+        # ``stages`` — a Tier-3-only repair runs against existing text.
         full_text: str | None = None
         full_text_flavour: TextFlavour | None = None
         if extracted_text is not None and score >= self.thresholds.full_text:
@@ -237,7 +295,7 @@ class Cascade:
 
         # ── Tier 1 (relevance gate) ────────────────────────────────
         tier1: Tier1Enrichment | None = None
-        tier1_attempted = score >= self.thresholds.relevance
+        tier1_attempted = "tier1" in stages and score >= self.thresholds.relevance
         if tier1_attempted:
             tier1 = self._run_tier1(acquired)
             if tier1 is None:
@@ -246,7 +304,11 @@ class Cascade:
         # ── Tier 3 (deep-extract gate, requires extracted text) ─────
         tier3: Tier3Extraction | None = None
         tier3_attempted = False
-        if score >= self.thresholds.deep_extract and full_text is not None:
+        if (
+            "tier3" in stages
+            and score >= self.thresholds.deep_extract
+            and full_text is not None
+        ):
             if counters.tier3_attempts >= REPAIR_COUNTED_CAP:
                 terminal_flags.append("influx:tier3-terminal")
             else:
@@ -259,7 +321,7 @@ class Cascade:
                 # text — the note still has every section except the
                 # Tier 3 deep-extract ones.
                 lower_tier_acceptable = tier1 is not None
-                tier3 = self._run_tier3(
+                tier3, tier3_failure = self._run_tier3(
                     acquired.item_id,
                     acquired.title,
                     full_text,
@@ -268,6 +330,12 @@ class Cascade:
                 if tier3 is None:
                     repair_flags.append("influx:repair-needed")
                     tier3_failed = True
+                    if count_failures:
+                        counters, capped = _advance_on_counted(
+                            counters, "tier3", tier3_failure
+                        )
+                        if capped:
+                            terminal_flags.append("influx:tier3-terminal")
 
         effective_tier = _classify_effective_tier(
             tier1=tier1,
@@ -294,6 +362,7 @@ class Cascade:
             terminal_flags=tuple(dict.fromkeys(terminal_flags)),
             effective_extraction_tier=effective_tier,
             fallback_used=fallback_used,
+            counters=counters,
         )
 
     # ── Tier dispatchers ──────────────────────────────────────────
@@ -353,8 +422,15 @@ class Cascade:
                 )
                 return None
 
-    def _run_tier2(self, acquired: Acquired) -> Tier2Result | None:
-        """Dispatch Tier 2 with telemetry + degrade-on-failure semantics."""
+    def _run_tier2(
+        self, acquired: Acquired
+    ) -> tuple[Tier2Result | None, BaseException | None]:
+        """Dispatch Tier 2 with telemetry + degrade-on-failure semantics.
+
+        Returns ``(result, None)`` on success and ``(None, exc)`` on a
+        caught :class:`ExtractionError`, so ``enrich`` can classify the
+        failure (transient vs counted) for the counter lifecycle.
+        """
         assert self.tier2_extractor is not None  # gate-checked by caller
         tracer = get_tracer()
         with tracer.span(
@@ -366,12 +442,12 @@ class Cascade:
             },
         ):
             try:
-                return self.tier2_extractor(acquired)
-            except ExtractionError:
+                return self.tier2_extractor(acquired), None
+            except ExtractionError as exc:
                 # Both HTML and PDF failed (or whatever stages the
                 # source-specific extractor walks).  Fall through to
                 # abstract-only + repair-needed.
-                return None
+                return None, exc
 
     def _run_tier3(
         self,
@@ -380,8 +456,12 @@ class Cascade:
         full_text: str,
         *,
         lower_tier_acceptable: bool,
-    ) -> Tier3Extraction | None:
+    ) -> tuple[Tier3Extraction | None, BaseException | None]:
         """Dispatch Tier 3 with telemetry + degrade-on-failure semantics.
+
+        Returns ``(result, None)`` on success and ``(None, exc)`` on a
+        caught failure, so ``enrich`` can classify it (transient vs
+        counted) for the counter lifecycle.
 
         ``lower_tier_acceptable`` controls log-level classification of a
         Tier 3 failure (#151):
@@ -412,12 +492,15 @@ class Cascade:
             },
         ):
             try:
-                return tier3_extract(
-                    title=title,
-                    full_text=full_text,
-                    config=self.config,
+                return (
+                    tier3_extract(
+                        title=title,
+                        full_text=full_text,
+                        config=self.config,
+                    ),
+                    None,
                 )
-            except LCMAError:
+            except LCMAError as exc:
                 self._log_tier3_failure(
                     item_id=item_id,
                     title=title,
@@ -425,8 +508,8 @@ class Cascade:
                     failure_kind="lcma_error",
                     exc_info=False,
                 )
-                return None
-            except Exception:
+                return None, exc
+            except Exception as exc:
                 # Defensive: same rationale as the Tier 1 catch — a
                 # validator bug or unforeseen response shape must not
                 # turn a single bad paper into a run-level abort
@@ -438,7 +521,7 @@ class Cascade:
                     failure_kind="unexpected_exception",
                     exc_info=True,
                 )
-                return None
+                return None, exc
 
     def _log_tier3_failure(
         self,
@@ -518,6 +601,32 @@ class Cascade:
         # outside a run context — the helper no-ops when the contextvar
         # bucket is unset.
         record_tier3_fallback(kind=fallback_kind)
+
+
+def _advance_on_counted(
+    counters: RepairCounters,
+    stage: Literal["tier2", "tier3"],
+    failure: BaseException | None,
+) -> tuple[RepairCounters, bool]:
+    """Advance the per-*stage* counter iff *failure* is counted-class.
+
+    Returns the (possibly-unchanged) counters plus whether the cap was
+    reached on this advance — the trigger for emitting
+    ``influx:<stage>-terminal``.  Transient failures (and the degenerate
+    ``failure is None``) leave the counter untouched, matching
+    :func:`influx.repair_counters.classify_failure`.  The ``## Repair``
+    bullet grammar stays in ``repair_counters`` (via ``bump_tier{2,3}``);
+    this only decides *when* to advance.
+    """
+    if failure is None or classify_failure(failure) != "counted":
+        return counters, False
+    failure_stage = getattr(failure, "stage", "") or ""
+    error = str(failure)
+    if stage == "tier2":
+        counters = counters.bump_tier2(stage=failure_stage, error=error)
+        return counters, counters.tier2_attempts >= REPAIR_COUNTED_CAP
+    counters = counters.bump_tier3(stage=failure_stage, error=error)
+    return counters, counters.tier3_attempts >= REPAIR_COUNTED_CAP
 
 
 def _text_tag_for(flavour: TextFlavour | None) -> str:
