@@ -1,9 +1,10 @@
 """Production-default repair hooks (PRD 07 US-016).
 
 Bridges the PRD 06 hook signatures (``ReExtractArchiveHook``,
-``Tier2EnrichHook``, ``Tier3ExtractHook``) to the lower-level
-extraction and enrichment helpers from PRD 07 (``extraction.html``,
-``extraction.pdf``, ``enrich.tier3_extract``).
+``Tier2EnrichHook``) to the lower-level extraction helpers from PRD 07
+(``extraction.html``, ``extraction.pdf``).  Tier 3 recovery is no longer
+a hook — the sweep runs it through the shared
+:class:`~influx.cascade.Cascade` (finding 3, 3a.2).
 
 The ``SweepHooks`` test-injection seam is preserved unchanged: these
 defaults are only wired in when ``sweep()`` is called without explicit
@@ -23,14 +24,10 @@ from influx.archive_policy import (
     registry_from_config as _archive_policy_registry_from_config,
 )
 from influx.canonical_note import (
-    FULL_TEXT,
-    extract_section_body,
     insert_full_text_section,
-    insert_tier3_sections,
 )
 from influx.config import AppConfig
-from influx.enrich import tier3_extract as _tier3_extract
-from influx.errors import ExtractionError, LCMAError, NetworkError
+from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article
 from influx.extraction.html import _clean_html_fragments, _strip_tags
 from influx.extraction.pdf import extract_pdf
@@ -44,7 +41,6 @@ from influx.repair import (
     SweepHooks,
     TextExtractionHook,
     Tier2EnrichHook,
-    Tier3ExtractHook,
 )
 from influx.storage import download_archive
 from influx.urls import url_hash
@@ -55,18 +51,8 @@ _log = logging.getLogger(__name__)
 
 # ── Content manipulation helpers ────────────────────────────────────
 #
-# The section-shape ops (insert Full Text / Tier 3, find the insertion point,
-# extract a section body) are owned by :mod:`influx.canonical_note` and
-# imported above.  Only ``_extract_title`` — a title locator with no canonical
-# equivalent — remains local.
-
-_TITLE_RE = re.compile(r"^# ([^\r\n]+)", re.MULTILINE)
-
-
-def _extract_title(content: str) -> str:
-    """Extract the ``# Title`` from note content."""
-    m = _TITLE_RE.search(content)
-    return m.group(1) if m else ""
+# The section-shape ops (insert Full Text, find the insertion point) are
+# owned by :mod:`influx.canonical_note` and imported above.
 
 
 # ── Archive file reading ────────────────────────────────────────────
@@ -1012,50 +998,6 @@ def _make_tier2_enrich_hook(config: AppConfig) -> Tier2EnrichHook:
     return hook
 
 
-def _make_tier3_extract_hook(config: AppConfig) -> Tier3ExtractHook:
-    """Create the production ``tier3_extract`` hook.
-
-    Reads the ``## Full Text`` body from the note, calls
-    ``enrich.tier3_extract``, inserts the four Tier 3 sections,
-    and adds the ``influx:deep-extracted`` tag.
-    """
-
-    def hook(note: dict[str, object]) -> None:
-        content: str = str(note.get("content", ""))
-        tags: list[str] = _note_tags(note)
-
-        # Extract full text from note content.
-        full_text = extract_section_body(content, FULL_TEXT)
-        if not full_text:
-            raise ExtractionError(
-                "No ## Full Text section found in note",
-                stage="parse",
-                detail="Cannot run Tier 3 extraction without full text",
-            )
-
-        title = _extract_title(content)
-
-        # Call the Tier 3 extraction model.
-        try:
-            tier3_result = _tier3_extract(
-                title=title,
-                full_text=full_text,
-                config=config,
-            )
-        except LCMAError:
-            raise  # Propagate — the sweep treats LCMAError as stage failure.
-
-        # Insert Tier 3 sections into content.
-        note["content"] = insert_tier3_sections(content, tier3_result)
-
-        # Add influx:deep-extracted tag.
-        if "influx:deep-extracted" not in tags:
-            tags.append("influx:deep-extracted")
-            note["tags"] = tags
-
-    return hook
-
-
 # ── Public factory ──────────────────────────────────────────────────
 
 
@@ -1063,10 +1005,11 @@ def _make_tier3_extract_hook(config: AppConfig) -> Tier3ExtractHook:
 class DefaultSweepHooks:
     """Production-default sweep hook wiring with non-optional callables.
 
-    Holds the five production hooks with non-``Optional`` types so
+    Holds the four production hooks with non-``Optional`` types so
     pyright can statically know they are wired, while the parent
     :class:`~influx.repair.SweepHooks` keeps them ``| None`` to preserve
-    the test-injection seam.
+    the test-injection seam.  (Tier 3 recovery is not a hook — the sweep
+    runs it through the shared Cascade; finding 3, 3a.2.)
 
     Use :meth:`to_sweep_hooks` to obtain a ``SweepHooks`` instance for
     passing into :func:`influx.repair.sweep`.
@@ -1075,7 +1018,6 @@ class DefaultSweepHooks:
     archive_download: ArchiveDownloadHook
     re_extract_archive: ReExtractArchiveHook
     tier2_enrich: Tier2EnrichHook
-    tier3_extract: Tier3ExtractHook
     text_extraction: TextExtractionHook
 
     def to_sweep_hooks(self) -> SweepHooks:
@@ -1084,7 +1026,6 @@ class DefaultSweepHooks:
             archive_download=self.archive_download,
             re_extract_archive=self.re_extract_archive,
             tier2_enrich=self.tier2_enrich,
-            tier3_extract=self.tier3_extract,
             text_extraction=self.text_extraction,
         )
 
@@ -1104,6 +1045,5 @@ def make_default_sweep_hooks(config: AppConfig) -> DefaultSweepHooks:
         archive_download=_make_archive_download_hook(config),
         re_extract_archive=_make_re_extract_archive_hook(config),
         tier2_enrich=_make_tier2_enrich_hook(config),
-        tier3_extract=_make_tier3_extract_hook(config),
         text_extraction=_make_text_extraction_hook(config),
     )

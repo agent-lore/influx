@@ -16,7 +16,6 @@ from influx.repair import (
     ReExtractArchiveHook,
     ReExtractionResult,
     Tier2EnrichHook,
-    Tier3ExtractHook,
 )
 
 # ── Fake hook implementations for substitution tests ─────────────────
@@ -81,17 +80,6 @@ def _fake_tier2_raises(note: dict[str, object]) -> None:
     raise ExtractionError(
         "tier2 failed",
         stage="full-text",
-    )
-
-
-def _fake_tier3(note: dict[str, object]) -> None:
-    pass
-
-
-def _fake_tier3_raises(note: dict[str, object]) -> None:
-    raise ExtractionError(
-        "tier3 failed",
-        stage="deep-extract",
     )
 
 
@@ -176,17 +164,6 @@ class TestTier2EnrichHookSubstitution:
 
     def test_raises_extraction_error(self) -> None:
         hook: Tier2EnrichHook = _fake_tier2_raises
-        with pytest.raises(ExtractionError):
-            hook({"id": "n1"})
-
-
-class TestTier3ExtractHookSubstitution:
-    def test_success_callable(self) -> None:
-        hook: Tier3ExtractHook = _fake_tier3
-        hook({"id": "n1"})  # should not raise
-
-    def test_raises_extraction_error(self) -> None:
-        hook: Tier3ExtractHook = _fake_tier3_raises
         with pytest.raises(ExtractionError):
             hook({"id": "n1"})
 

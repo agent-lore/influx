@@ -3,7 +3,9 @@
 Verifies that ``make_default_sweep_hooks`` creates hooks conforming to
 the PRD 06 signatures, that the ``re_extract_archive`` hook returns
 the correct ``ReExtractionResult`` variants, and that ``tier2_enrich``
-and ``tier3_extract`` mutate the note dict correctly.
+mutates the note dict correctly.  (Tier 3 recovery is no longer a
+production hook — it runs through the shared Cascade; its behaviour is
+covered by ``test_repair_sweep.py`` and ``test_cascade.py``.)
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from influx.config import (
     ExtractionConfig,
     StorageConfig,
 )
-from influx.errors import ExtractionError, LCMAError
+from influx.errors import ExtractionError
 from influx.repair import (
     ExtractionOutcome,
     ReExtractionResult,
@@ -28,10 +30,8 @@ from influx.repair import (
 )
 from influx.repair_hooks import (
     DefaultSweepHooks,
-    _extract_title,
     make_default_sweep_hooks,
 )
-from influx.schemas import Tier3Extraction
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -144,7 +144,6 @@ class TestMakeDefaultSweepHooks:
         assert sweep_hooks.archive_download is not None
         assert sweep_hooks.re_extract_archive is not None
         assert sweep_hooks.tier2_enrich is not None
-        assert sweep_hooks.tier3_extract is not None
         assert sweep_hooks.text_extraction is not None
 
     def test_archive_download_wired(self, tmp_path: Path) -> None:
@@ -345,121 +344,6 @@ class TestTier2EnrichFailure:
             hooks.tier2_enrich(note)
 
 
-# ── tier3_extract hook ───────────────────────────────────────────────
-
-
-class TestTier3ExtractSuccess:
-    """Production tier3_extract inserts Tier 3 sections and tag."""
-
-    def test_inserts_tier3_sections(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(full_text="This is the full extracted text.")
-
-        with patch("influx.repair_hooks._tier3_extract") as mock_t3:
-            mock_t3.return_value = Tier3Extraction(
-                claims=["Claim A", "Claim B"],
-                datasets=["Dataset 1"],
-                builds_on=["Ref 1"],
-                open_questions=["Question 1"],
-                potential_connections=["Connection 1"],
-            )
-            hooks.tier3_extract(note)
-
-        content: str = str(note["content"])
-        assert "## Claims" in content
-        assert "- Claim A" in content
-        assert "- Claim B" in content
-        assert "## Datasets & Benchmarks" in content
-        assert "- Dataset 1" in content
-        assert "## Builds On" in content
-        assert "- Ref 1" in content
-        assert "## Open Questions" in content
-        assert "- Question 1" in content
-
-    def test_adds_deep_extracted_tag(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(full_text="Full text here.")
-
-        with patch("influx.repair_hooks._tier3_extract") as mock_t3:
-            mock_t3.return_value = Tier3Extraction(
-                claims=["Claim"],
-            )
-            hooks.tier3_extract(note)
-
-        tags: list[str] = list(note.get("tags", []))
-        assert "influx:deep-extracted" in tags
-
-    def test_does_not_duplicate_deep_extracted_tag(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(full_text="Full text here.")
-        note["tags"] = list(note["tags"]) + ["influx:deep-extracted"]
-
-        with patch("influx.repair_hooks._tier3_extract") as mock_t3:
-            mock_t3.return_value = Tier3Extraction(claims=["Claim"])
-            hooks.tier3_extract(note)
-
-        tags: list[str] = list(note.get("tags", []))
-        assert tags.count("influx:deep-extracted") == 1
-
-    def test_tier3_sections_before_profile_relevance(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(full_text="Full text content.")
-
-        with patch("influx.repair_hooks._tier3_extract") as mock_t3:
-            mock_t3.return_value = Tier3Extraction(
-                claims=["Claim"],
-                datasets=["DS"],
-                builds_on=["Ref"],
-                open_questions=["Q"],
-            )
-            hooks.tier3_extract(note)
-
-        content: str = str(note["content"])
-        claims_pos = content.find("## Claims")
-        profile_pos = content.find("## Profile Relevance")
-        user_notes_pos = content.find("## User Notes")
-        assert claims_pos < profile_pos
-        assert claims_pos < user_notes_pos
-
-
-class TestTier3ExtractFailure:
-    """tier3_extract raises on failure."""
-
-    def test_raises_on_no_full_text(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(full_text=None)
-
-        with pytest.raises(ExtractionError, match="No ## Full Text"):
-            hooks.tier3_extract(note)
-
-    def test_propagates_lcma_error(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(full_text="Full text content here.")
-
-        with patch("influx.repair_hooks._tier3_extract") as mock_t3:
-            mock_t3.side_effect = LCMAError("model failed", model="extract")
-            with pytest.raises(LCMAError):
-                hooks.tier3_extract(note)
-
-
-# ── Content manipulation helpers ─────────────────────────────────────
-
-
-class TestExtractTitle:
-    def test_extracts_title(self) -> None:
-        content = "---\nfm\n---\n# My Paper Title\n\nbody"
-        assert _extract_title(content) == "My Paper Title"
-
-    def test_returns_empty_on_no_title(self) -> None:
-        assert _extract_title("no title here") == ""
-
-
 # NOTE: the ## Full Text / Tier 3 section-shape helpers moved to
 # influx.canonical_note in PR 2; their behaviour is covered by
 # tests/unit/test_canonical_note.py (extract_section_body, insert_full_text_
@@ -476,22 +360,21 @@ class TestSweepHooksInjectionSeam:
         """Test injection via SweepHooks still works."""
         call_count = 0
 
-        def fake_tier3(note: dict[str, object]) -> None:
+        def fake_tier2(note: dict[str, object]) -> None:
             nonlocal call_count
             call_count += 1
 
-        hooks = SweepHooks(tier3_extract=fake_tier3)
+        hooks = SweepHooks(tier2_enrich=fake_tier2)
         # Narrow the optional callable; this is the test-injection seam,
         # not the production-default factory.
-        assert hooks.tier3_extract is not None
-        hooks.tier3_extract({"id": "n1"})
+        assert hooks.tier2_enrich is not None
+        hooks.tier2_enrich({"id": "n1"})
         assert call_count == 1
 
     def test_empty_sweep_hooks_has_none_hooks(self) -> None:
         hooks = SweepHooks()
         assert hooks.re_extract_archive is None
         assert hooks.tier2_enrich is None
-        assert hooks.tier3_extract is None
         assert hooks.archive_download is None
         assert hooks.text_extraction is None
 
