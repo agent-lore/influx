@@ -152,8 +152,10 @@ class TestNoStubMarkers:
 #     in src/influx/lithos_client.py.
 #
 # PRD 06 (Repair Sweep + text-terminal + Retry-Order):
-#   - Seam: Hooks for re_extract_archive, tier2_enrich, tier3_extract are
-#     test-injectable callables that PRD 07 wires to real implementations.
+#   - Seam: Hooks for re_extract_archive and text_extraction are
+#     test-injectable callables that PRD 07 wires to real implementations
+#     (Tier 2 / Tier 3 recovery moved onto the shared Cascade in finding 3,
+#     3a.2 / 3a.3).
 #   - Resolution: PRD 07 (Extraction + Enrichment) replaced all hook stubs
 #     with real extraction/enrichment logic.  Confirmed: no stub hooks
 #     remain in src/influx/repair_hooks.py or src/influx/repair.py.

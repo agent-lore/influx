@@ -1,15 +1,15 @@
 """Unit tests for hook-mutation rollback (finding #1).
 
-Hooks (``archive_download``, ``re_extract_archive``, ``tier2_enrich``)
+Hooks (``archive_download``, ``re_extract_archive``, ``text_extraction``)
 receive the live mutable note dict.  When a hook raises
 ``ExtractionError`` / ``LithosError`` the sweep MUST treat that as
 "stage failed this pass" (per US-003 / US-013) and MUST NOT persist any
 partial in-place mutations the hook applied before raising.
 
-(Tier 3 is no longer a hook — it runs through the shared Cascade, which
-returns a value rather than mutating the note in place, so there is no
-partial-mutation to roll back.  The failing-Tier-3 invariant lives in
-``test_repair_sweep.py``.)
+(Tier 2 and Tier 3 are no longer hooks — they run through the shared
+Cascade, which returns a value rather than mutating the note in place,
+so there is no partial-mutation to roll back.  The failing-tier
+invariants live in ``test_repair_sweep.py``.)
 
 Each test below provides a fake hook that mutates ``note["tags"]`` (and
 sometimes ``note["content"]``) and then raises; the sweep is expected
@@ -335,48 +335,3 @@ class TestReExtractArchiveRollback:
 
         assert "influx:text-terminal" in result
         assert "text:abstract-only" in result
-
-
-# ── tier2_enrich rollback ───────────────────────────────────────────
-
-
-class TestTier2EnrichRollback:
-    """A failing tier2 hook must not leak ``full-text`` into the rewrite."""
-
-    async def test_tier2_hook_appends_full_text_then_raises(self) -> None:
-        items = [{"id": "n1", "title": "Paper"}]
-        # Score 9 ≥ default full_text threshold (8) so tier2 is selected.
-        read_notes = [
-            {
-                "id": "n1",
-                "title": "Paper",
-                "content": (
-                    "## Archive\npath: a.pdf\n"
-                    "## Profile Relevance\n"
-                    "### p\nScore: 9/10\n"
-                ),
-                "tags": [
-                    "influx:repair-needed",
-                    "text:html",
-                    "profile:p",
-                ],
-            }
-        ]
-
-        def bad_tier2(note: dict[str, object]) -> None:
-            tags = list(note.get("tags", []))  # type: ignore[arg-type]
-            tags.append("full-text")
-            note["tags"] = tags
-            raise ExtractionError("tier2 failed", stage="full-text")
-
-        config = _make_config()
-        client = _make_client(list_items=items, read_responses=read_notes)
-        hooks = SweepHooks(tier2_enrich=bad_tier2)
-
-        await sweep("p", client=client, config=config, hooks=hooks)
-
-        args = _last_write_args(client)
-        # full-text mutation from the failing hook MUST NOT survive.
-        assert "full-text" not in args["tags"]
-        # Stage failed so influx:repair-needed must remain.
-        assert "influx:repair-needed" in args["tags"]

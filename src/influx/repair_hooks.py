@@ -1,10 +1,12 @@
 """Production-default repair hooks (PRD 07 US-016).
 
 Bridges the PRD 06 hook signatures (``ReExtractArchiveHook``,
-``Tier2EnrichHook``) to the lower-level extraction helpers from PRD 07
-(``extraction.html``, ``extraction.pdf``).  Tier 3 recovery is no longer
-a hook — the sweep runs it through the shared
-:class:`~influx.cascade.Cascade` (finding 3, 3a.2).
+``TextExtractionHook``) to the lower-level extraction helpers from PRD
+07 (``extraction.html``, ``extraction.pdf``).  Tier 2 and Tier 3
+recovery are no longer hooks — the sweep runs them through the shared
+:class:`~influx.cascade.Cascade` (finding 3, 3a.2 / 3a.3); this module
+supplies the sweep's archive-reading :data:`~influx.cascade.Tier2Extractor`
+via :func:`make_sweep_tier2_extractor`.
 
 The ``SweepHooks`` test-injection seam is preserved unchanged: these
 defaults are only wired in when ``sweep()`` is called without explicit
@@ -23,16 +25,13 @@ import trafilatura
 from influx.archive_policy import (
     registry_from_config as _archive_policy_registry_from_config,
 )
-from influx.canonical_note import (
-    insert_full_text_section,
-)
+from influx.cascade import Acquired, TextFlavour, Tier2Extractor, Tier2Result
 from influx.config import AppConfig
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article
 from influx.extraction.html import _clean_html_fragments, _strip_tags
 from influx.extraction.pdf import extract_pdf
 from influx.extraction.pipeline import extract_arxiv_text
-from influx.notes import parse_archive_path, parse_note
 from influx.repair import (
     ArchiveDownloadHook,
     ExtractionOutcome,
@@ -40,12 +39,15 @@ from influx.repair import (
     ReExtractionResult,
     SweepHooks,
     TextExtractionHook,
-    Tier2EnrichHook,
 )
 from influx.storage import download_archive
 from influx.urls import url_hash
 
-__all__ = ["DefaultSweepHooks", "make_default_sweep_hooks"]
+__all__ = [
+    "DefaultSweepHooks",
+    "make_default_sweep_hooks",
+    "make_sweep_tier2_extractor",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -952,50 +954,39 @@ def _make_re_extract_archive_hook(
     return hook
 
 
-def _make_tier2_enrich_hook(config: AppConfig) -> Tier2EnrichHook:
-    """Create the production ``tier2_enrich`` hook.
+def make_sweep_tier2_extractor(config: AppConfig) -> Tier2Extractor:
+    """Create the sweep's Tier 2 extractor for :class:`~influx.cascade.Cascade`.
 
-    Reads the stored archive, extracts text, inserts ``## Full Text``
-    into the note content, and adds the ``full-text`` tag.
+    Re-extracts full text from the note's already-downloaded archive
+    file — the source-agnostic recovery path.  The Cascade owns the
+    counter lifecycle and section rendering; this extractor only turns
+    an :class:`~influx.cascade.Acquired` into a
+    :class:`~influx.cascade.Tier2Result`.
+
+    A missing archive path raises a counted ``parse`` failure (exactly
+    as the old ``tier2_enrich`` hook did), so the Tier-2 cap still trips
+    for a note that never gains an archive.  Archive-read and extraction
+    failures raise transient stages (``archive_read`` / ``extract`` /
+    ``min_length``) that keep ``influx:repair-needed`` without advancing
+    the counter.
     """
 
-    def hook(note: dict[str, object]) -> None:
-        content: str = str(note.get("content", ""))
-        tags: list[str] = _note_tags(note)
-
-        # Find archive path from note content.
-        try:
-            parsed = parse_note(content)
-            archive_path = parse_archive_path(parsed)
-        except Exception as exc:
-            raise ExtractionError(
-                "Cannot parse archive path from note",
-                stage="parse",
-                detail=str(exc),
-            ) from exc
-
-        if archive_path is None:
+    def extractor(acquired: Acquired) -> Tier2Result:
+        if not acquired.archive_path:
             raise ExtractionError(
                 "No archive path found in note",
                 stage="parse",
                 detail="## Archive section missing or empty",
             )
 
-        # Read and extract from archive.
-        file_bytes = _read_archive_file(config, archive_path)
-        extracted_text, _source_tag = _extract_from_archive(
-            file_bytes, archive_path, config
+        file_bytes = _read_archive_file(config, acquired.archive_path)
+        text, text_tag = _extract_from_archive(
+            file_bytes, acquired.archive_path, config
         )
+        flavour: TextFlavour = "pdf" if text_tag == "text:pdf" else "html"
+        return Tier2Result(text=text, flavour=flavour, text_tag=text_tag)
 
-        # Insert ## Full Text section into content.
-        note["content"] = insert_full_text_section(content, extracted_text)
-
-        # Add full-text tag.
-        if "full-text" not in tags:
-            tags.append("full-text")
-            note["tags"] = tags
-
-    return hook
+    return extractor
 
 
 # ── Public factory ──────────────────────────────────────────────────
@@ -1005,11 +996,12 @@ def _make_tier2_enrich_hook(config: AppConfig) -> Tier2EnrichHook:
 class DefaultSweepHooks:
     """Production-default sweep hook wiring with non-optional callables.
 
-    Holds the four production hooks with non-``Optional`` types so
+    Holds the three production hooks with non-``Optional`` types so
     pyright can statically know they are wired, while the parent
     :class:`~influx.repair.SweepHooks` keeps them ``| None`` to preserve
-    the test-injection seam.  (Tier 3 recovery is not a hook — the sweep
-    runs it through the shared Cascade; finding 3, 3a.2.)
+    the test-injection seam.  (Tier 2 and Tier 3 recovery are not hooks
+    — the sweep runs them through the shared Cascade; finding 3,
+    3a.2 / 3a.3.)
 
     Use :meth:`to_sweep_hooks` to obtain a ``SweepHooks`` instance for
     passing into :func:`influx.repair.sweep`.
@@ -1017,7 +1009,6 @@ class DefaultSweepHooks:
 
     archive_download: ArchiveDownloadHook
     re_extract_archive: ReExtractArchiveHook
-    tier2_enrich: Tier2EnrichHook
     text_extraction: TextExtractionHook
 
     def to_sweep_hooks(self) -> SweepHooks:
@@ -1025,7 +1016,6 @@ class DefaultSweepHooks:
         return SweepHooks(
             archive_download=self.archive_download,
             re_extract_archive=self.re_extract_archive,
-            tier2_enrich=self.tier2_enrich,
             text_extraction=self.text_extraction,
         )
 
@@ -1044,6 +1034,5 @@ def make_default_sweep_hooks(config: AppConfig) -> DefaultSweepHooks:
     return DefaultSweepHooks(
         archive_download=_make_archive_download_hook(config),
         re_extract_archive=_make_re_extract_archive_hook(config),
-        tier2_enrich=_make_tier2_enrich_hook(config),
         text_extraction=_make_text_extraction_hook(config),
     )

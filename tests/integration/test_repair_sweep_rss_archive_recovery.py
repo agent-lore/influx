@@ -12,9 +12,9 @@ The flow exercised here:
   ``archive_download`` succeeds → ``archive-missing`` cleared,
   ``## Archive`` populated with ``path:``.
 - Pass 2: feed run-1 written note back → ``re_extract_archive`` returns
-  ``UPGRADE`` → ``text:abstract-only`` replaced by ``text:html`` →
-  ``tier2_enrich`` adds ``full-text`` → the shared Cascade's Tier 3
-  adds ``influx:deep-extracted`` → ``influx:repair-needed`` cleared.
+  ``UPGRADE`` → ``text:abstract-only`` replaced by ``text:html`` → the
+  shared Cascade's Tier 2 adds ``full-text`` and its Tier 3 adds
+  ``influx:deep-extracted`` → ``influx:repair-needed`` cleared.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ from typing import Any
 
 import pytest
 
-from influx.canonical_note import insert_full_text_section
 from influx.config import (
     AppConfig,
     FeedbackConfig,
@@ -46,7 +45,7 @@ from influx.repair import (
     sweep,
 )
 from tests.contract.test_lithos_client import FakeLithosServer
-from tests.integration._cascade_fakes import Tier3SuccessCascade
+from tests.integration._cascade_fakes import Tier2Tier3SuccessCascade
 
 # ── Fixtures ───────────────────────────────────────────────────────
 
@@ -214,22 +213,6 @@ def _re_extract_upgrade_html(
     )
 
 
-def _add_tag_in_place(note: dict[str, object], tag: str) -> None:
-    raw = note.get("tags") or []
-    tags = list(raw) if isinstance(raw, list) else []
-    if tag not in tags:
-        tags.append(tag)
-    note["tags"] = tags
-
-
-def _tier2_enrich_adds_full_text(note: dict[str, object]) -> None:
-    # Mirror the production Tier 2 hook: insert the ``## Full Text`` section
-    # (not just the tag) so the Cascade's Tier-3 stage has body to read.
-    content = str(note.get("content", ""))
-    note["content"] = insert_full_text_section(content, "Recovered full text body.")
-    _add_tag_in_place(note, "full-text")
-
-
 # ── Tests ──────────────────────────────────────────────────────────
 
 
@@ -324,14 +307,14 @@ class TestRssArchiveRecoveryFlow:
 
             hooks_p2 = SweepHooks(
                 re_extract_archive=_re_extract_upgrade_html,
-                tier2_enrich=_tier2_enrich_adds_full_text,
             )
             await sweep(
                 "ai-robotics",
                 client=client,
                 config=config,
                 hooks=hooks_p2,
-                cascade=Tier3SuccessCascade(),  # type: ignore[arg-type]
+                # One fake drives both Tier 2 (full text) and Tier 3 (claims).
+                cascade=Tier2Tier3SuccessCascade(),  # type: ignore[arg-type]
             )
 
             write_calls_p2 = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
@@ -344,8 +327,8 @@ class TestRssArchiveRecoveryFlow:
             assert "influx:deep-extracted" in p2_payload["tags"]
 
             # Tier 3 wrote its sections into the note content, not just the
-            # tag — Tier3SuccessCascade returns claims=["A recovered claim."],
-            # so the Cascade output is inserted via insert_tier3_sections.
+            # tag — Tier2Tier3SuccessCascade returns claims=["A recovered
+            # claim."], inserted via insert_tier3_sections.
             assert "## Claims" in p2_payload["content"]
             assert "A recovered claim." in p2_payload["content"]
 

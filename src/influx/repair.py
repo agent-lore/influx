@@ -7,11 +7,12 @@ Tier 2, Tier 3) based on the current tag set, and rewriting every
 visited note so ``updated_at`` advances (retry-order advancement).
 
 Worker hooks (``archive_download``, ``re_extract_archive``,
-``tier2_enrich``, ``text_extraction``) are test-injectable callables
-whose real implementations ship with PRD 07.  Tier 3 recovery is no
-longer a hook: it runs through the shared
+``text_extraction``) are test-injectable callables whose real
+implementations ship with PRD 07.  Tier 2 and Tier 3 recovery are no
+longer hooks: they run through the shared
 :class:`~influx.cascade.Cascade` passed to :func:`sweep` (finding 3,
-3a.2), which the isolation tests inject the same way they inject hooks.
+3a.2 / 3a.3), which the isolation tests inject the same way they
+inject hooks.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import json
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from influx import metrics
 from influx.canonical_note import (
@@ -33,6 +34,7 @@ from influx.canonical_note import (
     drop_tier2_and_tier3,
     extract_section_body,
     graft_user_notes,
+    insert_full_text_section,
     insert_tier3_sections,
     parse_lenient,
     upsert_archive_path,
@@ -43,6 +45,7 @@ from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.notes import merge_tags
 from influx.repair_counters import (
     CountedStage,
+    RepairCounters,
     classify_failure,
     parse_repair_section,
     record_counted_failure,
@@ -51,7 +54,7 @@ from influx.repair_counters import (
 from influx.telemetry import current_run_id, get_tracer
 
 if TYPE_CHECKING:
-    from influx.cascade import Tier
+    from influx.cascade import EnrichedSections, Tier, Tier2Extractor
     from influx.config import AppConfig
     from influx.lithos_client import LithosClient
 
@@ -66,7 +69,6 @@ __all__ = [
     "SweepHooks",
     "SweepWriteError",
     "TextExtractionHook",
-    "Tier2EnrichHook",
     "apply_abstract_only_reextraction",
     "compute_clearing",
     "select_stages",
@@ -199,35 +201,6 @@ class ReExtractArchiveHook(Protocol):
     ) -> ReExtractionResult: ...
 
 
-class Tier2EnrichHook(Protocol):
-    """Callable protocol for Tier 2 enrichment retry (PRD 06 §4).
-
-    Called by the sweep when a note is missing ``full-text``, the
-    current max profile score meets the threshold, and
-    ``influx:text-terminal`` is absent.
-
-    The implementation performs full-text enrichment and updates the
-    note accordingly.  On success, the note should carry ``full-text``
-    after the sweep's rewrite.
-
-    Parameters
-    ----------
-    note:
-        The current note state (as returned by ``lithos_read``).
-
-    Raises
-    ------
-    ExtractionError
-        On enrichment failure — the sweep treats this as "stage
-        failed this pass" and keeps ``influx:repair-needed``.
-    LithosError
-        On Lithos API failure — propagated to the sweep's error
-        handling.
-    """
-
-    def __call__(self, note: dict[str, object]) -> None: ...
-
-
 class ArchiveDownloadHook(Protocol):
     """Callable protocol for archive download retry (PRD 04).
 
@@ -303,15 +276,14 @@ class SweepHooks:
     stage selection would otherwise select it.  PRD 07 wires the real
     implementations; tests inject fakes.
 
-    Tier 3 is no longer a hook: it runs through the shared
+    Tier 2 and Tier 3 are no longer hooks: they run through the shared
     :class:`~influx.cascade.Cascade` passed to :func:`sweep` (finding 3,
-    3a.2), so an absent cascade skips Tier 3 the same way an absent hook
-    skips its stage.
+    3a.2 / 3a.3), so an absent cascade skips both tiers the same way an
+    absent hook skips its stage.
     """
 
     archive_download: ArchiveDownloadHook | None = None
     re_extract_archive: ReExtractArchiveHook | None = None
-    tier2_enrich: Tier2EnrichHook | None = None
     text_extraction: TextExtractionHook | None = None
 
 
@@ -424,8 +396,8 @@ def select_stages(
 def _snapshot_note(note: dict[str, Any]) -> dict[str, Any]:
     """Deep-copy mutable note state for hook-call rollback.
 
-    Hooks (``archive_download``, ``re_extract_archive``, ``tier2_enrich``,
-    ``tier3_extract``) receive the live mutable note dict.  When a hook
+    Hooks (``archive_download``, ``re_extract_archive``,
+    ``text_extraction``) receive the live mutable note dict.  When a hook
     raises ``ExtractionError`` / ``LithosError`` the sweep treats that
     as "stage failed this pass" (per US-003 / US-013) and must NOT
     persist any partial in-place mutations the hook applied before
@@ -1147,70 +1119,31 @@ def _run_text_extraction_retry(
         return new_tags
 
 
-def _run_tier_retry(
-    note: dict[str, Any],
-    *,
-    profile: str,
-    current_tags: list[str],
-    hook: Tier2EnrichHook,
-    stage: CountedStage,
-    log_subject: str,
-) -> list[str]:
-    """Run the Tier 2 enrichment retry stage.
-
-    Wraps the hook in the counted-failure cap / terminal-tag flip /
-    hook-mutation rollback envelope, parameterised on *stage* and the
-    log subject used for the per-stage failure WARN line.  (Tier 3 now
-    runs through the Cascade — see :func:`_run_tier3_via_cascade`.)
-    """
-    try:
-        with _stage_attempt(
-            note,
-            profile=profile,
-            kind=stage,
-            span_name=f"influx.repair.{stage}",
-            sync_tags=current_tags,
-        ):
-            hook(note)
-        # Sync any tag/content mutations the hook applied to the note
-        # dict back into the working tag set.
-        return list(note.get("tags", current_tags))
-    except (ExtractionError, LCMAError, LithosError) as exc:
-        new_tags = _apply_counted_failure(
-            note=note,
-            current_tags=current_tags,
-            exc=exc,
-            profile=profile,
-            stage=stage,
-            failure_stage=getattr(exc, "stage", "") or "",
-        )
-        _log_stage_failure(
-            log_subject,
-            note=note,
-            profile=profile,
-            exc=exc,
-        )
-        return new_tags
-
-
-# ── Tier 3 recovery via the shared Cascade (finding 3, 3a.2) ────────
+# ── Tier 2 / Tier 3 recovery via the shared Cascade (finding 3) ─────
 #
-# The sweep re-runs Tier 3 through the same ``Cascade.enrich`` the create
-# path uses instead of a bespoke ``tier3_extract`` hook: reconstruct an
-# ``Acquired`` from the persisted note, run only the Tier-3 stage with the
-# note's ``## Repair`` counters, and apply the outcome surgically via the
-# canonical section ops.  Tier 2 (source-coupled extraction) and Tier 1
-# stay outside the Cascade for now — 3a.3 / 3a.4.
+# The sweep re-runs Tier 2 and Tier 3 through the same ``Cascade.enrich``
+# the create path uses instead of bespoke ``tier2_enrich`` / ``tier3_extract``
+# hooks: reconstruct an ``Acquired`` from the persisted note, run only the
+# stage being retried with the note's ``## Repair`` counters, and apply the
+# outcome surgically via the canonical section ops.  Tier 1 recovery stays
+# outside the Cascade for now — 3a.4.
 
+_TIER2_ONLY: frozenset[Tier] = frozenset(("tier2",))
 _TIER3_ONLY: frozenset[Tier] = frozenset(("tier3",))
 
 
-def _build_sweep_cascade(config: AppConfig, profile: str) -> Cascade:
+def _build_sweep_cascade(
+    config: AppConfig,
+    profile: str,
+    *,
+    tier2_extractor: Tier2Extractor | None = None,
+) -> Cascade:
     """Build the profile's enrichment Cascade for the repair sweep.
 
-    Tier-3-only for now (3a.2): ``tier2_extractor`` is left unset because
-    the sweep does not yet route Tier 2 through the Cascade — that stage's
-    source-coupled extractor dispatch is 3a.3.
+    ``tier2_extractor`` re-extracts a note's full text from its stored
+    archive (3a.3); the production sweep wires the archive extractor while
+    tests inject a fake or leave it unset to skip Tier 2.  Tier 3 needs no
+    extractor — it runs on the note's existing ``## Full Text``.
     """
     profile_cfg = next((p for p in config.profiles if p.name == profile), None)
     return Cascade(
@@ -1218,25 +1151,142 @@ def _build_sweep_cascade(config: AppConfig, profile: str) -> Cascade:
         profile_name=profile,
         profile_summary=profile_cfg.description if profile_cfg else "",
         thresholds=profile_cfg.thresholds if profile_cfg else ProfileThresholds(),
+        tier2_extractor=tier2_extractor,
     )
 
 
-def _reconstruct_acquired(note: dict[str, Any], *, full_text: str) -> Acquired:
-    """Rebuild the minimal ``Acquired`` the Cascade's Tier 3 needs.
+def _reconstruct_acquired(
+    note: dict[str, Any],
+    *,
+    extracted_text: str | None = None,
+    archive_path: str | None = None,
+) -> Acquired:
+    """Rebuild the minimal ``Acquired`` a Cascade recovery stage needs.
 
-    Tier 3 reads only ``item_id`` / ``title`` / ``extracted_text``; the
-    other fields are filled defensively from the note so the same helper
-    can grow to feed Tier 2 (3a.3) and Tier 1 (3a.4).  ``title`` comes
-    from the note's doc-level title (``read_note`` strips the ``# Title``
-    from ``content``), which is a strictly more reliable source than the
-    old hook's parse of the stripped body.
+    Tier 2 reads ``archive_path`` (its extractor re-reads the stored
+    archive) with ``extracted_text=None`` so the Tier-2 gate fires; Tier 3
+    reads ``extracted_text`` (the note's existing full text).  ``title``
+    comes from the note's doc-level title (``read_note`` strips the
+    ``# Title`` from ``content``), a strictly more reliable source than the
+    old hooks' parse of the stripped body.  Tier 1 (3a.4) will add
+    ``abstract``.
     """
     return Acquired(
         item_id=str(note.get("id") or ""),
         source_url=str(note.get("source_url") or ""),
         title=_doc_title(note),
         abstract="",
-        extracted_text=full_text,
+        extracted_text=extracted_text,
+        archive_path=archive_path,
+    )
+
+
+def _apply_enrich_recovery_failure(
+    *,
+    note: dict[str, Any],
+    content: str,
+    current_tags: list[str],
+    sections: EnrichedSections,
+    counters_before: RepairCounters,
+    stage: Literal["tier2", "tier3"],
+    profile: str,
+) -> list[str]:
+    """Persist a cascade recovery stage's counted-failure outcome.
+
+    Shared by the Tier-2 and Tier-3 sweep handlers: when ``enrich`` advanced
+    the ``## Repair`` counters (a counted-class failure) persist them, apply
+    any newly-tripped ``influx:<stage>-terminal`` flag, and emit the
+    terminal-flip WARNING.  Transient failures leave counters and tags
+    untouched — only ``influx:repair-needed`` stays, which the clearing step
+    preserves.
+    """
+    new_tags = list(current_tags)
+    if sections.counters != counters_before:
+        note["content"] = upsert_repair_section(content, sections.counters)
+    newly_terminal = [t for t in sections.terminal_flags if t not in current_tags]
+    new_tags.extend(newly_terminal)
+    if f"influx:{stage}-terminal" in newly_terminal:
+        attempts = getattr(sections.counters, f"{stage}_attempts")
+        logger.warning(
+            "sweep: %s marked terminal after %d counted failures for %s",
+            stage,
+            attempts,
+            note.get("id", "?"),
+            extra={
+                "sweep_stage": f"{stage}_terminal_flip",
+                "note_id": note.get("id"),
+                "profile": profile,
+                "run_id": current_run_id.get() or "",
+                f"{stage}_attempts": attempts,
+                # The counted stage that tripped the cap survives in the
+                # ## Repair counters even though ``enrich`` swallowed the
+                # exception, so operators still see *which* stage failed.
+                "stage": getattr(sections.counters, f"{stage}_last_stage"),
+            },
+        )
+    note["tags"] = list(new_tags)
+    return new_tags
+
+
+def _run_tier2_via_cascade(
+    note: dict[str, Any],
+    *,
+    profile: str,
+    current_tags: list[str],
+    cascade: Cascade,
+    archive_path: str | None,
+    max_profile_score: int,
+) -> list[str]:
+    """Re-run Tier 2 (full-text enrichment) through the shared Cascade (3a.3).
+
+    Replaces the bespoke ``tier2_enrich`` sweep hook.  The Cascade's
+    ``tier2_extractor`` re-extracts full text from the note's stored archive
+    (``archive_path``); on success the ``## Full Text`` section is inserted and
+    the ``full-text`` tag added.  On a counted-class failure the advanced
+    counters + ``influx:tier2-terminal`` are persisted — notably a missing
+    archive path, which the extractor raises as ``parse`` so ``enrich`` advances
+    the Tier-2 counter, exactly as the old hook did.
+    """
+    content = str(note.get("content") or "")
+    metrics.repair_candidates().add(1, {"profile": profile, "kind": "tier2"})
+
+    counters_before = parse_repair_section(content)
+    acquired = _reconstruct_acquired(note, archive_path=archive_path)
+
+    tracer = get_tracer()
+    with tracer.span(
+        "influx.repair.tier2",
+        attributes={
+            "influx.note_id": note.get("id", ""),
+            "influx.profile": profile,
+            "influx.run_id": current_run_id.get() or "",
+        },
+    ):
+        sections = cascade.enrich(
+            acquired,
+            max_profile_score,
+            stages=_TIER2_ONLY,
+            counters=counters_before,
+        )
+
+    if sections.full_text is not None:
+        new_tags = list(current_tags)
+        note["content"] = insert_full_text_section(content, sections.full_text)
+        if "full-text" not in new_tags:
+            new_tags.append("full-text")
+        note["tags"] = list(new_tags)
+        return new_tags
+
+    # Failure — ``enrich`` advanced the counters on a counted-class failure
+    # (transient leaves them); ``influx:repair-needed`` stays for next pass.
+    return _apply_enrich_recovery_failure(
+        note=note,
+        content=content,
+        current_tags=current_tags,
+        sections=sections,
+        counters_before=counters_before,
+        stage="tier2",
+        profile=profile,
     )
 
 
@@ -1281,7 +1331,7 @@ def _run_tier3_via_cascade(
         return new_tags
 
     counters_before = parse_repair_section(content)
-    acquired = _reconstruct_acquired(note, full_text=full_text)
+    acquired = _reconstruct_acquired(note, extracted_text=full_text)
 
     tracer = get_tracer()
     with tracer.span(
@@ -1299,8 +1349,8 @@ def _run_tier3_via_cascade(
             counters=counters_before,
         )
 
-    new_tags = list(current_tags)
     if sections.tier3 is not None:
+        new_tags = list(current_tags)
         note["content"] = insert_tier3_sections(content, sections.tier3)
         if "influx:deep-extracted" not in new_tags:
             new_tags.append("influx:deep-extracted")
@@ -1309,29 +1359,15 @@ def _run_tier3_via_cascade(
 
     # Failure — ``enrich`` already logged the Tier-3 failure and advanced
     # the counters on a counted-class failure (transient leaves them).
-    if sections.counters != counters_before:
-        note["content"] = upsert_repair_section(content, sections.counters)
-    newly_terminal = [t for t in sections.terminal_flags if t not in current_tags]
-    new_tags.extend(newly_terminal)
-    if "influx:tier3-terminal" in newly_terminal:
-        logger.warning(
-            "sweep: tier3 marked terminal after %d counted failures for %s",
-            sections.counters.tier3_attempts,
-            note.get("id", "?"),
-            extra={
-                "sweep_stage": "tier3_terminal_flip",
-                "note_id": note.get("id"),
-                "profile": profile,
-                "run_id": current_run_id.get() or "",
-                "tier3_attempts": sections.counters.tier3_attempts,
-                # The counted stage that tripped the cap survives in the
-                # ## Repair counters even though ``enrich`` swallowed the
-                # exception, so operators still see *which* stage failed.
-                "stage": sections.counters.tier3_last_stage,
-            },
-        )
-    note["tags"] = list(new_tags)
-    return new_tags
+    return _apply_enrich_recovery_failure(
+        note=note,
+        content=content,
+        current_tags=current_tags,
+        sections=sections,
+        counters_before=counters_before,
+        stage="tier3",
+        profile=profile,
+    )
 
 
 def _doc_title(note: dict[str, Any]) -> str:
@@ -1454,15 +1490,15 @@ async def _process_sweep_note(
             hook=hooks.re_extract_archive,
         )
 
-    if stages.tier2_retry and hooks.tier2_enrich:
+    if stages.tier2_retry and cascade is not None:
         current_tags = await asyncio.to_thread(
-            _run_tier_retry,
+            _run_tier2_via_cascade,
             note,
             profile=profile,
             current_tags=current_tags,
-            hook=hooks.tier2_enrich,
-            stage="tier2",
-            log_subject="tier2_enrichment",
+            cascade=cascade,
+            archive_path=archive_path,
+            max_profile_score=max_profile_score,
         )
 
     if stages.tier3_retry and cascade is not None:
@@ -1553,11 +1589,20 @@ async def sweep(
         effective_hooks = hooks
         effective_cascade = cascade
     else:
-        from influx.repair_hooks import make_default_sweep_hooks
+        from influx.repair_hooks import (
+            make_default_sweep_hooks,
+            make_sweep_tier2_extractor,
+        )
 
         effective_hooks = make_default_sweep_hooks(config).to_sweep_hooks()
         effective_cascade = (
-            cascade if cascade is not None else _build_sweep_cascade(config, profile)
+            cascade
+            if cascade is not None
+            else _build_sweep_cascade(
+                config,
+                profile,
+                tier2_extractor=make_sweep_tier2_extractor(config),
+            )
         )
 
     limit = config.repair.max_items_per_run

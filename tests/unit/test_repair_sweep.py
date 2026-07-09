@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from influx.cascade import Acquired, Tier2Result
 from influx.config import AppConfig, RepairConfig
 from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.repair import (
@@ -863,47 +864,76 @@ class TestStageFailureLogging:
         ]
         assert 'tier3_last_stage: "validate"' in write_calls[-1].args[1]["content"]
 
-    async def test_tier2_failure_logs_warning_with_extra(
-        self,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        import logging
+    async def test_tier2_counted_failure_persists_counter_via_cascade(self) -> None:
+        """The sweep now runs Tier 2 through the shared Cascade (3a.3).
 
+        Unlike Tier 1 / Tier 3, a Tier-2 failure degrades *silently* at the
+        Cascade level (no per-pass WARNING) — but a counted-class failure
+        (here an unparseable archive → ``parse``) still advances the durable
+        ``## Repair`` counter and keeps ``influx:repair-needed`` for the next
+        pass, because ``enrich`` owns the counter lifecycle.
+        """
+        # Score 8 selects tier2 (>= full_text 8) but not tier3 (< deep_extract
+        # 9), isolating the Tier-2 path in a single-cascade sweep.
+        content = (
+            "---\n"
+            "source_url: https://example.com/n2\n"
+            "tags: []\n"
+            "confidence: 0.9\n"
+            "---\n"
+            "# Paper\n\n"
+            "## Archive\n"
+            "path: arxiv/2026/04/paper.pdf\n\n"
+            "## Summary\n"
+            "Summary\n\n"
+            "## Profile Relevance\n"
+            "### ai-robotics\n"
+            "Score: 8/10\n"
+            "Relevant\n\n"
+            "## User Notes\n"
+        )
+        note = {
+            "id": "n2",
+            "title": "Paper",
+            "content": content,
+            "tags": ["influx:repair-needed", "text:html"],
+            "source_url": "https://example.com/n2",
+            "confidence": 0.9,
+        }
         items = [{"id": "n2", "title": "Paper"}]
-        note = self._note("n2", with_full_text=False)
-        # Strip ``full-text`` so tier2_retry is selected.
-        note["tags"] = ["influx:repair-needed", "text:html"]
 
-        def failing(note: dict[str, object]) -> None:
-            del note
-            raise LCMAError(
-                "Tier 2 enrichment HTTP failure",
-                model="enrich",
-                stage="http",
-                detail="connect timeout",
+        def failing_extractor(acquired: Acquired) -> Tier2Result:
+            del acquired
+            raise ExtractionError(
+                "archive unparseable",
+                stage="parse",
+                detail="counted failure",
             )
 
         config = _make_config()
         client = _make_client(list_items=items, read_responses=[note])
 
-        with caplog.at_level(logging.WARNING, logger="influx.repair"):
-            await sweep(
-                "ai-robotics",
-                client=client,
-                config=config,
-                hooks=SweepHooks(tier2_enrich=failing),
-            )
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(),
+            cascade=_build_sweep_cascade(
+                config, "ai-robotics", tier2_extractor=failing_extractor
+            ),
+        )
 
-        matching = [
-            r
-            for r in caplog.records
-            if getattr(r, "sweep_stage", None) == "tier2_enrichment"
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
         ]
-        assert matching
-        rec = matching[0]
-        assert getattr(rec, "exc_type", None) == "LCMAError"
-        assert getattr(rec, "stage", None) == "http"
-        assert rec.exc_info is not None
+        rewritten = write_calls[-1].args[1]
+        # Counted failure advanced the durable counter + persisted the stage.
+        assert "tier2_attempts: 1" in rewritten["content"]
+        assert 'tier2_last_stage: "parse"' in rewritten["content"]
+        # Stage failed → repair-needed stays, full-text not added, not terminal.
+        assert "influx:repair-needed" in rewritten["tags"]
+        assert "full-text" not in rewritten["tags"]
+        assert "influx:tier2-terminal" not in rewritten["tags"]
 
 
 # ── Layer 2 self-repair: counter + terminal flip ─────────────────────
