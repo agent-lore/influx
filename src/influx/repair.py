@@ -1565,13 +1565,14 @@ async def sweep(
         the production defaults are wired (and, unless *cascade* is
         given, the production :class:`~influx.cascade.Cascade` too).
         When supplied explicitly (tests), only the given hooks/cascade
-        are used — stages whose hook (or, for Tier 3, the cascade) is
-        absent are skipped, but notes are still rewritten.
+        are used — stages whose hook (or, for Tier 2 / Tier 3, the
+        cascade) is absent are skipped, but notes are still rewritten.
     cascade:
-        Optional enrichment Cascade for the Tier-3 recovery stage
-        (finding 3, 3a.2).  ``None`` skips Tier 3 exactly as an absent
-        hook skips its stage; the production path builds one when
-        *hooks* is ``None``.
+        Optional enrichment Cascade driving the Tier-2 and Tier-3
+        recovery stages (finding 3, 3a.2 / 3a.3).  ``None`` skips both
+        tiers exactly as an absent hook skips its stage; the production
+        path builds one (with the archive Tier-2 extractor) when *hooks*
+        is ``None``.
 
     Returns
     -------
