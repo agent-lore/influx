@@ -240,11 +240,11 @@ async def test_admin_endpoints_responsive_during_repair_sweep(
 ) -> None:
     """Repair sweep stage hooks must not starve the admin event loop.
 
-    Stage 1 of every Run is the repair sweep, which calls per-stage
-    sync hooks (``archive_download``, ``re_extract_archive``,
-    ``tier2_enrich``, ``tier3_extract``, ``text_extraction``) that do
-    blocking HTTP / extraction / model work — exactly the same class
-    of bug as the acquire/filter starvation.
+    Stage 1 of every Run is the repair sweep, which runs per-stage
+    sync work (the ``archive_download`` / ``re_extract_archive`` /
+    ``text_extraction`` hooks plus the shared Cascade's Tier 2 / Tier 3
+    recovery) that does blocking HTTP / extraction / model work — exactly
+    the same class of bug as the acquire/filter starvation.
 
     This test drives :func:`influx.repair._process_sweep_note`
     directly with a hook that hangs on a ``threading.Event``, so the

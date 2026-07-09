@@ -2,10 +2,12 @@
 
 Verifies that ``make_default_sweep_hooks`` creates hooks conforming to
 the PRD 06 signatures, that the ``re_extract_archive`` hook returns
-the correct ``ReExtractionResult`` variants, and that ``tier2_enrich``
-mutates the note dict correctly.  (Tier 3 recovery is no longer a
-production hook — it runs through the shared Cascade; its behaviour is
-covered by ``test_repair_sweep.py`` and ``test_cascade.py``.)
+the correct ``ReExtractionResult`` variants, and that
+``make_sweep_tier2_extractor`` turns an ``Acquired`` into a
+``Tier2Result`` (or raises the right counted/transient stage).  (Tier 2
+and Tier 3 recovery are no longer production hooks — they run through
+the shared Cascade; the sweep-level behaviour is covered by
+``test_repair_sweep.py`` and ``test_cascade.py``.)
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from influx.cascade import Acquired, Tier2Result
 from influx.config import (
     AppConfig,
     ArchivePolicyConfig,
@@ -31,6 +34,7 @@ from influx.repair import (
 from influx.repair_hooks import (
     DefaultSweepHooks,
     make_default_sweep_hooks,
+    make_sweep_tier2_extractor,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -127,6 +131,17 @@ def _make_note_dict(
     }
 
 
+def _acquired(*, archive_path: str | None) -> Acquired:
+    """Build the minimal ``Acquired`` the sweep's Tier 2 extractor reads."""
+    return Acquired(
+        item_id="note-001",
+        source_url="https://arxiv.org/abs/2601.00001",
+        title="Test Paper Title",
+        abstract="",
+        archive_path=archive_path,
+    )
+
+
 # ── make_default_sweep_hooks ─────────────────────────────────────────
 
 
@@ -143,7 +158,6 @@ class TestMakeDefaultSweepHooks:
         assert isinstance(sweep_hooks, SweepHooks)
         assert sweep_hooks.archive_download is not None
         assert sweep_hooks.re_extract_archive is not None
-        assert sweep_hooks.tier2_enrich is not None
         assert sweep_hooks.text_extraction is not None
 
     def test_archive_download_wired(self, tmp_path: Path) -> None:
@@ -268,13 +282,18 @@ class TestReExtractArchiveReturnsReExtractionResult:
         assert isinstance(result, ReExtractionResult)
 
 
-# ── tier2_enrich hook ────────────────────────────────────────────────
+# ── make_sweep_tier2_extractor ───────────────────────────────────────
 
 
-class TestTier2EnrichSuccess:
-    """Production tier2_enrich inserts ## Full Text and full-text tag."""
+class TestSweepTier2ExtractorSuccess:
+    """The sweep's Tier 2 extractor re-extracts full text from the archive.
 
-    def test_inserts_full_text_section(self, tmp_path: Path) -> None:
+    Section insertion + the ``full-text`` tag are the Cascade's / sweep's
+    job now (covered by ``test_repair_sweep.py`` + ``test_canonical_note``);
+    the extractor only produces the ``Tier2Result``.
+    """
+
+    def test_extracts_pdf(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
         archive_dir = Path(config.storage.archive_dir)
         (archive_dir / "papers").mkdir(parents=True)
@@ -282,66 +301,54 @@ class TestTier2EnrichSuccess:
         fixture_path = Path("tests/fixtures/extraction/sample.pdf")
         (archive_dir / pdf_path).write_bytes(fixture_path.read_bytes())
 
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(archive_path=pdf_path)
+        extractor = make_sweep_tier2_extractor(config)
+        result = extractor(_acquired(archive_path=pdf_path))
 
-        hooks.tier2_enrich(note)
+        assert isinstance(result, Tier2Result)
+        assert result.text
+        assert result.flavour == "pdf"
+        assert result.text_tag == "text:pdf"
 
-        content: str = str(note["content"])
-        assert "## Full Text" in content
-
-    def test_adds_full_text_tag(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
+    def test_extracts_html(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path, min_html_chars=10)
         archive_dir = Path(config.storage.archive_dir)
-        (archive_dir / "papers").mkdir(parents=True)
-        pdf_path = "papers/test.pdf"
-        fixture_path = Path("tests/fixtures/extraction/sample.pdf")
-        (archive_dir / pdf_path).write_bytes(fixture_path.read_bytes())
+        (archive_dir / "pages").mkdir(parents=True)
+        html_path = "pages/article.html"
+        fixture_path = Path("tests/fixtures/extraction/good_article.html")
+        (archive_dir / html_path).write_bytes(fixture_path.read_bytes())
 
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(archive_path=pdf_path)
+        extractor = make_sweep_tier2_extractor(config)
+        result = extractor(_acquired(archive_path=html_path))
 
-        hooks.tier2_enrich(note)
+        assert result.text
+        assert result.flavour == "html"
+        assert result.text_tag == "text:html"
 
-        tags: list[str] = list(note.get("tags", []))
-        assert "full-text" in tags
 
-    def test_does_not_duplicate_full_text_tag(self, tmp_path: Path) -> None:
+class TestSweepTier2ExtractorFailure:
+    """The extractor raises ``ExtractionError`` so the Cascade can classify it."""
+
+    def test_raises_counted_parse_on_no_archive_path(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
-        archive_dir = Path(config.storage.archive_dir)
-        (archive_dir / "papers").mkdir(parents=True)
-        pdf_path = "papers/test.pdf"
-        fixture_path = Path("tests/fixtures/extraction/sample.pdf")
-        (archive_dir / pdf_path).write_bytes(fixture_path.read_bytes())
+        extractor = make_sweep_tier2_extractor(config)
 
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(archive_path=pdf_path)
-        note["tags"] = list(note["tags"]) + ["full-text"]
+        with pytest.raises(ExtractionError) as exc_info:
+            extractor(_acquired(archive_path=None))
 
-        hooks.tier2_enrich(note)
+        # Counted stage: a note that never gains an archive still trips
+        # the Tier-2 cap, exactly as the old hook raised.
+        assert exc_info.value.stage == "parse"
 
-        tags: list[str] = list(note.get("tags", []))
-        assert tags.count("full-text") == 1
-
-
-class TestTier2EnrichFailure:
-    """tier2_enrich raises ExtractionError on failure."""
-
-    def test_raises_on_missing_archive(self, tmp_path: Path) -> None:
+    def test_raises_transient_read_on_missing_file(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(archive_path="papers/missing.pdf")
+        extractor = make_sweep_tier2_extractor(config)
 
-        with pytest.raises(ExtractionError):
-            hooks.tier2_enrich(note)
+        with pytest.raises(ExtractionError) as exc_info:
+            extractor(_acquired(archive_path="papers/missing.pdf"))
 
-    def test_raises_on_no_archive_path(self, tmp_path: Path) -> None:
-        config = _make_config(tmp_path)
-        hooks = make_default_sweep_hooks(config)
-        note = _make_note_dict(archive_path=None)
-
-        with pytest.raises(ExtractionError):
-            hooks.tier2_enrich(note)
+        # Transient: the archive file is expected but temporarily unreadable,
+        # so the counter must not advance.
+        assert exc_info.value.stage == "archive_read"
 
 
 # NOTE: the ## Full Text / Tier 3 section-shape helpers moved to
@@ -360,21 +367,21 @@ class TestSweepHooksInjectionSeam:
         """Test injection via SweepHooks still works."""
         call_count = 0
 
-        def fake_tier2(note: dict[str, object]) -> None:
+        def fake_text_extraction(note: dict[str, object]) -> str:
             nonlocal call_count
             call_count += 1
+            return "text:html"
 
-        hooks = SweepHooks(tier2_enrich=fake_tier2)
+        hooks = SweepHooks(text_extraction=fake_text_extraction)
         # Narrow the optional callable; this is the test-injection seam,
         # not the production-default factory.
-        assert hooks.tier2_enrich is not None
-        hooks.tier2_enrich({"id": "n1"})
+        assert hooks.text_extraction is not None
+        assert hooks.text_extraction({"id": "n1"}) == "text:html"
         assert call_count == 1
 
     def test_empty_sweep_hooks_has_none_hooks(self) -> None:
         hooks = SweepHooks()
         assert hooks.re_extract_archive is None
-        assert hooks.tier2_enrich is None
         assert hooks.archive_download is None
         assert hooks.text_extraction is None
 

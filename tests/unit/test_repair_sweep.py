@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from influx.cascade import Acquired, Tier2Result
 from influx.config import AppConfig, RepairConfig
 from influx.errors import ExtractionError, LCMAError, LithosError
 from influx.repair import (
@@ -863,25 +864,201 @@ class TestStageFailureLogging:
         ]
         assert 'tier3_last_stage: "validate"' in write_calls[-1].args[1]["content"]
 
-    async def test_tier2_failure_logs_warning_with_extra(
+    async def test_tier2_counted_failure_persists_counter_via_cascade(self) -> None:
+        """The sweep now runs Tier 2 through the shared Cascade (3a.3).
+
+        Unlike Tier 1 / Tier 3, a Tier-2 failure degrades *silently* at the
+        Cascade level (no per-pass WARNING) — but a counted-class failure
+        (here an unparseable archive → ``parse``) still advances the durable
+        ``## Repair`` counter and keeps ``influx:repair-needed`` for the next
+        pass, because ``enrich`` owns the counter lifecycle.
+        """
+        # Score 8 selects tier2 (>= full_text 8) but not tier3 (< deep_extract
+        # 9), isolating the Tier-2 path in a single-cascade sweep.
+        content = (
+            "---\n"
+            "source_url: https://example.com/n2\n"
+            "tags: []\n"
+            "confidence: 0.9\n"
+            "---\n"
+            "# Paper\n\n"
+            "## Archive\n"
+            "path: arxiv/2026/04/paper.pdf\n\n"
+            "## Summary\n"
+            "Summary\n\n"
+            "## Profile Relevance\n"
+            "### ai-robotics\n"
+            "Score: 8/10\n"
+            "Relevant\n\n"
+            "## User Notes\n"
+        )
+        note = {
+            "id": "n2",
+            "title": "Paper",
+            "content": content,
+            "tags": ["influx:repair-needed", "text:html"],
+            "source_url": "https://example.com/n2",
+            "confidence": 0.9,
+        }
+        items = [{"id": "n2", "title": "Paper"}]
+
+        def failing_extractor(acquired: Acquired) -> Tier2Result:
+            del acquired
+            raise ExtractionError(
+                "archive unparseable",
+                stage="parse",
+                detail="counted failure",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(),
+            cascade=_build_sweep_cascade(
+                config, "ai-robotics", tier2_extractor=failing_extractor
+            ),
+        )
+
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        rewritten = write_calls[-1].args[1]
+        # Counted failure advanced the durable counter + persisted the stage.
+        assert "tier2_attempts: 1" in rewritten["content"]
+        assert 'tier2_last_stage: "parse"' in rewritten["content"]
+        # Stage failed → repair-needed stays, full-text not added, not terminal.
+        assert "influx:repair-needed" in rewritten["tags"]
+        assert "full-text" not in rewritten["tags"]
+        assert "influx:tier2-terminal" not in rewritten["tags"]
+
+
+# ── Tier 2 recovery via the shared Cascade (3a.3) ────────────────────
+
+
+class TestSweepTier2RecoveryViaCascade:
+    """Tier 2 recovery runs through the injected Cascade (3a.3): the sweep
+    reconstructs an ``Acquired`` from the persisted note, hands its archive
+    path to the Cascade's extractor, and persists the outcome (full text on
+    success; advanced ``## Repair`` counters + ``influx:tier2-terminal`` at
+    the cap).  These prove the sweep-level handoff/persistence that the
+    permissive fake-Cascade integration test cannot.
+    """
+
+    @staticmethod
+    def _note_for_tier2(
+        note_id: str, *, score: int = 8, repair_section: str = ""
+    ) -> dict[str, Any]:
+        # No ## Full Text so tier2 is selected; score 8 keeps tier3 (needs
+        # >= 9) out, isolating the Tier-2 path in a single-cascade sweep.
+        body = (
+            "---\n"
+            f"source_url: https://example.com/{note_id}\n"
+            "tags: []\n"
+            "confidence: 0.9\n"
+            "---\n"
+            "# Paper\n\n"
+            "## Archive\n"
+            "path: arxiv/2026/04/paper.pdf\n\n"
+            "## Summary\nSummary\n\n"
+            f"{repair_section}"
+            "## Profile Relevance\n"
+            f"### ai-robotics\nScore: {score}/10\nRelevant\n\n"
+            "## User Notes\n"
+        )
+        return {
+            "id": note_id,
+            "title": "Paper",
+            "content": body,
+            "tags": ["influx:repair-needed", "text:html"],
+            "source_url": f"https://example.com/{note_id}",
+            "confidence": 0.9,
+        }
+
+    @staticmethod
+    def _last_write_args(client: AsyncMock) -> dict[str, Any]:
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        return dict(write_calls[-1].args[1])
+
+    async def test_tier2_success_recovers_full_text_and_clears_repair_needed(
+        self,
+    ) -> None:
+        """Real Cascade + archive-reading extractor: the reconstructed
+        ``Acquired`` carries the note's persisted archive path, the recovered
+        text lands as ``## Full Text`` + ``full-text``, and — Tier 3 not
+        required at score 8 — ``influx:repair-needed`` clears."""
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_tier2("n1", score=8)
+
+        seen: list[str | None] = []
+
+        def extractor(acquired: Acquired) -> Tier2Result:
+            # Prove the persisted ## Archive path reached the extractor —
+            # a bug reconstructing archive_path (e.g. None) fails here.
+            seen.append(acquired.archive_path)
+            return Tier2Result(
+                text="Recovered full text body.",
+                flavour="html",
+                text_tag="text:html",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(),
+            cascade=_build_sweep_cascade(
+                config, "ai-robotics", tier2_extractor=extractor
+            ),
+        )
+
+        # The reconstructed Acquired carried the persisted archive path.
+        assert seen == ["arxiv/2026/04/paper.pdf"]
+
+        rewritten = self._last_write_args(client)
+        assert "## Full Text" in rewritten["content"]
+        assert "Recovered full text body." in rewritten["content"]
+        assert "full-text" in rewritten["tags"]
+        # Archive + text + full-text present, Tier 3 waived at score 8.
+        assert "influx:repair-needed" not in rewritten["tags"]
+
+    async def test_tier2_counted_failure_at_cap_flips_terminal_and_logs(
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """At the counted-failure cap the sweep persists ``tier2_attempts: 3``,
+        adds ``influx:tier2-terminal``, and logs
+        ``sweep_stage=tier2_terminal_flip`` — the persistence/logging step
+        that lives in repair.py, not cascade.py."""
         import logging
 
-        items = [{"id": "n2", "title": "Paper"}]
-        note = self._note("n2", with_full_text=False)
-        # Strip ``full-text`` so tier2_retry is selected.
-        note["tags"] = ["influx:repair-needed", "text:html"]
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_tier2(
+            "n1",
+            score=8,
+            repair_section=(
+                "## Repair\n"
+                "- tier2_attempts: 2\n"
+                '- tier2_last_stage: "parse"\n'
+                '- tier2_last_error: "earlier failure"\n'
+                "- tier3_attempts: 0\n"
+                '- tier3_last_stage: ""\n'
+                '- tier3_last_error: ""\n\n'
+            ),
+        )
 
-        def failing(note: dict[str, object]) -> None:
-            del note
-            raise LCMAError(
-                "Tier 2 enrichment HTTP failure",
-                model="enrich",
-                stage="http",
-                detail="connect timeout",
-            )
+        def failing(acquired: Acquired) -> Tier2Result:
+            del acquired
+            raise ExtractionError("archive unparseable", stage="parse")
 
         config = _make_config()
         client = _make_client(list_items=items, read_responses=[note])
@@ -891,19 +1068,27 @@ class TestStageFailureLogging:
                 "ai-robotics",
                 client=client,
                 config=config,
-                hooks=SweepHooks(tier2_enrich=failing),
+                hooks=SweepHooks(),
+                cascade=_build_sweep_cascade(
+                    config, "ai-robotics", tier2_extractor=failing
+                ),
             )
 
-        matching = [
+        rewritten = self._last_write_args(client)
+        assert "influx:tier2-terminal" in rewritten["tags"]
+        assert "tier2_attempts: 3" in rewritten["content"]
+        # Stage still failed → repair-needed stays for the (now-capped) note.
+        assert "influx:repair-needed" in rewritten["tags"]
+
+        flip_logs = [
             r
             for r in caplog.records
-            if getattr(r, "sweep_stage", None) == "tier2_enrichment"
+            if getattr(r, "sweep_stage", None) == "tier2_terminal_flip"
         ]
-        assert matching
-        rec = matching[0]
-        assert getattr(rec, "exc_type", None) == "LCMAError"
-        assert getattr(rec, "stage", None) == "http"
-        assert rec.exc_info is not None
+        assert flip_logs, "expected tier2_terminal_flip log"
+        rec = flip_logs[0]
+        assert getattr(rec, "tier2_attempts", None) == 3
+        assert getattr(rec, "stage", None) == "parse"
 
 
 # ── Layer 2 self-repair: counter + terminal flip ─────────────────────

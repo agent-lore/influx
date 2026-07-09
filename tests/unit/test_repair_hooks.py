@@ -15,7 +15,6 @@ from influx.repair import (
     ExtractionOutcome,
     ReExtractArchiveHook,
     ReExtractionResult,
-    Tier2EnrichHook,
 )
 
 # ── Fake hook implementations for substitution tests ─────────────────
@@ -69,17 +68,6 @@ def _fake_re_extract_raises_lithos_error(
         "lithos write failed",
         operation="write_note",
         detail="version_conflict",
-    )
-
-
-def _fake_tier2(note: dict[str, object]) -> None:
-    pass
-
-
-def _fake_tier2_raises(note: dict[str, object]) -> None:
-    raise ExtractionError(
-        "tier2 failed",
-        stage="full-text",
     )
 
 
@@ -155,17 +143,6 @@ class TestReExtractArchiveHookSubstitution:
         hook: ReExtractArchiveHook = _fake_re_extract_raises_lithos_error
         with pytest.raises(LithosError):
             hook({"id": "n1"}, "arxiv/2025/01/123.pdf")
-
-
-class TestTier2EnrichHookSubstitution:
-    def test_success_callable(self) -> None:
-        hook: Tier2EnrichHook = _fake_tier2
-        hook({"id": "n1"})  # should not raise
-
-    def test_raises_extraction_error(self) -> None:
-        hook: Tier2EnrichHook = _fake_tier2_raises
-        with pytest.raises(ExtractionError):
-            hook({"id": "n1"})
 
 
 class TestNoteSourceUrlResolution:
