@@ -6,9 +6,12 @@ oldest-``updated_at``-first, independently selecting retry stages
 Tier 2, Tier 3) based on the current tag set, and rewriting every
 visited note so ``updated_at`` advances (retry-order advancement).
 
-Worker hooks (``re_extract_archive``, ``tier2_enrich``,
-``tier3_extract``) are test-injectable callables whose real
-implementations ship with PRD 07.
+Worker hooks (``archive_download``, ``re_extract_archive``,
+``tier2_enrich``, ``text_extraction``) are test-injectable callables
+whose real implementations ship with PRD 07.  Tier 3 recovery is no
+longer a hook: it runs through the shared
+:class:`~influx.cascade.Cascade` passed to :func:`sweep` (finding 3,
+3a.2), which the isolation tests inject the same way they inject hooks.
 """
 
 from __future__ import annotations

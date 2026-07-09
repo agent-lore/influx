@@ -343,6 +343,12 @@ class TestRssArchiveRecoveryFlow:
             assert "full-text" in p2_payload["tags"]
             assert "influx:deep-extracted" in p2_payload["tags"]
 
+            # Tier 3 wrote its sections into the note content, not just the
+            # tag — Tier3SuccessCascade returns claims=["A recovered claim."],
+            # so the Cascade output is inserted via insert_tier3_sections.
+            assert "## Claims" in p2_payload["content"]
+            assert "A recovered claim." in p2_payload["content"]
+
             assert "influx:repair-needed" not in p2_payload["tags"]
 
             assert f"source:rss-{_FEED_SLUG}" in p2_payload["tags"]
