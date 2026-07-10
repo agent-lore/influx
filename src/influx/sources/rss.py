@@ -46,10 +46,14 @@ from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article, extract_article_from_html
 from influx.filter import FilterScorerError, _acall_filter_model_with_retry
 from influx.http_client import aguarded_fetch as _aguarded_fetch
-from influx.renderer import render
 from influx.repair_hooks import has_usable_source
 from influx.slugs import slugify_feed_name
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
+from influx.sources.note_builder import (
+    append_cascade_outcome_tags,
+    profile_item_dict,
+    render_note_content,
+)
 from influx.storage import download_archive
 from influx.telemetry import (
     current_run_id,
@@ -689,56 +693,42 @@ def build_rss_note_item(
         tags.append("full-text")
     if archive_missing and "influx:repair-needed" not in tags:
         tags.append("influx:repair-needed")
-    if sections.tier3 is not None:
-        tags.append("influx:deep-extracted")
-    for flag in sections.repair_flags:
-        if flag not in tags:
-            tags.append(flag)
-    for flag in sections.terminal_flags:
-        if flag not in tags:
-            tags.append(flag)
+    append_cascade_outcome_tags(tags, sections)
 
     # Note storage path: articles/{source_tag}/{YYYY}/{MM} (FR-NOTE-2)
     path = f"articles/{item.source_tag}/{pub.year}/{pub.month:02d}"
 
-    # Suppress the plain-text summary when Tier 1 was attempted but
-    # failed (AC-07-A / FR-ENR-6).  When Tier 1 was not attempted
-    # (e.g. score below threshold), keep the extracted/feed summary so
-    # ``## Summary`` renders the fallback body.
-    summary_for_note = (
-        "" if sections.tier1_attempted and sections.tier1 is None else summary
-    )
-
-    content = render(
+    # The Tier-1-attempted-but-failed summary suppression (AC-07-A /
+    # FR-ENR-6) lives in the shared renderer helper.  When Tier 1 was
+    # not attempted (e.g. score below threshold), the extracted/feed
+    # summary is kept so ``## Summary`` renders the fallback body.
+    content = render_note_content(
         title=item.title,
         tags=tags,
         confidence=confidence,
         archive_path=archive_path,
-        summary=summary_for_note,
+        summary=summary,
         profile_name=profile_name,
         score=score,
         reason=reason,
-        tier1_enrichment=sections.tier1,
-        full_text=sections.full_text,
-        tier3_extraction=sections.tier3,
+        sections=sections,
     )
 
-    return {
-        "id": f"rss-{feed_slug}-{hash_val}",
-        "title": item.title,
-        "source": "rss",
-        "source_url": source_url,
-        "content": content,
-        "tags": tags,
-        "filter_tags": list(filter_tags) if filter_tags is not None else [],
-        "score": score,
-        "confidence": confidence,
-        "reason": reason,
-        "path": path,
-        "abstract_or_summary": summary,
-        "contributions": sections.tier1.contributions if sections.tier1 else None,
-        "builds_on": list(sections.tier3.builds_on) if sections.tier3 else None,
-    }
+    return profile_item_dict(
+        item_id=f"rss-{feed_slug}-{hash_val}",
+        title=item.title,
+        source="rss",
+        source_url=source_url,
+        content=content,
+        tags=tags,
+        filter_tags=filter_tags,
+        score=score,
+        confidence=confidence,
+        reason=reason,
+        path=path,
+        abstract_or_summary=summary,
+        sections=sections,
+    )
 
 
 async def _score_rss_items(

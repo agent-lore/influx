@@ -51,9 +51,13 @@ from influx.errors import NetworkError
 from influx.extraction.pipeline import extract_arxiv_text
 from influx.filter import FilterScorerError
 from influx.http_client import guarded_fetch
-from influx.renderer import render
 from influx.repair_hooks import has_usable_source
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
+from influx.sources.note_builder import (
+    append_cascade_outcome_tags,
+    profile_item_dict,
+    render_note_content,
+)
 from influx.storage import download_archive
 from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
@@ -1323,55 +1327,41 @@ def build_arxiv_note_item(
     # missing archive is visible in tags before the cascade's outcomes.
     if archive_missing and "influx:repair-needed" not in tags:
         tags.append("influx:repair-needed")
-    if sections.tier3 is not None:
-        tags.append("influx:deep-extracted")
-    for flag in sections.repair_flags:
-        if flag not in tags:
-            tags.append(flag)
-    for flag in sections.terminal_flags:
-        if flag not in tags:
-            tags.append(flag)
+    append_cascade_outcome_tags(tags, sections)
 
     # ── Render note ───────────────────────────────────────────────
-    # When Tier 1 was attempted but failed, suppress the plain-text
-    # summary so ## Summary is omitted entirely (AC-07-A / FR-ENR-6).
-    summary_text = item.abstract
-    if sections.tier1_attempted and sections.tier1 is None:
-        summary_text = ""
-
-    content = render(
+    # The Tier-1-attempted-but-failed summary suppression (AC-07-A /
+    # FR-ENR-6) lives in the shared renderer helper.
+    content = render_note_content(
         title=item.title,
         tags=tags,
         confidence=confidence,
         archive_path=archive_path,
-        summary=summary_text,
+        summary=item.abstract,
         profile_name=profile_name,
         score=score,
         reason=reason,
-        full_text=sections.full_text,
-        tier1_enrichment=sections.tier1,
-        tier3_extraction=sections.tier3,
+        sections=sections,
     )
 
     pub = item.published
     path = f"papers/arxiv/{pub.year}/{pub.month:02d}"
 
-    return {
-        "id": f"arxiv-{item.arxiv_id}",
-        "title": item.title,
-        "source": "arxiv",
-        "source_url": source_url,
-        "content": content,
-        "tags": tags,
-        "filter_tags": list(filter_tags) if filter_tags is not None else [],
-        "score": score,
-        "confidence": confidence,
-        "reason": reason,
-        "path": path,
-        "abstract_or_summary": item.abstract,
-        "contributions": sections.tier1.contributions if sections.tier1 else None,
-        "builds_on": list(sections.tier3.builds_on) if sections.tier3 else None,
-    }
+    return profile_item_dict(
+        item_id=f"arxiv-{item.arxiv_id}",
+        title=item.title,
+        source="arxiv",
+        source_url=source_url,
+        content=content,
+        tags=tags,
+        filter_tags=filter_tags,
+        score=score,
+        confidence=confidence,
+        reason=reason,
+        path=path,
+        abstract_or_summary=item.abstract,
+        sections=sections,
+    )
 
 
 def _make_arxiv_tier2_extractor(
