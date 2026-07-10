@@ -24,6 +24,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -49,7 +50,7 @@ from influx.config import (
 from influx.coordinator import RunKind
 from influx.errors import NetworkError
 from influx.extraction.pipeline import extract_arxiv_text
-from influx.filter import FilterScorerError
+from influx.filter import BatchScorer, Filter
 from influx.http_client import guarded_fetch
 from influx.repair_hooks import has_usable_source
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
@@ -65,7 +66,6 @@ from influx.telemetry import (
     get_tracer,
     record_empty_source_write,
     record_fetched_items,
-    record_filter_error,
     record_source_acquisition_error,
     record_source_cooldown_skip,
     record_source_retry,
@@ -1705,10 +1705,11 @@ def make_arxiv_item_provider(
     tests that want deterministic scoring without standing up a real
     LLM.  When set it takes precedence over *filter_scorer*.
 
-    When NEITHER scorer is configured the provider falls back to
-    score ``0`` (abstract-only, no extraction or enrichment) so a
-    misconfigured deployment still produces notes — it does NOT
-    fabricate a score equal to ``thresholds.full_text``.
+    When NEITHER scorer is configured (no ``[models.filter]`` slot) the
+    run yields zero items rather than fabricating scores, so a
+    misconfigured deployment completes cleanly instead of ingesting
+    unscored notes (``Filter.score`` returns an empty list when its
+    scorer is ``None``).
 
     Parameters
     ----------
@@ -1741,15 +1742,43 @@ def make_arxiv_item_provider(
         if not candidates:
             return ()
 
-        # ── 2. Filter.score (per-item or batched seams) ───────────
-        scored_list = await _score_arxiv_candidates(
-            candidates,
-            profile_cfg=profile_cfg,
-            filter_prompt=filter_prompt,
-            batch_size=int(config.filter.batch_size),
-            scorer=scorer,
-            filter_scorer=filter_scorer,
+        # ── 2. Filter.score (shared score-gated seam, finding 2.3) ──
+        # The per-item ``scorer`` (test) and batched ``filter_scorer``
+        # (production) seams are adapted onto the source-agnostic
+        # ``BatchScorer`` and driven through ``influx.filter.Filter`` so
+        # arXiv shares its chunk + threshold-gate + drop implementation
+        # with the other sources instead of re-implementing it.  The
+        # ``influx.filter`` span stays at this call site (rather than
+        # moving into ``Filter.score``) so it keeps arXiv's exact
+        # telemetry and does not change ``Filter`` for other callers.
+        if scorer is not None:
+            batch_scorer: BatchScorer | None = _batch_scorer_from_item_scorer(scorer)
+        elif filter_scorer is not None:
+            batch_scorer = _batch_scorer_from_arxiv_filter_scorer(filter_scorer)
+        else:
+            batch_scorer = None
+        arxiv_filter = Filter(
+            config=config, profile_cfg=profile_cfg, scorer=batch_scorer
         )
+        # Batched LLM scoring is wrapped in the ``influx.filter`` span; the
+        # per-item test scorer path emits none, matching the prior
+        # ``_score_arxiv_candidates`` behaviour.
+        span_cm = (
+            get_tracer().span(
+                "influx.filter",
+                attributes={
+                    "influx.profile": profile,
+                    "influx.run_id": current_run_id.get() or "",
+                    "influx.item_count": len(candidates),
+                },
+            )
+            if (filter_scorer is not None and scorer is None)
+            else nullcontext()
+        )
+        with span_cm:
+            scored_list = await arxiv_filter.score(
+                candidates, filter_prompt=filter_prompt, source="arxiv"
+            )
 
         # ── 3. Bind per-item acquire as closures (#125) ────────────
         # ``Source.acquire`` is invoked by the Run's Acquire stage after
@@ -1787,116 +1816,70 @@ def make_arxiv_item_provider(
     return provider
 
 
-# ── Score helper for the legacy provider seams ─────────────────────
+# ── Filter BatchScorer adapters (finding 2.3) ──────────────────────
 
 
-async def _score_arxiv_candidates(
-    candidates: list[Candidate],
-    *,
-    profile_cfg: ProfileConfig,
-    filter_prompt: str,
-    batch_size: int,
-    scorer: ArxivScorer | None,
-    filter_scorer: ArxivFilterScorer | None,
-) -> list[ScoredCandidate]:
-    """Score arXiv candidates via the per-item or batched legacy seams.
+def _batch_scorer_from_item_scorer(scorer: ArxivScorer) -> BatchScorer:
+    """Adapt a per-item :data:`ArxivScorer` (test seam) to a ``BatchScorer``.
 
-    Mirrors the contract from PRD 07 §5.6:
-
-    - Per-item *scorer* takes precedence when supplied (test seam).
-    - Batched *filter_scorer* is the production default.  When the
-      scorer raises :class:`FilterScorerError`, the whole batch is
-      skipped (FR-FLT-6 / spec §7.1) — items are not ingested with a
-      default score.
-    - Items absent from the filter response are dropped (FR-FLT-7).
-    - Items below ``profile_cfg.thresholds.relevance`` are dropped.
-    - When NEITHER scorer is wired the function returns an empty list
-      so misconfigured deployments still complete the run cleanly.
+    The synchronous per-item scorer maps each ``ArxivItem`` to an
+    ``ArxivScoreResult`` (or ``None`` to drop); the adapter runs it over a
+    chunk's candidates and returns the ``{item_id: ScoredCandidate}``
+    mapping :meth:`influx.filter.Filter.score` consumes.  It never raises
+    :class:`FilterScorerError`, so ``Filter`` never drops the batch on
+    this path.
     """
-    profile = profile_cfg.name
-    threshold = profile_cfg.thresholds.relevance
-    drop_attrs = {"profile": profile, "decision": "drop"}
-    pass_attrs = {"profile": profile, "decision": "pass"}
 
-    # Per-item synchronous scorer (test seam)
-    if scorer is not None:
-        kept: list[ScoredCandidate] = []
+    async def _batch(
+        candidates: list[Candidate], profile: str, filter_prompt: str
+    ) -> dict[str, ScoredCandidate]:
+        del filter_prompt
+        out: dict[str, ScoredCandidate] = {}
         for cand in candidates:
-            arxiv_item = cand.payload
-            score_result = scorer(arxiv_item, profile)
-            if score_result is None or score_result.score < threshold:
-                metrics.articles_filtered().add(1, drop_attrs)
-                continue
-            metrics.articles_filtered().add(1, pass_attrs)
-            kept.append(
-                ScoredCandidate(
+            result = scorer(cand.payload, profile)
+            if result is not None:
+                out[cand.item_id] = ScoredCandidate(
                     candidate=cand,
-                    score=score_result.score,
-                    confidence=score_result.confidence,
-                    reason=score_result.reason,
-                    filter_tags=score_result.filter_tags,
+                    score=result.score,
+                    confidence=result.confidence,
+                    reason=result.reason,
+                    filter_tags=result.filter_tags,
                 )
-            )
-        return kept
+        return out
 
-    if filter_scorer is None:
-        # No scorer wired: drop every item rather than fabricating a score.
-        for _ in candidates:
-            metrics.articles_filtered().add(1, drop_attrs)
-        return []
+    return _batch
 
-    # Batched scorer is the production default — chunk into
-    # ``filter.batch_size`` requests so the configured tunable shapes
-    # runtime behaviour (AC-X-1).
-    batch_size = max(batch_size, 1)
-    chunked_scores: dict[str, ArxivScoreResult] = {}
-    tracer = get_tracer()
-    with tracer.span(
-        "influx.filter",
-        attributes={
-            "influx.profile": profile,
-            "influx.run_id": current_run_id.get() or "",
-            "influx.item_count": len(candidates),
-        },
-    ):
-        for chunk_start in range(0, len(candidates), batch_size):
-            chunk = candidates[chunk_start : chunk_start + batch_size]
-            chunk_items = [c.payload for c in chunk]
-            try:
-                chunk_scores = await filter_scorer(chunk_items, profile, filter_prompt)
-            except FilterScorerError:
-                _log.warning(
-                    "filter_scorer failed for profile %r; skipping batch",
-                    profile,
-                    exc_info=True,
-                )
-                # FR-FLT-6 / spec §7.1: failed batch is skipped, not
-                # ingested with a default score.
-                for _ in candidates:
-                    metrics.articles_filtered().add(1, drop_attrs)
-                # #85 review: distinguish a scorer execution failure
-                # (transport/parse/provider error) from a clean filter
-                # rejection.  The ledger uses this to fire
-                # ``filter_error`` instead of misclassifying as
-                # ``filter_stall``.
-                record_filter_error()
-                return []
-            chunked_scores.update(chunk_scores)
 
-    kept = []
-    for cand in candidates:
-        score_result = chunked_scores.get(cand.item_id)
-        if score_result is None or score_result.score < threshold:
-            metrics.articles_filtered().add(1, drop_attrs)
-            continue
-        metrics.articles_filtered().add(1, pass_attrs)
-        kept.append(
-            ScoredCandidate(
-                candidate=cand,
-                score=score_result.score,
-                confidence=score_result.confidence,
-                reason=score_result.reason,
-                filter_tags=score_result.filter_tags,
-            )
+def _batch_scorer_from_arxiv_filter_scorer(
+    filter_scorer: ArxivFilterScorer,
+) -> BatchScorer:
+    """Adapt a batched :data:`ArxivFilterScorer` to a ``BatchScorer``.
+
+    The arXiv filter scorer returns ``{arxiv_id: ArxivScoreResult}`` for a
+    chunk of items; the adapter re-associates each result with its
+    ``Candidate`` and yields the ``{item_id: ScoredCandidate}`` mapping
+    :meth:`influx.filter.Filter.score` consumes.  :class:`FilterScorerError`
+    from the underlying scorer propagates so ``Filter`` applies its
+    whole-batch-drop (FR-FLT-6).
+    """
+
+    async def _batch(
+        candidates: list[Candidate], profile: str, filter_prompt: str
+    ) -> dict[str, ScoredCandidate]:
+        by_id = {c.item_id: c for c in candidates}
+        results = await filter_scorer(
+            [c.payload for c in candidates], profile, filter_prompt
         )
-    return kept
+        return {
+            rid: ScoredCandidate(
+                candidate=by_id[rid],
+                score=r.score,
+                confidence=r.confidence,
+                reason=r.reason,
+                filter_tags=r.filter_tags,
+            )
+            for rid, r in results.items()
+            if rid in by_id
+        }
+
+    return _batch
