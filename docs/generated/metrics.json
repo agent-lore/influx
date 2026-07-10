@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 653
+    "total_functions": 656
   },
   "domain": {
     "associations": 5,
@@ -320,11 +320,11 @@
         "classes": 2,
         "functions": 13,
         "largest_module": "influx.filter",
-        "largest_module_lines": 553,
-        "lines": 553,
+        "largest_module_lines": 550,
+        "lines": 550,
         "modules": 1,
         "public_symbols": 4,
-        "sloc": 469
+        "sloc": 466
       },
       "HttpApi": {
         "classes": 4,
@@ -398,13 +398,13 @@
       },
       "Sources": {
         "classes": 18,
-        "functions": 82,
+        "functions": 85,
         "largest_module": "influx.sources.arxiv",
-        "largest_module_lines": 1902,
-        "lines": 4588,
+        "largest_module_lines": 1885,
+        "lines": 4571,
         "modules": 11,
         "public_symbols": 37,
-        "sloc": 3515
+        "sloc": 3497
       },
       "Storage": {
         "classes": 2,
@@ -418,7 +418,7 @@
       }
     },
     "max_module": "influx.sources.arxiv",
-    "max_module_lines": 1902,
+    "max_module_lines": 1885,
     "modules_over_800": [
       "influx.config",
       "influx.http_api",
@@ -433,13 +433,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 28112,
+    "total_lines": 28092,
     "total_modules": 57,
-    "total_sloc": 21859
+    "total_sloc": 21838
   },
   "tests": {
-    "ratio": 2.47,
-    "src_lines": 28112,
-    "test_lines": 69521
+    "ratio": 2.48,
+    "src_lines": 28092,
+    "test_lines": 69699
   }
 }
