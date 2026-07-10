@@ -34,7 +34,11 @@ from influx.cascade import Acquired, Cascade, TextFlavour
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article_from_html
 from influx.extraction.pdf import extract_pdf
-from influx.renderer import render
+from influx.sources.note_builder import (
+    append_cascade_outcome_tags,
+    profile_item_dict,
+    render_note_content,
+)
 from influx.storage import archive_bytes, download_archive_autodetect
 from influx.thin_summary import is_thin_summary
 from influx.urls import normalise_url, url_hash
@@ -320,51 +324,38 @@ def build_inbox_note_item(
             tags.append("influx:repair-needed")
     if sections.full_text is not None:
         tags.append("full-text")
-    if sections.tier3 is not None:
-        tags.append("influx:deep-extracted")
-    for flag in sections.repair_flags:
-        if flag not in tags:
-            tags.append(flag)
-    for flag in sections.terminal_flags:
-        if flag not in tags:
-            tags.append(flag)
+    append_cascade_outcome_tags(tags, sections)
 
     now = datetime.now(UTC)
     path = f"articles/{source_tag}/{now.year}/{now.month:02d}"
 
-    # Suppress fallback summary when Tier 1 was attempted but failed
-    # (AC-07-A / FR-ENR-6) — mirrors the RSS builder.
-    summary_for_note = (
-        "" if sections.tier1_attempted and sections.tier1 is None else acquired.summary
-    )
-
-    content = render(
+    # The Tier-1-attempted-but-failed summary suppression (AC-07-A /
+    # FR-ENR-6) lives in the shared renderer helper — mirrors the RSS
+    # and arXiv builders.
+    content = render_note_content(
         title=title,
         tags=tags,
         confidence=confidence,
         archive_path=acquired.archive_path,
-        summary=summary_for_note,
+        summary=acquired.summary,
         profile_name=profile_name,
         score=score,
         reason=reason,
-        tier1_enrichment=sections.tier1,
-        full_text=sections.full_text,
-        tier3_extraction=sections.tier3,
+        sections=sections,
     )
 
-    return {
-        "id": f"inbox-{acquired.url_hash}",
-        "title": title,
-        "source": INBOX_SOURCE,
-        "source_url": source_url,
-        "content": content,
-        "tags": tags,
-        "filter_tags": list(filter_tags),
-        "score": score,
-        "confidence": confidence,
-        "reason": reason,
-        "path": path,
-        "abstract_or_summary": acquired.summary,
-        "contributions": sections.tier1.contributions if sections.tier1 else None,
-        "builds_on": list(sections.tier3.builds_on) if sections.tier3 else None,
-    }
+    return profile_item_dict(
+        item_id=f"inbox-{acquired.url_hash}",
+        title=title,
+        source=INBOX_SOURCE,
+        source_url=source_url,
+        content=content,
+        tags=tags,
+        filter_tags=filter_tags,
+        score=score,
+        confidence=confidence,
+        reason=reason,
+        path=path,
+        abstract_or_summary=acquired.summary,
+        sections=sections,
+    )
