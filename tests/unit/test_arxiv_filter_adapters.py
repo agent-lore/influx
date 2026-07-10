@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from influx.coordinator import RunKind
 from influx.filter import FilterScorerError
 from influx.source import Candidate
 from influx.sources.arxiv import (
@@ -20,7 +22,31 @@ from influx.sources.arxiv import (
     ArxivScoreResult,
     _batch_scorer_from_arxiv_filter_scorer,
     _batch_scorer_from_item_scorer,
+    make_arxiv_item_provider,
 )
+
+
+def _config_without_filter() -> Any:
+    """Minimal AppConfig with an arXiv profile and no ``[models.filter]``."""
+    from influx.config import (
+        AppConfig,
+        ProfileConfig,
+        PromptEntryConfig,
+        PromptsConfig,
+        ScheduleConfig,
+    )
+
+    return AppConfig(
+        schedule=ScheduleConfig(
+            cron="0 6 * * *", timezone="UTC", misfire_grace_seconds=3600
+        ),
+        profiles=[ProfileConfig(name="ai-robotics")],
+        prompts=PromptsConfig(
+            filter=PromptEntryConfig(text="t"),
+            tier1_enrich=PromptEntryConfig(text="t"),
+            tier3_extract=PromptEntryConfig(text="t"),
+        ),
+    )
 
 
 def _item(arxiv_id: str) -> ArxivItem:
@@ -107,3 +133,22 @@ class TestArxivFilterScorerAdapter:
         batch = _batch_scorer_from_arxiv_filter_scorer(filter_scorer)
         with pytest.raises(FilterScorerError):
             await batch([_cand("a")], "p", "prompt")
+
+
+class TestProviderNoScorer:
+    async def test_no_scorer_yields_zero_items(self) -> None:
+        """With neither scorer wired, the provider scores nothing and
+        yields zero bound candidates — it never fabricates a score."""
+        config = _config_without_filter()
+        provider = make_arxiv_item_provider(config)  # no scorer, no filter_scorer
+
+        with patch(
+            "influx.sources.arxiv.fetch_arxiv",
+            new_callable=MagicMock,
+            return_value=[_item("2401.00001")],
+        ):
+            bounds = list(
+                await provider("ai-robotics", RunKind.SCHEDULED, None, "prompt")
+            )
+
+        assert bounds == []
