@@ -2,14 +2,15 @@
 
 Uses :mod:`grimp` to compute actual module imports, grouped into the components
 declared in ``docs/architecture.toml``, and rewrites
-``docs/generated/architecture.md``. CI fails if the committed diagram drifts —
-so an unexpected cross-component edge shows up as a reviewable diff. The
-directional rules are enforced separately by ``test_layering_contract.py``.
+``docs/generated/architecture.md``. CI fails if the committed diagram drifts
+from the code — so an unexpected cross-component edge shows up as a reviewable
+diff. The directional rules themselves are enforced separately by
+``test_layering_contract.py`` (import-linter).
 """
 
 from __future__ import annotations
 
-from tests.meta import _diagram_toolkit as dt
+from tests.guardrail import _diagram_toolkit as dt
 
 
 def test_generate_component_diagram() -> None:
@@ -19,12 +20,10 @@ def test_generate_component_diagram() -> None:
 
 
 def test_every_internal_module_maps_to_a_component() -> None:
-    """No influx module should be missing from the component map (orphan check)."""
-    import grimp
-
+    """No internal module should be missing from the component map (orphan check)."""
     arch = dt.load_architecture()
     components = arch["components"]
-    graph = grimp.build_graph(dt.ROOT_PACKAGE)
+    graph = dt.build_import_graph()  # memoized in _common; don't rebuild
     orphans = sorted(
         m
         for m in graph.modules

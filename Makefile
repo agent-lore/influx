@@ -1,4 +1,4 @@
-.PHONY: install fmt lint typecheck test check diagrams docker-build \
+.PHONY: install fmt lint typecheck test check diagrams metrics-history metrics-diff docker-build \
 	docker-up-dev docker-up-prod docker-down-dev docker-down-prod
 
 install:
@@ -19,11 +19,23 @@ test:
 
 check: lint typecheck test
 
-# Regenerate the architecture & domain diagrams under docs/generated/.
-# Run after changing code/models and commit the result; CI fails if the
-# committed diagrams drift from the code (see .github/workflows/ci.yml).
+# Regenerate the architecture docs, metrics, and per-component pages under
+# docs/generated/. Run after changing code/models and commit the result; CI
+# fails if the committed artifacts drift from the code (.github/workflows/ci.yml).
 diagrams:
-	uv run pytest tests/meta/ -q
+	uv run pytest tests/guardrail/ -q
+
+# Print the architecture-metrics trend mined from the git history of
+# docs/generated/metrics.json. FORMAT=csv|mermaid (default csv).
+metrics-history:
+	uv run python scripts/metrics_history.py --format $(or $(FORMAT),csv)
+
+# Show the metrics delta between BASE (default origin/main) and the working tree.
+# `set -e` + `trap` so the recipe exits with metrics_diff.py's status, not rm's.
+metrics-diff:
+	@set -e; tmp=$$(mktemp); trap 'rm -f $$tmp' EXIT; \
+	git show $(or $(BASE),origin/main):docs/generated/metrics.json > $$tmp 2>/dev/null || echo '{}' > $$tmp; \
+	uv run python scripts/metrics_diff.py $$tmp docs/generated/metrics.json
 
 docker-build:
 	docker build -t influx:dev -f docker/Dockerfile .
