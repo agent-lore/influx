@@ -1126,7 +1126,8 @@ def _run_text_extraction_retry(
 # hooks: reconstruct an ``Acquired`` from the persisted note, run only the
 # stage being retried with the note's ``## Repair`` counters, and apply the
 # outcome surgically via the canonical section ops.  Tier 1 recovery stays
-# outside the Cascade for now — 3a.4.
+# outside the Cascade: re-running Tier 1 needs the source abstract, which a
+# note does not persist, so it awaits the Source-seam re-acquire (finding 3b).
 
 _TIER2_ONLY: frozenset[Tier] = frozenset(("tier2",))
 _TIER3_ONLY: frozenset[Tier] = frozenset(("tier3",))
@@ -1168,8 +1169,10 @@ def _reconstruct_acquired(
     reads ``extracted_text`` (the note's existing full text).  ``title``
     comes from the note's doc-level title (``read_note`` strips the
     ``# Title`` from ``content``), a strictly more reliable source than the
-    old hooks' parse of the stripped body.  Tier 1 (3a.4) will add
-    ``abstract``.
+    old hooks' parse of the stripped body.  ``abstract`` stays ``""``: Tier 1
+    recovery needs the source abstract, which the note does not persist, so
+    it awaits the Source-seam re-acquire (finding 3b) rather than this
+    note-only reconstruction.
     """
     return Acquired(
         item_id=str(note.get("id") or ""),
