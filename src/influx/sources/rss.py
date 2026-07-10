@@ -861,43 +861,76 @@ class RssSource:
     ) -> list[Candidate]:
         """Fetch every configured feed and flatten into a list of Candidates.
 
+        Composes :meth:`fetch_feed_candidates` across the profile's feeds.
         Each :class:`Candidate.payload` is the original
         :class:`RssFeedItem`, so :meth:`acquire` can reconstruct the
         feed-specific metadata (source_tag, feed_name) without a
         secondary lookup.
         """
         del kind, run_range
-        config = self._config
         candidates: list[Candidate] = []
         for feed_entry in profile_cfg.sources.rss:
-            items = await _fetch_rss_feed(
-                feed_entry,
-                self._cache,
-                max_download_bytes=config.storage.max_download_bytes,
-                timeout_seconds=config.storage.download_timeout_seconds,
-                profile=profile_cfg.name,
-                resilience=config.resilience,
+            candidates.extend(
+                await self.fetch_feed_candidates(feed_entry, profile_cfg=profile_cfg)
             )
-            metrics.candidates_fetched().add(
-                len(items), {"profile": profile_cfg.name, "source": "rss"}
-            )
-            # #85: per-feed pre-filter count.  Multiple feeds on one
-            # profile accumulate.  Sum-of-feeds is the correct
-            # ``fetched_total`` for filter_stall discrimination — what
-            # matters is whether ANY items reached the filter, not
-            # which feed they came from.
-            record_fetched_items(len(items))
-            for item in items:
-                candidates.append(
-                    Candidate(
-                        item_id=_rss_filter_id(item),
-                        title=item.title,
-                        abstract=item.summary,
-                        source_url=item.url,
-                        payload=item,
-                    )
-                )
         return candidates
+
+    async def fetch_feed_candidates(
+        self,
+        feed_entry: RssSourceEntry,
+        *,
+        profile_cfg: ProfileConfig,
+    ) -> list[Candidate]:
+        """Fetch a single feed and wrap its items as :class:`Candidate` records.
+
+        The per-feed fetch unit shared by :meth:`fetch_candidates` (which
+        flattens across the profile's feeds) and
+        :func:`make_rss_item_provider` (which keeps the per-feed boundary so
+        :func:`_score_rss_items` scores each feed independently).  Emits the
+        per-feed fetch telemetry: ``candidates_fetched`` + the run-level
+        ``fetched_total`` count (#85) plus the fetch start/complete INFO logs.
+        """
+        config = self._config
+        profile = profile_cfg.name
+        _log.info(
+            "rss feed fetch started profile=%s feed=%r url=%s source_tag=%s",
+            profile,
+            feed_entry.name,
+            feed_entry.url,
+            feed_entry.source_tag,
+        )
+        items = await _fetch_rss_feed(
+            feed_entry,
+            self._cache,
+            max_download_bytes=config.storage.max_download_bytes,
+            timeout_seconds=config.storage.download_timeout_seconds,
+            profile=profile,
+            resilience=config.resilience,
+        )
+        metrics.candidates_fetched().add(
+            len(items), {"profile": profile, "source": "rss"}
+        )
+        # #85: per-feed pre-filter count.  Multiple feeds on one profile
+        # accumulate.  Sum-of-feeds is the correct ``fetched_total`` for
+        # filter_stall discrimination — what matters is whether ANY items
+        # reached the filter, not which feed they came from.
+        record_fetched_items(len(items))
+        _log.info(
+            "rss feed fetch completed profile=%s feed=%r items=%d",
+            profile,
+            feed_entry.name,
+            len(items),
+        )
+        return [
+            Candidate(
+                item_id=_rss_filter_id(item),
+                title=item.title,
+                abstract=item.summary or "",
+                source_url=item.url,
+                payload=item,
+            )
+            for item in items
+        ]
 
     def acquire(
         self,
@@ -965,6 +998,13 @@ def make_rss_item_provider(
             _log.info("rss source skipped profile=%s reason=unknown_profile", profile)
             return ()
 
+        # ── Source.fetch_feed_candidates + Source.acquire (issue #57) ──
+        # Fetch and acquire route through the RssSource adapter; scoring
+        # stays on the per-feed boundary (one ``_score_rss_items`` call per
+        # feed) so chunk packing and filter-error granularity are
+        # unchanged.  Unifying scoring onto the Filter seam is finding 2.3.
+        source = RssSource(config, fetch_cache=cache)
+
         # ── Telemetry: influx.fetch.rss span (FR-OBS-4) ──
         _tracer = get_tracer()
         with _tracer.span(
@@ -977,33 +1017,10 @@ def make_rss_item_provider(
         ) as fetch_span:
             bounds: list[BoundScoredCandidate] = []
             for feed_entry in profile_cfg.sources.rss:
-                _log.info(
-                    "rss feed fetch started profile=%s feed=%r url=%s source_tag=%s",
-                    profile,
-                    feed_entry.name,
-                    feed_entry.url,
-                    feed_entry.source_tag,
+                candidates = await source.fetch_feed_candidates(
+                    feed_entry, profile_cfg=profile_cfg
                 )
-                items = await _fetch_rss_feed(
-                    feed_entry,
-                    cache,
-                    max_download_bytes=config.storage.max_download_bytes,
-                    timeout_seconds=config.storage.download_timeout_seconds,
-                    profile=profile,
-                    resilience=config.resilience,
-                )
-                metrics.candidates_fetched().add(
-                    len(items), {"profile": profile, "source": "rss"}
-                )
-                # #85: per-feed pre-filter count for the run-level
-                # ``fetched_total`` (filter_stall vs fetch_stall split).
-                record_fetched_items(len(items))
-                _log.info(
-                    "rss feed fetch completed profile=%s feed=%r items=%d",
-                    profile,
-                    feed_entry.name,
-                    len(items),
-                )
+                items = [c.payload for c in candidates]
                 try:
                     scores = await _score_rss_items(
                         items=items,
@@ -1033,8 +1050,9 @@ def make_rss_item_provider(
                 )
                 drop_attrs = {"profile": profile, "decision": "drop"}
                 pass_attrs = {"profile": profile, "decision": "pass"}
-                for item in items:
-                    scored = scores.get(_rss_filter_id(item))
+                for cand in candidates:
+                    item = cand.payload
+                    scored = scores.get(cand.item_id)
                     if scored is None:
                         metrics.articles_filtered().add(1, drop_attrs)
                         _log.info(
@@ -1079,18 +1097,12 @@ def make_rss_item_provider(
                     # Issue #125: emit a BoundScoredCandidate so the Run
                     # stage can run pre-acquire ``lithos_cache_lookup``
                     # before paying the article fetch / archive / extract
-                    # cost.  ``build_rss_note_item`` is the per-item
-                    # acquire entrypoint; issue #124's ``asyncio.to_thread``
-                    # offload moves into the closure, fired only when the
+                    # cost.  ``Source.acquire`` is the per-item acquire
+                    # entrypoint; issue #124's ``asyncio.to_thread`` offload
+                    # moves into the closure, fired only when the
                     # orchestrator decides this candidate must be acquired.
                     sc = ScoredCandidate(
-                        candidate=Candidate(
-                            item_id=_rss_filter_id(item),
-                            title=item.title,
-                            abstract=item.summary or "",
-                            source_url=item.url,
-                            payload=item,
-                        ),
+                        candidate=cand,
                         score=scored.score,
                         confidence=1.0,
                         reason=scored.reason,
@@ -1098,18 +1110,13 @@ def make_rss_item_provider(
                     )
 
                     async def _acquire(
-                        item: RssFeedItem = item,
-                        scored: Any = scored,
+                        sc: ScoredCandidate = sc,
                     ) -> dict[str, Any] | None:
                         return await asyncio.to_thread(
-                            build_rss_note_item,
-                            item=item,
-                            profile_name=profile,
+                            source.acquire,
+                            sc,
+                            profile_cfg=profile_cfg,
                             config=config,
-                            score=scored.score,
-                            confidence=1.0,
-                            reason=scored.reason,
-                            filter_tags=scored.tags,
                         )
 
                     bounds.append(
