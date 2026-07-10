@@ -20,6 +20,7 @@ arXiv / RSS / inbox adapters: fetch candidates, acquire (download/archive), and 
 | `influx.sources` | S | 1 | 1 |
 | `influx.sources.arxiv` | XL | 5 | 5 |
 | `influx.sources.inbox` | M | 1 | 3 |
+| `influx.sources.note_builder` | S | 0 | 3 |
 | `influx.sources.rss` | L | 2 | 3 |
 
 ## Public API
@@ -68,6 +69,11 @@ arXiv / RSS / inbox adapters: fetch candidates, acquire (download/archive), and 
 - def `acquire_inbox_bytes` — Download + extract one inbox URL into the fixed inbox archive subtree.
 - def `acquire_inbox_pdf` — Acquire one local PDF into the fixed ``inbox-pdf`` archive subtree.
 - def `build_inbox_note_item` — Build a complete ``ProfileItem`` for one (item, profile) ingestion.
+
+### `influx.sources.note_builder`
+- def `append_cascade_outcome_tags` — Append the cascade-driven outcome tags every builder emits.
+- def `render_note_content` — Render the canonical note, applying the shared Tier-1 summary rule.
+- def `profile_item_dict` — Assemble the 14-key ``ProfileItem`` dict the scheduler consumes.
 
 ### `influx.sources.rss`
 - class `RssFeedItem` — A single parsed item from an RSS/Atom feed.

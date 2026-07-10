@@ -13,7 +13,7 @@ lower a budget after improving the code to lock in the gain.
 |---|---:|---:|---:|
 | `component_cycles` | 3 | 3 | 0 |
 | `cross_component_edges` | 64 | 64 | 0 |
-| `max_module_lines` | 1912 | 2000 | 88 |
+| `max_module_lines` | 1902 | 2000 | 98 |
 | `module_cycles` | 3 | 3 | 0 |
 | `modules_over_800_lines` | 12 | 12 | 0 |
 
@@ -45,13 +45,13 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Orchestration | 5 | 3732 | 2911 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
 | Repair | 5 | 3934 | 3071 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 240 | 183 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
-| Sources | 10 | 4476 | 3420 | 5 | 8 | 0.62 | 38 (`influx.sources.arxiv.build_arxiv_note_item`) | 10 |
+| Sources | 11 | 4588 | 3515 | 5 | 8 | 0.62 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 10 |
 | Storage | 1 | 720 | 588 | 3 | 3 | 0.50 | 14 (`influx.storage.download_archive`) | 2 |
 
 ## Size
 
-- Modules: **56**, lines: **28000**, SLOC: **21764**
-- Largest module: `influx.sources.arxiv` (1912 lines)
+- Modules: **57**, lines: **28112**, SLOC: **21859**
+- Largest module: `influx.sources.arxiv` (1902 lines)
 - Modules over 800 lines: **12**
   - `influx.config`
   - `influx.http_api`
@@ -68,7 +68,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **650**, cyclomatic > 10: **50**
+- Functions: **653**, cyclomatic > 10: **50**
 
 Top 10 most complex functions:
 
@@ -76,16 +76,16 @@ Top 10 most complex functions:
 |---:|---|
 | 52 | `influx.run_service.ledger_lifecycle` |
 | 47 | `influx.run_ledger.RunLedger.complete` |
-| 38 | `influx.sources.arxiv.build_arxiv_note_item` |
-| 38 | `influx.sources.rss.build_rss_note_item` |
 | 31 | `influx.inbox.InboxTick._ingest_item` |
+| 28 | `influx.sources.arxiv.build_arxiv_note_item` |
+| 28 | `influx.sources.rss.build_rss_note_item` |
 | 26 | `influx.repair._process_sweep_note` |
-| 24 | `influx.sources.inbox.build_inbox_note_item` |
 | 23 | `influx.run._run_ingest_stage` |
 | 23 | `influx.run_ledger.build_degradation_summary` |
 | 22 | `influx.cascade.Cascade.enrich` |
+| 20 | `influx.promotion_gate.evaluate_promotion_gate` |
 
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.47** (69267 test lines / 28000 source lines)
+- Test-to-source line ratio: **2.47** (69521 test lines / 28112 source lines)

@@ -68,7 +68,7 @@
       },
       "Sources": {
         "functions_over_10": 10,
-        "max_complexity": 38,
+        "max_complexity": 28,
         "max_function": "influx.sources.arxiv.build_arxiv_note_item"
       },
       "Storage": {
@@ -88,24 +88,20 @@
         "qualname": "influx.run_ledger.RunLedger.complete"
       },
       {
-        "complexity": 38,
-        "qualname": "influx.sources.arxiv.build_arxiv_note_item"
-      },
-      {
-        "complexity": 38,
-        "qualname": "influx.sources.rss.build_rss_note_item"
-      },
-      {
         "complexity": 31,
         "qualname": "influx.inbox.InboxTick._ingest_item"
       },
       {
-        "complexity": 26,
-        "qualname": "influx.repair._process_sweep_note"
+        "complexity": 28,
+        "qualname": "influx.sources.arxiv.build_arxiv_note_item"
       },
       {
-        "complexity": 24,
-        "qualname": "influx.sources.inbox.build_inbox_note_item"
+        "complexity": 28,
+        "qualname": "influx.sources.rss.build_rss_note_item"
+      },
+      {
+        "complexity": 26,
+        "qualname": "influx.repair._process_sweep_note"
       },
       {
         "complexity": 23,
@@ -118,9 +114,13 @@
       {
         "complexity": 22,
         "qualname": "influx.cascade.Cascade.enrich"
+      },
+      {
+        "complexity": 20,
+        "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 650
+    "total_functions": 653
   },
   "domain": {
     "associations": 5,
@@ -398,13 +398,13 @@
       },
       "Sources": {
         "classes": 18,
-        "functions": 79,
+        "functions": 82,
         "largest_module": "influx.sources.arxiv",
-        "largest_module_lines": 1912,
-        "lines": 4476,
-        "modules": 10,
-        "public_symbols": 34,
-        "sloc": 3420
+        "largest_module_lines": 1902,
+        "lines": 4588,
+        "modules": 11,
+        "public_symbols": 37,
+        "sloc": 3515
       },
       "Storage": {
         "classes": 2,
@@ -418,7 +418,7 @@
       }
     },
     "max_module": "influx.sources.arxiv",
-    "max_module_lines": 1912,
+    "max_module_lines": 1902,
     "modules_over_800": [
       "influx.config",
       "influx.http_api",
@@ -433,13 +433,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 28000,
-    "total_modules": 56,
-    "total_sloc": 21764
+    "total_lines": 28112,
+    "total_modules": 57,
+    "total_sloc": 21859
   },
   "tests": {
     "ratio": 2.47,
-    "src_lines": 28000,
-    "test_lines": 69267
+    "src_lines": 28112,
+    "test_lines": 69521
   }
 }
