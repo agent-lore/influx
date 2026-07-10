@@ -85,8 +85,7 @@ Top 10 most complex functions:
 | 23 | `influx.run_ledger.build_degradation_summary` |
 | 22 | `influx.cascade.Cascade.enrich` |
 
-## Domain, tools & tests
+## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- MCP tools: **0** (0 without docstrings)
-- Test-to-source line ratio: **2.48** (69087 test lines / 27875 source lines)
+- Test-to-source line ratio: **2.48** (69170 test lines / 27875 source lines)

@@ -20,12 +20,10 @@ def test_generate_component_diagram() -> None:
 
 
 def test_every_internal_module_maps_to_a_component() -> None:
-    """No lithos module should be missing from the component map (orphan check)."""
-    import grimp
-
+    """No internal module should be missing from the component map (orphan check)."""
     arch = dt.load_architecture()
     components = arch["components"]
-    graph = grimp.build_graph(dt.ROOT_PACKAGE)
+    graph = dt.build_import_graph()  # memoized in _common; don't rebuild
     orphans = sorted(
         m
         for m in graph.modules
