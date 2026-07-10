@@ -382,7 +382,6 @@ class TestRssFetchDedup:
     ) -> None:
         """Shared RSS feed URL fetched once, items fan-out to both profiles."""
         from influx.http_client import FetchResult
-        from influx.schemas import FilterResult
         from influx.urls import url_hash
 
         rss_feed = RssSourceEntry(
@@ -463,19 +462,28 @@ class TestRssFetchDedup:
         async def acounting_guarded_fetch(url: str, **kwargs: Any) -> FetchResult:
             return counting_guarded_fetch(url, **kwargs)
 
-        async def score_rss_items(**kwargs: Any) -> dict[str, FilterResult]:
+        async def rss_scorer(
+            candidates: list[Any], profile: str, prompt: str
+        ) -> dict[str, Any]:
+            from influx.source import ScoredCandidate
+
+            target = url_hash("https://shared-blog.example/post-1")
             return {
-                url_hash("https://shared-blog.example/post-1"): FilterResult(
-                    id=url_hash("https://shared-blog.example/post-1"),
+                c.item_id: ScoredCandidate(
+                    candidate=c,
                     score=7,
-                    tags=["shared"],
+                    confidence=1.0,
                     reason="test-scorer",
+                    filter_tags=("shared",),
                 )
+                for c in candidates
+                if c.item_id == target
             }
 
         provider = make_item_provider(
             config,
             fetch_cache=fetch_cache,
+            rss_scorer=rss_scorer,
         )
 
         # Queue for both profiles: repair sweep + feedback
@@ -501,10 +509,6 @@ class TestRssFetchDedup:
             patch(
                 "influx.extraction.article.guarded_fetch",
                 side_effect=counting_guarded_fetch,
-            ),
-            patch(
-                "influx.sources.rss._score_rss_items",
-                side_effect=score_rss_items,
             ),
         ):
             asyncio.run(

@@ -151,6 +151,7 @@ def make_item_provider(
     fetch_cache: FetchCache | None = None,
     arxiv_scorer: Any | None = None,
     arxiv_filter_scorer: Any | None = None,
+    rss_scorer: Any | None = None,
 ) -> Callable[
     [str, RunKind, dict[str, str | int] | None, str],
     Awaitable[Iterable[BoundScoredCandidate]],
@@ -174,6 +175,10 @@ def make_item_provider(
         Per-item synchronous scorer override (test seam).
     arxiv_filter_scorer:
         Batched LLM filter scorer (production default).
+    rss_scorer:
+        Batched :data:`~influx.filter.BatchScorer` override for RSS (test
+        seam).  ``None`` installs the production-default
+        :func:`~influx.filter.make_default_batch_scorer` (finding 2.3b).
     """
     from influx.sources.arxiv import make_arxiv_item_provider
     from influx.sources.rss import make_rss_item_provider
@@ -186,7 +191,7 @@ def make_item_provider(
         filter_scorer=arxiv_filter_scorer,
         fetch_cache=cache,
     )
-    rss_provider = make_rss_item_provider(config, fetch_cache=cache)
+    rss_provider = make_rss_item_provider(config, scorer=rss_scorer, fetch_cache=cache)
 
     async def provider(
         profile: str,

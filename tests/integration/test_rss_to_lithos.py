@@ -14,33 +14,26 @@ Drives end-to-end ingest of fixture RSS feeds through
 from __future__ import annotations
 
 import http.server
-import json
 import threading
 from collections.abc import Generator
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Literal
 
 import pytest
 
-from influx import filter as filter_module
 from influx.config import (
     AppConfig,
-    FilterTuningConfig,
     LithosConfig,
-    ModelSlotConfig,
     ProfileConfig,
     ProfileSources,
     PromptEntryConfig,
     PromptsConfig,
-    ProviderConfig,
     RssSourceEntry,
     ScheduleConfig,
     SecurityConfig,
     StorageConfig,
 )
 from influx.slugs import slugify_feed_name
-from influx.sources import rss as rss_module
 from influx.sources.rss import RssFeedItem, build_rss_note_item, parse_feed
 from influx.urls import url_hash
 
@@ -150,27 +143,6 @@ def _make_config(
     )
 
 
-def _make_filter_config(*, archive_dir: Path, batch_size: int) -> AppConfig:
-    """Build a minimal AppConfig with an LLM filter slot for RSS scoring."""
-    config = _make_config(archive_dir=archive_dir)
-    return config.model_copy(
-        update={
-            "providers": {
-                "test": ProviderConfig(base_url="https://llm.example/v1"),
-            },
-            "models": {
-                "filter": ModelSlotConfig(
-                    provider="test",
-                    model="test-filter",
-                    max_retries=0,
-                    json_mode=True,
-                ),
-            },
-            "filter": FilterTuningConfig(batch_size=batch_size),
-        }
-    )
-
-
 def _make_item(
     *,
     title: str = "Test Article",
@@ -199,182 +171,6 @@ def _make_item(
         source_tag=source_tag,
         feed_name=feed_name,
     )
-
-
-def _filter_response_for(candidate_ids: list[str]) -> SimpleNamespace:
-    content = json.dumps(
-        {
-            "results": [
-                {"id": candidate_id, "score": 8, "tags": [], "reason": "ok"}
-                for candidate_id in candidate_ids
-            ]
-        }
-    )
-    envelope = {"choices": [{"message": {"content": content}}]}
-    return SimpleNamespace(status_code=200, body=json.dumps(envelope).encode())
-
-
-def _candidate_ids_from_filter_body(body: dict[str, object]) -> list[str]:
-    messages = body["messages"]
-    assert isinstance(messages, list)
-    content = messages[0]["content"]
-    assert isinstance(content, str)
-    candidates_json = content.split("## CANDIDATES\n", 1)[1]
-    candidates = json.loads(candidates_json)
-    return [candidate["id"] for candidate in candidates]
-
-
-# ── Issue #94: RSS filter chunking ──────────────────────────────────────
-
-
-async def test_score_rss_items_chunks_by_filter_batch_size(
-    archive_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _make_filter_config(archive_dir=archive_dir, batch_size=3)
-    items = [
-        _make_item(url=f"https://example.com/post-{i}", title=f"Post {i}")
-        for i in range(7)
-    ]
-    chunk_lengths: list[int] = []
-
-    def fake_post_json_fetch(
-        url: str,
-        body: dict[str, object],
-        **kwargs: object,
-    ) -> SimpleNamespace:
-        candidate_ids = _candidate_ids_from_filter_body(body)
-        chunk_lengths.append(len(candidate_ids))
-        return _filter_response_for(candidate_ids)
-
-    monkeypatch.setattr(
-        filter_module,
-        "guarded_post_json_fetch",
-        fake_post_json_fetch,
-    )
-
-    scores = await rss_module._score_rss_items(
-        items=items,
-        profile="test-profile",
-        filter_prompt="score these",
-        config=config,
-    )
-
-    assert chunk_lengths == [3, 3, 1]
-    assert set(scores) == {_rss_filter_id_for(item) for item in items}
-
-
-async def test_score_rss_items_skips_failed_chunk_but_keeps_other_scores(
-    archive_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _make_filter_config(archive_dir=archive_dir, batch_size=2)
-    items = [
-        _make_item(url=f"https://example.com/post-{i}", title=f"Post {i}")
-        for i in range(5)
-    ]
-    failed_chunk_ids = {
-        url_hash("https://example.com/post-2"),
-        url_hash("https://example.com/post-3"),
-    }
-    recorded_errors: list[None] = []
-
-    def fake_post_json_fetch(
-        url: str,
-        body: dict[str, object],
-        **kwargs: object,
-    ) -> SimpleNamespace:
-        candidate_ids = _candidate_ids_from_filter_body(body)
-        if set(candidate_ids) == failed_chunk_ids:
-            envelope = {"choices": [{"message": {"content": '{"results": ['}}]}
-            return SimpleNamespace(status_code=200, body=json.dumps(envelope).encode())
-        return _filter_response_for(candidate_ids)
-
-    monkeypatch.setattr(
-        filter_module,
-        "guarded_post_json_fetch",
-        fake_post_json_fetch,
-    )
-    monkeypatch.setattr(
-        rss_module,
-        "record_filter_error",
-        lambda: recorded_errors.append(None),
-    )
-
-    scores = await rss_module._score_rss_items(
-        items=items,
-        profile="test-profile",
-        filter_prompt="score these",
-        config=config,
-    )
-
-    assert set(scores) == {
-        url_hash("https://example.com/post-0"),
-        url_hash("https://example.com/post-1"),
-        url_hash("https://example.com/post-4"),
-    }
-    assert len(recorded_errors) == 1
-
-
-async def test_score_rss_items_honours_retry_after_on_429(
-    archive_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _make_filter_config(archive_dir=archive_dir, batch_size=2).model_copy(
-        update={
-            "models": {
-                "filter": ModelSlotConfig(
-                    provider="test",
-                    model="test-filter",
-                    max_retries=1,
-                    json_mode=True,
-                ),
-            },
-        }
-    )
-    items = [
-        _make_item(url="https://example.com/post-0", title="Post 0"),
-        _make_item(url="https://example.com/post-1", title="Post 1"),
-    ]
-    calls = {"count": 0}
-    sleeps: list[float] = []
-
-    def fake_post_json_fetch(
-        url: str,
-        body: dict[str, object],
-        **kwargs: object,
-    ) -> SimpleNamespace:
-        candidate_ids = _candidate_ids_from_filter_body(body)
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return SimpleNamespace(
-                status_code=429,
-                body=b'{"error":{"message":"rate limited"}}',
-                headers={"Retry-After": "7"},
-            )
-        return _filter_response_for(candidate_ids)
-
-    monkeypatch.setattr(
-        filter_module,
-        "guarded_post_json_fetch",
-        fake_post_json_fetch,
-    )
-    monkeypatch.setattr(filter_module, "_sleep", lambda seconds: sleeps.append(seconds))
-
-    scores = await rss_module._score_rss_items(
-        items=items,
-        profile="test-profile",
-        filter_prompt="score these",
-        config=config,
-    )
-
-    assert calls["count"] == 2
-    assert sleeps == [7.0]
-    assert set(scores) == {_rss_filter_id_for(item) for item in items}
-
-
-def _rss_filter_id_for(item: RssFeedItem) -> str:
-    return url_hash(item.url)
 
 
 # ── AC-09-A: source tag, archive path, and note path all agree ───────

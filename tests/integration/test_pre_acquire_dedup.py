@@ -279,7 +279,26 @@ class TestPreAcquireDedupRssBackfill:
         fake_lithos_url: str,
     ) -> None:
         config = _rss_only_config(fake_lithos_url)
-        provider = make_item_provider(config, fetch_cache=FetchCache())
+
+        async def _fake_rss_scorer(
+            candidates: list[Any], profile: str, filter_prompt: str
+        ) -> dict[str, Any]:
+            from influx.source import ScoredCandidate
+
+            return {
+                c.item_id: ScoredCandidate(
+                    candidate=c,
+                    score=8,
+                    confidence=1.0,
+                    reason="test",
+                    filter_tags=("test",),
+                )
+                for c in candidates
+            }
+
+        provider = make_item_provider(
+            config, fetch_cache=FetchCache(), rss_scorer=_fake_rss_scorer
+        )
 
         # Feedback list.
         fake_lithos.list_responses.append(json.dumps({"items": []}))
@@ -288,34 +307,10 @@ class TestPreAcquireDedupRssBackfill:
             json.dumps({"hit": True, "stale_exists": False})
         )
 
-        async def _fake_score_rss_items(
-            *,
-            items: list[RssFeedItem],
-            profile: str,
-            filter_prompt: str,
-            config: AppConfig,
-        ) -> dict[str, Any]:
-            from influx.schemas import FilterResult
-            from influx.urls import url_hash
-
-            return {
-                url_hash(item.url): FilterResult(
-                    id=url_hash(item.url),
-                    score=8,
-                    reason="test",
-                    tags=["test"],
-                )
-                for item in items
-            }
-
         with (
             patch(
                 "influx.sources.rss._fetch_rss_feed",
                 return_value=list(_RSS_FIXTURE),
-            ),
-            patch(
-                "influx.sources.rss._score_rss_items",
-                side_effect=_fake_score_rss_items,
             ),
             patch("influx.sources.rss.build_rss_note_item") as mock_build,
         ):

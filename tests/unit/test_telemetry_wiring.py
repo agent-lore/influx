@@ -647,9 +647,21 @@ class TestInfluxFetchRssSpan:
             ),
         ]
 
+        async def _scorer(
+            candidates: list[Any], profile: str, prompt: str
+        ) -> dict[str, Any]:
+            from influx.source import ScoredCandidate
+
+            return {
+                c.item_id: ScoredCandidate(
+                    candidate=c, score=7, confidence=1.0, reason="ok", filter_tags=()
+                )
+                for c in candidates
+            }
+
         token = current_run_id.set("test-run-fetch-rss")
         try:
-            provider = make_rss_item_provider(config)
+            provider = make_rss_item_provider(config, scorer=_scorer)
 
             with (
                 patch("influx.sources.rss.get_tracer", return_value=tracer),
@@ -657,17 +669,6 @@ class TestInfluxFetchRssSpan:
                     "influx.sources.rss._fetch_rss_feed",
                     new_callable=AsyncMock,
                     return_value=test_items,
-                ),
-                patch(
-                    "influx.sources.rss._score_rss_items",
-                    new_callable=AsyncMock,
-                    return_value={
-                        "781f5d2534": type(
-                            "Score",
-                            (),
-                            {"score": 7, "reason": "ok", "tags": []},
-                        )()
-                    },
                 ),
                 patch(
                     "influx.sources.rss.build_rss_note_item",
@@ -753,7 +754,19 @@ class TestInfluxFetchRssSpan:
             ),
         ]
 
-        provider = make_rss_item_provider(config)
+        async def _scorer(
+            candidates: list[Any], profile: str, prompt: str
+        ) -> dict[str, Any]:
+            from influx.source import ScoredCandidate
+
+            return {
+                c.item_id: ScoredCandidate(
+                    candidate=c, score=7, confidence=1.0, reason="ok", filter_tags=()
+                )
+                for c in candidates
+            }
+
+        provider = make_rss_item_provider(config, scorer=_scorer)
 
         with (
             patch("influx.sources.rss.get_tracer", return_value=disabled_tracer),
@@ -761,17 +774,6 @@ class TestInfluxFetchRssSpan:
                 "influx.sources.rss._fetch_rss_feed",
                 new_callable=AsyncMock,
                 return_value=test_items,
-            ),
-            patch(
-                "influx.sources.rss._score_rss_items",
-                new_callable=AsyncMock,
-                return_value={
-                    "781f5d2534": type(
-                        "Score",
-                        (),
-                        {"score": 7, "reason": "ok", "tags": []},
-                    )()
-                },
             ),
             patch(
                 "influx.sources.rss.build_rss_note_item",

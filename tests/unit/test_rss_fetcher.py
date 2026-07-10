@@ -465,24 +465,22 @@ class TestProductionPathIgnoresAllowPrivateIps:
                 final_url="https://example.com/feed.xml",
             )
 
-        # Stub the LLM filter so the test stays unit-scoped — accept
-        # everything the validator lets through.
-        async def _score_stub(*, items: list[Any], **_kwargs: object) -> dict[str, Any]:
-            from types import SimpleNamespace
-
-            from influx.sources.rss import _rss_filter_id
+        # Stub the LLM filter (a Filter BatchScorer) so the test stays
+        # unit-scoped — accept everything the URL validator lets through.
+        async def _score_stub(
+            candidates: list[Any], profile: str, prompt: str
+        ) -> dict[str, Any]:
+            from influx.source import ScoredCandidate
 
             return {
-                _rss_filter_id(it): SimpleNamespace(score=10, reason="ok", tags=[])
-                for it in items
+                c.item_id: ScoredCandidate(
+                    candidate=c, score=10, confidence=1.0, reason="ok", filter_tags=()
+                )
+                for c in candidates
             }
 
         with (
             patch("influx.sources.rss._aguarded_fetch", AsyncMock(side_effect=_stub)),
-            patch(
-                "influx.sources.rss._score_rss_items",
-                AsyncMock(side_effect=_score_stub),
-            ),
             patch(
                 "influx.sources.rss.build_rss_note_item",
                 lambda **kwargs: {
@@ -503,7 +501,7 @@ class TestProductionPathIgnoresAllowPrivateIps:
                 },
             ),
         ):
-            provider = make_rss_item_provider(config)
+            provider = make_rss_item_provider(config, scorer=_score_stub)
             bounds = list(
                 await provider("ai-robotics", RunKind.SCHEDULED, None, "prompt")
             )
@@ -517,3 +515,95 @@ class TestProductionPathIgnoresAllowPrivateIps:
         # though the config has allow_private_ips=True.
         assert len(results) == 1
         assert results[0]["source_url"] == "https://example.com/good"
+
+
+class TestFilterScorerErrorDropsWholeBatch:
+    """Finding 2.3b: RSS scoring now runs through the shared ``Filter``.
+
+    ``Filter.score`` catches a :class:`~influx.filter.FilterScorerError`
+    raised by the batch scorer, records one filter-error metric, and
+    drops the whole chunk (FR-FLT-6) — so the provider yields zero
+    bounds for that batch.  This replaces the old per-feed
+    ``_score_rss_items`` try/except-and-``continue`` seam; the reconciled
+    behaviour is that a filter failure drops otherwise-valid candidates
+    rather than passing them through.
+    """
+
+    @pytest.mark.asyncio
+    async def test_scorer_error_yields_zero_bounds(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from influx.config import (
+            AppConfig,
+            ProfileConfig,
+            ProfileSources,
+            PromptEntryConfig,
+            PromptsConfig,
+            ScheduleConfig,
+        )
+        from influx.coordinator import RunKind
+        from influx.filter import FilterScorerError
+        from influx.http_client import FetchResult
+        from influx.sources.rss import make_rss_item_provider
+        from influx.telemetry import current_filter_errors
+
+        rss_entry = _make_feed_entry(
+            name="good-feed",
+            url="https://example.com/feed.xml",
+            source_tag="rss",
+        )
+        config = AppConfig(
+            schedule=ScheduleConfig(
+                cron="0 6 * * *",
+                timezone="UTC",
+                misfire_grace_seconds=3600,
+            ),
+            profiles=[
+                ProfileConfig(
+                    name="ai-robotics",
+                    sources=ProfileSources(rss=[rss_entry]),
+                ),
+            ],
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="t"),
+                tier1_enrich=PromptEntryConfig(text="t"),
+                tier3_extract=PromptEntryConfig(text="t"),
+            ),
+        )
+
+        async def _stub(*_args: object, **_kwargs: object) -> FetchResult:
+            return FetchResult(
+                body=_MIXED_FEED_XML,
+                status_code=200,
+                content_type="application/rss+xml",
+                final_url="https://example.com/feed.xml",
+            )
+
+        # A BatchScorer that always fails — mirrors an exhausted-retry
+        # or unparseable-response filter call, which ``Filter`` surfaces
+        # as a ``FilterScorerError``.
+        async def _failing_scorer(
+            candidates: list[Any], profile: str, prompt: str
+        ) -> dict[str, Any]:
+            raise FilterScorerError("filter model unavailable")
+
+        # Seed the per-run filter-error counter (run_service normally does
+        # this via ledger_lifecycle) so ``record_filter_error`` is live.
+        token = current_filter_errors.set([0])
+        try:
+            with patch(
+                "influx.sources.rss._aguarded_fetch", AsyncMock(side_effect=_stub)
+            ):
+                provider = make_rss_item_provider(config, scorer=_failing_scorer)
+                bounds = list(
+                    await provider("ai-robotics", RunKind.SCHEDULED, None, "prompt")
+                )
+            counter = current_filter_errors.get()
+        finally:
+            current_filter_errors.reset(token)
+
+        # Whole-batch-drop: the otherwise-valid public-URL candidate is
+        # dropped, and exactly one filter-error metric is recorded.
+        assert bounds == []
+        assert counter is not None
+        assert counter[0] == 1
