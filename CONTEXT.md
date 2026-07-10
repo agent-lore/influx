@@ -24,20 +24,20 @@ The score-gated entry to ingestion. Calls `models.filter` with the configured pr
 _Avoid_: classifier, scorer.
 
 **Cascade**:
-The score-gated enrichment pipeline that turns an **Acquired** item into **EnrichedSections**: Tier 1 summary at `score >= relevance`, Tier 2 full text at `score >= full_text`, Tier 3 deep extraction at `score >= deep_extract`. _(proposed as a single module shared across Sources)_
+The score-gated enrichment pipeline that turns an **Acquired** item into **EnrichedSections**: Tier 1 summary at `score >= relevance`, Tier 2 full text at `score >= full_text`, Tier 3 deep extraction at `score >= deep_extract`.
 _Avoid_: enrichment chain, tier pipeline.
 
 **Tier 1 / Tier 2 / Tier 3**:
 The three enrichment levels, each gated by a different threshold and producing different note sections. Tier 1 = `models.enrich` summary. Tier 2 = full text extraction. Tier 3 = `models.extract` claims/datasets/builds_on/open_questions/potential_connections.
 
 **Acquired**:
-The bundle a **Source** produces for one Candidate after download/archive/extract: identity, source URL, archive path (or repair flag), extracted text (or `None`), text source flavour (`html`/`pdf`/`summary-fallback`), and source-specific signals (e.g. `archive_terminal`). _(proposed)_
+The bundle a **Source** produces for one Candidate after download/archive/extract: identity, source URL, archive path (or repair flag), extracted text (or `None`), text source flavour (`html`/`pdf`/`summary-fallback`), and source-specific signals (e.g. `archive_terminal`).
 
 **EnrichedSections**:
-The **Cascade**'s output for one Acquired: optional Tier 1 result, optional full text + flavour, optional Tier 3 result, plus `repair_flags` and `terminal_flags` for the Renderer to apply as note tags. _(proposed)_
+The **Cascade**'s output for one Acquired: optional Tier 1 result, optional full text + flavour, optional Tier 3 result, plus `repair_flags` and `terminal_flags` for the Renderer to apply as note tags.
 
 **Renderer**:
-Produces a **CanonicalNote** from an Acquired plus EnrichedSections plus the score/reason. Owns the canonical Markdown shape from spec section 9. _(proposed as a separate module from the cascade)_
+Produces a **CanonicalNote** from an Acquired plus EnrichedSections plus the score/reason. Owns the canonical Markdown shape from spec section 9.
 
 **CanonicalNote**:
 An Influx-authored Markdown note: typed frontmatter, fixed section order (`## Archive`, `## Summary`, `## Full Text`, `## Claims`, `## Datasets & Benchmarks`, `## Builds On`, `## Open Questions`, `## Profile Relevance`, `## User Notes`), and stable tag conventions. `## User Notes` is preserved byte-exactly across rewrites.
