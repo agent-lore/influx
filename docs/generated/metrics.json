@@ -320,11 +320,11 @@
         "classes": 2,
         "functions": 13,
         "largest_module": "influx.filter",
-        "largest_module_lines": 550,
-        "lines": 550,
+        "largest_module_lines": 569,
+        "lines": 569,
         "modules": 1,
         "public_symbols": 4,
-        "sloc": 466
+        "sloc": 476
       },
       "HttpApi": {
         "classes": 4,
@@ -433,13 +433,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27939,
+    "total_lines": 27958,
     "total_modules": 57,
-    "total_sloc": 21695
+    "total_sloc": 21705
   },
   "tests": {
     "ratio": 2.49,
-    "src_lines": 27939,
-    "test_lines": 69562
+    "src_lines": 27958,
+    "test_lines": 69744
   }
 }

@@ -304,6 +304,36 @@ _MIXED_FEED_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+# Three public items so a batch_size < 3 splits them across batches.
+_THREE_ITEM_FEED_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+  <title>Three Item Feed</title>
+  <link>https://example.com/</link>
+  <description>Three good links for batch-splitting tests.</description>
+  <item>
+    <title>Keep A</title>
+    <link>https://example.com/a</link>
+    <description>First article.</description>
+    <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
+  </item>
+  <item>
+    <title>Keep B</title>
+    <link>https://example.com/b</link>
+    <description>Second article.</description>
+    <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
+  </item>
+  <item>
+    <title>Fail C</title>
+    <link>https://example.com/c</link>
+    <description>Third article.</description>
+    <pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate>
+  </item>
+</channel>
+</rss>
+"""
+
+
 class TestParseFeedRejectsInvalidUrls:
     """Issue #131: ``parse_feed`` rejects loopback/private/malformed URLs."""
 
@@ -517,20 +547,21 @@ class TestProductionPathIgnoresAllowPrivateIps:
         assert results[0]["source_url"] == "https://example.com/good"
 
 
-class TestFilterScorerErrorDropsWholeBatch:
+class TestFilterScorerErrorSkipsFailedBatch:
     """Finding 2.3b: RSS scoring now runs through the shared ``Filter``.
 
     ``Filter.score`` catches a :class:`~influx.filter.FilterScorerError`
     raised by the batch scorer, records one filter-error metric, and
-    drops the whole chunk (FR-FLT-6) — so the provider yields zero
-    bounds for that batch.  This replaces the old per-feed
-    ``_score_rss_items`` try/except-and-``continue`` seam; the reconciled
-    behaviour is that a filter failure drops otherwise-valid candidates
-    rather than passing them through.
+    skips *that* batch (FR-FLT-6 / spec §7.1).  When the whole candidate
+    list fits in one batch and that batch fails, the provider yields zero
+    bounds; when an earlier batch scored cleanly it survives a later
+    batch's failure (``test_earlier_batch_survives_later_batch_failure``).
+    This replaces the old per-feed ``_score_rss_items``
+    try/except-and-``continue`` seam.
     """
 
     @pytest.mark.asyncio
-    async def test_scorer_error_yields_zero_bounds(self) -> None:
+    async def test_single_failed_batch_yields_zero_bounds(self) -> None:
         from unittest.mock import AsyncMock
 
         from influx.config import (
@@ -602,8 +633,104 @@ class TestFilterScorerErrorDropsWholeBatch:
         finally:
             current_filter_errors.reset(token)
 
-        # Whole-batch-drop: the otherwise-valid public-URL candidate is
-        # dropped, and exactly one filter-error metric is recorded.
+        # The single (whole-list) batch failed, so its otherwise-valid
+        # public-URL candidate is dropped and exactly one filter-error
+        # metric is recorded.
         assert bounds == []
+        assert counter is not None
+        assert counter[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_earlier_batch_survives_later_batch_failure(self) -> None:
+        """PR #265 review: a clean batch is not discarded when another
+        batch of the *same* flattened RSS scoring call fails.
+
+        With ``filter.batch_size = 1`` each of the three feed items is its
+        own batch; the ``[Fail C]`` batch raises while ``[Keep A]`` and
+        ``[Keep B]`` score cleanly.  The two survivors must still be
+        bound (the failing batch must not discard the others), regardless
+        of parse order; only C is dropped.
+        """
+        from unittest.mock import AsyncMock
+
+        from influx.config import (
+            AppConfig,
+            FilterTuningConfig,
+            ProfileConfig,
+            ProfileSources,
+            PromptEntryConfig,
+            PromptsConfig,
+            ScheduleConfig,
+        )
+        from influx.coordinator import RunKind
+        from influx.filter import FilterScorerError
+        from influx.http_client import FetchResult
+        from influx.source import ScoredCandidate
+        from influx.sources.rss import make_rss_item_provider
+        from influx.telemetry import current_filter_errors
+
+        rss_entry = _make_feed_entry(
+            name="three-item-feed",
+            url="https://example.com/feed.xml",
+            source_tag="rss",
+        )
+        config = AppConfig(
+            schedule=ScheduleConfig(
+                cron="0 6 * * *",
+                timezone="UTC",
+                misfire_grace_seconds=3600,
+            ),
+            profiles=[
+                ProfileConfig(
+                    name="ai-robotics",
+                    sources=ProfileSources(rss=[rss_entry]),
+                ),
+            ],
+            prompts=PromptsConfig(
+                filter=PromptEntryConfig(text="t"),
+                tier1_enrich=PromptEntryConfig(text="t"),
+                tier3_extract=PromptEntryConfig(text="t"),
+            ),
+            filter=FilterTuningConfig(batch_size=1),
+        )
+
+        async def _stub(*_args: object, **_kwargs: object) -> FetchResult:
+            return FetchResult(
+                body=_THREE_ITEM_FEED_XML,
+                status_code=200,
+                content_type="application/rss+xml",
+                final_url="https://example.com/feed.xml",
+            )
+
+        # Fails the batch containing "Fail C"; scores the rest cleanly.
+        async def _batchwise_scorer(
+            candidates: list[Any], profile: str, prompt: str
+        ) -> dict[str, Any]:
+            if any(c.title == "Fail C" for c in candidates):
+                raise FilterScorerError("filter model unavailable for this batch")
+            return {
+                c.item_id: ScoredCandidate(
+                    candidate=c, score=10, confidence=1.0, reason="ok", filter_tags=()
+                )
+                for c in candidates
+            }
+
+        token = current_filter_errors.set([0])
+        try:
+            with patch(
+                "influx.sources.rss._aguarded_fetch", AsyncMock(side_effect=_stub)
+            ):
+                provider = make_rss_item_provider(config, scorer=_batchwise_scorer)
+                bounds = list(
+                    await provider("ai-robotics", RunKind.SCHEDULED, None, "prompt")
+                )
+            counter = current_filter_errors.get()
+        finally:
+            current_filter_errors.reset(token)
+
+        # Keep A + Keep B survive the failure of the [Fail C] batch.
+        survivors = sorted(b.scored.candidate.source_url for b in bounds)
+        assert survivors == ["https://example.com/a", "https://example.com/b"]
+        # One batch failed → one filter-error recorded.
         assert counter is not None
         assert counter[0] == 1
