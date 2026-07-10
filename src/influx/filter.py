@@ -6,9 +6,8 @@ that scores a batch of fetched arXiv items in one LLM call.
 
 This is the production default that satisfies the score-gating contract
 in PRD 07 §5.6 / US-014 / US-015 — without it the production
-``InfluxService`` path would write every arXiv item abstract-only with
-no extraction or enrichment, regardless of the candidate's real
-relevance.
+``InfluxService`` path would score nothing and the run would yield zero
+items, regardless of the candidates' real relevance.
 
 Design notes
 ------------
@@ -16,19 +15,16 @@ Design notes
   an ``arxiv_filter_scorer`` override so integration tests can substitute
   a deterministic batch scorer without standing up a real LLM filter.
 - ``models.filter`` configuration is required for the default scorer to
-  exist.  When it is missing we return ``None`` and the provider falls
-  back to its existing no-scorer behaviour (every item written
-  abstract-only) so misconfigured deployments still produce notes
-  rather than crashing.
-- Scorer failure is non-fatal at the per-item level: items the LLM
-  filter omits from its ``results`` array are dropped; transport / parse
-  / validation failures raise :class:`FilterScorerError` so the caller
-  (the arXiv item provider) can fall every item in the batch back to
-  abstract-only ingestion instead of dropping the batch entirely
-  (§5.6 graceful degradation).  An empty returned mapping therefore
-  unambiguously means "the LLM intentionally scored nothing above
-  ``filter.min_score_in_results``" — drop the items, do not emit
-  abstract-only notes for them.
+  exist.  When it is missing we return ``None``; :meth:`Filter.score`
+  then yields zero items (its scorer is ``None``) so misconfigured
+  deployments complete the run cleanly rather than crashing.
+- Scorer failure is handled at the batch level: items the LLM filter
+  omits from its ``results`` array are dropped, and transport / parse /
+  validation failures raise :class:`FilterScorerError`, which
+  :meth:`Filter.score` catches to skip the whole batch (zero items) and
+  record a ``filter_error`` (FR-FLT-6 / §7.1).  An empty returned mapping
+  therefore unambiguously means "the LLM intentionally scored nothing
+  above ``filter.min_score_in_results``" — drop the items.
 """
 
 from __future__ import annotations
@@ -76,11 +72,11 @@ class FilterScorerError(RuntimeError):
     """Hard failure of the production-default LLM filter scorer.
 
     Raised when the scorer cannot produce a valid scoring decision at
-    all (provider misconfigured, HTTP error, malformed response).  The
-    arXiv item provider catches this and falls every item in the batch
-    back to abstract-only ingestion (score=0) so a misconfigured /
-    transient-LLM-failure deployment still produces notes instead of
-    silently dropping the run (PRD 07 §5.6 graceful degradation).
+    all (provider misconfigured, HTTP error, malformed response).
+    :meth:`Filter.score` catches this and skips the whole batch — the run
+    yields zero items and records a ``filter_error`` (FR-FLT-6 / §7.1) —
+    so a misconfigured / transient-LLM-failure deployment fails cleanly
+    instead of crashing or ingesting unscored notes.
     """
 
 
@@ -276,9 +272,9 @@ def make_default_arxiv_filter_scorer(
     (OpenAI-compatible ``/chat/completions``) and parses the response
     against :class:`~influx.schemas.FilterResponse`.
 
-    Returns ``None`` when ``[models.filter]`` is not configured — the
-    provider then falls back to its no-scorer behaviour (every item
-    written abstract-only) instead of crashing.
+    Returns ``None`` when ``[models.filter]`` is not configured —
+    :meth:`Filter.score` then yields zero items (its scorer is ``None``)
+    instead of crashing.
     """
     if "filter" not in config.models:
         return None
@@ -298,7 +294,7 @@ def make_default_arxiv_filter_scorer(
         if provider is None:
             _log.warning(
                 "filter provider %r not configured for profile %r; "
-                "falling back to abstract-only ingestion",
+                "skipping this batch (zero items)",
                 slot.provider,
                 profile,
             )
@@ -373,8 +369,9 @@ def make_default_batch_scorer(config: AppConfig) -> BatchScorer | None:
     Returns an async :data:`BatchScorer` that posts the rendered filter
     prompt + candidates to the ``models.filter`` slot and parses the
     response against :class:`FilterResponse`.  Returns ``None`` when
-    ``[models.filter]`` is not configured so misconfigured deployments
-    still ingest abstract-only notes (PRD 07 §5.6 graceful degradation).
+    ``[models.filter]`` is not configured so :meth:`Filter.score` yields
+    zero items and the run completes cleanly (PRD 07 §5.6 graceful
+    degradation).
     """
     if "filter" not in config.models:
         return None
