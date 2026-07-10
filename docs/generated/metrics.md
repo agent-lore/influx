@@ -43,14 +43,14 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1912 | 1401 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
 | Orchestration | 5 | 3732 | 2911 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
-| Repair | 5 | 3816 | 2952 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
+| Repair | 5 | 3934 | 3071 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 240 | 183 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
 | Sources | 10 | 4469 | 3418 | 5 | 8 | 0.62 | 38 (`influx.sources.arxiv.build_arxiv_note_item`) | 10 |
 | Storage | 1 | 720 | 588 | 3 | 3 | 0.50 | 14 (`influx.storage.download_archive`) | 2 |
 
 ## Size
 
-- Modules: **56**, lines: **27875**, SLOC: **21643**
+- Modules: **56**, lines: **27993**, SLOC: **21762**
 - Largest module: `influx.sources.arxiv` (1912 lines)
 - Modules over 800 lines: **12**
   - `influx.config`
@@ -68,7 +68,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **650**, cyclomatic > 10: **50**
+- Functions: **649**, cyclomatic > 10: **50**
 
 Top 10 most complex functions:
 
@@ -88,4 +88,4 @@ Top 10 most complex functions:
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.48** (69170 test lines / 27875 source lines)
+- Test-to-source line ratio: **2.47** (69218 test lines / 27993 source lines)

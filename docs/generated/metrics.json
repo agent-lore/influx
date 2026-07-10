@@ -120,7 +120,7 @@
         "qualname": "influx.cascade.Cascade.enrich"
       }
     ],
-    "total_functions": 650
+    "total_functions": 649
   },
   "domain": {
     "associations": 5,
@@ -377,14 +377,14 @@
         "sloc": 2911
       },
       "Repair": {
-        "classes": 19,
-        "functions": 90,
+        "classes": 17,
+        "functions": 89,
         "largest_module": "influx.repair",
-        "largest_module_lines": 1485,
-        "lines": 3816,
+        "largest_module_lines": 1674,
+        "lines": 3934,
         "modules": 5,
-        "public_symbols": 40,
-        "sloc": 2952
+        "public_symbols": 39,
+        "sloc": 3071
       },
       "Schemas": {
         "classes": 4,
@@ -433,13 +433,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27875,
+    "total_lines": 27993,
     "total_modules": 56,
-    "total_sloc": 21643
+    "total_sloc": 21762
   },
   "tests": {
-    "ratio": 2.48,
-    "src_lines": 27875,
-    "test_lines": 69170
+    "ratio": 2.47,
+    "src_lines": 27993,
+    "test_lines": 69218
   }
 }

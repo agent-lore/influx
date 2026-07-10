@@ -13,9 +13,9 @@ The per-Run repair sweep, per-tier repair counters, archive policy, and promotio
 |---|---|---:|---:|
 | `influx.archive_policy` | M | 2 | 6 |
 | `influx.promotion_gate` | M | 2 | 2 |
-| `influx.repair` | L | 12 | 4 |
+| `influx.repair` | XL | 10 | 4 |
 | `influx.repair_counters` | M | 2 | 6 |
-| `influx.repair_hooks` | L | 1 | 3 |
+| `influx.repair_hooks` | L | 1 | 4 |
 
 ## Public API
 
@@ -41,8 +41,6 @@ The per-Run repair sweep, per-tier repair counters, archive policy, and promotio
 - class `ExtractionOutcome` — Discriminator for the three abstract-only re-extraction outcomes.
 - class `ReExtractionResult` — Return value of the ``re_extract_archive`` hook.
 - class `ReExtractArchiveHook` — Callable protocol for abstract-only re-extraction (PRD 06 §4).
-- class `Tier2EnrichHook` — Callable protocol for Tier 2 enrichment retry (PRD 06 §4).
-- class `Tier3ExtractHook` — Callable protocol for Tier 3 deep extraction retry (PRD 06 §4).
 - class `ArchiveDownloadHook` — Callable protocol for archive download retry (PRD 04).
 - class `TextExtractionHook` — Callable protocol for text-extraction retry (FR-REP-1 stage 2).
 - class `SweepHooks` — Optional hook callables for stage execution within the sweep.
@@ -66,6 +64,7 @@ The per-Run repair sweep, per-tier repair counters, archive policy, and promotio
 ### `influx.repair_hooks`
 - def `has_usable_source` — Whether a note has a usable, dispatchable source at ingest time (#189).
 - def `infer_note_source` — Return a dispatchable ``source:*`` suffix for *note*, or ``None``.
+- def `make_sweep_tier2_extractor` — Create the sweep's Tier 2 extractor for :class:`~influx.cascade.Cascade`.
 - class `DefaultSweepHooks` — Production-default sweep hook wiring with non-optional callables.
 - def `make_default_sweep_hooks` — Create production-default sweep hooks for the repair sweep.
 
