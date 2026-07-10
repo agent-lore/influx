@@ -48,6 +48,13 @@ class TestAppendCascadeOutcomeTags:
         append_cascade_outcome_tags(tags, EnrichedSections())
         assert "influx:deep-extracted" not in tags
 
+    def test_deep_extracted_deduplicated_against_existing_tags(self) -> None:
+        # A pre-seeded influx:deep-extracted is not duplicated — the
+        # helper appends each outcome tag at most once.
+        tags: list[str] = ["influx:deep-extracted"]
+        append_cascade_outcome_tags(tags, EnrichedSections(tier3=_tier3()))
+        assert tags.count("influx:deep-extracted") == 1
+
     def test_repair_and_terminal_flags_appended(self) -> None:
         tags: list[str] = []
         sections = EnrichedSections(

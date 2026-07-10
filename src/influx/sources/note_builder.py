@@ -31,10 +31,15 @@ if TYPE_CHECKING:
 def append_cascade_outcome_tags(tags: list[str], sections: EnrichedSections) -> None:
     """Append the cascade-driven outcome tags every builder emits.
 
-    ``influx:deep-extracted`` (Tier 3 produced content) followed by the
-    cascade's ``repair_flags`` then ``terminal_flags``, each
-    de-duplicated against ``tags``.  This is the byte-identical tail all
-    three builders share after their provenance / archive tags.
+    ``influx:deep-extracted`` (when Tier 3 produced content), then the
+    cascade's ``repair_flags`` and ``terminal_flags`` — each appended
+    only if not already present in ``tags``.  This is the byte-identical
+    tail all three builders share after their provenance / archive tags.
+
+    The three source builders never pre-seed ``influx:deep-extracted``
+    (this helper is its sole emitter), so guarding it is inert for the
+    current callers; the guard keeps the helper's contract uniform —
+    "append each outcome tag at most once" — for any future caller.
 
     ``full-text`` and ``influx:repair-needed`` deliberately stay with
     each caller: their placement relative to the source-specific archive
@@ -44,7 +49,7 @@ def append_cascade_outcome_tags(tags: list[str], sections: EnrichedSections) -> 
 
     Mutates ``tags`` in place, matching the callers' existing style.
     """
-    if sections.tier3 is not None:
+    if sections.tier3 is not None and "influx:deep-extracted" not in tags:
         tags.append("influx:deep-extracted")
     for flag in sections.repair_flags:
         if flag not in tags:
