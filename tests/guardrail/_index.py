@@ -118,7 +118,7 @@ def _usage_lines(present: set[str]) -> list[str]:
         "## How to use these",
         "",
         "- **New to the codebase?** Start at [architecture.md](architecture.md) "
-        "for the",
+        + "for the",
         "  component map and click a node to open its drill-down page.",
     ]
     if "containers.md" in present:
@@ -133,15 +133,15 @@ def _usage_lines(present: set[str]) -> list[str]:
     if "tool_catalog.md" in present:
         lines += [
             "- **Building against the server?** [tool_catalog.md](tool_catalog.md) "
-            "is the",
+            + "is the",
             "  public API — every tool, its signature, and the components it touches.",
         ]
     lines += [
         "- **Reviewing a PR?** CI posts an architecture-metrics delta in its job "
-        "summary;",
+        + "summary;",
         "  [metrics.md](metrics.md) has the full snapshot and the budgets that gate",
         "  regressions. `make metrics-history` plots any metric over its commit "
-        "history.",
+        + "history.",
     ]
     return lines
 
@@ -183,16 +183,16 @@ def render_index(arch: dict | None = None) -> str:
         "## Legend",
         "",
         "- `A --> B` in the component diagram: at least one real `import` from a "
-        "module",
+        + "module",
         "  in component A to a module in component B.",
         "- Tier subgraphs (Entrypoints / Core / Foundation): dependencies must only",
         "  point downward; enforced by import-linter "
-        "(`pyproject.toml [tool.importlinter]`).",
+        + "(`pyproject.toml [tool.importlinter]`).",
         "- Dashed grey edge: a tier-skipping dependency "
-        "(e.g. Entrypoints → Foundation).",
+        + "(e.g. Entrypoints → Foundation).",
         "  Grey edge: a dependency on a Foundation component (de-emphasized fan-in).",
         "- Component nodes are clickable — they link to the per-component "
-        "drill-down page.",
+        + "drill-down page.",
         '- `Src "1" --> "0..*" Dst : field` in the domain model: class `Src` has a',
         "  field holding many `Dst`; `0..1` = optional, `1` = exactly one.",
         "",
