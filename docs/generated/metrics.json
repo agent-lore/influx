@@ -120,7 +120,7 @@
         "qualname": "influx.cascade.Cascade.enrich"
       }
     ],
-    "total_functions": 649
+    "total_functions": 650
   },
   "domain": {
     "associations": 5,
@@ -398,13 +398,13 @@
       },
       "Sources": {
         "classes": 18,
-        "functions": 78,
+        "functions": 79,
         "largest_module": "influx.sources.arxiv",
         "largest_module_lines": 1912,
-        "lines": 4469,
+        "lines": 4476,
         "modules": 10,
         "public_symbols": 34,
-        "sloc": 3418
+        "sloc": 3420
       },
       "Storage": {
         "classes": 2,
@@ -433,13 +433,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27993,
+    "total_lines": 28000,
     "total_modules": 56,
-    "total_sloc": 21762
+    "total_sloc": 21764
   },
   "tests": {
     "ratio": 2.47,
-    "src_lines": 27993,
+    "src_lines": 28000,
     "test_lines": 69267
   }
 }
