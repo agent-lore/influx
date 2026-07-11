@@ -12,14 +12,14 @@ lower a budget after improving the code to lock in the gain.
 | Metric | Actual | Budget | Headroom |
 |---|---:|---:|---:|
 | `component_cycles` | 3 | 3 | 0 |
-| `cross_component_edges` | 62 | 64 | 2 |
+| `cross_component_edges` | 62 | 62 | 0 |
 | `max_module_lines` | 1780 | 2000 | 220 |
 | `module_cycles` | 3 | 3 | 0 |
 | `modules_over_800_lines` | 12 | 12 | 0 |
 
 ## Import graph
 
-- Cross-component edges: **62**
+- Cross-component edges: **62** (187 module-level)
 - Component cycles: Common ↔ Config; Enrich ↔ Repair ↔ Sources ↔ Storage; HttpApi ↔ Orchestration
 - Module cycles: influx.backfill ↔ influx.http_api ↔ influx.inbox ↔ influx.run ↔ influx.run_service ↔ influx.scheduler ↔ influx.service; influx.repair ↔ influx.repair_hooks; influx.sources ↔ influx.sources.arxiv ↔ influx.sources.rss
 - Tier-skipping edges (Entrypoints → Foundation): 9 (Entrypoint -> Common, Entrypoint -> Config, Entrypoint -> Observability, HttpApi -> Common, HttpApi -> Config, HttpApi -> Observability, Orchestration -> Common, Orchestration -> Config, Orchestration -> Observability)
@@ -88,4 +88,4 @@ Top 10 most complex functions:
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.52** (69762 test lines / 27722 source lines)
+- Test-to-source line ratio: **2.53** (70085 test lines / 27722 source lines)

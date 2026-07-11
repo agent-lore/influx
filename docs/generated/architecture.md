@@ -5,6 +5,11 @@
 
 ```mermaid
 graph TD
+  subgraph tier_Entrypoints["Entrypoints"]
+    Entrypoint
+    HttpApi
+    Orchestration
+  end
   subgraph tier_Core["Core"]
     Enrich
     Feedback
@@ -14,11 +19,6 @@ graph TD
     Repair
     Sources
     Storage
-  end
-  subgraph tier_Entrypoints["Entrypoints"]
-    Entrypoint
-    HttpApi
-    Orchestration
   end
   subgraph tier_Foundation["Foundation"]
     Common

@@ -77,7 +77,7 @@ Foundation  = ["Config", "Observability", "Schemas", "Common"]
 # is deliberately NOT pinned to the exact current high-water mark. Ratchet the
 # *count* of oversized modules down via modules_over_800_lines instead.
 [budgets]
-cross_component_edges  = 64   # measured 2026-07; direction: down
+cross_component_edges  = 62   # measured 2026-07 (64->62 after #267 broke Sources<->Filter); direction: down
 component_cycles       = 3    # Common<->Config, a Core SCC, HttpApi<->Orchestration; goal: fewer
 module_cycles          = 3    # goal: 0
 modules_over_800_lines = 12   # existing god modules; direction: down, no new ones
