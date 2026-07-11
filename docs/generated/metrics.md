@@ -37,7 +37,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Enrich | 2 | 986 | 798 | 2 | 5 | 0.71 | 22 (`influx.cascade.Cascade.enrich`) | 2 |
 | Entrypoint | 2 | 573 | 454 | 0 | 5 | 1.00 | 14 (`influx.main._cmd_backfill`) | 2 |
 | Feedback | 3 | 571 | 450 | 1 | 5 | 0.83 | 15 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
-| Filter | 1 | 550 | 466 | 3 | 5 | 0.62 | 11 (`influx.filter.make_default_batch_scorer._scorer`) | 1 |
+| Filter | 1 | 569 | 476 | 3 | 5 | 0.62 | 11 (`influx.filter.make_default_batch_scorer._scorer`) | 1 |
 | HttpApi | 3 | 1541 | 1288 | 2 | 8 | 0.80 | 17 (`influx.http_api.post_backfills`) | 3 |
 | LithosBridge | 8 | 4064 | 3230 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 4 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
@@ -45,12 +45,12 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Orchestration | 5 | 3732 | 2911 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
 | Repair | 5 | 3934 | 3071 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 240 | 183 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
-| Sources | 11 | 4571 | 3497 | 5 | 8 | 0.62 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 10 |
+| Sources | 11 | 4418 | 3354 | 5 | 8 | 0.62 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 8 |
 | Storage | 1 | 720 | 588 | 3 | 3 | 0.50 | 14 (`influx.storage.download_archive`) | 2 |
 
 ## Size
 
-- Modules: **57**, lines: **28092**, SLOC: **21838**
+- Modules: **57**, lines: **27958**, SLOC: **21705**
 - Largest module: `influx.sources.arxiv` (1885 lines)
 - Modules over 800 lines: **12**
   - `influx.config`
@@ -68,7 +68,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **656**, cyclomatic > 10: **50**
+- Functions: **655**, cyclomatic > 10: **48**
 
 Top 10 most complex functions:
 
@@ -88,4 +88,4 @@ Top 10 most complex functions:
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.48** (69699 test lines / 28092 source lines)
+- Test-to-source line ratio: **2.50** (69768 test lines / 27958 source lines)

@@ -21,10 +21,11 @@ Design notes
 - Scorer failure is handled at the batch level: items the LLM filter
   omits from its ``results`` array are dropped, and transport / parse /
   validation failures raise :class:`FilterScorerError`, which
-  :meth:`Filter.score` catches to skip the whole batch (zero items) and
-  record a ``filter_error`` (FR-FLT-6 / §7.1).  An empty returned mapping
-  therefore unambiguously means "the LLM intentionally scored nothing
-  above ``filter.min_score_in_results``" — drop the items.
+  :meth:`Filter.score` catches to skip that batch (record a
+  ``filter_error`` and drop only the failed batch's items — batches that
+  already scored cleanly are kept) per FR-FLT-6 / §7.1.  An empty
+  returned mapping therefore unambiguously means "the LLM intentionally
+  scored nothing above ``filter.min_score_in_results``" — drop the items.
 """
 
 from __future__ import annotations
@@ -73,8 +74,9 @@ class FilterScorerError(RuntimeError):
 
     Raised when the scorer cannot produce a valid scoring decision at
     all (provider misconfigured, HTTP error, malformed response).
-    :meth:`Filter.score` catches this and skips the whole batch — the run
-    yields zero items and records a ``filter_error`` (FR-FLT-6 / §7.1) —
+    :meth:`Filter.score` catches this and skips the failing batch — its
+    items are dropped and a ``filter_error`` is recorded (FR-FLT-6 /
+    §7.1), while batches that already scored cleanly are still returned —
     so a misconfigured / transient-LLM-failure deployment fails cleanly
     instead of crashing or ingesting unscored notes.
     """
@@ -458,9 +460,11 @@ class Filter:
       explicitly chose not to score them).
     - Items below ``profile_cfg.thresholds.relevance`` are dropped
       (FR-FLT-7).
-    - When the scorer raises :class:`FilterScorerError`, the entire
-      batch is skipped (FR-FLT-6 / spec §7.1) — the run yields zero
-      items rather than ingesting abstract-only notes for them.
+    - When the scorer raises :class:`FilterScorerError`, that batch is
+      skipped (FR-FLT-6 / spec §7.1) — its items are dropped (without an
+      ``articles_filtered{drop}`` tick, since a failed filter call is not
+      a per-item rejection) and a ``filter_error`` is recorded, while
+      batches that already scored cleanly are still returned.
     - When *scorer* is ``None`` (no ``[models.filter]`` configured),
       :meth:`score` returns an empty list so misconfigured deployments
       still complete the run cleanly.
@@ -516,28 +520,43 @@ class Filter:
         batch_size = max(int(self._config.filter.batch_size), 1)
 
         all_scores: dict[str, ScoredCandidate] = {}
+        failed_item_ids: set[str] = set()
         for chunk_start in range(0, len(candidates), batch_size):
             chunk = candidates[chunk_start : chunk_start + batch_size]
             try:
                 chunk_scores = await self._scorer(chunk, profile, filter_prompt)
             except FilterScorerError:
                 _log.warning(
-                    "filter scorer failed for profile %r source=%s; skipping batch",
+                    "filter scorer failed for profile %r source=%s; "
+                    "skipping this batch (%d items)",
                     profile,
                     source,
+                    len(chunk),
                     exc_info=True,
                 )
-                # #85 review: surface the scorer execution failure to
-                # the run ledger so it fires ``filter_error`` rather
-                # than misclassifying as ``filter_stall``.
+                # #85 review: surface the scorer execution failure to the
+                # run ledger so it fires ``filter_error`` rather than
+                # misclassifying as ``filter_stall``.  Skip only THIS
+                # batch (FR-FLT-6 / spec §7.1: "failed filter batches are
+                # skipped") — batches that already scored cleanly are kept
+                # rather than discarded by the first failure.  A failed
+                # filter call is not a per-item rejection (2.3a), so its
+                # items are dropped WITHOUT an ``articles_filtered{drop}``
+                # tick.
                 record_filter_error()
-                return []
+                failed_item_ids.update(c.item_id for c in chunk)
+                continue
             all_scores.update(chunk_scores)
 
         drop_attrs = {"profile": profile, "decision": "drop"}
         pass_attrs = {"profile": profile, "decision": "pass"}
         kept: list[ScoredCandidate] = []
         for cand in candidates:
+            if cand.item_id in failed_item_ids:
+                # Scorer errored on this candidate's batch — the failure is
+                # already surfaced as ``filter_error``; do not double-count
+                # it as a per-item relevance drop.
+                continue
             scored = all_scores.get(cand.item_id)
             if scored is None:
                 metrics.articles_filtered().add(1, drop_attrs)

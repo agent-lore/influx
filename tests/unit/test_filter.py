@@ -8,7 +8,8 @@ Covers the three behaviours called out in the AC:
   reaches the scorer untouched, so feedback examples flow through)
 
 Also exercises :data:`FilterScorerError` skip-the-batch behaviour
-(FR-FLT-6 / spec §7.1) and the no-scorer fallback.
+(FR-FLT-6 / spec §7.1) — a failing batch is skipped while batches that
+already scored cleanly are kept — and the no-scorer fallback.
 """
 
 from __future__ import annotations
@@ -148,6 +149,60 @@ async def test_score_skips_entire_batch_on_filter_scorer_error() -> None:
 
     # Failed batches must NOT be ingested with a default score.
     assert result == []
+
+
+async def test_score_keeps_successful_batches_when_a_later_batch_fails() -> None:
+    """A FilterScorerError skips ONLY its own batch (FR-FLT-6 / spec §7.1).
+
+    Regression for PR #265 review: with the flattened RSS/arXiv scoring
+    call, an earlier batch that scored cleanly must survive a later
+    batch's failure — the whole run must not be discarded by the first
+    error.
+    """
+    from influx.telemetry import current_filter_errors
+
+    config = _make_config(batch_size=2)
+    profile_cfg = config.profiles[0]
+    # batch_size=2 → chunk1=[a, b] scores cleanly; chunk2=[c, d] fails.
+    candidates = [
+        _candidate("a"),
+        _candidate("b"),
+        _candidate("c"),
+        _candidate("d"),
+    ]
+    scores = {"a": 9, "b": 8}
+
+    async def flaky_scorer(
+        chunk: list[Candidate],
+        profile: str,
+        filter_prompt: str,
+    ) -> dict[str, ScoredCandidate]:
+        if any(c.item_id in {"c", "d"} for c in chunk):
+            raise FilterScorerError("upstream LLM down for this batch")
+        return {
+            c.item_id: ScoredCandidate(
+                candidate=c,
+                score=scores[c.item_id],
+                confidence=1.0,
+                reason="ok",
+                filter_tags=(),
+            )
+            for c in chunk
+        }
+
+    token = current_filter_errors.set([0])
+    try:
+        f = Filter(config=config, profile_cfg=profile_cfg, scorer=flaky_scorer)
+        result = await f.score(candidates, filter_prompt="prompt", source="rss")
+        errors = current_filter_errors.get()
+    finally:
+        current_filter_errors.reset(token)
+
+    # The clean first batch survives; the failed batch's items are gone.
+    assert [s.candidate.item_id for s in result] == ["a", "b"]
+    # Exactly one batch failed → one filter_error recorded.
+    assert errors is not None
+    assert errors[0] == 1
 
 
 # ── No-scorer fallback ─────────────────────────────────────────────

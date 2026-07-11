@@ -20,9 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
-import json
 import logging
-import os
 import threading
 import time
 from collections.abc import Iterable
@@ -44,7 +42,7 @@ from influx.cascade import Acquired, Cascade
 from influx.coordinator import RunKind
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article, extract_article_from_html
-from influx.filter import FilterScorerError, _acall_filter_model_with_retry
+from influx.filter import BatchScorer, Filter, make_default_batch_scorer
 from influx.http_client import aguarded_fetch as _aguarded_fetch
 from influx.repair_hooks import has_usable_source
 from influx.slugs import slugify_feed_name
@@ -60,7 +58,6 @@ from influx.telemetry import (
     get_tracer,
     record_empty_source_write,
     record_fetched_items,
-    record_filter_error,
     record_invalid_url_rejection,
     record_source_acquisition_error,
     record_source_cooldown_skip,
@@ -731,90 +728,6 @@ def build_rss_note_item(
     )
 
 
-async def _score_rss_items(
-    *,
-    items: list[RssFeedItem],
-    profile: str,
-    filter_prompt: str,
-    config: AppConfig,
-) -> dict[str, Any]:
-    """Score RSS items with the configured relevance filter."""
-    if not items:
-        return {}
-    slot = config.models.get("filter")
-    if slot is None:
-        raise FilterScorerError("models.filter is not configured")
-    provider = config.providers.get(slot.provider)
-    if provider is None:
-        raise FilterScorerError(f"filter provider {slot.provider!r} not configured")
-
-    headers: dict[str, str] = {**provider.extra_headers}
-    if provider.api_key_env:
-        api_key = os.environ.get(provider.api_key_env, "")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-    url = f"{provider.base_url.rstrip('/')}/chat/completions"
-    attempts = slot.max_retries + 1
-
-    all_scores: dict[str, Any] = {}
-    batch_size = max(int(config.filter.batch_size), 1)
-    for chunk_start in range(0, len(items), batch_size):
-        chunk = items[chunk_start : chunk_start + batch_size]
-        candidates = [
-            {"id": _rss_filter_id(item), "title": item.title, "abstract": item.summary}
-            for item in chunk
-        ]
-        body: dict[str, Any] = {
-            "model": slot.model,
-            "temperature": slot.temperature,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        f"{filter_prompt}\n\n## CANDIDATES\n"
-                        f"{json.dumps(candidates, ensure_ascii=False)}"
-                    ),
-                }
-            ],
-        }
-        if slot.max_tokens is not None:
-            body["max_tokens"] = slot.max_tokens
-        if slot.json_mode:
-            body["response_format"] = {"type": "json_object"}
-
-        last_error: Exception | None = None
-        for _attempt in range(attempts):
-            try:
-                response = await _acall_filter_model_with_retry(
-                    config=config,
-                    profile=profile,
-                    url=url,
-                    body=body,
-                    headers=headers,
-                    attempts=attempts,
-                )
-                all_scores.update({result.id: result for result in response.results})
-                break
-            except Exception as exc:
-                last_error = exc
-                continue
-        else:
-            exc_info = None
-            if last_error is not None:
-                exc_info = (type(last_error), last_error, last_error.__traceback__)
-            _log.warning(
-                "RSS filter failed for profile %r items %d-%d; skipping chunk",
-                profile,
-                chunk_start,
-                chunk_start + len(chunk) - 1,
-                exc_info=exc_info,
-            )
-            record_filter_error()
-
-    return all_scores
-
-
 def _rss_filter_id(item: RssFeedItem) -> str:
     return url_hash(item.url)
 
@@ -826,9 +739,10 @@ class RssSource:
     """RSS adapter conforming to :class:`influx.source.Source`.
 
     Fans out across the profile's configured feeds in
-    :meth:`fetch_candidates`; per-feed filter scoring stays in the
-    legacy provider closure so :func:`_score_rss_items` retains its
-    test seam.
+    :meth:`fetch_candidates` (flattening every feed into one candidate
+    list); :func:`make_rss_item_provider` then scores that list through
+    the shared :class:`influx.filter.Filter` seam and acquires each
+    survivor via :meth:`acquire`.
     """
 
     name = "rss"
@@ -873,12 +787,10 @@ class RssSource:
     ) -> list[Candidate]:
         """Fetch a single feed and wrap its items as :class:`Candidate` records.
 
-        The per-feed fetch unit shared by :meth:`fetch_candidates` (which
-        flattens across the profile's feeds) and
-        :func:`make_rss_item_provider` (which keeps the per-feed boundary so
-        :func:`_score_rss_items` scores each feed independently).  Emits the
-        per-feed fetch telemetry: ``candidates_fetched`` + the run-level
-        ``fetched_total`` count (#85) plus the fetch start/complete INFO logs.
+        The per-feed fetch unit :meth:`fetch_candidates` composes across
+        the profile's feeds.  Emits the per-feed fetch telemetry:
+        ``candidates_fetched`` + the run-level ``fetched_total`` count
+        (#85) plus the fetch start/complete INFO logs.
         """
         config = self._config
         profile = profile_cfg.name
@@ -957,23 +869,34 @@ class RssSource:
 def make_rss_item_provider(
     config: AppConfig,
     *,
+    scorer: BatchScorer | None = None,
     fetch_cache: FetchCache | None = None,
 ) -> Any:
     """Build the item provider for RSS feed profiles.
 
-    Fetches each RSS feed configured for the profile, parses items,
-    and maps each through :func:`build_rss_note_item`.
+    Fetches each RSS feed configured for the profile, scores the
+    flattened candidate list through :class:`influx.filter.Filter`, and
+    maps each surviving candidate through :func:`build_rss_note_item`.
 
     Parameters
     ----------
     config:
         Loaded :class:`~influx.config.AppConfig`.
+    scorer:
+        Batched :data:`~influx.filter.BatchScorer` override (test seam).
+        When ``None`` the production default
+        :func:`~influx.filter.make_default_batch_scorer` is installed —
+        the same source-agnostic LLM filter scorer arXiv uses (finding
+        2.3).  ``Filter`` chunks the flattened feed candidates by
+        ``filter.batch_size`` and skips the whole batch on a
+        :class:`~influx.filter.FilterScorerError`.
     fetch_cache:
         Optional shared :class:`~influx.sources.FetchCache` for
         per-fire dedup (R-8).  When two profiles share the same RSS
         feed URL the feed is fetched once and the result shared.
     """
     cache = fetch_cache
+    batch_scorer = scorer if scorer is not None else make_default_batch_scorer(config)
 
     async def provider(
         profile: str,
@@ -981,19 +904,20 @@ def make_rss_item_provider(
         run_range: dict[str, str | int] | None,
         filter_prompt: str,
     ) -> Iterable[BoundScoredCandidate]:
-        del kind, run_range
-
         profile_cfg = next((p for p in config.profiles if p.name == profile), None)
         if profile_cfg is None:
             _log.info("rss source skipped profile=%s reason=unknown_profile", profile)
             return ()
 
-        # ── Source.fetch_feed_candidates + Source.acquire (issue #57) ──
-        # Fetch and acquire route through the RssSource adapter; scoring
-        # stays on the per-feed boundary (one ``_score_rss_items`` call per
-        # feed) so chunk packing and filter-error granularity are
-        # unchanged.  Unifying scoring onto the Filter seam is finding 2.3.
+        # ── Source + Filter seams (issue #57 / finding 2.3b) ──
+        # Fetch flattens every configured feed into one candidate list;
+        # scoring runs through the shared ``Filter`` (chunk by
+        # ``filter.batch_size`` across feed boundaries, threshold gate +
+        # ``articles_filtered`` metrics, whole-batch-drop on a
+        # ``FilterScorerError``) — the same seam arXiv uses.  Acquire
+        # routes through ``RssSource.acquire``.
         source = RssSource(config, fetch_cache=cache)
+        rss_filter = Filter(config=config, profile_cfg=profile_cfg, scorer=batch_scorer)
 
         # ── Telemetry: influx.fetch.rss span (FR-OBS-4) ──
         _tracer = get_tracer()
@@ -1005,128 +929,46 @@ def make_rss_item_provider(
                 "influx.source": "rss",
             },
         ) as fetch_span:
+            candidates = await source.fetch_candidates(
+                profile_cfg=profile_cfg, kind=kind, run_range=run_range
+            )
+            scored_list = await rss_filter.score(
+                candidates, filter_prompt=filter_prompt, source="rss"
+            )
+
             bounds: list[BoundScoredCandidate] = []
-            for feed_entry in profile_cfg.sources.rss:
-                candidates = await source.fetch_feed_candidates(
-                    feed_entry, profile_cfg=profile_cfg
-                )
-                items = [c.payload for c in candidates]
-                try:
-                    scores = await _score_rss_items(
-                        items=items,
-                        profile=profile,
-                        filter_prompt=filter_prompt,
+            for sc in scored_list:
+                # Issue #125: emit a BoundScoredCandidate so the Run stage
+                # can run pre-acquire ``lithos_cache_lookup`` before paying
+                # the article fetch / archive / extract cost.
+                # ``Source.acquire`` is the per-item acquire entrypoint;
+                # issue #124's ``asyncio.to_thread`` offload moves into the
+                # closure, fired only when the orchestrator decides this
+                # candidate must be acquired.
+                async def _acquire(
+                    sc: ScoredCandidate = sc,
+                ) -> dict[str, Any] | None:
+                    return await asyncio.to_thread(
+                        source.acquire,
+                        sc,
+                        profile_cfg=profile_cfg,
                         config=config,
                     )
-                except FilterScorerError:
-                    _log.warning(
-                        "RSS filter failed for feed %r; skipping feed batch",
-                        feed_entry.name,
-                        exc_info=True,
-                    )
-                    # #85 review: see arxiv.py for rationale.  Per-feed
-                    # failures each tick the counter so a profile with
-                    # multiple feeds reflects the true partial-failure
-                    # surface.
-                    record_filter_error()
-                    continue
-                _log.info(
-                    "rss filter completed profile=%s feed=%r items=%d "
-                    "scores_returned=%d",
-                    profile,
-                    feed_entry.name,
-                    len(items),
-                    len(scores),
-                )
-                drop_attrs = {"profile": profile, "decision": "drop"}
-                pass_attrs = {"profile": profile, "decision": "pass"}
-                for cand in candidates:
-                    item = cand.payload
-                    scored = scores.get(cand.item_id)
-                    if scored is None:
-                        metrics.articles_filtered().add(1, drop_attrs)
-                        _log.info(
-                            "article inspected source=rss profile=%s feed=%r "
-                            "published=%s score=none decision=drop "
-                            "reason=not_returned_by_filter title=%r url=%s",
-                            profile,
-                            feed_entry.name,
-                            item.published.isoformat(),
-                            item.title,
-                            item.url,
-                        )
-                        continue
-                    if scored.score < profile_cfg.thresholds.relevance:
-                        metrics.articles_filtered().add(1, drop_attrs)
-                        _log.info(
-                            "article inspected source=rss profile=%s feed=%r "
-                            "published=%s score=%d threshold=%d decision=drop "
-                            "reason=below_relevance title=%r url=%s",
-                            profile,
-                            feed_entry.name,
-                            item.published.isoformat(),
-                            scored.score,
-                            profile_cfg.thresholds.relevance,
-                            item.title,
-                            item.url,
-                        )
-                        continue
-                    metrics.articles_filtered().add(1, pass_attrs)
-                    _log.info(
-                        "article inspected source=rss profile=%s feed=%r "
-                        "published=%s score=%d threshold=%d decision=accept "
-                        "title=%r url=%s",
-                        profile,
-                        feed_entry.name,
-                        item.published.isoformat(),
-                        scored.score,
-                        profile_cfg.thresholds.relevance,
-                        item.title,
-                        item.url,
-                    )
-                    # Issue #125: emit a BoundScoredCandidate so the Run
-                    # stage can run pre-acquire ``lithos_cache_lookup``
-                    # before paying the article fetch / archive / extract
-                    # cost.  ``Source.acquire`` is the per-item acquire
-                    # entrypoint; issue #124's ``asyncio.to_thread`` offload
-                    # moves into the closure, fired only when the
-                    # orchestrator decides this candidate must be acquired.
-                    sc = ScoredCandidate(
-                        candidate=cand,
-                        score=scored.score,
-                        confidence=1.0,
-                        reason=scored.reason,
-                        filter_tags=scored.tags,
-                    )
 
-                    async def _acquire(
-                        sc: ScoredCandidate = sc,
-                    ) -> dict[str, Any] | None:
-                        return await asyncio.to_thread(
-                            source.acquire,
-                            sc,
-                            profile_cfg=profile_cfg,
-                            config=config,
-                        )
-
-                    bounds.append(
-                        BoundScoredCandidate(
-                            scored=sc,
-                            acquire=_acquire,
-                            source_label=f"rss:{feed_entry.name}",
-                        )
+                feed_name = getattr(sc.candidate.payload, "feed_name", "")
+                bounds.append(
+                    BoundScoredCandidate(
+                        scored=sc,
+                        acquire=_acquire,
+                        source_label=f"rss:{feed_name}",
                     )
-                _log.info(
-                    "rss feed completed profile=%s feed=%r accepted_so_far=%d",
-                    profile,
-                    feed_entry.name,
-                    len(bounds),
                 )
             fetch_span.set_attribute("influx.item_count", len(bounds))
             _log.info(
-                "rss source completed profile=%s feeds=%d accepted=%d",
+                "rss source completed profile=%s feeds=%d fetched=%d accepted=%d",
                 profile,
                 len(profile_cfg.sources.rss),
+                len(candidates),
                 len(bounds),
             )
 
