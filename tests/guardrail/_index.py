@@ -66,7 +66,7 @@ def artifacts(arch: dict | None = None) -> list[Artifact]:
             path="architecture.md",
             title="Component dependencies",
             description=f"{graph_desc}, grouped by tier"
-            f" ({' → '.join(_tier_names(arch))}).",
+            + f" ({' → '.join(_tier_names(arch))}).",
         ),
     ]
     if language == "python":
@@ -77,7 +77,7 @@ def artifacts(arch: dict | None = None) -> list[Artifact]:
                 description=(
                     "Class diagram of the domain dataclasses and Pydantic models, "
                     "extracted statically from the modules listed in"
-                    " docs/architecture.toml."
+                    + " docs/architecture.toml."
                 ),
             )
         )
@@ -88,8 +88,8 @@ def artifacts(arch: dict | None = None) -> list[Artifact]:
                 title="Data stores",
                 description=(
                     "The on-disk stores and external engines (corpus, indexes,"
-                    " SQLite DBs) with the component that owns each — source of"
-                    " truth vs derived views."
+                    + " SQLite DBs) with the component that owns each — source of"
+                    + " truth vs derived views."
                 ),
             )
         )
@@ -110,8 +110,8 @@ def artifacts(arch: dict | None = None) -> list[Artifact]:
             title="Architecture metrics",
             description=(
                 "Quantitative snapshot (coupling, cycles, size, complexity)"
-                " with the hard budgets from docs/architecture.toml — the"
-                " improving-vs-regressing signal."
+                + " with the hard budgets from docs/architecture.toml — the"
+                + " improving-vs-regressing signal."
             ),
         ),
         Artifact(
@@ -136,7 +136,7 @@ def _usage_lines(present: set[str]) -> list[str]:
         "## How to use these",
         "",
         "- **New to the codebase?** Start at [architecture.md](architecture.md)"
-        " for the",
+        + " for the",
         "  component map and click a node to open its drill-down page.",
     ]
     if "containers.md" in present:
@@ -151,15 +151,15 @@ def _usage_lines(present: set[str]) -> list[str]:
     if "tool_catalog.md" in present:
         lines += [
             "- **Building against the server?** [tool_catalog.md](tool_catalog.md)"
-            " is the",
+            + " is the",
             "  public API — every tool, its signature, and the components it touches.",
         ]
     lines += [
         "- **Reviewing a PR?** CI posts an architecture-metrics delta in its"
-        " job summary;",
+        + " job summary;",
         "  [metrics.md](metrics.md) has the full snapshot and the budgets that gate",
         "  regressions. `make metrics-history` plots any metric over its"
-        " commit history.",
+        + " commit history.",
     ]
     return lines
 
@@ -202,7 +202,7 @@ def render_index(arch: dict | None = None) -> str:
         " (no upward edges)."
         if LANGUAGE == "cpp"
         else "  point downward; enforced by import-linter"
-        " (`pyproject.toml [tool.importlinter]`)."
+        + " (`pyproject.toml [tool.importlinter]`)."
     )
     tier_names = _tier_names(arch)
     lines += [
@@ -210,16 +210,16 @@ def render_index(arch: dict | None = None) -> str:
         "## Legend",
         "",
         f"- `A --> B` in the component diagram: at least one real {dep_word}"
-        " from a module",
+        + " from a module",
         "  in component A to a module in component B.",
         f"- Tier subgraphs ({' / '.join(tier_names)}): dependencies must only",
         enforced_by,
-        f"- Dashed grey edge: a tier-skipping dependency"
-        f" (e.g. {tier_names[0]} → {tier_names[-1]}).",
+        "- Dashed grey edge: a tier-skipping dependency"
+        + f" (e.g. {tier_names[0]} → {tier_names[-1]}).",
         f"  Grey edge: a dependency on a {tier_names[-1]} component"
-        " (de-emphasized fan-in).",
+        + " (de-emphasized fan-in).",
         "- Component nodes are clickable — they link to the per-component"
-        " drill-down page.",
+        + " drill-down page.",
     ]
     if LANGUAGE == "python":
         lines += [
@@ -236,7 +236,7 @@ def render_index(arch: dict | None = None) -> str:
     if LANGUAGE == "python":
         lines.append(
             "- `pyproject.toml [tool.importlinter]` — the enforced"
-            " directional contracts."
+            + " directional contracts."
         )
     if (REPO_ROOT / "CONTEXT.md").exists():
         lines.append(

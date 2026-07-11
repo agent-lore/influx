@@ -65,8 +65,8 @@ def _component_table(metrics: dict[str, Any]) -> list[str]:
         )
         lines.append(
             f"| {comp} | {s['modules']} | {s['lines']} | {s['sloc']} |"
-            f" {g['fan_in']} | {g['fan_out']} | {g['instability']:.2f} |"
-            f" {max_cx} | {c['functions_over_10']} |"
+            + f" {g['fan_in']} | {g['fan_out']} | {g['instability']:.2f} |"
+            + f" {max_cx} | {c['functions_over_10']} |"
         )
     return lines
 
@@ -99,7 +99,7 @@ def _graph_section(metrics: dict[str, Any]) -> list[str]:
         f"- Component cycles: {cycles}",
         f"- Module cycles: {module_cycles}",
         f"- Tier-skipping edges ({tiers[0]} → {tiers[-1]}):"
-        f" {g['tier_skipping_edges']} ({skips})",
+        + f" {g['tier_skipping_edges']} ({skips})",
         f"- Longest component dependency chain: {g['longest_component_chain']}",
     ]
 
@@ -159,7 +159,7 @@ def _summary_section(metrics: dict[str, Any]) -> list[str]:
     if has_tools:
         lines.append(
             f"- MCP tools: **{m['tools']}**"
-            f" ({m['tools_without_docstrings']} without docstrings)"
+            + f" ({m['tools_without_docstrings']} without docstrings)"
         )
     lines.append(
         f"- Test-to-source line ratio: **{t['ratio']:.2f}**"

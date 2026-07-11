@@ -50,7 +50,7 @@ def test_every_model_is_scanned_or_excluded() -> None:
         "public models in modules neither included nor excluded in "
         "docs/architecture.toml [domain] (add the module to include_modules to "
         "diagram them, or exclude_modules if they are not domain entities):"
-        f" {offenders}"
+        + f" {offenders}"
     )
 
 
