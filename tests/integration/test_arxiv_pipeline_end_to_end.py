@@ -16,6 +16,7 @@ extraction stack end-to-end (PRD 07 US-014).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -635,6 +636,22 @@ class TestDefaultFilterScorerEndToEnd:
 
             # Default scorer was invoked exactly once (batched).
             assert mock_filter_post.call_count == 1
+            # Payload equivalence (finding 2.4): after unifying arXiv onto
+            # the source-agnostic default scorer, the LLM request must
+            # still carry the arXiv id/title/abstract it did before —
+            # arXiv's ``Candidate.item_id`` IS the arxiv_id.  ``body`` is
+            # the second positional arg to ``guarded_post_json_fetch``.
+            sent_body = mock_filter_post.call_args.args[1]
+            user_message = sent_body["messages"][0]["content"]
+            assert "## CANDIDATES" in user_message
+            sent_candidates = json.loads(user_message.rsplit("## CANDIDATES", 1)[1])
+            assert sent_candidates == [
+                {
+                    "id": _ARXIV_ID,
+                    "title": "End-To-End Pipeline Paper",
+                    "abstract": "Paper about end-to-end arxiv ingestion validation.",
+                }
+            ]
             # Below-full_text scores must NOT trigger HTML extraction.
             assert mock_html.call_count == 0
 

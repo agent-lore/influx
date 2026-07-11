@@ -379,6 +379,58 @@ class TestInfluxFilterSpan:
         assert attrs.get("influx.run_id") == "test-run-filter-provider"
         assert attrs.get("influx.item_count") == 1
 
+    async def test_no_filter_span_and_zero_items_when_no_scorer(self) -> None:
+        """No scorer + no ``[models.filter]`` → the provider scores nothing,
+        emits no ``influx.filter`` span, and yields zero items (finding 2.4:
+        the span is gated on a wired scorer, and a misconfigured deployment
+        completes cleanly instead of ingesting unscored notes).
+
+        Restores the provider-level no-scorer coverage that used to live in
+        the now-deleted ``test_arxiv_filter_adapters.py``.
+        """
+        from datetime import UTC, datetime
+
+        from influx.sources.arxiv import ArxivItem, make_arxiv_item_provider
+
+        tracer, collected = _make_collecting_tracer()
+        # ``_make_minimal_config`` has no ``[models.filter]`` slot, so
+        # ``make_default_batch_scorer`` returns ``None`` and no scorer is
+        # wired.
+        config = _make_minimal_config()
+
+        test_items = [
+            ArxivItem(
+                arxiv_id="2401.00001",
+                title="Test Paper",
+                abstract="Abstract text",
+                published=datetime(2024, 1, 1, tzinfo=UTC),
+                categories=["cs.AI"],
+            ),
+        ]
+
+        token = current_run_id.set("test-run-no-scorer")
+        try:
+            provider = make_arxiv_item_provider(config)
+            with (
+                patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch(
+                    "influx.sources.arxiv.fetch_arxiv",
+                    new_callable=MagicMock,
+                    return_value=test_items,
+                ),
+            ):
+                result = await provider(
+                    "ai-robotics", RunKind.SCHEDULED, None, "test filter prompt"
+                )
+                bounds = list(result)
+        finally:
+            current_run_id.reset(token)
+
+        # Candidates were fetched, but with no scorer nothing is scored:
+        # zero items and no ``influx.filter`` span.
+        assert bounds == []
+        assert [s for s in collected if s.name == "influx.filter"] == []
+
 
 # ── (3) AC-10-A regression check: no spans when OTEL disabled ─────────
 
