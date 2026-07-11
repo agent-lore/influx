@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 649
+    "total_functions": 650
   },
   "domain": {
     "associations": 5,
@@ -289,11 +289,11 @@
         "classes": 4,
         "functions": 12,
         "largest_module": "influx.cascade",
-        "largest_module_lines": 683,
-        "lines": 986,
+        "largest_module_lines": 685,
+        "lines": 988,
         "modules": 2,
         "public_symbols": 6,
-        "sloc": 798
+        "sloc": 800
       },
       "Entrypoint": {
         "classes": 0,
@@ -337,13 +337,13 @@
       },
       "LithosBridge": {
         "classes": 13,
-        "functions": 114,
+        "functions": 115,
         "largest_module": "influx.lithos_client",
-        "largest_module_lines": 1780,
-        "lines": 4064,
+        "largest_module_lines": 1789,
+        "lines": 4097,
         "modules": 8,
-        "public_symbols": 51,
-        "sloc": 3230
+        "public_symbols": 52,
+        "sloc": 3254
       },
       "Notifications": {
         "classes": 5,
@@ -417,7 +417,7 @@
       }
     },
     "max_module": "influx.lithos_client",
-    "max_module_lines": 1780,
+    "max_module_lines": 1789,
     "modules_over_800": [
       "influx.config",
       "influx.http_api",
@@ -432,13 +432,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27722,
+    "total_lines": 27757,
     "total_modules": 57,
-    "total_sloc": 21522
+    "total_sloc": 21548
   },
   "tests": {
     "ratio": 2.53,
-    "src_lines": 27722,
-    "test_lines": 70085
+    "src_lines": 27757,
+    "test_lines": 70237
   }
 }

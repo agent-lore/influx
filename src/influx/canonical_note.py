@@ -76,6 +76,7 @@ __all__ = [
     "NoteParseError",
     "ProfileRelevanceEntry",
     "Section",
+    "carry_forward_section",
     "drop_tier2",
     "drop_tier2_and_tier3",
     "extract_section_body",
@@ -581,6 +582,29 @@ def extract_section_body(content: str, heading: str) -> str:
     if next_match is not None:
         return content[body_start : next_match.start()].rstrip()
     return content[body_start:].rstrip()
+
+
+def carry_forward_section(source: str, target: str, heading: str) -> str:
+    """Copy *heading*'s section from *source* into *target*.
+
+    Used by the multi-profile / cache-hit merge to preserve a section the
+    freshly-rendered *target* does not itself carry — notably ``## Repair``
+    counters, which only the repair sweep writes.  The section *body* is
+    carried across as text (no ``RepairCounters`` parse / re-render
+    round-trip, so unknown or hand-added bullets survive), then written
+    via :func:`upsert_section_text`.  Like every canonical section op,
+    that normalises the section it writes to LF boundaries and drops the
+    body's trailing whitespace — so this is semantic preservation of the
+    section's content, not a byte-exact copy: a hand-edited ``## Repair``
+    keeps its bullets but loses trailing blank lines / CRLF *within* the
+    section.  The section is placed at :func:`insertion_point`, or
+    replaces an existing section of the same heading in *target*.  A no-op
+    when *source* has no such section.
+    """
+    body = extract_section_body(source, heading)
+    if not body:
+        return target
+    return upsert_section_text(target, heading, f"## {heading}\n{body}\n")
 
 
 def upsert_archive_path(content: str, archive_path: str) -> str:

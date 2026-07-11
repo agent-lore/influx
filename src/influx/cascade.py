@@ -158,11 +158,13 @@ class EnrichedSections:
     Counter state (Fork 6):
 
     - ``counters`` — the post-enrich :class:`RepairCounters`.  When the
-      caller passed a ``counters`` value (the repair sweep, or the
-      create-path merge onto a note that already has a ``## Repair``
-      section), a counted-class Tier 2 / Tier 3 failure advances it; the
-      caller persists the result.  On the initial-write path (no
-      ``counters`` passed) it is the zero default and no advance happens.
+      caller passed a ``counters`` value (the repair sweep), a
+      counted-class Tier 2 / Tier 3 failure advances it; the caller
+      persists the result.  The create path always enriches with the
+      zero default (no ``counters``); when it re-ingests an existing note
+      its accumulated ``## Repair`` counters are preserved at the
+      multi-profile merge (``lithos_client``, 3a.4) rather than fed back
+      into ``enrich``.
       Note ``repair_flags`` (``influx:repair-needed``) is emitted for
       *any* tier failure — transient or counted — but only *counted*
       failures advance ``counters`` (see
@@ -226,15 +228,15 @@ class Cascade:
             text without re-extracting.
         counters:
             Optional :class:`RepairCounters` to consult.  When provided
-            (repair sweep, or a create-path merge onto a note that
-            already carries a ``## Repair`` section) the Cascade owns the
-            full counter lifecycle: it skips a tier already at the cap
-            (emitting ``influx:tier{2,3}-terminal``), and on a
-            counted-class failure advances the counter and emits the
-            terminal flag when the cap is reached.  When omitted
-            (initial-write path) it defaults to a zero-counter value and
-            no advance happens — counted failures still emit
-            ``influx:repair-needed`` for the first sweep to pick up.
+            (the repair sweep) the Cascade owns the full counter
+            lifecycle: it skips a tier already at the cap (emitting
+            ``influx:tier{2,3}-terminal``), and on a counted-class failure
+            advances the counter and emits the terminal flag when the cap
+            is reached.  When omitted (the create path, always) it defaults
+            to a zero-counter value and no advance happens — counted
+            failures still emit ``influx:repair-needed`` for the first
+            sweep to pick up.  A re-ingested note's existing ``## Repair``
+            counters are preserved at the multi-profile merge, not here.
 
         Returns
         -------

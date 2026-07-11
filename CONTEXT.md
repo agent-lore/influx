@@ -43,7 +43,7 @@ Produces a **CanonicalNote** from an Acquired plus EnrichedSections plus the sco
 An Influx-authored Markdown note: typed frontmatter, fixed section order (`## Archive`, `## Summary`, `## Full Text`, `## Claims`, `## Datasets & Benchmarks`, `## Builds On`, `## Open Questions`, `## Profile Relevance`, `## User Notes`), and stable tag conventions. `## User Notes` is preserved byte-exactly across rewrites.
 
 **RepairCounters**:
-Per-tier attempt counter persisted in the note's `## Repair` section. Read on tier entry (skip if `tier{N}-terminal` is set), advanced on counted (parse/validate) failures, never advanced on transient failures. Reaches the cap → adds `influx:tier{N}-terminal`. _(proposed as a module shared between the create path and the repair sweep)_
+Per-tier attempt counter persisted in the note's `## Repair` section. Read on tier entry (skip if `tier{N}-terminal` is set), advanced on counted (parse/validate) failures, never advanced on transient failures. Reaches the cap → adds `influx:tier{N}-terminal`. The repair sweep owns the full lifecycle (read → advance → terminal) via `Cascade.enrich`; the create path enriches with a zero counter but preserves an existing note's `## Repair` section across a multi-profile re-ingest, so caps survive.
 
 ### Domain — execution
 

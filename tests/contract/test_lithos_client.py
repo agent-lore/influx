@@ -1959,6 +1959,87 @@ class TestWriteEnvelopeVersionConflict:
         finally:
             await client.close()
 
+    async def test_version_conflict_preserves_repair_section(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """3a.4: a multi-profile re-ingest preserves the existing note's
+        ``## Repair`` counters so a tier-terminal note keeps its caps.
+
+        The freshly-ingested create-path content carries no ``## Repair``
+        section (only the sweep writes one), so without the carry-forward
+        the merge would drop the accumulated counters and let the next
+        sweep re-attempt a capped tier from zero.
+        """
+        import json as _json
+
+        repair_section = (
+            "## Repair\n"
+            "- tier2_attempts: 3\n"
+            '- tier2_last_stage: "parse"\n'
+            '- tier2_last_error: "unparseable full text"\n'
+            "- tier3_attempts: 0\n"
+            '- tier3_last_stage: ""\n'
+            '- tier3_last_error: ""\n'
+            "- archive_attempts: 0\n"
+            '- archive_last_kind: ""\n'
+            '- archive_last_error: ""\n'
+        )
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "version_conflict", "note_id": "note-050"}',
+                '{"status": "updated"}',
+            ]
+        )
+        fake_lithos_server.read_responses.append(
+            _json.dumps(
+                {
+                    "id": "note-050",
+                    "content": (
+                        f"## Summary\nOld summary.\n\n{repair_section}\n"
+                        "## User Notes\nHand notes."
+                    ),
+                    "tags": [
+                        "profile:ml-research",
+                        "influx:tier2-terminal",
+                    ],
+                    "version": 5,
+                }
+            )
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Re-ingested Paper",
+                # Fresh create-path content: no ## Repair section.
+                content="## Summary\nFresh summary.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.22222",
+                tags=["profile:cv-research", "source:arxiv"],
+                confidence=0.9,
+            )
+            assert result.status == "updated"
+
+            write_calls = [
+                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
+            ]
+            retry_content = write_calls[1][1]["content"]
+            # The accumulated ## Repair counters survive the merge — this is
+            # the cap's source of truth.  (The ``influx:tier2-terminal``
+            # *tag* is Influx-owned and intentionally replaced by the fresh
+            # write per the merge_tags contract; the next sweep re-derives
+            # it from these preserved counters — attempts=3 ≥ cap.)
+            assert "## Repair" in retry_content
+            assert "tier2_attempts: 3" in retry_content
+            assert 'tier2_last_error: "unparseable full text"' in retry_content
+            # The fresh content + preserved user notes are still there.
+            assert "Fresh summary" in retry_content
+            assert "Hand notes" in retry_content
+        finally:
+            await client.close()
+
     async def test_version_conflict_preserves_user_notes_block(
         self,
         fake_lithos_url: str,
