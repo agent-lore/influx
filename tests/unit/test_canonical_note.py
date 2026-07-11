@@ -521,6 +521,43 @@ class TestCarryForwardSection:
         assert "tier2_attempts: 3" in result
         assert "tier2_attempts: 0" not in result
 
+    def test_exact_output_for_canonical_lf_content(self) -> None:
+        # Pins the full output for canonical LF notes: ## Repair lands
+        # before ## User Notes with a single blank-line separator.
+        source = (
+            "## Summary\nold\n\n"
+            '## Repair\n- tier2_attempts: 3\n- tier2_last_error: "boom"\n\n'
+            "## User Notes\nmine\n"
+        )
+        target = "## Summary\nfresh\n\n## User Notes\nmine\n"
+        assert cn.carry_forward_section(source, target, REPAIR) == (
+            "## Summary\nfresh\n\n"
+            '## Repair\n- tier2_attempts: 3\n- tier2_last_error: "boom"\n\n'
+            "## User Notes\nmine\n"
+        )
+
+    def test_normalises_trailing_blank_lines(self) -> None:
+        # Documented non-byte-exactness: extra trailing blank lines inside
+        # the source ## Repair are normalised away (extract_section_body
+        # rstrips; upsert_section_text re-renders LF boundaries).
+        source = "## Repair\n- tier2_attempts: 3\n\n\n## User Notes\nx\n"
+        target = "## Summary\nfresh\n"
+        result = cn.carry_forward_section(source, target, REPAIR)
+        assert result == "## Summary\nfresh\n\n## Repair\n- tier2_attempts: 3\n"
+        assert "\n\n\n" not in result
+
+    def test_inserts_before_profile_relevance(self) -> None:
+        source = "## Repair\n- tier2_attempts: 2\n\n## User Notes\nn\n"
+        target = (
+            "## Summary\ns\n\n"
+            "## Profile Relevance\n### p\nScore: 5/10\nr\n\n"
+            "## User Notes\nn\n"
+        )
+        result = cn.carry_forward_section(source, target, REPAIR)
+        # SECTION_ORDER places ## Repair before ## Profile Relevance.
+        assert result.index("## Repair") < result.index("## Profile Relevance")
+        assert "tier2_attempts: 2" in result
+
 
 class TestSectionInsertBytes:
     """Exact-byte splice behaviour for the section-insert ops.

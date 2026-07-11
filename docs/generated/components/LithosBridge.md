@@ -40,7 +40,7 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 - def `drop_tier2` — Remove the ``## Full Text`` (Tier 2) section, keeping Tier 1/Tier 3.
 - def `drop_tier2_and_tier3` — Remove ``## Full Text`` and all Tier 3 sections, keeping Tier 1.
 - def `extract_section_body` — Return the trailing-stripped body of *heading*, or ``""`` if absent.
-- def `carry_forward_section` — Copy *heading*'s section from *source* into *target* verbatim.
+- def `carry_forward_section` — Copy *heading*'s section from *source* into *target*.
 - def `upsert_archive_path` — Set the ``## Archive`` ``path:`` line, idempotently.
 - def `replace_profile_relevance_section` — Replace the ``## Profile Relevance`` section body with *entries*.
 - def `upsert_section_text` — Insert or replace a full section with *rendered_section*.
