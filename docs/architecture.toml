@@ -82,6 +82,8 @@ component_cycles       = 3    # Common<->Config, a Core SCC, HttpApi<->Orchestra
 module_cycles          = 3    # goal: 0
 modules_over_800_lines = 12   # existing god modules; direction: down, no new ones
 max_module_lines       = 2000 # stop-loss; largest today is sources.arxiv at 1912
+cross_module_private_refs = 5   # measured 2026-07; extraction.html helpers x4, telemetry x1; goal: 0
+tests_private_imports     = 91  # measured 2026-07; lithos_client + repair helpers dominate; direction: down
 
 # Domain class diagram: scoped to the LLM extraction contracts (schemas) and the
 # run-cycle data types — the same narrow scope as before this kit landed. Every
