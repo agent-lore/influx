@@ -35,7 +35,7 @@ Negative-example feedback loop, rejection-rate logging, and run-level dedup.
 
 ## Dependencies
 
-- Depends on: [Common](Common.md), [Config](Config.md), [LithosBridge](LithosBridge.md), [Observability](Observability.md), [Sources](Sources.md)
+- Depends on: [Common](Common.md), [Config](Config.md), [LithosBridge](LithosBridge.md), [Observability](Observability.md)
 - Used by: [Orchestration](Orchestration.md)
 
 [← all generated docs](../README.md)

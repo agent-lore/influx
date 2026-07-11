@@ -26,7 +26,7 @@ from fastapi import FastAPI
 from influx.config import AppConfig
 from influx.coordinator import Coordinator, RunKind
 from influx.errors import ConfigError
-from influx.filter import make_default_arxiv_filter_scorer
+from influx.filter import BatchScorer
 from influx.http_api import install_exception_handlers, router
 from influx.inbox import InboxStatus, InboxTick
 from influx.lithos_client import LithosClient
@@ -35,10 +35,6 @@ from influx.probes import ProbeLoop
 from influx.run_ledger import RunLedger
 from influx.scheduler import InfluxScheduler
 from influx.sources import FetchCache, make_item_provider
-from influx.sources.arxiv import (
-    ArxivFilterScorer,
-    ArxivScorer,
-)
 from influx.telemetry import get_tracer
 
 __all__ = [
@@ -104,8 +100,7 @@ def create_app(
     config: AppConfig,
     lifespan: Any | None = None,
     *,
-    arxiv_scorer: ArxivScorer | None = None,
-    arxiv_filter_scorer: ArxivFilterScorer | None = None,
+    arxiv_scorer: BatchScorer | None = None,
 ) -> FastAPI:
     """Build and return the FastAPI app with all dependencies on ``app.state``.
 
@@ -118,20 +113,17 @@ def create_app(
         Optional FastAPI lifespan context manager (async generator).
         When provided, wired into the app for startup/shutdown handling.
     arxiv_scorer:
-        Per-item synchronous score-gating override used by tests that
-        want deterministic scoring without standing up a real LLM.
-        When set, takes precedence over *arxiv_filter_scorer*.  See
-        :func:`~influx.sources.arxiv.make_arxiv_item_provider`.
-    arxiv_filter_scorer:
-        Optional override for the batched LLM filter scorer.  When
-        ``None`` the production default
-        :func:`~influx.filter.make_default_arxiv_filter_scorer` is
-        installed automatically — that default reads ``[models.filter]``
-        + ``[prompts.filter]`` from *config* and drives the real
-        score-gating contract from US-014/US-015 on the production
-        ``InfluxService`` path.  Tests can pass a deterministic batch
-        scorer here to exercise the score-gating behaviour without
-        mocking HTTP.
+        Optional override for arXiv's batched
+        :data:`~influx.filter.BatchScorer`.  When ``None`` the production
+        default :func:`~influx.filter.make_default_batch_scorer` is
+        installed automatically (inside
+        :func:`~influx.sources.arxiv.make_arxiv_item_provider`) — that
+        default reads ``[models.filter]`` + ``[prompts.filter]`` from
+        *config* and drives the real score-gating contract from
+        US-014/US-015 on the production ``InfluxService`` path.  Tests can
+        pass a deterministic batch scorer here to exercise the
+        score-gating behaviour without mocking HTTP.  This is the same
+        source-agnostic scorer RSS uses (finding 2.4).
     """
     app = FastAPI(title="Influx Admin API", lifespan=lifespan)
     app.include_router(router)
@@ -171,12 +163,10 @@ def create_app(
 
     # Production default item provider — drives arXiv + RSS fetch with
     # shared FetchCache for per-fire dedup (R-8 mitigation, AC-09-D).
-    # When no per-item ``arxiv_scorer`` override is supplied, the batched
-    # LLM filter default is installed so the production ``InfluxService``
-    # / ``serve`` path drives the score-gated extraction + enrichment
-    # behaviour from US-014/US-015.
-    if arxiv_scorer is None and arxiv_filter_scorer is None:
-        arxiv_filter_scorer = make_default_arxiv_filter_scorer(config)
+    # When no ``arxiv_scorer`` override is supplied, each source provider
+    # installs the source-agnostic ``make_default_batch_scorer`` default
+    # so the production ``InfluxService`` / ``serve`` path drives the
+    # score-gated extraction + enrichment behaviour from US-014/US-015.
 
     # HTTP-triggered runs (POST /runs, POST /backfills) keep using a
     # single shared cache held on ``app.state``; each request brackets
@@ -186,7 +176,6 @@ def create_app(
         config,
         fetch_cache=fetch_cache,
         arxiv_scorer=arxiv_scorer,
-        arxiv_filter_scorer=arxiv_filter_scorer,
     )
 
     # Scheduled ticks use a per-tick factory so cron tick N+1 starts
@@ -200,7 +189,6 @@ def create_app(
             config,
             fetch_cache=cache,
             arxiv_scorer=arxiv_scorer,
-            arxiv_filter_scorer=arxiv_filter_scorer,
         )
         return provider, cache
 

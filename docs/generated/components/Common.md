@@ -3,7 +3,7 @@
 
 # Common
 
-Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP client, shared enums.
+Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP client, shared enums, and the Source seam contracts (Candidate / ScoredCandidate / Source Protocol).
 
 **Tier:** Foundation
 
@@ -15,6 +15,7 @@ Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP c
 | `influx.errors` | S | 7 | 1 |
 | `influx.http_client` | M | 1 | 7 |
 | `influx.run_ledger` | L | 1 | 2 |
+| `influx.source` | S | 4 | 0 |
 | `influx.source_kind` | S | 0 | 1 |
 | `influx.thin_summary` | S | 0 | 1 |
 
@@ -49,6 +50,12 @@ Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP c
 - def `classify_degradation_severity` — Return the severity classification for *degraded_reasons*.
 - def `build_degradation_summary` — Build the bounded ``degradation_summary`` block for one run (#152).
 - class `RunLedger` — Append-only local run ledger backed by JSON files.
+
+### `influx.source`
+- class `Candidate` — An unscored item returned from :meth:`Source.fetch_candidates`.
+- class `ScoredCandidate` — A :class:`Candidate` plus the Filter's 1–10 relevance score.
+- class `BoundScoredCandidate` — A :class:`ScoredCandidate` plus a thunk that performs source-specific acquire (#125).
+- class `Source` — Unified Source seam (CONTEXT.md).
 
 ### `influx.source_kind`
 - def `classify_source_kind` — Return the URL's likely source kind based on host/path shape.

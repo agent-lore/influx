@@ -57,12 +57,10 @@ graph TD
   Feedback --> Config
   Feedback --> LithosBridge
   Feedback --> Observability
-  Feedback --> Sources
   Filter --> Common
   Filter --> Config
   Filter --> Observability
   Filter --> Schemas
-  Filter --> Sources
   HttpApi --> Common
   HttpApi --> Config
   HttpApi --> Filter
@@ -117,27 +115,27 @@ graph TD
   linkStyle 12 stroke:#bbb
   linkStyle 13 stroke:#bbb
   linkStyle 15 stroke:#bbb
+  linkStyle 16 stroke:#bbb
   linkStyle 17 stroke:#bbb
   linkStyle 18 stroke:#bbb
   linkStyle 19 stroke:#bbb
-  linkStyle 20 stroke:#bbb
-  linkStyle 22 stroke:#999,stroke-dasharray:4
-  linkStyle 23 stroke:#999,stroke-dasharray:4
-  linkStyle 27 stroke:#999,stroke-dasharray:4
+  linkStyle 20 stroke:#999,stroke-dasharray:4
+  linkStyle 21 stroke:#999,stroke-dasharray:4
+  linkStyle 25 stroke:#999,stroke-dasharray:4
+  linkStyle 28 stroke:#bbb
+  linkStyle 29 stroke:#bbb
   linkStyle 30 stroke:#bbb
   linkStyle 31 stroke:#bbb
   linkStyle 32 stroke:#bbb
-  linkStyle 33 stroke:#bbb
-  linkStyle 34 stroke:#bbb
-  linkStyle 35 stroke:#999,stroke-dasharray:4
-  linkStyle 36 stroke:#999,stroke-dasharray:4
-  linkStyle 42 stroke:#999,stroke-dasharray:4
-  linkStyle 46 stroke:#bbb
-  linkStyle 47 stroke:#bbb
-  linkStyle 50 stroke:#bbb
-  linkStyle 53 stroke:#bbb
-  linkStyle 54 stroke:#bbb
-  linkStyle 58 stroke:#bbb
-  linkStyle 61 stroke:#bbb
-  linkStyle 62 stroke:#bbb
+  linkStyle 33 stroke:#999,stroke-dasharray:4
+  linkStyle 34 stroke:#999,stroke-dasharray:4
+  linkStyle 40 stroke:#999,stroke-dasharray:4
+  linkStyle 44 stroke:#bbb
+  linkStyle 45 stroke:#bbb
+  linkStyle 48 stroke:#bbb
+  linkStyle 51 stroke:#bbb
+  linkStyle 52 stroke:#bbb
+  linkStyle 56 stroke:#bbb
+  linkStyle 59 stroke:#bbb
+  linkStyle 60 stroke:#bbb
 ```

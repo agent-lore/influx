@@ -53,13 +53,11 @@ from influx.config import (
     SecurityConfig,
 )
 from influx.coordinator import RunKind
+from influx.filter import BatchScorer
 from influx.scheduler import run_profile
+from influx.source import ScoredCandidate
 from influx.sources import FetchCache, make_item_provider
-from influx.sources.arxiv import (
-    ArxivItem,
-    ArxivScorer,
-    ArxivScoreResult,
-)
+from influx.sources.arxiv import ArxivItem
 from influx.sources.rss import RssFeedItem
 from tests.contract.test_lithos_client import FakeLithosServer
 
@@ -177,10 +175,20 @@ def _rss_only_config(lithos_url: str) -> AppConfig:
     )
 
 
-def _deterministic_arxiv_scorer(score: int = 8) -> ArxivScorer:
-    def _score(item: ArxivItem, profile: str) -> ArxivScoreResult:
-        del item, profile
-        return ArxivScoreResult(score=score, confidence=1.0, reason="test-scorer")
+def _deterministic_arxiv_scorer(score: int = 8) -> BatchScorer:
+    async def _score(
+        candidates: list[Any], profile: str, filter_prompt: str
+    ) -> dict[str, ScoredCandidate]:
+        return {
+            c.item_id: ScoredCandidate(
+                candidate=c,
+                score=score,
+                confidence=1.0,
+                reason="test-scorer",
+                filter_tags=(),
+            )
+            for c in candidates
+        }
 
     return _score
 
@@ -283,8 +291,6 @@ class TestPreAcquireDedupRssBackfill:
         async def _fake_rss_scorer(
             candidates: list[Any], profile: str, filter_prompt: str
         ) -> dict[str, Any]:
-            from influx.source import ScoredCandidate
-
             return {
                 c.item_id: ScoredCandidate(
                     candidate=c,

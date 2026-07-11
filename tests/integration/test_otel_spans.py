@@ -186,9 +186,9 @@ async def _run_arxiv_scenario(
     """Exercise the arXiv pipeline end-to-end with OTEL enabled."""
     from influx.extraction.pipeline import ArxivExtractionResult
     from influx.schemas import Tier1Enrichment, Tier3Extraction
+    from influx.source import ScoredCandidate
     from influx.sources.arxiv import (
         ArxivItem,
-        ArxivScoreResult,
         make_arxiv_item_provider,
     )
 
@@ -208,16 +208,20 @@ async def _run_arxiv_scenario(
     ]
 
     async def fake_filter_scorer(
-        items: list[Any], profile: str, prompt: str
-    ) -> dict[str, ArxivScoreResult]:
+        candidates: list[Any], profile: str, prompt: str
+    ) -> dict[str, ScoredCandidate]:
         return {
-            item.arxiv_id: ArxivScoreResult(
-                score=10, confidence=0.95, reason="relevant"
+            c.item_id: ScoredCandidate(
+                candidate=c,
+                score=10,
+                confidence=0.95,
+                reason="relevant",
+                filter_tags=(),
             )
-            for item in items
+            for c in candidates
         }
 
-    arxiv_provider = make_arxiv_item_provider(config, filter_scorer=fake_filter_scorer)
+    arxiv_provider = make_arxiv_item_provider(config, scorer=fake_filter_scorer)
 
     mock_client = _mock_lithos_client()
 
@@ -421,9 +425,9 @@ class TestOtelDisabledZeroSpans:
 
         from influx.extraction.pipeline import ArxivExtractionResult
         from influx.schemas import Tier1Enrichment, Tier3Extraction
+        from influx.source import ScoredCandidate
         from influx.sources.arxiv import (
             ArxivItem,
-            ArxivScoreResult,
             make_arxiv_item_provider,
         )
 
@@ -443,18 +447,20 @@ class TestOtelDisabledZeroSpans:
         ]
 
         async def fake_filter_scorer(
-            items: list[Any], profile: str, prompt: str
-        ) -> dict[str, ArxivScoreResult]:
+            candidates: list[Any], profile: str, prompt: str
+        ) -> dict[str, ScoredCandidate]:
             return {
-                item.arxiv_id: ArxivScoreResult(
-                    score=10, confidence=0.95, reason="relevant"
+                c.item_id: ScoredCandidate(
+                    candidate=c,
+                    score=10,
+                    confidence=0.95,
+                    reason="relevant",
+                    filter_tags=(),
                 )
-                for item in items
+                for c in candidates
             }
 
-        arxiv_provider = make_arxiv_item_provider(
-            config, filter_scorer=fake_filter_scorer
-        )
+        arxiv_provider = make_arxiv_item_provider(config, scorer=fake_filter_scorer)
 
         mock_client = _mock_lithos_client()
 
