@@ -489,9 +489,9 @@ def test_render_tier3_sections_emits_all_four_headings_when_lists_empty() -> Non
 
 
 class TestCarryForwardSection:
-    """``carry_forward_section`` copies a section verbatim from a source
-    note into a target note (the 3a.4 multi-profile-merge ## Repair
-    preservation seam).
+    """``carry_forward_section`` copies a section (as text, with LF-
+    normalised boundaries) from a source note into a target note (the
+    3a.4 multi-profile-merge ## Repair preservation seam).
     """
 
     _REPAIR = '## Repair\n- tier2_attempts: 3\n- tier2_last_error: "boom"\n'

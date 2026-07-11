@@ -1141,7 +1141,7 @@ class LithosClient:
         # the repair sweep writes that section; the freshly-ingested
         # create-path content has none, so a naive merge would drop the
         # accumulated counters and reset a tier-terminal note's caps on
-        # re-ingest.  Carry the section forward verbatim so re-ingesting a
+        # re-ingest.  Carry the section forward (as text) so re-ingesting a
         # capped note keeps respecting its caps.
         merged_content = carry_forward_section(existing_content, merged_content, REPAIR)
         retry_args = {
