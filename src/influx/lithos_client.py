@@ -26,6 +26,8 @@ from mcp.client.sse import sse_client
 from mcp.shared.exceptions import McpError
 
 from influx.canonical_note import (
+    REPAIR,
+    carry_forward_section,
     drop_tier2,
     drop_tier2_and_tier3,
     graft_user_notes,
@@ -1135,6 +1137,13 @@ class LithosClient:
         merged_content = _merge_profile_relevance_in_content(
             existing_content, merged_content, merged_tags
         )
+        # 3a.4: preserve the existing note's ``## Repair`` counters.  Only
+        # the repair sweep writes that section; the freshly-ingested
+        # create-path content has none, so a naive merge would drop the
+        # accumulated counters and reset a tier-terminal note's caps on
+        # re-ingest.  Carry the section forward verbatim so re-ingesting a
+        # capped note keeps respecting its caps.
+        merged_content = carry_forward_section(existing_content, merged_content, REPAIR)
         retry_args = {
             **args,
             "tags": merged_tags,

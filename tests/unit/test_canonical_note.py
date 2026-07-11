@@ -488,6 +488,40 @@ def test_render_tier3_sections_emits_all_four_headings_when_lists_empty() -> Non
         assert heading in rendered
 
 
+class TestCarryForwardSection:
+    """``carry_forward_section`` copies a section verbatim from a source
+    note into a target note (the 3a.4 multi-profile-merge ## Repair
+    preservation seam).
+    """
+
+    _REPAIR = '## Repair\n- tier2_attempts: 3\n- tier2_last_error: "boom"\n'
+
+    def test_copies_section_when_target_lacks_it(self) -> None:
+        source = f"## Summary\nold\n\n{self._REPAIR}\n## User Notes\nmine\n"
+        target = "## Summary\nfresh\n\n## User Notes\nmine\n"
+        result = cn.carry_forward_section(source, target, REPAIR)
+        assert "## Repair" in result
+        assert "tier2_attempts: 3" in result
+        assert 'tier2_last_error: "boom"' in result
+        # Placed before ## User Notes (insertion-point fallback chain).
+        assert result.index("## Repair") < result.index("## User Notes")
+        # Target's own content is preserved.
+        assert "fresh" in result
+
+    def test_noop_when_source_lacks_section(self) -> None:
+        source = "## Summary\nold\n"
+        target = "## Summary\nfresh\n"
+        assert cn.carry_forward_section(source, target, REPAIR) == target
+
+    def test_existing_target_section_replaced_by_source(self) -> None:
+        source = f"## Summary\ns\n\n{self._REPAIR}"
+        target = "## Summary\ns\n\n## Repair\n- tier2_attempts: 0\n"
+        result = cn.carry_forward_section(source, target, REPAIR)
+        # Source (accumulated) counters win over the target's zero baseline.
+        assert "tier2_attempts: 3" in result
+        assert "tier2_attempts: 0" not in result
+
+
 class TestSectionInsertBytes:
     """Exact-byte splice behaviour for the section-insert ops.
 
