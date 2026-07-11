@@ -2,8 +2,9 @@
 
 One page per component: its description, tier, modules (with a coarse size band
 so ordinary line churn doesn't dirty the page), the public API of each module,
-which components it depends on / is used by, and the ADRs that mention it. All
-derived statically from the code + config.
+which components it depends on / is used by, the data stores it owns (when the
+[containers] adapter is configured), and the ADRs that mention it. All derived
+statically from the code + config.
 """
 
 from __future__ import annotations
@@ -89,6 +90,22 @@ def _tier_of(component: str, tiers: dict[str, list[str]]) -> str:
     return next((tier for tier, members in tiers.items() if component in members), "")
 
 
+def _owned_stores(component: str, arch: dict) -> list[dict]:
+    """Data stores owned by this component — [] unless [containers] is configured.
+
+    The _containers import is local and only reachable when the config section
+    is populated, so projects without the containers adapter (and without the
+    _containers module) still run this generator unchanged.
+    """
+    if not arch.get("containers", {}).get("stores"):
+        return []
+    # The module only exists in repos with the containers adapter installed
+    # (short import line so 88-width reflow can't strand the ignore comment).
+    from tests.guardrail import _containers  # pyright: ignore
+
+    return [st for st in _containers.stores() if st["owner"] == component]
+
+
 def render_component_page(
     component: str,
     arch: dict,
@@ -100,6 +117,7 @@ def render_component_page(
     paths = comp_modules.get(component, [])
     depends = sorted({d for s, d in edges if s == component})
     used_by = sorted({s for s, d in edges if d == component})
+    owned = _owned_stores(component, arch)
 
     lines = [f"# {component}", ""]
     if desc:
@@ -140,6 +158,12 @@ def render_component_page(
         "- Depends on: " + (", ".join(f"[{d}]({d}.md)" for d in depends) or "—")
     )
     lines.append("- Used by: " + (", ".join(f"[{u}]({u}.md)" for u in used_by) or "—"))
+
+    if owned:
+        lines += ["", "## Data stores", ""]
+        for st in owned:
+            engine = f" ({st['engine']})" if st.get("engine") else ""
+            lines.append(f"- `{st['id']}` — {st['label']}{engine}")
 
     adrs = _adrs_for(paths)
     if adrs:
