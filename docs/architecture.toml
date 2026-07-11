@@ -41,13 +41,13 @@ Notifications = "Post-run webhook / digest notification dispatch."
 Config        = "Pydantic config schema / loading, health probes, slug generation, and prompt templates."
 Observability = "OpenTelemetry tracing, metrics, and structured logging setup."
 Schemas       = "The LLM extraction contracts (Pydantic filter / enrichment / extraction models)."
-Common        = "Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP client, shared enums."
+Common        = "Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP client, shared enums, and the Source seam contracts (Candidate / ScoredCandidate / Source Protocol)."
 
 [components]
 Entrypoint    = ["influx.main", "influx.__main__"]
 HttpApi       = ["influx.http_api", "influx.service", "influx.backfill"]
 Orchestration = ["influx.scheduler", "influx.run_service", "influx.run", "influx.inbox", "influx.audit_invalid_source"]
-Sources       = ["influx.source", "influx.sources", "influx.extraction"]
+Sources       = ["influx.sources", "influx.extraction"]
 Filter        = ["influx.filter"]
 Enrich        = ["influx.enrich", "influx.cascade"]
 Repair        = ["influx.repair", "influx.repair_hooks", "influx.repair_counters", "influx.archive_policy", "influx.promotion_gate"]
@@ -58,7 +58,7 @@ Notifications = ["influx.notifications"]
 Config        = ["influx.config", "influx.probes", "influx.slugs", "influx.prompts"]
 Observability = ["influx.telemetry", "influx.metrics", "influx.logging_config"]
 Schemas       = ["influx.schemas"]
-Common        = ["influx.errors", "influx.coordinator", "influx.run_ledger", "influx.thin_summary", "influx.http_client", "influx.source_kind"]
+Common        = ["influx.errors", "influx.coordinator", "influx.run_ledger", "influx.thin_summary", "influx.http_client", "influx.source_kind", "influx.source"]
 
 [tiers]
 Entrypoints = ["Entrypoint", "HttpApi", "Orchestration"]

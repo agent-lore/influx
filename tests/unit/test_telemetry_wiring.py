@@ -212,17 +212,19 @@ class TestInfluxFilterSpan:
     async def test_filter_span_created_with_attributes(self) -> None:
         """With OTEL enabled, the filter call site emits an ``influx.filter``
         span carrying ``influx.profile``, ``influx.run_id``, ``influx.item_count``."""
-        from influx.sources.arxiv import ArxivItem, ArxivScoreResult
+        from influx.sources.arxiv import ArxivItem
 
         tracer, collected = _make_collecting_tracer()
 
-        # Set up a mock filter_scorer
+        # Set up a mock BatchScorer (source-agnostic seam, finding 2.4)
         async def fake_scorer(
-            items: list[Any], profile: str, prompt: str
+            candidates: list[Any], profile: str, prompt: str
         ) -> dict[str, Any]:
             return {
-                item.arxiv_id: ArxivScoreResult(score=8, confidence=1.0, reason="ok")
-                for item in items
+                c.item_id: ScoredCandidate(
+                    candidate=c, score=8, confidence=1.0, reason="ok", filter_tags=()
+                )
+                for c in candidates
             }
 
         # Create test items
@@ -244,6 +246,17 @@ class TestInfluxFilterSpan:
                 categories=["cs.RO"],
             ),
         ]
+        # arXiv: Candidate.item_id == arxiv_id (the provider builds these).
+        candidates = [
+            Candidate(
+                item_id=it.arxiv_id,
+                title=it.title,
+                abstract=it.abstract,
+                source_url=f"https://arxiv.org/abs/{it.arxiv_id}",
+                payload=it,
+            )
+            for it in items
+        ]
 
         # Set run_id context var (normally set by run_profile)
         token = current_run_id.set("test-run-id-filter")
@@ -251,22 +264,18 @@ class TestInfluxFilterSpan:
         try:
             # Patch get_tracer in arxiv module to return our collecting tracer
             with patch("influx.sources.arxiv.get_tracer", return_value=tracer):
-                # Import the filter call site context — we need to exercise the
-                # actual filter_scorer call path in make_arxiv_item_provider.
-                # Instead of calling the full provider (which needs config etc),
-                # directly replicate the filter span instrumentation pattern.
-                from influx.sources.arxiv import get_tracer as _gt  # noqa: F401
-
+                # Replicate the filter span instrumentation pattern from
+                # make_arxiv_item_provider without standing up the full provider.
                 _tracer = tracer
                 with _tracer.span(
                     "influx.filter",
                     attributes={
                         "influx.profile": "ai-robotics",
                         "influx.run_id": current_run_id.get() or "",
-                        "influx.item_count": len(items),
+                        "influx.item_count": len(candidates),
                     },
                 ):
-                    await fake_scorer(items, "ai-robotics", "test prompt")
+                    await fake_scorer(candidates, "ai-robotics", "test prompt")
         finally:
             current_run_id.reset(token)
 
@@ -284,20 +293,21 @@ class TestInfluxFilterSpan:
         is emitted by ``make_arxiv_item_provider``."""
         from influx.sources.arxiv import (
             ArxivItem,
-            ArxivScoreResult,
             make_arxiv_item_provider,
         )
 
         tracer, collected = _make_collecting_tracer()
         config = _make_minimal_config()
 
-        # Deterministic filter scorer
+        # Deterministic BatchScorer (source-agnostic seam, finding 2.4)
         async def fake_scorer(
-            items: list[Any], profile: str, prompt: str
+            candidates: list[Any], profile: str, prompt: str
         ) -> dict[str, Any]:
             return {
-                item.arxiv_id: ArxivScoreResult(score=8, confidence=1.0, reason="ok")
-                for item in items
+                c.item_id: ScoredCandidate(
+                    candidate=c, score=8, confidence=1.0, reason="ok", filter_tags=()
+                )
+                for c in candidates
             }
 
         # Mock fetch_arxiv to return test items
@@ -319,7 +329,7 @@ class TestInfluxFilterSpan:
         try:
             provider = make_arxiv_item_provider(
                 config,
-                filter_scorer=fake_scorer,
+                scorer=fake_scorer,
             )
 
             # Patch get_tracer in arxiv and the fetch function
@@ -368,6 +378,58 @@ class TestInfluxFilterSpan:
         assert attrs.get("influx.profile") == "ai-robotics"
         assert attrs.get("influx.run_id") == "test-run-filter-provider"
         assert attrs.get("influx.item_count") == 1
+
+    async def test_no_filter_span_and_zero_items_when_no_scorer(self) -> None:
+        """No scorer + no ``[models.filter]`` → the provider scores nothing,
+        emits no ``influx.filter`` span, and yields zero items (finding 2.4:
+        the span is gated on a wired scorer, and a misconfigured deployment
+        completes cleanly instead of ingesting unscored notes).
+
+        Restores the provider-level no-scorer coverage that used to live in
+        the now-deleted ``test_arxiv_filter_adapters.py``.
+        """
+        from datetime import UTC, datetime
+
+        from influx.sources.arxiv import ArxivItem, make_arxiv_item_provider
+
+        tracer, collected = _make_collecting_tracer()
+        # ``_make_minimal_config`` has no ``[models.filter]`` slot, so
+        # ``make_default_batch_scorer`` returns ``None`` and no scorer is
+        # wired.
+        config = _make_minimal_config()
+
+        test_items = [
+            ArxivItem(
+                arxiv_id="2401.00001",
+                title="Test Paper",
+                abstract="Abstract text",
+                published=datetime(2024, 1, 1, tzinfo=UTC),
+                categories=["cs.AI"],
+            ),
+        ]
+
+        token = current_run_id.set("test-run-no-scorer")
+        try:
+            provider = make_arxiv_item_provider(config)
+            with (
+                patch("influx.sources.arxiv.get_tracer", return_value=tracer),
+                patch(
+                    "influx.sources.arxiv.fetch_arxiv",
+                    new_callable=MagicMock,
+                    return_value=test_items,
+                ),
+            ):
+                result = await provider(
+                    "ai-robotics", RunKind.SCHEDULED, None, "test filter prompt"
+                )
+                bounds = list(result)
+        finally:
+            current_run_id.reset(token)
+
+        # Candidates were fetched, but with no scorer nothing is scored:
+        # zero items and no ``influx.filter`` span.
+        assert bounds == []
+        assert [s for s in collected if s.name == "influx.filter"] == []
 
 
 # ── (3) AC-10-A regression check: no spans when OTEL disabled ─────────
@@ -467,7 +529,6 @@ class TestInfluxFetchArxivSpan:
 
         from influx.sources.arxiv import (
             ArxivItem,
-            ArxivScoreResult,
             make_arxiv_item_provider,
         )
 
@@ -491,9 +552,20 @@ class TestInfluxFetchArxivSpan:
             ),
         ]
 
-        # Deterministic scorer to avoid filter_scorer interactions
-        def simple_scorer(item: Any, profile: str) -> ArxivScoreResult:
-            return ArxivScoreResult(score=7, confidence=0.8, reason="test")
+        # Deterministic BatchScorer to avoid real filter interactions
+        async def simple_scorer(
+            candidates: list[Any], profile: str, prompt: str
+        ) -> dict[str, Any]:
+            return {
+                c.item_id: ScoredCandidate(
+                    candidate=c,
+                    score=7,
+                    confidence=0.8,
+                    reason="test",
+                    filter_tags=(),
+                )
+                for c in candidates
+            }
 
         token = current_run_id.set("test-run-fetch-arxiv")
         try:
@@ -545,7 +617,6 @@ class TestInfluxFetchArxivSpan:
 
         from influx.sources.arxiv import (
             ArxivItem,
-            ArxivScoreResult,
             make_arxiv_item_provider,
         )
 
@@ -561,8 +632,19 @@ class TestInfluxFetchArxivSpan:
             ),
         ]
 
-        def simple_scorer(item: Any, profile: str) -> ArxivScoreResult:
-            return ArxivScoreResult(score=7, confidence=0.8, reason="test")
+        async def simple_scorer(
+            candidates: list[Any], profile: str, prompt: str
+        ) -> dict[str, Any]:
+            return {
+                c.item_id: ScoredCandidate(
+                    candidate=c,
+                    score=7,
+                    confidence=0.8,
+                    reason="test",
+                    filter_tags=(),
+                )
+                for c in candidates
+            }
 
         provider = make_arxiv_item_provider(config, scorer=simple_scorer)
 

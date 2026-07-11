@@ -96,9 +96,9 @@ source_modules = [
     "influx.thin_summary",
     "influx.http_client",
     "influx.source_kind",
+    "influx.source",
 ]
 forbidden_modules = [
-    "influx.source",
     "influx.sources",
     "influx.extraction",
     "influx.filter",
@@ -138,7 +138,6 @@ forbidden_modules = [
 name = "Core must not import Entrypoints"
 type = "forbidden"
 source_modules = [
-    "influx.source",
     "influx.sources",
     "influx.extraction",
     "influx.filter",

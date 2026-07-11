@@ -150,7 +150,6 @@ def make_item_provider(
     *,
     fetch_cache: FetchCache | None = None,
     arxiv_scorer: Any | None = None,
-    arxiv_filter_scorer: Any | None = None,
     rss_scorer: Any | None = None,
 ) -> Callable[
     [str, RunKind, dict[str, str | int] | None, str],
@@ -172,9 +171,10 @@ def make_item_provider(
         callers that want cross-profile dedup should share a single
         instance across all profiles in a scheduled fire.
     arxiv_scorer:
-        Per-item synchronous scorer override (test seam).
-    arxiv_filter_scorer:
-        Batched LLM filter scorer (production default).
+        Batched :data:`~influx.filter.BatchScorer` override for arXiv
+        (test seam).  ``None`` installs the production-default
+        :func:`~influx.filter.make_default_batch_scorer` (finding 2.4) —
+        the same source-agnostic scorer RSS uses.
     rss_scorer:
         Batched :data:`~influx.filter.BatchScorer` override for RSS (test
         seam).  ``None`` installs the production-default
@@ -188,7 +188,6 @@ def make_item_provider(
     arxiv_provider = make_arxiv_item_provider(
         config,
         scorer=arxiv_scorer,
-        filter_scorer=arxiv_filter_scorer,
         fetch_cache=cache,
     )
     rss_provider = make_rss_item_provider(config, scorer=rss_scorer, fetch_cache=cache)

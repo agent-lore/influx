@@ -9,6 +9,7 @@ discarded.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from influx.config import (
@@ -20,9 +21,9 @@ from influx.config import (
     ScheduleConfig,
 )
 from influx.coordinator import RunKind
+from influx.source import ScoredCandidate
 from influx.sources.arxiv import (
     ArxivItem,
-    ArxivScoreResult,
     make_arxiv_item_provider,
 )
 
@@ -66,17 +67,19 @@ async def test_filter_scorer_invoked_in_chunks_of_batch_size() -> None:
     chunk_lengths: list[int] = []
 
     async def fake_filter_scorer(
-        chunk: list[ArxivItem],
+        chunk: list[Any],
         profile: str,
         filter_prompt: str,
-    ) -> dict[str, ArxivScoreResult]:
+    ) -> dict[str, ScoredCandidate]:
         chunk_lengths.append(len(chunk))
         return {
-            it.arxiv_id: ArxivScoreResult(score=8, confidence=1.0, reason="ok")
-            for it in chunk
+            c.item_id: ScoredCandidate(
+                candidate=c, score=8, confidence=1.0, reason="ok", filter_tags=()
+            )
+            for c in chunk
         }
 
-    provider = make_arxiv_item_provider(config, filter_scorer=fake_filter_scorer)
+    provider = make_arxiv_item_provider(config, scorer=fake_filter_scorer)
 
     with (
         patch(
@@ -111,17 +114,19 @@ async def test_filter_scorer_single_call_when_batch_exceeds_total() -> None:
     chunk_lengths: list[int] = []
 
     async def fake_filter_scorer(
-        chunk: list[ArxivItem],
+        chunk: list[Any],
         profile: str,
         filter_prompt: str,
-    ) -> dict[str, ArxivScoreResult]:
+    ) -> dict[str, ScoredCandidate]:
         chunk_lengths.append(len(chunk))
         return {
-            it.arxiv_id: ArxivScoreResult(score=8, confidence=1.0, reason="ok")
-            for it in chunk
+            c.item_id: ScoredCandidate(
+                candidate=c, score=8, confidence=1.0, reason="ok", filter_tags=()
+            )
+            for c in chunk
         }
 
-    provider = make_arxiv_item_provider(config, filter_scorer=fake_filter_scorer)
+    provider = make_arxiv_item_provider(config, scorer=fake_filter_scorer)
 
     with (
         patch(

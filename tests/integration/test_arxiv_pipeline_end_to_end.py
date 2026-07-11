@@ -16,8 +16,10 @@ extraction stack end-to-end (PRD 07 US-014).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -40,10 +42,11 @@ from influx.config import (
     SecurityConfig,
 )
 from influx.coordinator import RunKind
+from influx.filter import BatchScorer
 from influx.http_client import FetchResult
 from influx.scheduler import run_profile
 from influx.service import create_app
-from influx.sources.arxiv import ArxivItem, ArxivScorer, ArxivScoreResult
+from influx.source import ScoredCandidate
 from influx.storage import ArchiveResult
 from tests.contract.test_lithos_client import FakeLithosServer
 
@@ -214,17 +217,27 @@ def _html_fetch_result() -> FetchResult:
 # ── Tests ─────────────────────────────────────────────────────────
 
 
-def _scorer_with_score(score: int) -> ArxivScorer:
-    """Build a deterministic scorer that returns the same score for every item.
+def _scorer_with_score(score: int) -> BatchScorer:
+    """Build a deterministic BatchScorer that returns the same score for every item.
 
     Used by the integration tests below to drive the score-gated
     extraction / enrichment paths from US-014/US-015 without standing
     up a real LLM filter.
     """
 
-    def _score(item: ArxivItem, profile: str) -> ArxivScoreResult:
-        del item, profile
-        return ArxivScoreResult(score=score, confidence=1.0, reason="test-scorer")
+    async def _score(
+        candidates: list[Any], profile: str, filter_prompt: str
+    ) -> dict[str, ScoredCandidate]:
+        return {
+            c.item_id: ScoredCandidate(
+                candidate=c,
+                score=score,
+                confidence=1.0,
+                reason="test-scorer",
+                filter_tags=(),
+            )
+            for c in candidates
+        }
 
     return _score
 
@@ -491,7 +504,7 @@ def _make_config_with_filter(lithos_url: str) -> AppConfig:
 
     Same shape as :func:`_make_config` but adds a ``providers.openai``
     entry and a ``models.filter`` slot so
-    :func:`influx.filter.make_default_arxiv_filter_scorer` returns a
+    :func:`influx.filter.make_default_batch_scorer` returns a
     real scorer (instead of falling through to the no-scorer default).
     Thresholds are kept deterministic so the score-gating tests can
     pin behaviour to specific scores.
@@ -576,7 +589,7 @@ def _filter_fetch_result(body: dict[str, object]) -> FetchResult:
 class TestDefaultFilterScorerEndToEnd:
     """Default LLM filter scorer drives score gating without a test override.
 
-    These tests do NOT pass ``arxiv_scorer`` or ``arxiv_filter_scorer``
+    These tests do NOT pass ``arxiv_scorer``
     to :func:`create_app` — they exercise the production-default scorer
     that ``create_app`` installs from ``[models.filter]``, mocking only
     the guarded model POST helper so the filter LLM call is
@@ -623,6 +636,22 @@ class TestDefaultFilterScorerEndToEnd:
 
             # Default scorer was invoked exactly once (batched).
             assert mock_filter_post.call_count == 1
+            # Payload equivalence (finding 2.4): after unifying arXiv onto
+            # the source-agnostic default scorer, the LLM request must
+            # still carry the arXiv id/title/abstract it did before —
+            # arXiv's ``Candidate.item_id`` IS the arxiv_id.  ``body`` is
+            # the second positional arg to ``guarded_post_json_fetch``.
+            sent_body = mock_filter_post.call_args.args[1]
+            user_message = sent_body["messages"][0]["content"]
+            assert "## CANDIDATES" in user_message
+            sent_candidates = json.loads(user_message.rsplit("## CANDIDATES", 1)[1])
+            assert sent_candidates == [
+                {
+                    "id": _ARXIV_ID,
+                    "title": "End-To-End Pipeline Paper",
+                    "abstract": "Paper about end-to-end arxiv ingestion validation.",
+                }
+            ]
             # Below-full_text scores must NOT trigger HTML extraction.
             assert mock_html.call_count == 0
 

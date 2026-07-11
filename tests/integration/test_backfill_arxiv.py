@@ -44,13 +44,11 @@ from influx.config import (
     SecurityConfig,
 )
 from influx.coordinator import Coordinator, RunKind
+from influx.filter import BatchScorer
 from influx.scheduler import run_profile
+from influx.source import ScoredCandidate
 from influx.sources import FetchCache, make_item_provider
-from influx.sources.arxiv import (
-    ArxivItem,
-    ArxivScorer,
-    ArxivScoreResult,
-)
+from influx.sources.arxiv import ArxivItem
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ───────────��────────────────────────────────────────────
@@ -143,10 +141,20 @@ def _make_config(
     )
 
 
-def _deterministic_scorer(score: int = 5) -> ArxivScorer:
-    def _score(item: ArxivItem, profile: str) -> ArxivScoreResult:
-        del item, profile
-        return ArxivScoreResult(score=score, confidence=1.0, reason="test-scorer")
+def _deterministic_scorer(score: int = 5) -> BatchScorer:
+    async def _score(
+        candidates: list[Any], profile: str, filter_prompt: str
+    ) -> dict[str, ScoredCandidate]:
+        return {
+            c.item_id: ScoredCandidate(
+                candidate=c,
+                score=score,
+                confidence=1.0,
+                reason="test-scorer",
+                filter_tags=(),
+            )
+            for c in candidates
+        }
 
     return _score
 

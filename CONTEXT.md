@@ -13,7 +13,7 @@ A named interest scope with its own description, score thresholds, source list, 
 _Avoid_: topic, channel, feed.
 
 **Source**:
-A place candidates come from — currently `arxiv` or `rss`/`blog`. Each Source is an adapter that exposes `fetch_candidates` (bulk per Profile) and `acquire` (per item: download, archive, extract). _(proposed as a unified seam; today the two sources duplicate the pipeline)_
+A place candidates come from — currently `arxiv` or `rss`/`blog`. Each Source is an adapter that exposes `fetch_candidates` (bulk per Profile) and `acquire` (per item: download, archive, extract). Both arXiv and RSS run in production through this seam; scoring is delegated to the shared **Filter** (finding 2). The manual **Inbox** intake reuses the same scorer but stays a separate fan-out rather than a Source (it scores one submitted item against many Profiles).
 _Avoid_: provider (used for OpenAI-compatible model providers).
 
 **Candidate**:

@@ -11,19 +11,18 @@ Score-gated entry: scores candidates 1–10 against the Profile and drops sub-th
 
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
-| `influx.filter` | M | 2 | 2 |
+| `influx.filter` | M | 2 | 1 |
 
 ## Public API
 
 ### `influx.filter`
 - class `FilterScorerError` — Hard failure of the production-default LLM filter scorer.
-- def `make_default_arxiv_filter_scorer` — Build the production-default LLM filter scorer.
 - def `make_default_batch_scorer` — Build the production-default source-agnostic batched scorer.
 - class `Filter` — Score-gated entry to ingestion (CONTEXT.md ``Filter``).
 
 ## Dependencies
 
-- Depends on: [Common](Common.md), [Config](Config.md), [Observability](Observability.md), [Schemas](Schemas.md), [Sources](Sources.md)
+- Depends on: [Common](Common.md), [Config](Config.md), [Observability](Observability.md), [Schemas](Schemas.md)
 - Used by: [HttpApi](HttpApi.md), [Orchestration](Orchestration.md), [Sources](Sources.md)
 
 [← all generated docs](../README.md)

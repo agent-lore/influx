@@ -1,8 +1,10 @@
-"""Production-default arXiv filter scorer.
+"""Source-agnostic relevance filter and its production-default scorer.
 
-Wraps the configured ``[models.filter]`` slot + ``[prompts.filter]``
-prompt into an :data:`~influx.sources.arxiv.ArxivFilterScorer` callable
-that scores a batch of fetched arXiv items in one LLM call.
+The :class:`Filter` is the single score-gated entry to ingestion for
+every bulk source (arXiv, RSS).  :func:`make_default_batch_scorer` wraps
+the configured ``[models.filter]`` slot + ``[prompts.filter]`` prompt
+into a :data:`BatchScorer` that scores a batch of fetched
+:class:`~influx.source.Candidate` records in one LLM call.
 
 This is the production default that satisfies the score-gating contract
 in PRD 07 §5.6 / US-014 / US-015 — without it the production
@@ -11,9 +13,11 @@ items, regardless of the candidates' real relevance.
 
 Design notes
 ------------
-- The seam stays test-injectable: ``influx.service.create_app`` accepts
-  an ``arxiv_filter_scorer`` override so integration tests can substitute
-  a deterministic batch scorer without standing up a real LLM filter.
+- The seam stays test-injectable: each source provider
+  (``make_arxiv_item_provider`` / ``make_rss_item_provider``) and
+  ``influx.service.create_app`` accept a ``scorer`` override so
+  integration tests can substitute a deterministic batch scorer without
+  standing up a real LLM filter.
 - ``models.filter`` configuration is required for the default scorer to
   exist.  When it is missing we return ``None``; :meth:`Filter.score`
   then yields zero items (its scorer is ``None``) so misconfigured
@@ -54,7 +58,6 @@ __all__ = [
     "BatchScorer",
     "Filter",
     "FilterScorerError",
-    "make_default_arxiv_filter_scorer",
     "make_default_batch_scorer",
 ]
 
@@ -262,104 +265,6 @@ async def _acall_filter_model_with_retry(
         headers=headers,
         attempts=attempts,
     )
-
-
-def make_default_arxiv_filter_scorer(
-    config: AppConfig,
-) -> Any | None:
-    """Build the production-default LLM filter scorer.
-
-    Returns an async ``ArxivFilterScorer`` that POSTs the rendered
-    filter prompt + items to the ``models.filter`` slot
-    (OpenAI-compatible ``/chat/completions``) and parses the response
-    against :class:`~influx.schemas.FilterResponse`.
-
-    Returns ``None`` when ``[models.filter]`` is not configured —
-    :meth:`Filter.score` then yields zero items (its scorer is ``None``)
-    instead of crashing.
-    """
-    if "filter" not in config.models:
-        return None
-
-    async def _scorer(
-        items: list[Any],
-        profile: str,
-        filter_prompt: str,
-    ) -> dict[str, Any]:
-        from influx.sources.arxiv import ArxivScoreResult
-
-        if not items:
-            return {}
-
-        slot = config.models["filter"]
-        provider = config.providers.get(slot.provider)
-        if provider is None:
-            _log.warning(
-                "filter provider %r not configured for profile %r; "
-                "skipping this batch (zero items)",
-                slot.provider,
-                profile,
-            )
-            raise FilterScorerError(
-                f"filter provider {slot.provider!r} not configured",
-            )
-
-        item_payload = [
-            {
-                "id": item.arxiv_id,
-                "title": item.title,
-                "abstract": item.abstract,
-            }
-            for item in items
-        ]
-        # Append the candidate batch to the rendered filter prompt so
-        # the LLM has both the scoring rubric (profile description +
-        # negative examples + min_score_in_results, already rendered
-        # by ``scheduler.run_profile``) AND the items to score.
-        user_message = (
-            f"{filter_prompt}\n\n"
-            "## CANDIDATES\n"
-            f"{json.dumps(item_payload, ensure_ascii=False)}"
-        )
-
-        api_key = ""
-        if provider.api_key_env:
-            api_key = os.environ.get(provider.api_key_env, "")
-
-        url = f"{provider.base_url.rstrip('/')}/chat/completions"
-        headers: dict[str, str] = {**provider.extra_headers}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        body: dict[str, Any] = {
-            "model": slot.model,
-            "temperature": slot.temperature,
-            "messages": [{"role": "user", "content": user_message}],
-        }
-        if slot.max_tokens is not None:
-            body["max_tokens"] = slot.max_tokens
-        if slot.json_mode:
-            body["response_format"] = {"type": "json_object"}
-
-        response = await _acall_filter_model_with_retry(
-            config=config,
-            profile=profile,
-            url=url,
-            body=body,
-            headers=headers,
-            attempts=slot.max_retries + 1,
-        )
-        return {
-            r.id: ArxivScoreResult(
-                score=r.score,
-                confidence=1.0,
-                reason=r.reason,
-                filter_tags=tuple(r.tags),
-            )
-            for r in response.results
-        }
-
-    return _scorer
 
 
 # ── Source-agnostic Filter (issue #57) ───────────────────────────────

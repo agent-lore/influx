@@ -16,9 +16,8 @@ arXiv / RSS / inbox adapters: fetch candidates, acquire (download/archive), and 
 | `influx.extraction.html` | S | 1 | 1 |
 | `influx.extraction.pdf` | XS | 1 | 1 |
 | `influx.extraction.pipeline` | XS | 1 | 1 |
-| `influx.source` | S | 4 | 0 |
 | `influx.sources` | S | 1 | 1 |
-| `influx.sources.arxiv` | XL | 5 | 5 |
+| `influx.sources.arxiv` | XL | 4 | 5 |
 | `influx.sources.inbox` | M | 1 | 3 |
 | `influx.sources.note_builder` | S | 0 | 3 |
 | `influx.sources.rss` | L | 2 | 3 |
@@ -42,19 +41,12 @@ arXiv / RSS / inbox adapters: fetch candidates, acquire (download/archive), and 
 - class `ArxivExtractionResult` — Successful arXiv extraction outcome.
 - def `extract_arxiv_text` — Run the HTML → PDF extraction cascade for an arXiv paper.
 
-### `influx.source`
-- class `Candidate` — An unscored item returned from :meth:`Source.fetch_candidates`.
-- class `ScoredCandidate` — A :class:`Candidate` plus the Filter's 1–10 relevance score.
-- class `BoundScoredCandidate` — A :class:`ScoredCandidate` plus a thunk that performs source-specific acquire (#125).
-- class `Source` — Unified Source seam (CONTEXT.md).
-
 ### `influx.sources`
 - class `FetchCache` — Per-fire fetch deduplication cache (R-8).
 - def `make_item_provider` — Build a unified item provider for arXiv + RSS with fetch dedup.
 
 ### `influx.sources.arxiv`
 - class `ArxivItem` — A single parsed arXiv entry from the Atom feed.
-- class `ArxivScoreResult` — One scored candidate emitted by an :data:`ArxivScorer`.
 - class `BackfillRange` — Resolved backfill date range with absolute UTC bounds.
 - def `resolve_backfill_range` — Convert a ``run_range`` dict into a concrete :class:`BackfillRange`.
 - def `build_query_url` — Build the arXiv API query URL per FR-SRC-1.
@@ -85,6 +77,6 @@ arXiv / RSS / inbox adapters: fetch candidates, acquire (download/archive), and 
 ## Dependencies
 
 - Depends on: [Common](Common.md), [Config](Config.md), [Enrich](Enrich.md), [Filter](Filter.md), [LithosBridge](LithosBridge.md), [Observability](Observability.md), [Repair](Repair.md), [Storage](Storage.md)
-- Used by: [Feedback](Feedback.md), [Filter](Filter.md), [HttpApi](HttpApi.md), [Orchestration](Orchestration.md), [Repair](Repair.md)
+- Used by: [HttpApi](HttpApi.md), [Orchestration](Orchestration.md), [Repair](Repair.md)
 
 [← all generated docs](../README.md)
