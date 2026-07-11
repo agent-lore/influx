@@ -67,7 +67,7 @@
         "max_function": "influx.schemas._harden_for_openai_strict"
       },
       "Sources": {
-        "functions_over_10": 7,
+        "functions_over_10": 8,
         "max_complexity": 28,
         "max_function": "influx.sources.arxiv.build_arxiv_note_item"
       },
@@ -77,7 +77,7 @@
         "max_function": "influx.storage.download_archive"
       }
     },
-    "functions_over_10": 47,
+    "functions_over_10": 48,
     "top_functions": [
       {
         "complexity": 52,
@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 649
+    "total_functions": 655
   },
   "domain": {
     "associations": 5,
@@ -135,6 +135,7 @@
       ],
       [
         "Enrich",
+        "Filter",
         "Repair",
         "Sources",
         "Storage"
@@ -167,13 +168,13 @@
       },
       "Feedback": {
         "fan_in": 1,
-        "fan_out": 4,
-        "instability": 0.8
+        "fan_out": 5,
+        "instability": 0.83
       },
       "Filter": {
         "fan_in": 3,
-        "fan_out": 4,
-        "instability": 0.57
+        "fan_out": 5,
+        "instability": 0.62
       },
       "HttpApi": {
         "fan_in": 2,
@@ -211,9 +212,9 @@
         "instability": 0.0
       },
       "Sources": {
-        "fan_in": 3,
+        "fan_in": 5,
         "fan_out": 8,
-        "instability": 0.73
+        "instability": 0.62
       },
       "Storage": {
         "fan_in": 3,
@@ -221,8 +222,9 @@
         "instability": 0.5
       }
     },
-    "cross_component_edges": 62,
-    "longest_component_chain": 4,
+    "cross_component_edges": 64,
+    "cross_component_module_edges": 187,
+    "longest_component_chain": 5,
     "module_cycle_count": 3,
     "module_cycles": [
       [
@@ -235,13 +237,14 @@
         "influx.service"
       ],
       [
-        "influx.repair",
-        "influx.repair_hooks"
-      ],
-      [
+        "influx.filter",
         "influx.sources",
         "influx.sources.arxiv",
         "influx.sources.rss"
+      ],
+      [
+        "influx.repair",
+        "influx.repair_hooks"
       ]
     ],
     "tier_skipping": [
@@ -265,14 +268,14 @@
   "size": {
     "components": {
       "Common": {
-        "classes": 16,
-        "functions": 60,
+        "classes": 12,
+        "functions": 58,
         "largest_module": "influx.run_ledger",
         "largest_module_lines": 1457,
-        "lines": 2670,
-        "modules": 7,
-        "public_symbols": 28,
-        "sloc": 1949
+        "lines": 2542,
+        "modules": 6,
+        "public_symbols": 24,
+        "sloc": 1852
       },
       "Config": {
         "classes": 28,
@@ -316,23 +319,23 @@
       },
       "Filter": {
         "classes": 2,
-        "functions": 11,
+        "functions": 13,
         "largest_module": "influx.filter",
-        "largest_module_lines": 474,
-        "lines": 474,
+        "largest_module_lines": 569,
+        "lines": 569,
         "modules": 1,
-        "public_symbols": 3,
-        "sloc": 398
+        "public_symbols": 4,
+        "sloc": 476
       },
       "HttpApi": {
         "classes": 4,
         "functions": 43,
         "largest_module": "influx.http_api",
         "largest_module_lines": 1007,
-        "lines": 1529,
+        "lines": 1541,
         "modules": 3,
         "public_symbols": 18,
-        "sloc": 1276
+        "sloc": 1288
       },
       "LithosBridge": {
         "classes": 13,
@@ -395,14 +398,14 @@
         "sloc": 183
       },
       "Sources": {
-        "classes": 13,
-        "functions": 78,
+        "classes": 18,
+        "functions": 84,
         "largest_module": "influx.sources.arxiv",
-        "largest_module_lines": 1757,
-        "lines": 4161,
-        "modules": 10,
-        "public_symbols": 32,
-        "sloc": 3164
+        "largest_module_lines": 1885,
+        "lines": 4418,
+        "modules": 11,
+        "public_symbols": 37,
+        "sloc": 3354
       },
       "Storage": {
         "classes": 2,
@@ -415,8 +418,8 @@
         "sloc": 588
       }
     },
-    "max_module": "influx.lithos_client",
-    "max_module_lines": 1780,
+    "max_module": "influx.sources.arxiv",
+    "max_module_lines": 1885,
     "modules_over_800": [
       "influx.config",
       "influx.http_api",
@@ -431,13 +434,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27722,
+    "total_lines": 27958,
     "total_modules": 57,
-    "total_sloc": 21522
+    "total_sloc": 21705
   },
   "tests": {
-    "ratio": 2.52,
-    "src_lines": 27722,
-    "test_lines": 69762
+    "ratio": 2.51,
+    "src_lines": 27958,
+    "test_lines": 70091
   }
 }
