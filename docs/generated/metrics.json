@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 650
+    "total_functions": 651
   },
   "domain": {
     "associations": 5,
@@ -222,7 +222,7 @@
       }
     },
     "cross_component_edges": 62,
-    "cross_component_module_edges": 187,
+    "cross_component_module_edges": 190,
     "longest_component_chain": 4,
     "module_cycle_count": 3,
     "module_cycles": [
@@ -275,9 +275,7 @@
     "tests_private_detail": [
       "tests/unit/test_lithos_client.py -> influx.lithos_client._classify_squatter (x10)",
       "tests/integration/test_serve.py -> influx.main._cmd_serve (x5)",
-      "tests/unit/test_repair_hooks.py -> influx.repair_hooks._note_source_url (x5)",
       "tests/unit/test_lithos_client.py -> influx.lithos_client._existing_id_from_detail (x4)",
-      "tests/unit/test_repair_hooks_production.py -> influx.repair_hooks._rss_item_id_from_note (x3)",
       "tests/unit/test_repair_sweep.py -> influx.repair._doc_title (x3)",
       "tests/integration/test_event_loop_responsiveness.py -> influx.filter._acall_filter_model_with_retry (x2)",
       "tests/unit/test_canonical_note.py -> influx.canonical_note._has_title_heading (x2)",
@@ -288,6 +286,8 @@
       "tests/integration/test_event_loop_responsiveness.py -> influx.repair._process_sweep_note",
       "tests/integration/test_fetch_dedup.py -> influx.sources.rss._fetch_rss_feed",
       "tests/integration/test_pre_write_dedup_fallback.py -> influx.run._run_ingest_stage",
+      "tests/unit/test_archive_download_identity.py -> influx.sources.arxiv._year_month_from_arxiv_id",
+      "tests/unit/test_archive_download_identity.py -> influx.sources.rss._rss_item_id_from_note",
       "tests/unit/test_article_extraction.py -> influx.extraction.article._recover_html_title",
       "tests/unit/test_arxiv_cooldown.py -> influx.sources.arxiv._arxiv_cooldown_snapshot",
       "tests/unit/test_arxiv_cooldown.py -> influx.sources.arxiv._fetch_with_retry",
@@ -304,19 +304,19 @@
       "tests/unit/test_arxiv_fetcher.py -> influx.sources.arxiv._classify_arxiv_429",
       "tests/unit/test_arxiv_fetcher.py -> influx.sources.arxiv._extract_arxiv_429_classification"
     ],
-    "tests_private_imports": 91
+    "tests_private_imports": 80
   },
   "size": {
     "components": {
       "Common": {
-        "classes": 16,
-        "functions": 60,
+        "classes": 17,
+        "functions": 66,
         "largest_module": "influx.run_ledger",
         "largest_module_lines": 1457,
-        "lines": 2670,
+        "lines": 2837,
         "modules": 7,
-        "public_symbols": 28,
-        "sloc": 1949
+        "public_symbols": 34,
+        "sloc": 2075
       },
       "Config": {
         "classes": 28,
@@ -410,23 +410,23 @@
       },
       "Orchestration": {
         "classes": 20,
-        "functions": 62,
+        "functions": 63,
         "largest_module": "influx.inbox",
         "largest_module_lines": 1192,
-        "lines": 3732,
+        "lines": 3753,
         "modules": 5,
         "public_symbols": 30,
-        "sloc": 2911
+        "sloc": 2929
       },
       "Repair": {
         "classes": 17,
-        "functions": 89,
+        "functions": 79,
         "largest_module": "influx.repair",
-        "largest_module_lines": 1674,
-        "lines": 3934,
+        "largest_module_lines": 1686,
+        "lines": 3769,
         "modules": 5,
         "public_symbols": 39,
-        "sloc": 3071
+        "sloc": 2927
       },
       "Schemas": {
         "classes": 4,
@@ -440,13 +440,13 @@
       },
       "Sources": {
         "classes": 13,
-        "functions": 78,
+        "functions": 82,
         "largest_module": "influx.sources.arxiv",
-        "largest_module_lines": 1757,
-        "lines": 4161,
+        "largest_module_lines": 1830,
+        "lines": 4343,
         "modules": 10,
         "public_symbols": 32,
-        "sloc": 3164
+        "sloc": 3323
       },
       "Storage": {
         "classes": 2,
@@ -459,8 +459,8 @@
         "sloc": 588
       }
     },
-    "max_module": "influx.lithos_client",
-    "max_module_lines": 1789,
+    "max_module": "influx.sources.arxiv",
+    "max_module_lines": 1830,
     "modules_over_800": [
       "influx.config",
       "influx.http_api",
@@ -475,13 +475,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27757,
+    "total_lines": 27962,
     "total_modules": 57,
-    "total_sloc": 21548
+    "total_sloc": 21707
   },
   "tests": {
-    "ratio": 2.54,
-    "src_lines": 27757,
-    "test_lines": 70546
+    "ratio": 2.53,
+    "src_lines": 27962,
+    "test_lines": 70756
   }
 }

@@ -46,7 +46,17 @@ from influx.filter import BatchScorer, Filter, make_default_batch_scorer
 from influx.http_client import aguarded_fetch as _aguarded_fetch
 from influx.repair_hooks import has_usable_source
 from influx.slugs import slugify_feed_name
-from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
+from influx.source import (
+    ArchiveDownloadIdentity,
+    BoundScoredCandidate,
+    Candidate,
+    ScoredCandidate,
+    find_note_tag,
+    note_source_url,
+    note_tags,
+    year_month_from_created_at,
+    year_month_from_note_path,
+)
 from influx.sources.note_builder import (
     append_cascade_outcome_tags,
     profile_item_dict,
@@ -735,6 +745,48 @@ def _rss_filter_id(item: RssFeedItem) -> str:
 # ── Source adapter (issue #57) ──────────────────────────────────────
 
 
+# Identity components a Source writes at acquire time (see
+# ``build_rss_note_item``): note id ``rss-<feed-slug>-<url-hash>`` and the
+# ``feed-slug:`` tag.  Read back here to reconstruct the archive item_id.
+_RSS_NOTE_ID_PREFIX = "rss-"
+_FEED_SLUG_TAG_PREFIX = "feed-slug:"
+
+
+def _rss_item_id_from_note(note: dict[str, object]) -> str | None:
+    """Recover an archive ``item_id`` from an RSS note (finding 3b).
+
+    RSS notes are written with ``id = "rss-<feed-slug>-<url-hash>"`` (see
+    :func:`build_rss_note_item`).  The leading ``rss-`` prefix is dropped to
+    mirror arxiv's ``id = "arxiv-<arxiv-id>" -> item_id = "<arxiv-id>"``.
+
+    The retry archive path will differ from what initial acquisition
+    produced (the original embedded a ``YYYY-MM-DD`` component that is not
+    recoverable from the persisted note); this is fine because acquisition
+    failed and no archive currently lives on disk for the original path.
+
+    ``read_note`` (the repair sweep's only note source) returns a Lithos
+    UUID as ``id``, not the Influx ``rss-<feed-slug>-<url-hash>`` form, so
+    the prefix strip yields nothing.  In that case reconstruct the same
+    date-free ``{feed-slug}-{url-hash}`` retry identity from the
+    ``feed-slug:`` tag and ``source_url``: acquisition builds the note id as
+    ``rss-{feed_slug}-{url_hash(url)}`` and ``url_hash`` normalises
+    internally, so the reconstruction matches that **note id's** suffix
+    byte-for-byte.  It deliberately does **not** match acquisition's dated
+    archive item_id ``{feed-slug}-{YYYY-MM-DD}-{url-hash}`` (the day is not
+    recoverable), per the second paragraph above.
+    """
+    note_id = str(note.get("id", ""))
+    if note_id.startswith(_RSS_NOTE_ID_PREFIX):
+        item_id = note_id[len(_RSS_NOTE_ID_PREFIX) :]
+        if item_id:
+            return item_id
+    feed_slug = find_note_tag(note_tags(note), _FEED_SLUG_TAG_PREFIX)
+    source_url = note_source_url(note)
+    if feed_slug and source_url:
+        return f"{feed_slug}-{url_hash(source_url)}"
+    return None
+
+
 class RssSource:
     """RSS adapter conforming to :class:`influx.source.Source`.
 
@@ -860,6 +912,63 @@ class RssSource:
             confidence=scored.confidence,
             reason=scored.reason,
             filter_tags=scored.filter_tags,
+        )
+
+    def archive_download_identity(
+        self, note: dict[str, object]
+    ) -> ArchiveDownloadIdentity | None:
+        """Rebuild the RSS archive-download identity from a note (finding 3b).
+
+        Re-fetches the archive from the note's doc-level ``source_url`` as
+        ``.html``; the ``item_id`` is the date-free ``{feed-slug}-{url-hash}``
+        reconstruction (see :func:`_rss_item_id_from_note`).
+
+        This is a *deterministic retry* identity, **not** a byte-exact
+        inverse of acquisition: unlike arXiv (whose acquire-time archive
+        ``item_id`` is the bare arxiv id, so it round-trips exactly),
+        :func:`build_rss_note_item` embeds a ``YYYY-MM-DD`` in the RSS
+        archive ``item_id`` (``{feed-slug}-{YYYY-MM-DD}-{url-hash}``) that
+        the note does not persist — so re-download lands at a different
+        (still deterministic) archive path.  That is fine: the archive is
+        missing, so nothing lives at the original dated path to collide
+        with.  What is co-located and drift-proof is the shared
+        ``feed-slug`` + ``url_hash`` *scheme*, not the day.  The
+        ``(year, month)`` bucket falls back path -> ``created_at``.
+
+        Returns ``None`` when the note lacks a doc-level ``source_url``, a
+        recoverable ``item_id``, or any resolvable ``(year, month)``.
+        """
+        source_url = note_source_url(note)
+        if not source_url:
+            _log.warning(
+                "rss archive re-acquire: no doc-level source_url on note id=%s",
+                note.get("id", "?"),
+            )
+            return None
+        item_id = _rss_item_id_from_note(note)
+        if not item_id:
+            _log.warning(
+                "rss archive re-acquire: cannot recover item_id (no 'rss-' id, "
+                "and no feed-slug tag + source_url) for note id=%s",
+                note.get("id", "?"),
+            )
+            return None
+        ym = year_month_from_note_path(note) or year_month_from_created_at(note)
+        if ym is None:
+            _log.warning(
+                "rss archive re-acquire: no year/month from path or created_at "
+                "for note id=%s",
+                note.get("id", "?"),
+            )
+            return None
+        year, month = ym
+        return ArchiveDownloadIdentity(
+            url=source_url,
+            item_id=item_id,
+            published_year=year,
+            published_month=month,
+            ext=".html",
+            expected_content_type="html",
         )
 
 

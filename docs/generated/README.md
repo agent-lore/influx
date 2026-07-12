@@ -47,6 +47,7 @@ Per-component drill-down pages: [Common](components/Common.md) · [Config](compo
   which modules are scanned for domain models.
 - `pyproject.toml [tool.importlinter]` — the enforced directional contracts.
 - [`CONTEXT.md`](../../CONTEXT.md) — the domain vocabulary used in labels.
+- [`docs/adr/`](../adr/) — the decisions behind the architecture.
 
 ## Regenerating
 

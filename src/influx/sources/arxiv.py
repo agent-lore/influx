@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -53,7 +54,17 @@ from influx.extraction.pipeline import extract_arxiv_text
 from influx.filter import BatchScorer, Filter, make_default_batch_scorer
 from influx.http_client import guarded_fetch
 from influx.repair_hooks import has_usable_source
-from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
+from influx.source import (
+    ARXIV_ID_TAG_PREFIX,
+    ArchiveDownloadIdentity,
+    BoundScoredCandidate,
+    Candidate,
+    ScoredCandidate,
+    find_note_tag,
+    note_tags,
+    year_month_from_created_at,
+    year_month_from_note_path,
+)
 from influx.sources.note_builder import (
     append_cascade_outcome_tags,
     profile_item_dict,
@@ -1338,6 +1349,22 @@ def _make_arxiv_tier2_extractor(
 # ── Source adapter (issue #57) ──────────────────────────────────────
 
 
+# Modern arxiv ids encode the publication YYMM in their first four digits
+# (e.g. ``2605.10178`` -> 2026-05), matching acquisition's published_year/month.
+_ARXIV_ID_YYMM_RE = re.compile(r"^(?P<yy>\d{2})(?P<mm>\d{2})\.")
+
+
+def _year_month_from_arxiv_id(arxiv_id: str) -> tuple[int, int] | None:
+    """Derive ``(year, month)`` from a modern arxiv id's ``YYMM`` prefix."""
+    m = _ARXIV_ID_YYMM_RE.match(arxiv_id)
+    if not m:
+        return None
+    month = int(m.group("mm"))
+    if not 1 <= month <= 12:
+        return None
+    return 2000 + int(m.group("yy")), month
+
+
 class ArxivSource:
     """arXiv adapter conforming to :class:`influx.source.Source`.
 
@@ -1522,6 +1549,52 @@ class ArxivSource:
             profile_name=profile_cfg.name,
             config=config,
             filter_tags=scored.filter_tags,
+        )
+
+    def archive_download_identity(
+        self, note: dict[str, object]
+    ) -> ArchiveDownloadIdentity | None:
+        """Rebuild the arXiv archive-download identity from a note (finding 3b).
+
+        The inverse of the acquire-time identity: the PDF URL, ``.pdf``
+        extension, and ``item_id = arxiv_id`` mirror the download that
+        :meth:`acquire` -> :func:`build_arxiv_note_item` performs
+        (``https://arxiv.org/pdf/<id>.pdf``).  The archive ``(year, month)``
+        bucket falls back path -> arxiv-id ``YYMM`` -> ``created_at`` because
+        ``read_note`` does not preserve the note path; the retry bucket may
+        differ from the original (acceptable — acquisition failed, so no
+        archive lives on disk for the original path).
+
+        Returns ``None`` when the note lacks the ``arxiv-id`` tag or any
+        resolvable publication ``(year, month)``.
+        """
+        arxiv_id = find_note_tag(note_tags(note), ARXIV_ID_TAG_PREFIX)
+        if not arxiv_id:
+            _log.warning(
+                "arxiv archive re-acquire: no arxiv-id tag on note id=%s",
+                note.get("id", "?"),
+            )
+            return None
+        ym = (
+            year_month_from_note_path(note)
+            or _year_month_from_arxiv_id(arxiv_id)
+            or year_month_from_created_at(note)
+        )
+        if ym is None:
+            _log.warning(
+                "arxiv archive re-acquire: no year/month from path, arxiv id, "
+                "or created_at for note id=%s",
+                note.get("id", "?"),
+            )
+            return None
+        year, month = ym
+        return ArchiveDownloadIdentity(
+            url=f"https://arxiv.org/pdf/{arxiv_id}.pdf",
+            item_id=arxiv_id,
+            published_year=year,
+            published_month=month,
+            ext=".pdf",
+            expected_content_type="pdf",
         )
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,8 +41,14 @@ from influx.repair import (
     SweepHooks,
     TextExtractionHook,
 )
+from influx.source import (
+    ARXIV_ID_TAG_PREFIX,
+    Source,
+    find_note_tag,
+    note_source_url,
+    note_tags,
+)
 from influx.storage import download_archive
-from influx.urls import url_hash
 
 __all__ = [
     "DefaultSweepHooks",
@@ -123,42 +130,25 @@ def _extract_from_archive(
     return extracted, "text:html"
 
 
-# ── Archive download metadata recovery ──────────────────────────────
+# ── Source metadata / note-id helpers ───────────────────────────────
+#
+# The archive-download identity reconstruction (arXiv YYMM buckets +
+# pdf URL, RSS ``{feed-slug}-{url-hash}`` item_id) now lives with the
+# adapter that owns each scheme — ``Source.archive_download_identity`` in
+# ``influx.sources.arxiv`` / ``influx.sources.rss`` (finding 3b).  The
+# generic note-envelope readers (:func:`find_note_tag`, :func:`note_tags`,
+# :func:`note_source_url`) are shared from :mod:`influx.source`.
 
-_ARXIV_ID_TAG_PREFIX = "arxiv-id:"
 _SOURCE_TAG_PREFIX = "source:"
-_FEED_SLUG_TAG_PREFIX = "feed-slug:"
-# Modern arxiv ids encode the publication YYMM in their first four digits
-# (e.g. ``2605.10178`` → 2026-05), matching acquisition's published_year/month.
-_ARXIV_ID_YYMM_RE = re.compile(r"^(?P<yy>\d{2})(?P<mm>\d{2})\.")
-# Leading ``YYYY-MM`` of an ISO-8601 ``created_at`` timestamp.
-_ISO_YEAR_MONTH_RE = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})")
-_NOTE_PATH_RE = re.compile(
-    r"(?:papers|articles)/(?P<source>[^/]+)/(?P<year>\d{4})/(?P<month>\d{2})"
-)
 _NOTE_PATH_SOURCE_RE = re.compile(r"(?:^|/)(?:papers|articles)/(?P<source>[^/]+)/")
 _RSS_NOTE_ID_PREFIX = "rss-"
 _ARXIV_NOTE_ID_PREFIX = "arxiv-"
 _ARXIV_HOSTNAMES: frozenset[str] = frozenset({"arxiv.org", "www.arxiv.org"})
 
 
-def _find_tag(tags: list[str], prefix: str) -> str | None:
-    """Return the suffix of the first tag starting with *prefix*, or None."""
-    for tag in tags:
-        if tag.startswith(prefix):
-            return tag[len(prefix) :]
-    return None
-
-
-def _note_tags(note: dict[str, object]) -> list[str]:
-    """Read and cast the note's tag list defensively (Lithos returns ``Any``)."""
-    raw = note.get("tags", [])
-    return list(raw) if isinstance(raw, list) else []
-
-
 def _note_source_tag(note: dict[str, object]) -> str:
     """Return the note's ``source:*`` tag suffix or an empty string."""
-    return _find_tag(_note_tags(note), _SOURCE_TAG_PREFIX) or ""
+    return find_note_tag(note_tags(note), _SOURCE_TAG_PREFIX) or ""
 
 
 # Public alias: cross-module callers (e.g. ``influx.audit_invalid_source``,
@@ -345,7 +335,7 @@ def infer_note_source(note: dict[str, object]) -> str | None:
     if resolved is not None:
         return resolved
 
-    source_url = _note_source_url(note) or ""
+    source_url = note_source_url(note) or ""
     inferred = _infer_source_from_url(source_url)
     if inferred is not None:
         return inferred
@@ -370,7 +360,7 @@ def _backfill_source_tag(note: dict[str, object], inferred: str) -> None:
     suffix so the next sweep pass never re-enters the inference path
     for the same note.
     """
-    tags = _note_tags(note)
+    tags = note_tags(note)
     rebuilt = [t for t in tags if not t.startswith(_SOURCE_TAG_PREFIX)]
     rebuilt.append(f"{_SOURCE_TAG_PREFIX}{inferred}")
     note["tags"] = rebuilt
@@ -422,69 +412,6 @@ def _raise_invalid_source_metadata(
     )
 
 
-def _parse_year_month_from_note_path(note_path: str) -> tuple[int, int] | None:
-    """Pull ``(year, month)`` from a Lithos note path like ``papers/arxiv/2026/04``."""
-    m = _NOTE_PATH_RE.search(note_path)
-    if not m:
-        return None
-    try:
-        return int(m.group("year")), int(m.group("month"))
-    except ValueError:
-        return None
-
-
-def _year_month_from_arxiv_id(arxiv_id: str) -> tuple[int, int] | None:
-    """Derive ``(year, month)`` from a modern arxiv id's ``YYMM`` prefix."""
-    m = _ARXIV_ID_YYMM_RE.match(arxiv_id)
-    if not m:
-        return None
-    month = int(m.group("mm"))
-    if not 1 <= month <= 12:
-        return None
-    return 2000 + int(m.group("yy")), month
-
-
-def _year_month_from_iso(timestamp: str) -> tuple[int, int] | None:
-    """Derive ``(year, month)`` from the leading ``YYYY-MM`` of an ISO timestamp."""
-    m = _ISO_YEAR_MONTH_RE.match(timestamp)
-    if not m:
-        return None
-    month = int(m.group("month"))
-    if not 1 <= month <= 12:
-        return None
-    return int(m.group("year")), month
-
-
-def _year_month_from_note(
-    note: dict[str, object], *, arxiv_id: str | None = None
-) -> tuple[int, int] | None:
-    """Resolve the archive ``(year, month)`` bucket for a note.
-
-    ``read_note`` does not preserve the Influx note ``path``
-    (``papers|articles/<source>/YYYY/MM``), so the path-based parse fails
-    for every sweep candidate. Fall back to the publication date encoded in
-    the arxiv id (``YYMM``), then to the note's ``created_at``. The retry
-    archive path may differ from the original bucket — that is acceptable
-    (see :func:`_rss_item_id_from_note`); it only needs to be deterministic.
-    """
-    ym = _parse_year_month_from_note_path(str(note.get("path") or ""))
-    if ym is not None:
-        return ym
-    if arxiv_id:
-        ym = _year_month_from_arxiv_id(arxiv_id)
-        if ym is not None:
-            return ym
-    created_at = note.get("created_at")
-    if not isinstance(created_at, str) or not created_at:
-        meta = note.get("metadata")
-        if isinstance(meta, dict):
-            meta_created = meta.get("created_at")
-            created_at = meta_created if isinstance(meta_created, str) else ""
-        else:
-            created_at = ""
-    return _year_month_from_iso(created_at) if created_at else None
-
-
 def _classify_download_kind(error: str) -> str:
     """Return the ``kind`` discriminator from an ``ArchiveResult.error`` string.
 
@@ -500,183 +427,30 @@ def _classify_download_kind(error: str) -> str:
     return head or "archive_failed"
 
 
-def _note_source_url(note: dict[str, object]) -> str | None:
-    """Return the note's doc-level ``source_url`` (top-level or ``metadata``).
-
-    The repair sweep operates on the ``lithos_read`` envelope, where
-    ``source_url`` is a structured doc-level field — hoisted to the top
-    level by the #187 read-envelope normalisation, with ``metadata`` as
-    the fallback location.  Mirrors
-    :func:`influx.lithos_client._doc_source_url`.
-
-    This deliberately does NOT parse a ``source_url:`` line out of the
-    content body.  That was the pre-fix legacy shape (empty doc-level
-    metadata, populated content-body frontmatter); those notes have been
-    cleaned up and the writer no longer produces them, so reading the
-    content body would only reintroduce a dependency on a removed shape.
-    Returns ``None`` when no doc-level source_url is present — callers
-    treat that as a transient "needs operator hand-fix" signal.
-    """
-    direct = note.get("source_url")
-    if isinstance(direct, str) and direct:
-        return direct
-    meta = note.get("metadata")
-    if isinstance(meta, dict):
-        nested = meta.get("source_url")
-        if isinstance(nested, str) and nested:
-            return nested
-    return None
-
-
-def _rss_item_id_from_note(note: dict[str, object]) -> str | None:
-    """Recover an archive ``item_id`` from an RSS note's ``id`` field.
-
-    RSS notes are written with ``id = "rss-<feed-slug>-<url-hash>"``
-    (see ``influx.sources.rss.build_rss_note_item``).  The leading
-    ``rss-`` prefix is dropped to mirror arxiv's
-    ``id = "arxiv-<arxiv-id>" -> item_id = "<arxiv-id>"`` convention.
-
-    The retry archive path will differ from what initial acquisition
-    would have produced (the original embedded a ``YYYY-MM-DD``
-    component that is not recoverable from the persisted note); this is
-    fine because acquisition failed and no archive currently lives on
-    disk for the original path.
-
-    ``read_note`` (the repair sweep's only note source) returns a Lithos
-    UUID as ``id``, not the Influx ``rss-<feed-slug>-<url-hash>`` form, so
-    the prefix strip yields nothing. In that case reconstruct the exact
-    same ``{feed-slug}-{url-hash}`` item_id from the ``feed-slug:`` tag and
-    ``source_url`` — acquisition builds the note id as
-    ``rss-{feed_slug}-{url_hash(url)}`` (``influx.sources.rss``), and
-    ``url_hash`` normalises internally, so this matches byte-for-byte.
-    """
-    note_id = str(note.get("id", ""))
-    if note_id.startswith(_RSS_NOTE_ID_PREFIX):
-        item_id = note_id[len(_RSS_NOTE_ID_PREFIX) :]
-        if item_id:
-            return item_id
-    feed_slug = _find_tag(_note_tags(note), _FEED_SLUG_TAG_PREFIX)
-    source_url = _note_source_url(note)
-    if feed_slug and source_url:
-        return f"{feed_slug}-{url_hash(source_url)}"
-    return None
-
-
-def _resolve_rss_download_args(
-    note: dict[str, object],
-    config: AppConfig,
-) -> dict[str, object]:
-    """Build kwargs for :func:`download_archive` from an RSS note's state.
-
-    Raises :class:`ExtractionError` (stage ``"resolve"``) when the note
-    is missing fields needed to retry — the sweep treats this as
-    transient so an operator hand-fix lands the next pass.
-    """
-    source = _note_source_tag(note)
-    source_url = _note_source_url(note)
-    if not source_url:
-        raise ExtractionError(
-            "Cannot retry archive download: no doc-level source_url on note",
-            stage="resolve",
-            detail=f"note id={note.get('id', '?')}",
-        )
-    item_id = _rss_item_id_from_note(note)
-    if not item_id:
-        raise ExtractionError(
-            "Cannot retry archive download: cannot recover RSS item_id "
-            "(no 'rss-' id, and no feed-slug tag + source_url to reconstruct)",
-            stage="resolve",
-            detail=f"note id={note.get('id', '?')}",
-        )
-    ym = _year_month_from_note(note)
-    if ym is None:
-        raise ExtractionError(
-            "Cannot retry archive download: no year/month from path or created_at",
-            stage="resolve",
-            detail=f"note id={note.get('id', '?')}",
-        )
-    year, month = ym
-    return {
-        "url": source_url,
-        "archive_root": Path(config.storage.archive_dir),
-        "source": source,
-        "item_id": item_id,
-        "published_year": year,
-        "published_month": month,
-        "ext": ".html",
-        "allow_private_ips": config.security.allow_private_ips,
-        "max_download_bytes": config.storage.max_download_bytes,
-        "timeout_seconds": config.storage.download_timeout_seconds,
-        "expected_content_type": "html",
-    }
-
-
-def _resolve_archive_download_args(
-    note: dict[str, object],
-    config: AppConfig,
-) -> dict[str, object]:
-    """Dispatch :func:`download_archive` kwarg construction by note source.
-
-    Currently supports ``arxiv`` and ``rss-*`` (plus the bare ``rss``
-    sentinel).  Other sources raise ``unsupported_source`` so the sweep
-    keeps existing transient-retry behavior until a per-source
-    resolver lands.
-    """
-    source = _note_source_tag(note)
-    if source == "arxiv":
-        return _resolve_arxiv_download_args(note, config)
-    if _is_rss_source(source):
-        return _resolve_rss_download_args(note, config)
-    _raise_unsupported_source(note, stage_label="archive_download retry", source=source)
-    raise AssertionError("unreachable")  # pragma: no cover
-
-
-def _resolve_arxiv_download_args(
-    note: dict[str, object],
-    config: AppConfig,
-) -> dict[str, object]:
-    """Build kwargs for :func:`download_archive` from an arxiv note's state.
-
-    Raises :class:`ExtractionError` (stage ``"resolve"``) when the note is
-    missing fields needed to retry — the sweep treats this as transient
-    so an operator hand-fix lands the next pass.
-    """
-    arxiv_id = _find_tag(_note_tags(note), _ARXIV_ID_TAG_PREFIX)
-    if not arxiv_id:
-        raise ExtractionError(
-            "Cannot retry archive download: no arxiv-id tag on note",
-            stage="resolve",
-            detail=f"note id={note.get('id', '?')}",
-        )
-    ym = _year_month_from_note(note, arxiv_id=arxiv_id)
-    if ym is None:
-        raise ExtractionError(
-            "Cannot retry archive download: no year/month from path, "
-            "arxiv id, or created_at",
-            stage="resolve",
-            detail=f"note id={note.get('id', '?')}",
-        )
-    year, month = ym
-    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-    return {
-        "url": pdf_url,
-        "archive_root": Path(config.storage.archive_dir),
-        "source": "arxiv",
-        "item_id": arxiv_id,
-        "published_year": year,
-        "published_month": month,
-        "ext": ".pdf",
-        "allow_private_ips": config.security.allow_private_ips,
-        "max_download_bytes": config.storage.max_download_bytes,
-        "timeout_seconds": config.storage.download_timeout_seconds,
-        "expected_content_type": "pdf",
-    }
-
-
 # ── Hook factories ──────────────────────────────────────────────────
 
 
-def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
+def _reacquirer_for_source(
+    source: str, reacquirers: Mapping[str, Source]
+) -> Source | None:
+    """Pick the Source that owns *source*'s archive-identity scheme.
+
+    Maps the note's ``source:*`` tag suffix to a canonical family key —
+    ``"arxiv"`` or ``"rss"`` (any ``rss-<feed>`` variant).  Returns
+    ``None`` for a source with no registered reacquirer (e.g. inbox),
+    which the hook treats as ``unsupported_source`` (transient).
+    """
+    if source == "arxiv":
+        return reacquirers.get("arxiv")
+    if _is_rss_source(source):
+        return reacquirers.get("rss")
+    return None
+
+
+def _make_archive_download_hook(
+    config: AppConfig,
+    archive_reacquirers: Mapping[str, Source],
+) -> ArchiveDownloadHook:
     """Create the production ``archive_download`` hook (FR-REP-1).
 
     The hook re-runs :func:`influx.storage.download_archive` for a note
@@ -687,11 +461,20 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
     counted-class kinds — currently ``"oversize"``) and flips
     ``influx:archive-terminal`` once the cap is reached.
 
-    Supports ``source:arxiv`` and ``source:rss-*`` notes via
-    :func:`_resolve_archive_download_args`.  Other sources raise an
-    ``ExtractionError(stage="unsupported_source")`` which classifies as
-    transient — the note re-enters the sweep next pass and is fixed
-    automatically once a per-source resolver is added.
+    *archive_reacquirers* maps a canonical source family (``"arxiv"`` /
+    ``"rss"``) to the :class:`~influx.source.Source` that owns that
+    family's archive-identity scheme.  The hook dispatches each note to
+    its Source's
+    :meth:`~influx.source.Source.archive_download_identity` (finding 3b)
+    — so the acquire-time identity scheme and its repair-time
+    reconstruction live in one module and cannot drift.  A note whose
+    source has no registered reacquirer raises
+    ``ExtractionError(stage="unsupported_source")`` (transient) — the
+    note re-enters the sweep next pass, preserving the pre-3b behaviour
+    for sources without a resolver (e.g. inbox — GH #248).  A note whose
+    reacquirer cannot rebuild the identity (missing fields) raises
+    ``ExtractionError(stage="resolve")`` (also transient) awaiting an
+    operator hand-fix.
 
     Issue #149 follow-up: the per-domain archive policy registry is
     built once from ``config.storage.archive_policy`` and threaded into
@@ -707,10 +490,36 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
     )
 
     def hook(note: dict[str, object]) -> str:
-        kwargs = _resolve_archive_download_args(note, config)
+        source = _note_source_tag(note)
+        reacquirer = _reacquirer_for_source(source, archive_reacquirers)
+        if reacquirer is None:
+            _raise_unsupported_source(
+                note, stage_label="archive_download retry", source=source
+            )
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        identity = reacquirer.archive_download_identity(note)
+        if identity is None:
+            raise ExtractionError(
+                "Cannot retry archive download: source "
+                f"{source!r} could not rebuild archive identity from note",
+                stage="resolve",
+                detail=f"note id={note.get('id', '?')}",
+            )
+
         result = download_archive(
             policy_registry=policy_registry,
-            **kwargs,  # type: ignore[arg-type]
+            url=identity.url,
+            archive_root=Path(config.storage.archive_dir),
+            source=source,
+            item_id=identity.item_id,
+            published_year=identity.published_year,
+            published_month=identity.published_month,
+            ext=identity.ext,
+            allow_private_ips=config.security.allow_private_ips,
+            max_download_bytes=config.storage.max_download_bytes,
+            timeout_seconds=config.storage.download_timeout_seconds,
+            expected_content_type=identity.expected_content_type,
         )
         if result.ok and result.rel_posix_path:
             _log.info(
@@ -728,7 +537,7 @@ def _make_archive_download_hook(config: AppConfig) -> ArchiveDownloadHook:
         stage = _classify_download_kind(result.error) or "archive_failed"
         raise ExtractionError(
             f"archive_download retry failed: {result.error}",
-            url=str(kwargs.get("url", "")),
+            url=identity.url,
             stage=stage,
             detail=result.error,
         )
@@ -758,7 +567,7 @@ def _run_arxiv_text_extraction(note: dict[str, object], config: AppConfig) -> st
     and it should keep surfacing through the sweep's failure-logging
     path until corrected.
     """
-    arxiv_id = _find_tag(_note_tags(note), _ARXIV_ID_TAG_PREFIX)
+    arxiv_id = find_note_tag(note_tags(note), ARXIV_ID_TAG_PREFIX)
     if not arxiv_id:
         raise ExtractionError(
             "Cannot retry text extraction: no arxiv-id tag on note",
@@ -804,7 +613,7 @@ def _run_rss_text_extraction(note: dict[str, object], config: AppConfig) -> str:
     fix can repair, and it should keep surfacing through the sweep's
     failure-logging path until corrected.
     """
-    source_url = _note_source_url(note)
+    source_url = note_source_url(note)
     if not source_url:
         raise ExtractionError(
             "Cannot retry text extraction: no doc-level source_url on note",
@@ -1020,11 +829,25 @@ class DefaultSweepHooks:
         )
 
 
-def make_default_sweep_hooks(config: AppConfig) -> DefaultSweepHooks:
+def make_default_sweep_hooks(
+    config: AppConfig,
+    *,
+    archive_reacquirers: Mapping[str, Source] | None = None,
+) -> DefaultSweepHooks:
     """Create production-default sweep hooks for the repair sweep.
 
     Each hook bridges the PRD 06 hook signature to the lower-level
     fetch / extraction / enrichment helpers (FR-REP-1).
+
+    *archive_reacquirers* maps a canonical source family (``"arxiv"`` /
+    ``"rss"``) to the :class:`~influx.source.Source` that reconstructs
+    that family's archive-download identity from a persisted note
+    (finding 3b).  The Repair layer cannot import the Sources adapters
+    (it would close a module cycle), so the composition root
+    (``run._run_repair_stage``) injects them.  When ``None`` (tests that
+    do not exercise archive re-download, or drive the sweep with their
+    own hooks) the archive-download hook treats every note as
+    ``unsupported_source`` — a transient no-op.
 
     Returns :class:`DefaultSweepHooks` (typed with non-optional
     callables) so callers and tests do not need to narrow ``Optional``
@@ -1032,7 +855,7 @@ def make_default_sweep_hooks(config: AppConfig) -> DefaultSweepHooks:
     the sweep entrypoint via :meth:`DefaultSweepHooks.to_sweep_hooks`.
     """
     return DefaultSweepHooks(
-        archive_download=_make_archive_download_hook(config),
+        archive_download=_make_archive_download_hook(config, archive_reacquirers or {}),
         re_extract_archive=_make_re_extract_archive_hook(config),
         text_extraction=_make_text_extraction_hook(config),
     )

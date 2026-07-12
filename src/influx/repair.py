@@ -23,7 +23,7 @@ import copy
 import enum
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from influx.cascade import EnrichedSections, Tier, Tier2Extractor
     from influx.config import AppConfig
     from influx.lithos_client import LithosClient
+    from influx.source import Source
 
 __all__ = [
     "ArchiveDownloadHook",
@@ -1546,6 +1547,7 @@ async def sweep(
     config: AppConfig,
     hooks: SweepHooks | None = None,
     cascade: Cascade | None = None,
+    archive_reacquirers: Mapping[str, Source] | None = None,
 ) -> list[dict[str, Any]]:
     """Run the repair sweep for *profile* (PRD 06 §5.1 FR-REP-1).
 
@@ -1576,6 +1578,14 @@ async def sweep(
         tiers exactly as an absent hook skips its stage; the production
         path builds one (with the archive Tier-2 extractor) when *hooks*
         is ``None``.
+    archive_reacquirers:
+        Maps a canonical source family (``"arxiv"`` / ``"rss"``) to the
+        :class:`~influx.source.Source` that rebuilds that family's
+        archive-download identity from a persisted note (finding 3b).
+        Injected by the composition root (``run._run_repair_stage``)
+        because the Repair layer cannot import the Sources adapters.
+        Only consulted on the default-hooks path (*hooks* is ``None``);
+        ``None`` there makes archive re-download a transient no-op.
 
     Returns
     -------
@@ -1598,7 +1608,9 @@ async def sweep(
             make_sweep_tier2_extractor,
         )
 
-        effective_hooks = make_default_sweep_hooks(config).to_sweep_hooks()
+        effective_hooks = make_default_sweep_hooks(
+            config, archive_reacquirers=archive_reacquirers
+        ).to_sweep_hooks()
         effective_cascade = (
             cascade
             if cascade is not None

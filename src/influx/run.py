@@ -52,7 +52,9 @@ from influx.repair import SweepWriteError
 from influx.repair import sweep as repair_sweep
 from influx.run_dedup import dedup_scored_candidates
 from influx.run_ledger import RunLedger
-from influx.source import BoundScoredCandidate
+from influx.source import BoundScoredCandidate, Source
+from influx.sources.arxiv import ArxivSource
+from influx.sources.rss import RssSource
 from influx.telemetry import (
     current_archive_terminal_arxiv_ids,
     current_fetched_total,
@@ -323,6 +325,20 @@ async def lithos_task_lifecycle(
 # ── Stages ──────────────────────────────────────────────────────────
 
 
+def _default_archive_reacquirers(config: AppConfig) -> dict[str, Source]:
+    """Build the Source registry the repair sweep uses to re-download a
+    note's missing archive (finding 3b).
+
+    Constructed here in the Orchestration layer — the composition root —
+    because the Repair layer cannot import the Sources adapters without
+    closing a module cycle (``sources.*`` already import
+    ``repair_hooks.has_usable_source``).  Each adapter owns the inverse of
+    the identity it writes at acquire time via
+    :meth:`~influx.source.Source.archive_download_identity`.
+    """
+    return {"arxiv": ArxivSource(config), "rss": RssSource(config)}
+
+
 async def _run_repair_stage(
     plan: RunPlan,
     *,
@@ -339,7 +355,12 @@ async def _run_repair_stage(
         return RepairResult(candidates_visited=0), StageDiagnostics()
 
     try:
-        repaired = await repair_sweep(plan.profile, client=client, config=config)
+        repaired = await repair_sweep(
+            plan.profile,
+            client=client,
+            config=config,
+            archive_reacquirers=_default_archive_reacquirers(config),
+        )
     except SweepWriteError as exc:
         diagnostics = StageDiagnostics(
             health_actions=(
