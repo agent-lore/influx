@@ -209,8 +209,11 @@ class RunDispatcher:
         ``schedule.shutdown_grace_seconds`` before the service shuts down.
         When ``log_context`` is provided the task gets a second done-callback
         that logs request-keyed completion or failure (#105).
+
+        Dispatch always happens inside an active request coroutine, so we bind
+        the task to the running loop explicitly.
         """
-        task = asyncio.get_event_loop().create_task(coro)
+        task = asyncio.get_running_loop().create_task(coro)
         self._active_tasks.add(task)
         task.add_done_callback(self._active_tasks.discard)
         if log_context is not None:

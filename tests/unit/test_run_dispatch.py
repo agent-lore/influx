@@ -44,18 +44,67 @@ def _make_dispatcher(
     config: AppConfig,
     active_tasks: set[asyncio.Task[object]],
     tmp_path: Path,
+    fetch_cache: object = None,
 ) -> RunDispatcher:
     return RunDispatcher(
         coordinator,
         config,
         run_ledger=RunLedger(tmp_path / "state"),
         active_tasks=active_tasks,
+        fetch_cache=fetch_cache,
     )
 
 
 async def _drain(active_tasks: set[asyncio.Task[object]]) -> None:
-    """Let every launched background task run to completion."""
-    await asyncio.gather(*list(active_tasks))
+    """Let every launched background task run to completion.
+
+    ``return_exceptions=True`` so failure-path tests (where ``run_profile``
+    re-raises) can still assert on side effects without the drain re-raising.
+    The done-callback already retrieves each task's exception.
+    """
+    await asyncio.gather(*list(active_tasks), return_exceptions=True)
+
+
+class _RecordingRunProfile:
+    """Records the args each ``run_profile`` call receives."""
+
+    def __init__(self, *, raises: bool = False) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._raises = raises
+
+    async def __call__(
+        self,
+        profile: str,
+        kind: RunKind,
+        run_range: object = None,
+        *,
+        run_id: object = None,
+        **_: object,
+    ) -> None:
+        self.calls.append(
+            {
+                "profile": profile,
+                "kind": kind,
+                "run_range": run_range,
+                "run_id": run_id,
+            }
+        )
+        if self._raises:
+            raise RuntimeError("run_profile blew up")
+
+
+class _FakeFetchCache:
+    """Counts begin_fire / end_fire so tests can assert they balance."""
+
+    def __init__(self) -> None:
+        self.begins = 0
+        self.ends = 0
+
+    def begin_fire(self) -> None:
+        self.begins += 1
+
+    def end_fire(self) -> None:
+        self.ends += 1
 
 
 async def test_dispatch_one_launches_and_tracks(
@@ -177,4 +226,114 @@ async def test_dispatch_all_rolls_back_on_busy(
     assert active_tasks == set()
     assert called is False
     # Rollback released the lock acquired before hitting the busy profile.
+    assert not coordinator.is_busy("alpha")
+
+
+async def test_dispatch_one_forwards_run_range_and_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _RecordingRunProfile()
+    monkeypatch.setattr("influx.run_dispatch.run_profile", recorder)
+
+    coordinator = Coordinator()
+    config = _make_config(["alpha"])
+    active_tasks: set[asyncio.Task[object]] = set()
+    dispatcher = _make_dispatcher(coordinator, config, active_tasks, tmp_path)
+
+    await dispatcher.dispatch_one(
+        "alpha",
+        RunKind.BACKFILL,
+        run_range={"days": 7},
+        request_id="r1",
+        log_context={"request_id": "r1", "kind": "backfill", "scope": "alpha"},
+    )
+    await _drain(active_tasks)
+
+    assert recorder.calls == [
+        {
+            "profile": "alpha",
+            "kind": RunKind.BACKFILL,
+            "run_range": {"days": 7},
+            "run_id": "r1",
+        }
+    ]
+
+
+async def test_dispatch_all_forwards_run_range_and_per_profile_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _RecordingRunProfile()
+    monkeypatch.setattr("influx.run_dispatch.run_profile", recorder)
+
+    coordinator = Coordinator()
+    config = _make_config(["alpha", "beta"])
+    active_tasks: set[asyncio.Task[object]] = set()
+    dispatcher = _make_dispatcher(coordinator, config, active_tasks, tmp_path)
+
+    await dispatcher.dispatch_all(
+        RunKind.BACKFILL,
+        run_range={"days": 3},
+        request_id="r1",
+        log_context={"request_id": "r1", "kind": "backfill", "scope": "all"},
+    )
+    await _drain(active_tasks)
+
+    # Each fanned-out run gets the shared run_range and a per-profile run id.
+    by_profile = {c["profile"]: c for c in recorder.calls}
+    assert by_profile["alpha"]["run_id"] == "r1:alpha"
+    assert by_profile["beta"]["run_id"] == "r1:beta"
+    assert by_profile["alpha"]["run_range"] == {"days": 3}
+    assert by_profile["beta"]["run_range"] == {"days": 3}
+
+
+async def test_fetch_cache_begin_end_balanced_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("influx.run_dispatch.run_profile", _RecordingRunProfile())
+
+    coordinator = Coordinator()
+    config = _make_config(["alpha"])
+    active_tasks: set[asyncio.Task[object]] = set()
+    fetch_cache = _FakeFetchCache()
+    dispatcher = _make_dispatcher(
+        coordinator, config, active_tasks, tmp_path, fetch_cache=fetch_cache
+    )
+
+    await dispatcher.dispatch_one(
+        "alpha",
+        RunKind.MANUAL,
+        request_id="r1",
+        log_context={"request_id": "r1", "kind": "manual", "scope": "alpha"},
+    )
+    await _drain(active_tasks)
+
+    assert (fetch_cache.begins, fetch_cache.ends) == (1, 1)
+
+
+async def test_fetch_cache_begin_end_balanced_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "influx.run_dispatch.run_profile", _RecordingRunProfile(raises=True)
+    )
+
+    coordinator = Coordinator()
+    config = _make_config(["alpha"])
+    active_tasks: set[asyncio.Task[object]] = set()
+    fetch_cache = _FakeFetchCache()
+    dispatcher = _make_dispatcher(
+        coordinator, config, active_tasks, tmp_path, fetch_cache=fetch_cache
+    )
+
+    await dispatcher.dispatch_one(
+        "alpha",
+        RunKind.MANUAL,
+        request_id="r1",
+        log_context={"request_id": "r1", "kind": "manual", "scope": "alpha"},
+    )
+    await _drain(active_tasks)
+
+    # end_fire runs in the finally even when the run raises, and the lock is
+    # still released.
+    assert (fetch_cache.begins, fetch_cache.ends) == (1, 1)
     assert not coordinator.is_busy("alpha")
