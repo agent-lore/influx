@@ -39,6 +39,7 @@ classDiagram
   class IngestResult {
     +ingested tuple[HighlightItem, ...]
     +sources_checked int
+    +written_note_ids tuple[str, ...]
   }
   class RepairResult {
     +candidates_visited int
@@ -50,6 +51,7 @@ classDiagram
     +probe_loop Any | None
     +ledger RunLedger | None
     +run_id str | None
+    +client_factory Callable[[], LithosClient] | None
   }
   class RunOutcome {
     +sources_checked int
@@ -62,6 +64,7 @@ classDiagram
     +profile_run_result ProfileRunResult | None
     +skipped bool
     +skip_reason str | None
+    +written_note_ids tuple[str, ...]
   }
   class RunPlan {
     +profile str

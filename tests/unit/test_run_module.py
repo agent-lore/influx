@@ -506,8 +506,93 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
 
     assert outcome.sources_checked == 1
     assert outcome.ingested == 1
+    # finding 6: the written Lithos note id is surfaced on the outcome.
+    assert outcome.written_note_ids == ("note-new",)
     mock_client.write_note.assert_awaited_once()
     wire.assert_awaited_once()
+
+
+async def test_run_execute_uses_injected_client_factory() -> None:
+    """finding 6: ``RunDeps.client_factory`` supplies the LithosClient.
+
+    With a factory injected, ``Run.execute`` never constructs its own
+    ``LithosClient`` — so tests plug a fake straight in without having to
+    ``patch("influx.run.LithosClient")``.  This test deliberately does NOT
+    patch that symbol, proving the seam carries the dependency.
+    """
+    config = _make_config()
+    plan = _scheduled_plan()
+
+    items = [
+        {
+            "title": "Test Paper",
+            "source_url": "https://arxiv.org/abs/2401.00001",
+            "content": "# Summary\n\nbody",
+            "tags": ["profile:alpha", "source:arxiv"],
+            "confidence": 0.9,
+            "score": 9,
+            "path": "papers/arxiv/2024/01",
+            "abstract_or_summary": "abs",
+        }
+    ]
+
+    async def provider(
+        profile: str, kind: RunKind, run_range: Any, filter_prompt: str
+    ) -> list[BoundScoredCandidate]:
+        return [_bound_for(it) for it in items]
+
+    from mcp import types as mcp_types
+
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
+    mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
+    mock_client.task_complete = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"status": "completed"})
+                )
+            ]
+        )
+    )
+    mock_client.cache_lookup_for_item_body = AsyncMock(return_value={"hit": False})
+    mock_client.cache_lookup_by_url_body = AsyncMock(return_value={"hit": False})
+    write_result = MagicMock()
+    write_result.status = "created"
+    write_result.note_id = "note-injected"
+    mock_client.write_note = AsyncMock(return_value=write_result)
+
+    factory_calls = 0
+
+    def client_factory() -> Any:
+        nonlocal factory_calls
+        factory_calls += 1
+        return mock_client
+
+    deps = RunDeps(
+        config=config,
+        item_provider=provider,
+        probe_loop=None,
+        client_factory=client_factory,
+    )
+
+    # No patch("influx.run.LithosClient") — the factory is the only source.
+    with (
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
+        patch("influx.run.lcma_wire", new_callable=AsyncMock, return_value=[]),
+        patch("influx.service.post_run_webhook_hook"),
+    ):
+        outcome = await Run(plan, deps).execute()
+
+    assert factory_calls == 1
+    assert outcome.ingested == 1
+    assert outcome.written_note_ids == ("note-injected",)
+    mock_client.write_note.assert_awaited_once()
 
 
 async def test_run_execute_threads_tags_source_url_confidence_to_lithos_write() -> None:
@@ -705,6 +790,9 @@ async def test_run_execute_continues_after_lcma_wiring_failure() -> None:
 
     assert outcome.sources_checked == 2
     assert outcome.ingested == 2
+    # finding 6: both written note ids surface in ingest order even when a
+    # post-write LCMA wiring failure occurs for one of them.
+    assert outcome.written_note_ids == ("note-1", "note-2")
     assert wire.await_count == 2
 
 

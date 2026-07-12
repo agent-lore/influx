@@ -830,10 +830,16 @@ class InboxTick:
             name for name, (o, _rid) in dispatched.items() if o.ingested > 0
         ]
         # On a cache hit the canonical note id is already known; otherwise
-        # recover it after the first write created it.
+        # take it from the first ingesting dispatch's RunOutcome — the single
+        # inbox item merges into one canonical note across profiles, and
+        # finding 6 surfaces its id, so no extra cache_lookup_by_url_body.
         note_id = cache_note_id
-        if note_id is None and ingested_names:
-            note_id = await self._recover_note_id(client, acquired.source_url)
+        if note_id is None:
+            for name in ingested_names:
+                written = dispatched[name][0].written_note_ids
+                if written:
+                    note_id = written[0]
+                    break
 
         per_profile = self._build_per_profile(
             scored_profiles, dispatched, busy, dispatch_failed, note_id
@@ -1087,22 +1093,6 @@ class InboxTick:
         if not issues and len(ingested_names) == total:
             return f"ingested into {len(ingested_names)} profile(s): {names}"
         return f"ingested into {len(ingested_names)}/{total} profiles ({names}){tail}"
-
-    async def _recover_note_id(
-        self, client: LithosClient, source_url: str
-    ) -> str | None:
-        """Recover the canonical note id for ``cited_nodes`` (§7.2).
-
-        ``RunOutcome`` does not surface the written note id, so re-resolve
-        it by exact source-URL cache lookup after the dispatch.  Best-effort
-        — a recovery miss simply leaves ``cited_nodes`` empty.
-        """
-        try:
-            body = await client.cache_lookup_by_url_body(source_url=source_url)
-        except (LithosError, LCMAError):
-            logger.debug("note-id recovery failed for %s", source_url, exc_info=True)
-            return None
-        return _extract_note_id(body)
 
     async def _complete(
         self, client: LithosClient, task_id: str, result: _ItemOutcome
