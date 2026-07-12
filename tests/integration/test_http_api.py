@@ -1013,12 +1013,12 @@ class TestBackfillObservability:
     ) -> None:
         import httpx
 
-        import influx.backfill as backfill_mod
+        from influx import http_api as http_api_mod
 
-        async def fake_run_backfill(*args: Any, **kwargs: Any) -> None:
+        async def fake_run_profile(*args: Any, **kwargs: Any) -> None:
             return None
 
-        monkeypatch.setattr(backfill_mod, "run_backfill", fake_run_backfill)
+        monkeypatch.setattr(http_api_mod, "run_profile", fake_run_profile)
 
         with caplog.at_level("INFO", logger="influx.http_api"):
             transport = httpx.ASGITransport(app=app_with_state)

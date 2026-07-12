@@ -35,7 +35,6 @@ from unittest.mock import patch
 
 import pytest
 
-from influx.backfill import run_backfill
 from influx.config import (
     AppConfig,
     ArxivSourceConfig,
@@ -250,8 +249,9 @@ class TestPreAcquireDedupArxivBackfill:
             patch("influx.sources.arxiv.build_arxiv_note_item") as mock_build,
         ):
             result = asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"days": 7},
                     config=config,
                     item_provider=provider,
@@ -321,8 +321,9 @@ class TestPreAcquireDedupRssBackfill:
             patch("influx.sources.rss.build_rss_note_item") as mock_build,
         ):
             result = asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"days": 7},
                     config=config,
                     item_provider=provider,

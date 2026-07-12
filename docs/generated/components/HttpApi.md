@@ -11,7 +11,7 @@ FastAPI HTTP surface (/runs, /backfills, /ready) and backfill request handling.
 
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
-| `influx.backfill` | S | 1 | 2 |
+| `influx.backfill` | XS | 1 | 1 |
 | `influx.http_api` | L | 2 | 8 |
 | `influx.service` | M | 1 | 4 |
 
@@ -20,7 +20,6 @@ FastAPI HTTP surface (/runs, /backfills, /ready) and backfill request handling.
 ### `influx.backfill`
 - class `BackfillRangeError` — Raised when the backfill range inputs are invalid.
 - def `validate_backfill_range` — Validate and normalise backfill range inputs into a ``run_range`` dict.
-- def `run_backfill` — Execute a backfill run for a single profile.
 
 ### `influx.http_api`
 - def `install_exception_handlers` — Install structured JSON error handlers for the admin API.

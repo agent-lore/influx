@@ -27,7 +27,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from influx.backfill import run_backfill
 from influx.config import (
     AppConfig,
     ArxivSourceConfig,
@@ -190,7 +189,7 @@ def clear_fakes(fake_lithos: FakeLithosServer) -> None:
 
 
 class TestBackfillRunCompletes:
-    """Backfill --profile X --days 7 completes via run_backfill."""
+    """Backfill --profile X --days 7 completes via run_profile(kind=BACKFILL)."""
 
     def test_backfill_days_7_completes(
         self,
@@ -214,8 +213,9 @@ class TestBackfillRunCompletes:
             return_value=list(_FIXTURE_ARXIV_ITEMS),
         ):
             result = asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"days": 7},
                     config=config,
                     item_provider=provider,
@@ -256,8 +256,9 @@ class TestBackfillRunCompletes:
             return_value=list(_FIXTURE_ARXIV_ITEMS),
         ):
             result = asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"from": "2026-04-20", "to": "2026-04-27"},
                     config=config,
                     item_provider=provider,
@@ -312,8 +313,9 @@ class TestBackfillCacheLookupSkip:
             return_value=list(_FIXTURE_ARXIV_ITEMS),
         ):
             result = asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"days": 7},
                     config=config,
                     item_provider=provider,
@@ -364,8 +366,9 @@ class TestBackfillCacheLookupSkip:
             return_value=list(_FIXTURE_ARXIV_ITEMS),
         ):
             result = asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"days": 7},
                     config=config,
                     item_provider=provider,
@@ -433,8 +436,9 @@ class TestBackfillNoOverlap:
             ) as mock_sweep,
         ):
             asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"days": 7},
                     config=config,
                     item_provider=provider,
@@ -471,8 +475,9 @@ class TestBackfillNoOverlap:
             ) as mock_webhook,
         ):
             asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"days": 7},
                     config=config,
                     item_provider=provider,
@@ -565,8 +570,9 @@ class TestBackfillTaskTagging:
             return_value=list(_FIXTURE_ARXIV_ITEMS),
         ):
             result = asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"days": 7},
                     config=config,
                     item_provider=provider,
@@ -684,8 +690,9 @@ class TestBackfillRangePropagation:
             patch("influx.sources.arxiv._sleep") as mock_sleep,
         ):
             asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"days": 7},
                     config=config,
                     item_provider=provider,
@@ -764,8 +771,9 @@ class TestBackfillRangePropagation:
             patch("influx.sources.arxiv._sleep"),
         ):
             asyncio.run(
-                run_backfill(
+                run_profile(
                     PROFILE,
+                    RunKind.BACKFILL,
                     run_range={"from": "2026-04-20", "to": "2026-04-27"},
                     config=config,
                     item_provider=provider,
@@ -855,8 +863,8 @@ def _wait_for_idle(
 class TestBackfillEndpointEndToEnd:
     """Review finding 3: drive ``POST /backfills`` through the real app.
 
-    The earlier tests in this module call ``run_backfill`` directly and
-    mock ``post_run_webhook_hook`` / ``repair_sweep``.  Those tests
+    The earlier tests in this module call ``run_profile(kind=BACKFILL)``
+    directly and mock ``post_run_webhook_hook`` / ``repair_sweep``.  Those tests
     cannot prove that ``kind="backfill"`` propagates from the HTTP layer
     down to task tagging, that the webhook gate prevents a real outbound
     HTTP call, or that the repair-sweep gate prevents a real
