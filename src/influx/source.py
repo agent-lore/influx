@@ -189,7 +189,6 @@ class Source(Protocol):
         treats that as a transient "needs operator hand-fix" and re-enters
         the note next pass.
         """
-        ...
 
 
 # ── Repair-sweep note-envelope readers ───────────────────────────────

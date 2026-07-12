@@ -313,10 +313,10 @@
         "functions": 66,
         "largest_module": "influx.run_ledger",
         "largest_module_lines": 1457,
-        "lines": 2838,
+        "lines": 2837,
         "modules": 7,
         "public_symbols": 34,
-        "sloc": 2076
+        "sloc": 2075
       },
       "Config": {
         "classes": 28,
@@ -475,13 +475,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27960,
+    "total_lines": 27959,
     "total_modules": 57,
-    "total_sloc": 21705
+    "total_sloc": 21704
   },
   "tests": {
     "ratio": 2.53,
-    "src_lines": 27960,
+    "src_lines": 27959,
     "test_lines": 70756
   }
 }

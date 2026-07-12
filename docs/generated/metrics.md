@@ -34,7 +34,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 | Component | Modules | Lines | SLOC | Fan-in | Fan-out | Instability | Max complexity | Functions > 10 |
 |---|---:|---:|---:|---:|---:|---:|---|---:|
-| Common | 7 | 2838 | 2076 | 12 | 1 | 0.08 | 47 (`influx.run_ledger.RunLedger.complete`) | 4 |
+| Common | 7 | 2837 | 2075 | 12 | 1 | 0.08 | 47 (`influx.run_ledger.RunLedger.complete`) | 4 |
 | Config | 4 | 1567 | 1134 | 11 | 1 | 0.08 | 14 (`influx.config.NotificationWebhookConfig._validate_type_specific_fields`) | 1 |
 | Enrich | 2 | 988 | 800 | 2 | 5 | 0.71 | 22 (`influx.cascade.Cascade.enrich`) | 2 |
 | Entrypoint | 2 | 573 | 454 | 0 | 5 | 1.00 | 14 (`influx.main._cmd_backfill`) | 2 |
@@ -52,7 +52,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **57**, lines: **27960**, SLOC: **21705**
+- Modules: **57**, lines: **27959**, SLOC: **21704**
 - Largest module: `influx.sources.arxiv` (1830 lines)
 - Modules over 800 lines: **12**
   - `influx.config`
@@ -134,4 +134,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.53** (70756 test lines / 27960 source lines)
+- Test-to-source line ratio: **2.53** (70756 test lines / 27959 source lines)
