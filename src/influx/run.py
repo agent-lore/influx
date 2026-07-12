@@ -130,6 +130,12 @@ class RunOutcome:
     ``sources_checked == 0`` space into ``fetch_stall`` (no items
     reached the filter) and ``filter_stall`` (items reached the
     filter, all rejected).
+
+    ``written_note_ids`` carries the Lithos note ids of the notes this
+    Run created/updated, in ingest order (finding 6).  The single-item
+    ``RunKind.INBOX`` dispatch reads it to attribute the write without a
+    second ``cache_lookup_by_url_body`` round-trip; empty for Runs that
+    ingested nothing.
     """
 
     sources_checked: int = 0
@@ -142,6 +148,7 @@ class RunOutcome:
     profile_run_result: ProfileRunResult | None = None
     skipped: bool = False
     skip_reason: str | None = None
+    written_note_ids: tuple[str, ...] = ()
 
 
 # ── StageDiagnostics + HealthAction (Q1 grilling — hybrid C) ────────
@@ -219,6 +226,8 @@ class IngestResult:
 
     ingested: tuple[HighlightItem, ...] = ()
     sources_checked: int = 0
+    # Lithos note ids of created/updated notes, in ingest order (finding 6).
+    written_note_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +264,13 @@ class RunDeps:
     ``probe_loop`` and ``ledger`` are typed as ``Any`` to avoid an
     import cycle and to mirror the legacy ``run_profile`` signature
     (which accepted duck-typed substitutes from tests).
+
+    ``client_factory`` is the LithosClient seam (finding 6), mirroring
+    :class:`~influx.inbox.InboxTick`'s: ``None`` builds the production
+    client from ``config.lithos`` (the scheduler / inbox paths), while
+    tests inject a fake transport double so the Run's interface — not a
+    module-level ``patch("influx.run.LithosClient")`` — is its test
+    surface.
     """
 
     config: AppConfig
@@ -262,6 +278,7 @@ class RunDeps:
     probe_loop: Any | None = None
     ledger: RunLedger | None = None
     run_id: str | None = None
+    client_factory: Callable[[], LithosClient] | None = None
 
 
 @asynccontextmanager
@@ -500,6 +517,7 @@ async def _run_ingest_stage(
     """
     profile = plan.profile
     ingested: list[HighlightItem] = []
+    written_note_ids: list[str] = []
     sources_checked = 0
     tracer = get_tracer()
 
@@ -679,6 +697,10 @@ async def _run_ingest_stage(
                     related_in_lithos=related_in_lithos,
                 )
             )
+            # Surface the Lithos note id so the inbox dispatch need not
+            # re-resolve it via cache_lookup_by_url_body (finding 6).
+            if write_result.note_id:
+                written_note_ids.append(write_result.note_id)
         elif not cache_hit:
             logger.warning(
                 "article write skipped profile=%s source_url=%s title=%r "
@@ -719,6 +741,7 @@ async def _run_ingest_stage(
         IngestResult(
             ingested=tuple(ingested),
             sources_checked=sources_checked,
+            written_note_ids=tuple(written_note_ids),
         ),
         StageDiagnostics(),
     )
@@ -778,6 +801,7 @@ async def _run_finalise_stage(
         fetched_total=fetched_total,
         profile_run_result=profile_run_result,
         source_acquisition_errors=tuple(current_source_acquisition_errors.get() or []),
+        written_note_ids=ingest.written_note_ids,
     )
     return FinaliseResult(outcome=outcome), StageDiagnostics()
 
@@ -852,7 +876,11 @@ class Run:
         config = deps.config
         probe_loop = deps.probe_loop
 
-        client = LithosClient(url=config.lithos.url, transport=config.lithos.transport)
+        client = (
+            deps.client_factory()
+            if deps.client_factory is not None
+            else LithosClient(url=config.lithos.url, transport=config.lithos.transport)
+        )
         try:
             async with lithos_task_lifecycle(plan, client) as run_task_id:
                 profile_cfg = next(

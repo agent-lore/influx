@@ -75,11 +75,11 @@ class FakeClient:
     ) -> None:
         self._tasks = tasks
         self._claim_success = claim_success
-        # ``note_id`` is what post-dispatch recovery resolves for a *fresh*
-        # item; ``existing_note_id`` (+ ``existing_note``) drive the
-        # cache-hit gate + read_note for replay tests.  cache_lookup is
-        # called twice on the fresh path (gate miss, then recovery hit), so
-        # the first call models the gate and later calls model recovery.
+        # ``existing_note_id`` (+ ``existing_note``) drive the cache-hit gate
+        # + read_note for replay tests.  Since finding 6 the fresh path calls
+        # cache_lookup only ONCE (the gate) — the note id comes from
+        # ``RunOutcome.written_note_ids``, so ``note_id`` here only models a
+        # stray second lookup (asserted absent via ``cache_lookup_calls``).
         self._note_id = note_id
         self._existing_note_id = existing_note_id
         self._existing_note = existing_note or {"content": "", "tags": []}
@@ -88,6 +88,7 @@ class FakeClient:
         self.updated: list[tuple[str, dict[str, Any]]] = []
         self.completed: list[dict[str, Any]] = []
         self.list_calls = 0
+        self.cache_lookup_calls = 0
 
     async def task_list_body(self, **_: Any) -> dict[str, Any]:
         self.list_calls += 1
@@ -117,8 +118,10 @@ class FakeClient:
         return {"status": "completed"}
 
     async def cache_lookup_by_url_body(self, *, source_url: str) -> dict[str, Any]:
-        # First lookup for a URL is the cache-hit gate; later lookups for the
-        # same URL are post-dispatch note-id recovery (fresh path).
+        # The only lookup per URL is the cache-hit gate (finding 6 removed the
+        # post-dispatch recovery lookup); the second-call branch is retained
+        # to prove, via ``cache_lookup_calls``, that it never fires.
+        self.cache_lookup_calls += 1
         if source_url not in self._gated:
             self._gated.add(source_url)
             if self._existing_note_id:
@@ -219,7 +222,8 @@ async def test_happy_path_ingests_and_completes_with_cited_nodes() -> None:
         ),
         patch("influx.inbox.build_filter_prompt", return_value="prompt"),
         patch(
-            "influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)
+            "influx.inbox.dispatch_profile",
+            return_value=RunOutcome(ingested=1, written_note_ids=("note-xyz",)),
         ) as mock_dispatch,
     ):
         await _tick(client).execute()
@@ -230,7 +234,10 @@ async def test_happy_path_ingests_and_completes_with_cited_nodes() -> None:
     assert len(client.completed) == 1
     done = client.completed[0]
     assert "ingested into 1 profile(s): alpha" in done["outcome"]
+    # note id comes from RunOutcome.written_note_ids (finding 6) …
     assert done["cited_nodes"] == ["note-xyz"]
+    # … with no post-dispatch recovery round-trip: only the cache-hit gate.
+    assert client.cache_lookup_calls == 1
     # Structured inbox_result attached before completion.
     assert client.updated[0][1]["inbox_result"]["per_profile"]["alpha"]["ingested"]
 
@@ -449,7 +456,8 @@ async def test_per_profile_dispatch_failure_isolated() -> None:
 
 
 def test_extract_note_id_key_fallback() -> None:
-    """note-id recovery tolerates id / note_id / existing_id; miss → None."""
+    """The cache-hit gate's id extraction tolerates id / note_id / existing_id;
+    a miss → None."""
     assert _extract_note_id({"hit": True, "id": "n1"}) == "n1"
     assert _extract_note_id({"hit": True, "note_id": "n2"}) == "n2"
     assert _extract_note_id({"hit": True, "existing_id": "n3"}) == "n3"
@@ -472,7 +480,8 @@ async def test_fans_out_to_all_clearing_profiles() -> None:
         ),
         patch("influx.inbox.build_filter_prompt", return_value="prompt"),
         patch(
-            "influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)
+            "influx.inbox.dispatch_profile",
+            return_value=RunOutcome(ingested=1, written_note_ids=("note-1",)),
         ) as mock_dispatch,
     ):
         await _tick(client, config).execute()
@@ -996,7 +1005,8 @@ async def test_pdf_happy_path_ingests(tmp_path: Path) -> None:
         ),
         patch("influx.inbox.build_filter_prompt", return_value="prompt"),
         patch(
-            "influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)
+            "influx.inbox.dispatch_profile",
+            return_value=RunOutcome(ingested=1, written_note_ids=("note-pdf",)),
         ) as mock_dispatch,
     ):
         await _tick(client, config).execute()
