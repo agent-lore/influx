@@ -487,60 +487,6 @@ async def _run_and_release(
             fetch_cache.end_fire()
 
 
-async def _backfill_and_release(
-    coordinator: Coordinator,
-    profile: str,
-    run_range: dict[str, str | int],
-    *,
-    config: Any = None,
-    item_provider: Any = None,
-    probe_loop: Any = None,
-    fetch_cache: Any = None,
-    run_id: str | None = None,
-    run_ledger: RunLedger | None = None,
-) -> None:
-    """Run ``backfill.run_backfill`` and release the coordinator lock afterward.
-
-    Analogous to :func:`_run_and_release` but routes through the
-    :mod:`influx.backfill` module so that backfill-specific logic
-    (cache-hit skip, pacing) is exercised end-to-end (US-009).
-    """
-    from influx.backfill import run_backfill
-
-    if fetch_cache is not None:
-        fetch_cache.begin_fire()
-    try:
-        try:
-            await run_backfill(
-                profile,
-                run_range=run_range,
-                config=config,
-                item_provider=item_provider,
-                probe_loop=probe_loop,
-                run_id=run_id,
-                run_ledger=run_ledger,
-            )
-        except Exception:
-            logger.warning(
-                "run_backfill %r aborted request_id=%s",
-                profile,
-                run_id,
-                exc_info=True,
-                extra={
-                    "request_id": run_id,
-                    "kind": "backfill",
-                    "scope": profile,
-                    "profile": profile,
-                    "status": "failed",
-                },
-            )
-            raise
-    finally:
-        coordinator.release(profile)
-        if fetch_cache is not None:
-            fetch_cache.end_fire()
-
-
 async def _run_many_and_release(
     coordinator: Coordinator,
     profiles: list[str],
@@ -898,12 +844,15 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
                 ledger=run_ledger,
             )
 
-        # Launch the backfill in the background via backfill.run_backfill.
+        # Launch the single-profile backfill in the background. A backfill is
+        # just a Run with RunKind.BACKFILL, so it shares _run_and_release with
+        # manual runs — the kind drives repair/cache/notify gating downstream.
         _spawn_tracked_task(
             request.app,
-            _backfill_and_release(
+            _run_and_release(
                 coordinator,
                 body.profile,
+                RunKind.BACKFILL,
                 run_range,
                 config=config,
                 item_provider=getattr(request.app.state, "item_provider", None),

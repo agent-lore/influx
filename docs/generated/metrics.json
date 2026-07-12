@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 650
+    "total_functions": 648
   },
   "domain": {
     "associations": 5,
@@ -222,12 +222,11 @@
       }
     },
     "cross_component_edges": 62,
-    "cross_component_module_edges": 190,
+    "cross_component_module_edges": 185,
     "longest_component_chain": 4,
     "module_cycle_count": 3,
     "module_cycles": [
       [
-        "influx.backfill",
         "influx.http_api",
         "influx.inbox",
         "influx.run",
@@ -370,13 +369,13 @@
       },
       "HttpApi": {
         "classes": 4,
-        "functions": 43,
+        "functions": 41,
         "largest_module": "influx.http_api",
-        "largest_module_lines": 1007,
-        "lines": 1529,
+        "largest_module_lines": 956,
+        "lines": 1410,
         "modules": 3,
-        "public_symbols": 18,
-        "sloc": 1276
+        "public_symbols": 17,
+        "sloc": 1167
       },
       "LithosBridge": {
         "classes": 13,
@@ -475,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27980,
+    "total_lines": 27861,
     "total_modules": 57,
-    "total_sloc": 21720
+    "total_sloc": 21611
   },
   "tests": {
-    "ratio": 2.53,
-    "src_lines": 27980,
-    "test_lines": 70854
+    "ratio": 2.54,
+    "src_lines": 27861,
+    "test_lines": 70863
   }
 }

@@ -21,9 +21,9 @@ lower a budget after improving the code to lock in the gain.
 
 ## Import graph
 
-- Cross-component edges: **62** (190 module-level)
+- Cross-component edges: **62** (185 module-level)
 - Component cycles: Common ↔ Config; Enrich ↔ Repair ↔ Sources ↔ Storage; HttpApi ↔ Orchestration
-- Module cycles: influx.backfill ↔ influx.http_api ↔ influx.inbox ↔ influx.run ↔ influx.run_service ↔ influx.scheduler ↔ influx.service; influx.repair ↔ influx.repair_hooks; influx.sources ↔ influx.sources.arxiv ↔ influx.sources.rss
+- Module cycles: influx.http_api ↔ influx.inbox ↔ influx.run ↔ influx.run_service ↔ influx.scheduler ↔ influx.service; influx.repair ↔ influx.repair_hooks; influx.sources ↔ influx.sources.arxiv ↔ influx.sources.rss
 - Tier-skipping edges (Entrypoints → Foundation): 9 (Entrypoint -> Common, Entrypoint -> Config, Entrypoint -> Observability, HttpApi -> Common, HttpApi -> Config, HttpApi -> Observability, Orchestration -> Common, Orchestration -> Config, Orchestration -> Observability)
 - Longest component dependency chain: 4
 
@@ -40,7 +40,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Entrypoint | 2 | 573 | 454 | 0 | 5 | 1.00 | 14 (`influx.main._cmd_backfill`) | 2 |
 | Feedback | 3 | 571 | 450 | 1 | 4 | 0.80 | 15 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
 | Filter | 1 | 474 | 398 | 3 | 4 | 0.57 | 11 (`influx.filter.make_default_batch_scorer._scorer`) | 1 |
-| HttpApi | 3 | 1529 | 1276 | 2 | 8 | 0.80 | 17 (`influx.http_api.post_backfills`) | 3 |
+| HttpApi | 3 | 1410 | 1167 | 2 | 8 | 0.80 | 17 (`influx.http_api.post_backfills`) | 3 |
 | LithosBridge | 8 | 4097 | 3254 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 4 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1912 | 1401 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
@@ -52,7 +52,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **57**, lines: **27980**, SLOC: **21720**
+- Modules: **57**, lines: **27861**, SLOC: **21611**
 - Largest module: `influx.sources.arxiv` (1830 lines)
 - Modules over 800 lines: **12**
   - `influx.config`
@@ -70,7 +70,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **650**, cyclomatic > 10: **47**
+- Functions: **648**, cyclomatic > 10: **47**
 
 Top 10 most complex functions:
 
@@ -134,4 +134,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.53** (70854 test lines / 27980 source lines)
+- Test-to-source line ratio: **2.54** (70863 test lines / 27861 source lines)

@@ -122,7 +122,7 @@ async def run_profile(
     """Backward-compatible thin wrapper over :class:`influx.run_service.RunService`.
 
     Existing callers (HTTP admin handlers, ``InfluxScheduler._fire_profile``,
-    ``influx.backfill.run_backfill``, integration tests) still call
+    integration tests) still call
     ``run_profile`` with the legacy signature.  Internally we now build
     a :class:`RunPlan`, hand it to :class:`RunService`, and unwrap the
     :class:`RunOutcome` back into a legacy :class:`ProfileRunResult` so
