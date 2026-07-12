@@ -15,7 +15,7 @@ Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP c
 | `influx.errors` | S | 7 | 1 |
 | `influx.http_client` | M | 1 | 7 |
 | `influx.run_ledger` | L | 1 | 2 |
-| `influx.source` | S | 4 | 0 |
+| `influx.source` | S | 5 | 5 |
 | `influx.source_kind` | S | 0 | 1 |
 | `influx.thin_summary` | S | 0 | 1 |
 
@@ -55,7 +55,13 @@ Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP c
 - class `Candidate` — An unscored item returned from :meth:`Source.fetch_candidates`.
 - class `ScoredCandidate` — A :class:`Candidate` plus the Filter's 1–10 relevance score.
 - class `BoundScoredCandidate` — A :class:`ScoredCandidate` plus a thunk that performs source-specific acquire (#125).
+- class `ArchiveDownloadIdentity` — A Source's reconstruction of the archive-download identity for a note.
 - class `Source` — Unified Source seam (CONTEXT.md).
+- def `note_tags` — Read and cast the note's tag list defensively (Lithos returns ``Any``).
+- def `find_note_tag` — Return the suffix of the first tag starting with *prefix*, or None.
+- def `note_source_url` — Return the note's doc-level ``source_url`` (top-level or ``metadata``).
+- def `year_month_from_note_path` — Pull the archive ``(year, month)`` bucket from a note path.
+- def `year_month_from_created_at` — Derive ``(year, month)`` from the note's ``created_at`` timestamp.
 
 ### `influx.source_kind`
 - def `classify_source_kind` — Return the URL's likely source kind based on host/path shape.
