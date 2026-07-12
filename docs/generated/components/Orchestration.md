@@ -15,7 +15,7 @@ Schedules ticks and drives per-Profile Runs / inbox ticks end-to-end (Run / RunS
 | `influx.inbox` | L | 2 | 2 |
 | `influx.run` | L | 12 | 2 |
 | `influx.run_dispatch` | M | 3 | 0 |
-| `influx.run_service` | L | 1 | 2 |
+| `influx.run_service` | L | 1 | 1 |
 | `influx.scheduler` | M | 1 | 2 |
 
 ## Public API
@@ -58,11 +58,10 @@ Schedules ticks and drives per-Profile Runs / inbox ticks end-to-end (Run / RunS
 ### `influx.run_service`
 - def `ledger_lifecycle` — Outer lifecycle CM — ledger entry + run-level metrics + contextvars.
 - class `RunService` — Request-lifecycle wrapper that drives one :class:`Run` execution.
-- def `run_via_service` — Build a :class:`RunPlan`, drive a :class:`RunService`, return the legacy :class:`ProfileRunResult` for backward-compatible callers.
 
 ### `influx.scheduler`
 - def `default_item_provider` — No-op item provider — PRD 04 replaces this with arXiv + RSS fetch.
-- def `run_profile` — Backward-compatible thin wrapper over :class:`influx.run_service.RunService`.
+- def `run_profile` — The per-Profile Run entry point: build a :class:`RunPlan` and drive it.
 - class `InfluxScheduler` — In-process APScheduler wrapper for the ``influx-tick`` dispatcher.
 
 ## Dependencies

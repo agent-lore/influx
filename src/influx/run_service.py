@@ -13,8 +13,9 @@ Architecture (after #58 → #59 → #60 → #61)::
         └─ ledger.complete / ledger.fail / ledger.skip + metric tick
 
 The scheduler's three entry points (scheduled tick, ``POST /runs``,
-``POST /backfills``) become thin :class:`RunPlan` builders that hand
-off to :class:`RunService`.
+``POST /backfills``) route through :func:`influx.scheduler.run_profile`,
+which builds the :class:`RunPlan` via :meth:`RunPlan.for_request` and
+hands it to :class:`RunService`.
 
 This module replaces the legacy ``_run_profile_body`` orchestrator
 plus the inline prelude/postlude that lived in
@@ -35,7 +36,6 @@ from typing import Any
 from influx import metrics
 from influx.config import AppConfig
 from influx.errors import format_exception_for_ledger
-from influx.notifications import ProfileRunResult
 from influx.run import (
     ItemProvider,
     Run,
@@ -888,57 +888,3 @@ class RunService:
         async with ledger_lifecycle(plan, deps) as session:
             session.skip_reason = skip_reason
         return RunOutcome(skipped=True, skip_reason=skip_reason)
-
-
-# ── Backwards-compatibility helper for run_profile callers ──────────
-
-
-async def run_via_service(
-    profile: str,
-    kind: Any,
-    run_range: dict[str, str | int] | None = None,
-    *,
-    config: AppConfig,
-    item_provider: ItemProvider | None = None,
-    probe_loop: Any | None = None,
-    run_id: str | None = None,
-    run_ledger: RunLedger | None = None,
-) -> ProfileRunResult | None:
-    """Build a :class:`RunPlan`, drive a :class:`RunService`, return the
-    legacy :class:`ProfileRunResult` for backward-compatible callers.
-
-    ``run_profile`` (in :mod:`influx.scheduler`) delegates to this
-    helper; the three scheduler entry points (cron tick, ``POST /runs``,
-    ``POST /backfills``) ultimately route through here.
-
-    The mapping from ``RunKind`` to ``RunPlan`` flag values mirrors the
-    body that #58 / #59 / #60 migrated:
-
-    - ``BACKFILL`` → ``skip_repair=True``, ``skip_cache_hits=True``,
-      ``notify=False``.
-    - everything else → all flags False (run_repair, write cache hits,
-      notify) except ``notify=True``.
-    """
-    from influx.coordinator import RunKind
-
-    is_backfill = kind == RunKind.BACKFILL
-    plan = RunPlan(
-        profile=profile,
-        kind=kind,
-        date_window=run_range,
-        skip_repair=is_backfill,
-        skip_cache_hits=is_backfill,
-        notify=not is_backfill,
-    )
-    service = RunService(
-        config=config,
-        item_provider=item_provider,
-        probe_loop=probe_loop,
-        ledger=run_ledger,
-    )
-    outcome = await service.execute(plan, run_id=run_id)
-    # Legacy ``_run_profile_body`` could return ``None`` (used by tests
-    # that patched the body out).  Preserve that contract here.
-    if outcome is None:
-        return None
-    return outcome.profile_run_result

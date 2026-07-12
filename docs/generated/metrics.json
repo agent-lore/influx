@@ -222,7 +222,7 @@
       }
     },
     "cross_component_edges": 62,
-    "cross_component_module_edges": 189,
+    "cross_component_module_edges": 187,
     "longest_component_chain": 4,
     "module_cycle_count": 3,
     "module_cycles": [
@@ -413,10 +413,10 @@
         "functions": 70,
         "largest_module": "influx.inbox",
         "largest_module_lines": 1182,
-        "lines": 4124,
+        "lines": 4103,
         "modules": 6,
-        "public_symbols": 33,
-        "sloc": 3255
+        "public_symbols": 32,
+        "sloc": 3241
       },
       "Repair": {
         "classes": 17,
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27945,
+    "total_lines": 27924,
     "total_modules": 58,
-    "total_sloc": 21675
+    "total_sloc": 21661
   },
   "tests": {
     "ratio": 2.55,
-    "src_lines": 27945,
-    "test_lines": 71202
+    "src_lines": 27924,
+    "test_lines": 71178
   }
 }
