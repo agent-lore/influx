@@ -46,7 +46,7 @@ Common        = "Cross-cutting foundation: errors, per-Profile run coordinator, 
 [components]
 Entrypoint    = ["influx.main", "influx.__main__"]
 HttpApi       = ["influx.http_api", "influx.service", "influx.backfill"]
-Orchestration = ["influx.scheduler", "influx.run_service", "influx.run", "influx.inbox", "influx.audit_invalid_source"]
+Orchestration = ["influx.scheduler", "influx.run_service", "influx.run", "influx.run_dispatch", "influx.inbox", "influx.audit_invalid_source"]
 Sources       = ["influx.sources", "influx.extraction"]
 Filter        = ["influx.filter"]
 Enrich        = ["influx.enrich", "influx.cascade"]
@@ -80,7 +80,7 @@ Foundation  = ["Config", "Observability", "Schemas", "Common"]
 cross_component_edges  = 62   # measured 2026-07 (64->62 after #267 broke Sources<->Filter); direction: down
 component_cycles       = 3    # Common<->Config, a Core SCC, HttpApi<->Orchestration; goal: fewer
 module_cycles          = 3    # goal: 0
-modules_over_800_lines = 12   # existing god modules; direction: down, no new ones
+modules_over_800_lines = 11   # 12->11 after finding 4 split http_api's orchestration into run_dispatch; direction: down, no new ones
 max_module_lines       = 2000 # stop-loss; largest today is sources.arxiv at 1912
 cross_module_private_refs = 5   # measured 2026-07; extraction.html helpers x4, telemetry x1; goal: 0
 tests_private_imports     = 80  # 91->80 after 3b moved archive-identity tests onto the Source seam; direction: down
@@ -115,6 +115,7 @@ exclude_modules = [
     "influx.repair_counters",
     "influx.repair_hooks",
     "influx.run_dedup",
+    "influx.run_dispatch",
     "influx.run_ledger",
     "influx.run_service",
     "influx.source",

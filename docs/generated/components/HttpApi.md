@@ -12,7 +12,7 @@ FastAPI HTTP surface (/runs, /backfills, /ready) and backfill request handling.
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
 | `influx.backfill` | XS | 1 | 1 |
-| `influx.http_api` | L | 2 | 8 |
+| `influx.http_api` | M | 2 | 8 |
 | `influx.service` | M | 1 | 4 |
 
 ## Public API

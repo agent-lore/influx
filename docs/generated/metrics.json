@@ -33,7 +33,7 @@
       },
       "HttpApi": {
         "functions_over_10": 3,
-        "max_complexity": 17,
+        "max_complexity": 15,
         "max_function": "influx.http_api.post_backfills"
       },
       "LithosBridge": {
@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 648
+    "total_functions": 652
   },
   "domain": {
     "associations": 5,
@@ -222,7 +222,7 @@
       }
     },
     "cross_component_edges": 62,
-    "cross_component_module_edges": 185,
+    "cross_component_module_edges": 189,
     "longest_component_chain": 4,
     "module_cycle_count": 3,
     "module_cycles": [
@@ -230,6 +230,7 @@
         "influx.http_api",
         "influx.inbox",
         "influx.run",
+        "influx.run_dispatch",
         "influx.run_service",
         "influx.scheduler",
         "influx.service"
@@ -369,13 +370,13 @@
       },
       "HttpApi": {
         "classes": 4,
-        "functions": 41,
+        "functions": 37,
         "largest_module": "influx.http_api",
-        "largest_module_lines": 956,
-        "lines": 1410,
+        "largest_module_lines": 687,
+        "lines": 1141,
         "modules": 3,
         "public_symbols": 17,
-        "sloc": 1167
+        "sloc": 918
       },
       "LithosBridge": {
         "classes": 13,
@@ -408,14 +409,14 @@
         "sloc": 1401
       },
       "Orchestration": {
-        "classes": 20,
-        "functions": 62,
+        "classes": 23,
+        "functions": 70,
         "largest_module": "influx.inbox",
         "largest_module_lines": 1182,
-        "lines": 3771,
-        "modules": 5,
-        "public_symbols": 30,
-        "sloc": 2942
+        "lines": 4121,
+        "modules": 6,
+        "public_symbols": 33,
+        "sloc": 3253
       },
       "Repair": {
         "classes": 17,
@@ -462,7 +463,6 @@
     "max_module_lines": 1830,
     "modules_over_800": [
       "influx.config",
-      "influx.http_api",
       "influx.inbox",
       "influx.lithos_client",
       "influx.repair",
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27861,
-    "total_modules": 57,
-    "total_sloc": 21611
+    "total_lines": 27942,
+    "total_modules": 58,
+    "total_sloc": 21673
   },
   "tests": {
     "ratio": 2.54,
-    "src_lines": 27861,
-    "test_lines": 70863
+    "src_lines": 27942,
+    "test_lines": 71043
   }
 }

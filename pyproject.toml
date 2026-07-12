@@ -130,6 +130,7 @@ forbidden_modules = [
     "influx.scheduler",
     "influx.run_service",
     "influx.run",
+    "influx.run_dispatch",
     "influx.inbox",
     "influx.audit_invalid_source",
 ]
@@ -171,6 +172,7 @@ forbidden_modules = [
     "influx.scheduler",
     "influx.run_service",
     "influx.run",
+    "influx.run_dispatch",
     "influx.inbox",
     "influx.audit_invalid_source",
 ]
