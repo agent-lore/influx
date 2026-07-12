@@ -413,10 +413,10 @@
         "functions": 70,
         "largest_module": "influx.inbox",
         "largest_module_lines": 1182,
-        "lines": 4102,
+        "lines": 4103,
         "modules": 6,
         "public_symbols": 32,
-        "sloc": 3240
+        "sloc": 3241
       },
       "Repair": {
         "classes": 17,
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27923,
+    "total_lines": 27924,
     "total_modules": 58,
-    "total_sloc": 21660
+    "total_sloc": 21661
   },
   "tests": {
     "ratio": 2.55,
-    "src_lines": 27923,
+    "src_lines": 27924,
     "test_lines": 71178
   }
 }

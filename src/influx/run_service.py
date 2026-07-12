@@ -13,8 +13,9 @@ Architecture (after #58 → #59 → #60 → #61)::
         └─ ledger.complete / ledger.fail / ledger.skip + metric tick
 
 The scheduler's three entry points (scheduled tick, ``POST /runs``,
-``POST /backfills``) become thin :class:`RunPlan` builders that hand
-off to :class:`RunService`.
+``POST /backfills``) route through :func:`influx.scheduler.run_profile`,
+which builds the :class:`RunPlan` via :meth:`RunPlan.for_request` and
+hands it to :class:`RunService`.
 
 This module replaces the legacy ``_run_profile_body`` orchestrator
 plus the inline prelude/postlude that lived in
