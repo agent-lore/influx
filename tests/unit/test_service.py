@@ -316,7 +316,7 @@ class TestInfluxService:
         )
 
     async def test_stop_awaits_http_triggered_work_on_real_app(self) -> None:
-        """Regression for Finding 1: ``_spawn_tracked_task`` must register
+        """Regression for Finding 1: the ``RunDispatcher`` must register
         HTTP-triggered tasks on the existing (possibly empty) set on
         ``app.state`` so ``InfluxService.stop`` can actually await them.
         """
@@ -345,7 +345,7 @@ class TestInfluxService:
                 raise
 
         transport = httpx.ASGITransport(app=svc.app)
-        with patch("influx.http_api.run_profile", slow_run_profile):
+        with patch("influx.run_dispatch.run_profile", slow_run_profile):
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
             ) as client:
@@ -358,7 +358,7 @@ class TestInfluxService:
             # The real bug: with the empty-set replacement, this would
             # stay at 0 because the task went into a throwaway local set.
             assert len(svc.app.state.active_tasks) >= 1, (
-                "_spawn_tracked_task must register task on app.state.active_tasks"
+                "RunDispatcher must register task on app.state.active_tasks"
             )
 
             await svc.stop()

@@ -849,14 +849,14 @@ class TestRunObservability:
     ) -> None:
         import httpx
 
-        from influx import http_api as http_api_mod
+        from influx import run_dispatch as run_dispatch_mod
 
         async def fake_run_profile(*args: Any, **kwargs: Any) -> None:
             return None
 
-        monkeypatch.setattr(http_api_mod, "run_profile", fake_run_profile)
+        monkeypatch.setattr(run_dispatch_mod, "run_profile", fake_run_profile)
 
-        with caplog.at_level("INFO", logger="influx.http_api"):
+        with caplog.at_level("INFO", logger="influx"):
             transport = httpx.ASGITransport(app=app_with_state)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
@@ -887,14 +887,14 @@ class TestRunObservability:
     ) -> None:
         import httpx
 
-        from influx import http_api as http_api_mod
+        from influx import run_dispatch as run_dispatch_mod
 
         async def boom(*args: Any, **kwargs: Any) -> None:
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(http_api_mod, "run_profile", boom)
+        monkeypatch.setattr(run_dispatch_mod, "run_profile", boom)
 
-        with caplog.at_level("INFO", logger="influx.http_api"):
+        with caplog.at_level("INFO", logger="influx"):
             transport = httpx.ASGITransport(app=app_with_state)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
@@ -936,7 +936,7 @@ class TestRunObservability:
     ) -> None:
         import httpx
 
-        from influx import http_api as http_api_mod
+        from influx import run_dispatch as run_dispatch_mod
 
         async def selective_run_profile(
             profile: str, *args: Any, **kwargs: Any
@@ -945,9 +945,9 @@ class TestRunObservability:
                 raise RuntimeError("web-tech blew up")
             return None
 
-        monkeypatch.setattr(http_api_mod, "run_profile", selective_run_profile)
+        monkeypatch.setattr(run_dispatch_mod, "run_profile", selective_run_profile)
 
-        with caplog.at_level("INFO", logger="influx.http_api"):
+        with caplog.at_level("INFO", logger="influx"):
             transport = httpx.ASGITransport(app=app_with_state)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
@@ -1013,14 +1013,14 @@ class TestBackfillObservability:
     ) -> None:
         import httpx
 
-        from influx import http_api as http_api_mod
+        from influx import run_dispatch as run_dispatch_mod
 
         async def fake_run_profile(*args: Any, **kwargs: Any) -> None:
             return None
 
-        monkeypatch.setattr(http_api_mod, "run_profile", fake_run_profile)
+        monkeypatch.setattr(run_dispatch_mod, "run_profile", fake_run_profile)
 
-        with caplog.at_level("INFO", logger="influx.http_api"):
+        with caplog.at_level("INFO", logger="influx"):
             transport = httpx.ASGITransport(app=app_with_state)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
@@ -1066,7 +1066,7 @@ class TestBackfillObservability:
     ) -> None:
         import httpx
 
-        from influx import http_api as http_api_mod
+        from influx import run_dispatch as run_dispatch_mod
 
         async def selective_run_profile(
             profile: str, *args: Any, **kwargs: Any
@@ -1075,9 +1075,9 @@ class TestBackfillObservability:
                 raise RuntimeError("ai-robotics blew up")
             return None
 
-        monkeypatch.setattr(http_api_mod, "run_profile", selective_run_profile)
+        monkeypatch.setattr(run_dispatch_mod, "run_profile", selective_run_profile)
 
-        with caplog.at_level("INFO", logger="influx.http_api"):
+        with caplog.at_level("INFO", logger="influx"):
             transport = httpx.ASGITransport(app=app_with_state)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"

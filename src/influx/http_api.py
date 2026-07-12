@@ -17,7 +17,6 @@ import asyncio
 import logging
 import os
 import uuid
-from collections.abc import Callable, Coroutine
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -30,9 +29,9 @@ from pydantic import BaseModel, Field, model_validator
 
 import influx
 from influx.config import AppConfig
-from influx.coordinator import Coordinator, ProfileBusyError, RunKind
+from influx.coordinator import Coordinator, RunKind
+from influx.run_dispatch import RunDispatcher, RunRejectedBusy
 from influx.run_ledger import RunLedger
-from influx.scheduler import run_profile
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -290,12 +289,12 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
     on acceptance or ``409 Conflict`` with ``reason="profile_busy"``
     when the profile is already running.
 
-    Multi-profile (``all_profiles``) fan-out of ``run_profile()``
-    execution is deferred to PRD 09.
+    ``all_profiles`` fans out with all-or-nothing lock acquisition via the
+    request-orchestration collaborator (:class:`RunDispatcher`).
     """
-    coordinator: Coordinator = request.app.state.coordinator
     config: AppConfig = request.app.state.config
     run_ledger = _get_run_ledger(request)
+    dispatcher = _run_dispatcher(request, run_ledger)
 
     request_id = str(uuid.uuid4())
     submitted_at = datetime.now(UTC).isoformat()
@@ -310,31 +309,10 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
                 profile=body.profile,
             )
 
-        try:
-            acquired = await coordinator.try_acquire(body.profile)
-            if not acquired:
-                raise ProfileBusyError(body.profile)
-        except ProfileBusyError:
-            return _profile_busy_response(
-                profile=body.profile,
-                request_id=request_id,
-                ledger=run_ledger,
-            )
-
-        # Launch the run in the background so the response returns immediately.
-        _spawn_tracked_task(
-            request.app,
-            _run_and_release(
-                coordinator,
-                body.profile,
-                RunKind.MANUAL,
-                config=config,
-                item_provider=getattr(request.app.state, "item_provider", None),
-                probe_loop=getattr(request.app.state, "probe_loop", None),
-                fetch_cache=getattr(request.app.state, "fetch_cache", None),
-                run_id=request_id,
-                run_ledger=run_ledger,
-            ),
+        outcome = await dispatcher.dispatch_one(
+            body.profile,
+            RunKind.MANUAL,
+            request_id=request_id,
             log_context={
                 "request_id": request_id,
                 "kind": "manual",
@@ -342,6 +320,13 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
                 "profile": body.profile,
             },
         )
+        if isinstance(outcome, RunRejectedBusy):
+            return _profile_busy_response(
+                profile=outcome.profile,
+                request_id=request_id,
+                ledger=run_ledger,
+            )
+
         logger.info(
             "manual run accepted request_id=%s profile=%s submitted_at=%s",
             request_id,
@@ -368,51 +353,33 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
             status_code=202,
         )
 
-    acquired_profiles: list[str] = []
-    for profile_cfg in config.profiles:
-        acquired = await coordinator.try_acquire(profile_cfg.name)
-        if not acquired:
-            for acquired_profile in acquired_profiles:
-                coordinator.release(acquired_profile)
-            return _profile_busy_response(
-                profile=profile_cfg.name,
-                request_id=request_id,
-                ledger=run_ledger,
-            )
-        acquired_profiles.append(profile_cfg.name)
-
-    run_log_context: dict[str, Any] = {
-        "request_id": request_id,
-        "kind": "manual",
-        "scope": "all",
-        "profiles": list(acquired_profiles),
-    }
-    _spawn_tracked_task(
-        request.app,
-        _run_many_and_release(
-            coordinator,
-            acquired_profiles,
-            RunKind.MANUAL,
-            config=config,
-            item_provider=getattr(request.app.state, "item_provider", None),
-            probe_loop=getattr(request.app.state, "probe_loop", None),
-            fetch_cache=getattr(request.app.state, "fetch_cache", None),
-            request_id=request_id,
-            run_ledger=run_ledger,
-            log_context=run_log_context,
-        ),
-        log_context=run_log_context,
+    outcome = await dispatcher.dispatch_all(
+        RunKind.MANUAL,
+        request_id=request_id,
+        log_context={
+            "request_id": request_id,
+            "kind": "manual",
+            "scope": "all",
+            "profiles": [p.name for p in config.profiles],
+        },
     )
+    if isinstance(outcome, RunRejectedBusy):
+        return _profile_busy_response(
+            profile=outcome.profile,
+            request_id=request_id,
+            ledger=run_ledger,
+        )
+
     logger.info(
         "manual run accepted request_id=%s scope=all profiles=%s submitted_at=%s",
         request_id,
-        acquired_profiles,
+        list(outcome.profiles),
         submitted_at,
         extra={
             "request_id": request_id,
             "kind": "manual",
             "scope": "all",
-            "profiles": list(acquired_profiles),
+            "profiles": list(outcome.profiles),
             "submitted_at": submitted_at,
             "status": "accepted",
         },
@@ -429,234 +396,29 @@ async def post_runs(body: RunRequest, request: Request) -> JSONResponse:
     )
 
 
-async def _run_and_release(
-    coordinator: Coordinator,
-    profile: str,
-    kind: RunKind,
-    run_range: dict[str, str | int] | None = None,
-    *,
-    config: Any = None,
-    item_provider: Any = None,
-    probe_loop: Any = None,
-    fetch_cache: Any = None,
-    run_id: str | None = None,
-    run_ledger: RunLedger | None = None,
-) -> None:
-    """Run ``run_profile`` and release the coordinator lock afterward.
+def _run_dispatcher(request: Request, run_ledger: RunLedger) -> RunDispatcher:
+    """Build the request-orchestration collaborator from the app state.
 
-    Failures in ``run_profile`` (e.g. Lithos unreachable per AC-M1-11)
-    are logged with request context and re-raised; the surrounding
-    asyncio task captures the exception and the request-level done-
-    callback (#105) records a failure log keyed by ``request_id``. The
-    coordinator lock is always released via ``finally`` so the service
-    stays alive (FR-HTTP-4 + AC-M1-11).
+    Ensures the shutdown-grace task set exists on ``app.state`` and passes
+    that same set into the dispatcher so :meth:`InfluxService.stop` still
+    sees HTTP-launched background tasks (US-008).
     """
-    if fetch_cache is not None:
-        fetch_cache.begin_fire()
-    try:
-        try:
-            await run_profile(
-                profile,
-                kind,
-                run_range=run_range,
-                config=config,
-                item_provider=item_provider,
-                probe_loop=probe_loop,
-                run_id=run_id,
-                run_ledger=run_ledger,
-            )
-        except Exception:
-            logger.warning(
-                "run_profile %r aborted request_id=%s kind=%s",
-                profile,
-                run_id,
-                kind.value,
-                exc_info=True,
-                extra={
-                    "request_id": run_id,
-                    "kind": kind.value,
-                    "scope": profile,
-                    "profile": profile,
-                    "status": "failed",
-                },
-            )
-            raise
-    finally:
-        coordinator.release(profile)
-        if fetch_cache is not None:
-            fetch_cache.end_fire()
-
-
-async def _run_many_and_release(
-    coordinator: Coordinator,
-    profiles: list[str],
-    kind: RunKind,
-    run_range: dict[str, str | int] | None = None,
-    *,
-    config: Any = None,
-    item_provider: Any = None,
-    probe_loop: Any = None,
-    fetch_cache: Any = None,
-    request_id: str | None = None,
-    run_ledger: RunLedger | None = None,
-    log_context: dict[str, Any] | None = None,
-) -> None:
-    """Run several already-acquired profiles and release all locks.
-
-    Per-profile failures from the underlying ``asyncio.gather`` are
-    logged with request context (#105) so that multi-profile partial
-    failures are visible. When ``log_context`` is supplied, the helper
-    records ``failed_count`` / ``total_count`` / ``failed_profiles``
-    onto it so the request-level done-callback can distinguish
-    ``completed`` from ``partial_failure`` for the same ``request_id``.
-    """
-    if fetch_cache is not None:
-        fetch_cache.begin_fire()
-    try:
-        results = await asyncio.gather(
-            *(
-                run_profile(
-                    profile,
-                    kind,
-                    run_range=run_range,
-                    config=config,
-                    item_provider=item_provider,
-                    probe_loop=probe_loop,
-                    run_id=f"{request_id}:{profile}" if request_id else None,
-                    run_ledger=run_ledger,
-                )
-                for profile in profiles
-            ),
-            return_exceptions=True,
-        )
-        failed: list[tuple[str, BaseException]] = []
-        for profile, result in zip(profiles, results, strict=True):
-            if isinstance(result, BaseException):
-                failed.append((profile, result))
-                logger.warning(
-                    "profile %r in %s run %s failed: %s",
-                    profile,
-                    kind.value,
-                    request_id,
-                    result,
-                    exc_info=result,
-                    extra={
-                        "request_id": request_id,
-                        "kind": kind.value,
-                        "scope": "all",
-                        "profile": profile,
-                        "status": "failed",
-                    },
-                )
-            else:
-                logger.info(
-                    "profile %r in %s run %s completed",
-                    profile,
-                    kind.value,
-                    request_id,
-                    extra={
-                        "request_id": request_id,
-                        "kind": kind.value,
-                        "scope": "all",
-                        "profile": profile,
-                        "status": "completed",
-                    },
-                )
-        if log_context is not None:
-            log_context["failed_count"] = len(failed)
-            log_context["total_count"] = len(profiles)
-            log_context["failed_profiles"] = [p for p, _ in failed]
-    finally:
-        for profile in profiles:
-            coordinator.release(profile)
-        if fetch_cache is not None:
-            fetch_cache.end_fire()
-
-
-def _log_task_completion(
-    log_context: dict[str, Any],
-) -> Callable[[asyncio.Task[Any]], None]:
-    """Build a done-callback that logs task outcome with request context (#105).
-
-    Treats cancellation as graceful shutdown rather than failure so that
-    the US-008 shutdown path stays quiet, and routes uncaught exceptions
-    to ``logger.error`` with ``exc_info`` so operators can find them by
-    ``request_id``.
-    """
-
-    def _callback(task: asyncio.Task[Any]) -> None:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.error(
-                "background task failed request_id=%s kind=%s scope=%s: %s",
-                log_context.get("request_id"),
-                log_context.get("kind"),
-                log_context.get("scope"),
-                exc,
-                exc_info=exc,
-                extra={**log_context, "status": "failed"},
-            )
-            return
-        # Task itself succeeded — but for all-profiles fan-out a
-        # partial failure surfaces via ``failed_count`` written back
-        # onto the shared ``log_context`` by ``_run_many_and_release``.
-        # We must NOT report ``completed`` for those requests (#105).
-        failed_count = int(log_context.get("failed_count") or 0)
-        if failed_count > 0:
-            logger.warning(
-                "background task partial failure request_id=%s kind=%s "
-                "scope=%s failed=%d/%d",
-                log_context.get("request_id"),
-                log_context.get("kind"),
-                log_context.get("scope"),
-                failed_count,
-                int(log_context.get("total_count") or 0),
-                extra={**log_context, "status": "partial_failure"},
-            )
-            return
-        logger.info(
-            "background task completed request_id=%s kind=%s scope=%s",
-            log_context.get("request_id"),
-            log_context.get("kind"),
-            log_context.get("scope"),
-            extra={**log_context, "status": "completed"},
-        )
-
-    return _callback
-
-
-def _spawn_tracked_task(
-    app: FastAPI,
-    coro: Coroutine[Any, Any, Any],
-    *,
-    log_context: dict[str, Any] | None = None,
-) -> asyncio.Task[Any]:
-    """Create an ``asyncio.Task`` and register it on ``app.state.active_tasks``.
-
-    The task set is consulted by :meth:`InfluxService.stop` so HTTP-triggered
-    work can complete within ``schedule.shutdown_grace_seconds`` before
-    the service shuts down (US-008 shutdown-grace contract).
-
-    When ``log_context`` is provided the task gets a second done-callback
-    that logs request-keyed completion or failure (#105).
-    """
-    # Preserve the existing set even when empty — ``... or set()`` would
-    # treat an empty set as falsy and replace it with a throwaway local
-    # set that is never written back to ``app.state``.
+    app = request.app
     active_tasks: set[asyncio.Task[Any]] | None = getattr(
         app.state, "active_tasks", None
     )
     if active_tasks is None:
         active_tasks = set()
         app.state.active_tasks = active_tasks
-    task = asyncio.get_event_loop().create_task(coro)
-    active_tasks.add(task)
-    task.add_done_callback(active_tasks.discard)
-    if log_context is not None:
-        task.add_done_callback(_log_task_completion(log_context))
-    return task
+    return RunDispatcher(
+        app.state.coordinator,
+        app.state.config,
+        run_ledger=run_ledger,
+        active_tasks=active_tasks,
+        item_provider=getattr(app.state, "item_provider", None),
+        probe_loop=getattr(app.state, "probe_loop", None),
+        fetch_cache=getattr(app.state, "fetch_cache", None),
+    )
 
 
 # ── POST /backfills ────────────────────────────────────────────────
@@ -776,9 +538,9 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
     Backfills go through the same coordinator as scheduled and manual
     runs, ensuring non-overlap for the same profile (AC-M3-7).
     """
-    coordinator: Coordinator = request.app.state.coordinator
     config: AppConfig = request.app.state.config
     run_ledger = _get_run_ledger(request)
+    dispatcher = _run_dispatcher(request, run_ledger)
 
     request_id = str(uuid.uuid4())
     submitted_at = datetime.now(UTC).isoformat()
@@ -833,34 +595,14 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
                 profile=body.profile,
             )
 
-        try:
-            acquired = await coordinator.try_acquire(body.profile)
-            if not acquired:
-                raise ProfileBusyError(body.profile)
-        except ProfileBusyError:
-            return _profile_busy_response(
-                profile=body.profile,
-                request_id=request_id,
-                ledger=run_ledger,
-            )
-
-        # Launch the single-profile backfill in the background. A backfill is
-        # just a Run with RunKind.BACKFILL, so it shares _run_and_release with
-        # manual runs — the kind drives repair/cache/notify gating downstream.
-        _spawn_tracked_task(
-            request.app,
-            _run_and_release(
-                coordinator,
-                body.profile,
-                RunKind.BACKFILL,
-                run_range,
-                config=config,
-                item_provider=getattr(request.app.state, "item_provider", None),
-                probe_loop=getattr(request.app.state, "probe_loop", None),
-                fetch_cache=getattr(request.app.state, "fetch_cache", None),
-                run_id=request_id,
-                run_ledger=run_ledger,
-            ),
+        # A backfill is just a Run with RunKind.BACKFILL, so it shares the
+        # dispatcher's lock lifecycle with manual runs — the kind drives
+        # repair/cache/notify gating downstream.
+        outcome = await dispatcher.dispatch_one(
+            body.profile,
+            RunKind.BACKFILL,
+            run_range=run_range,
+            request_id=request_id,
             log_context={
                 "request_id": request_id,
                 "kind": "backfill",
@@ -868,6 +610,13 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
                 "profile": body.profile,
             },
         )
+        if isinstance(outcome, RunRejectedBusy):
+            return _profile_busy_response(
+                profile=outcome.profile,
+                request_id=request_id,
+                ledger=run_ledger,
+            )
+
         logger.info(
             "backfill accepted request_id=%s profile=%s submitted_at=%s",
             request_id,
@@ -894,52 +643,34 @@ async def post_backfills(body: BackfillRequest, request: Request) -> JSONRespons
             status_code=202,
         )
 
-    acquired_profiles = []
-    for profile_cfg in config.profiles:
-        acquired = await coordinator.try_acquire(profile_cfg.name)
-        if not acquired:
-            for acquired_profile in acquired_profiles:
-                coordinator.release(acquired_profile)
-            return _profile_busy_response(
-                profile=profile_cfg.name,
-                request_id=request_id,
-                ledger=run_ledger,
-            )
-        acquired_profiles.append(profile_cfg.name)
-
-    backfill_log_context: dict[str, Any] = {
-        "request_id": request_id,
-        "kind": "backfill",
-        "scope": "all",
-        "profiles": list(acquired_profiles),
-    }
-    _spawn_tracked_task(
-        request.app,
-        _run_many_and_release(
-            coordinator,
-            acquired_profiles,
-            RunKind.BACKFILL,
-            run_range=run_range,
-            config=config,
-            item_provider=getattr(request.app.state, "item_provider", None),
-            probe_loop=getattr(request.app.state, "probe_loop", None),
-            fetch_cache=getattr(request.app.state, "fetch_cache", None),
-            request_id=request_id,
-            run_ledger=run_ledger,
-            log_context=backfill_log_context,
-        ),
-        log_context=backfill_log_context,
+    outcome = await dispatcher.dispatch_all(
+        RunKind.BACKFILL,
+        run_range=run_range,
+        request_id=request_id,
+        log_context={
+            "request_id": request_id,
+            "kind": "backfill",
+            "scope": "all",
+            "profiles": [p.name for p in config.profiles],
+        },
     )
+    if isinstance(outcome, RunRejectedBusy):
+        return _profile_busy_response(
+            profile=outcome.profile,
+            request_id=request_id,
+            ledger=run_ledger,
+        )
+
     logger.info(
         "backfill accepted request_id=%s scope=all profiles=%s submitted_at=%s",
         request_id,
-        acquired_profiles,
+        list(outcome.profiles),
         submitted_at,
         extra={
             "request_id": request_id,
             "kind": "backfill",
             "scope": "all",
-            "profiles": list(acquired_profiles),
+            "profiles": list(outcome.profiles),
             "submitted_at": submitted_at,
             "status": "accepted",
         },

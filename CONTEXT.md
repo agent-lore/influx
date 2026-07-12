@@ -72,6 +72,10 @@ The post-write step that calls `lithos_retrieve` for related notes, upserts `rel
 **RunService**:
 The collaborator that owns "build RunPlan → execute Run → dispatch notifications → record outcome" for one request. The scheduler's three entry points (scheduled tick, `POST /runs`, `POST /backfills`) are thin RunPlan builders that hand off to RunService. Lives in `src/influx/run_service.py` as `RunService.execute()`.
 
+**RunDispatcher**:
+The request-orchestration collaborator that turns an admin `POST /runs` or `POST /backfills` request into background Runs. Acquires the per-Profile Coordinator locks all-or-nothing (any busy Profile releases everything acquired so far and rejects the request — no partial fan-out), launches the Run(s) as tracked background tasks so the response returns immediately, registers them on the shutdown-grace set so `InfluxService.stop` can drain them, and releases the locks. Kind-agnostic — manual runs and backfills share one lock lifecycle and one fan-out path — so the HTTP router stays thin translation, turning a `RunAccepted` / `RunRejectedBusy` outcome into a `202` / `409`. Lives in `src/influx/run_dispatch.py`.
+_Avoid_: for the single per-(item, Profile) inbox dispatch use InboxTick, not RunDispatcher.
+
 ### Domain — Inbox (manual submission)
 
 **InboxTask**:

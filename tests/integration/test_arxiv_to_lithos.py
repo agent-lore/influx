@@ -2,7 +2,7 @@
 
 Drives the real production ``run_profile`` body through ``POST /runs``
 against a local fake Lithos SSE server and a local fake webhook
-receiver — no monkeypatching of ``influx.http_api.run_profile``.
+receiver — no monkeypatching of ``influx.run_dispatch.run_profile``.
 Source acquisition is supplied by the ``app.state.item_provider``
 seam that PRD 04 will replace with the real arXiv + RSS fetcher.
 
@@ -248,7 +248,7 @@ def _make_app(
 
     The injected ``app.state.item_provider`` plugs source acquisition
     into the real production ``run_profile`` so tests do NOT
-    monkeypatch ``influx.http_api.run_profile`` (US-019).
+    monkeypatch ``influx.run_dispatch.run_profile`` (US-019).
     """
     app = FastAPI()
     app.include_router(router)

@@ -14,6 +14,7 @@ Schedules ticks and drives per-Profile Runs / inbox ticks end-to-end (Run / RunS
 | `influx.audit_invalid_source` | S | 1 | 5 |
 | `influx.inbox` | L | 2 | 2 |
 | `influx.run` | L | 12 | 2 |
+| `influx.run_dispatch` | M | 3 | 0 |
 | `influx.run_service` | L | 1 | 2 |
 | `influx.scheduler` | M | 1 | 2 |
 
@@ -48,6 +49,11 @@ Schedules ticks and drives per-Profile Runs / inbox ticks end-to-end (Run / RunS
 - def `lithos_task_lifecycle` — Inner lifecycle CM — Lithos task bracketing.
 - class `Run` — Score-gated ingestion executor (CONTEXT.md ``Run``).
 - def `default_item_provider` — No-op fallback (mirrors ``influx.scheduler.default_item_provider``).
+
+### `influx.run_dispatch`
+- class `RunAccepted` — A dispatch was admitted; the Run(s) are executing in the background.
+- class `RunRejectedBusy` — A dispatch was refused because a Profile lock was already held.
+- class `RunDispatcher` — Acquire Profile locks, launch background Runs, and track them.
 
 ### `influx.run_service`
 - def `ledger_lifecycle` — Outer lifecycle CM — ledger entry + run-level metrics + contextvars.
