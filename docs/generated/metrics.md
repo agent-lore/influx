@@ -47,12 +47,12 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Orchestration | 5 | 3753 | 2929 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
 | Repair | 5 | 3769 | 2927 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 240 | 183 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
-| Sources | 10 | 4340 | 3320 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
+| Sources | 10 | 4343 | 3323 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
 | Storage | 1 | 720 | 588 | 3 | 3 | 0.50 | 14 (`influx.storage.download_archive`) | 2 |
 
 ## Size
 
-- Modules: **57**, lines: **27959**, SLOC: **21704**
+- Modules: **57**, lines: **27962**, SLOC: **21707**
 - Largest module: `influx.sources.arxiv` (1830 lines)
 - Modules over 800 lines: **12**
   - `influx.config`
@@ -134,4 +134,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.53** (70756 test lines / 27959 source lines)
+- Test-to-source line ratio: **2.53** (70756 test lines / 27962 source lines)

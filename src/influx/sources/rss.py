@@ -766,11 +766,14 @@ def _rss_item_id_from_note(note: dict[str, object]) -> str | None:
 
     ``read_note`` (the repair sweep's only note source) returns a Lithos
     UUID as ``id``, not the Influx ``rss-<feed-slug>-<url-hash>`` form, so
-    the prefix strip yields nothing.  In that case reconstruct the exact
-    same ``{feed-slug}-{url-hash}`` item_id from the ``feed-slug:`` tag and
-    ``source_url`` — acquisition builds the note id as
-    ``rss-{feed_slug}-{url_hash(url)}``, and ``url_hash`` normalises
-    internally, so this matches byte-for-byte.
+    the prefix strip yields nothing.  In that case reconstruct the same
+    date-free ``{feed-slug}-{url-hash}`` retry identity from the
+    ``feed-slug:`` tag and ``source_url``: acquisition builds the note id as
+    ``rss-{feed_slug}-{url_hash(url)}`` and ``url_hash`` normalises
+    internally, so the reconstruction matches that **note id's** suffix
+    byte-for-byte.  It deliberately does **not** match acquisition's dated
+    archive item_id ``{feed-slug}-{YYYY-MM-DD}-{url-hash}`` (the day is not
+    recoverable), per the second paragraph above.
     """
     note_id = str(note.get("id", ""))
     if note_id.startswith(_RSS_NOTE_ID_PREFIX):
