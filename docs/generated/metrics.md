@@ -13,9 +13,11 @@ lower a budget after improving the code to lock in the gain.
 |---|---:|---:|---:|
 | `component_cycles` | 3 | 3 | 0 |
 | `cross_component_edges` | 62 | 62 | 0 |
+| `cross_module_private_refs` | 5 | 5 | 0 |
 | `max_module_lines` | 1789 | 2000 | 211 |
 | `module_cycles` | 3 | 3 | 0 |
 | `modules_over_800_lines` | 12 | 12 | 0 |
+| `tests_private_imports` | 91 | 91 | 0 |
 
 ## Import graph
 
@@ -85,7 +87,51 @@ Top 10 most complex functions:
 | 22 | `influx.cascade.Cascade.enrich` |
 | 20 | `influx.promotion_gate.evaluate_promotion_gate` |
 
+## Seams
+
+Private-name reaches across module seams. Both counts can be pinned as
+`[budgets]` ratchets (`cross_module_private_refs`, `tests_private_imports`).
+
+- Cross-module private refs (src): **5**
+  - `influx.extraction.article -> influx.extraction.html._clean_html_fragments`
+  - `influx.extraction.article -> influx.extraction.html._strip_tags`
+  - `influx.logging_config -> influx.telemetry._build_logger_provider`
+  - `influx.repair_hooks -> influx.extraction.html._clean_html_fragments`
+  - `influx.repair_hooks -> influx.extraction.html._strip_tags`
+- Tests importing src privates: **91**
+  - `tests/unit/test_lithos_client.py -> influx.lithos_client._classify_squatter (x10)`
+  - `tests/integration/test_serve.py -> influx.main._cmd_serve (x5)`
+  - `tests/unit/test_repair_hooks.py -> influx.repair_hooks._note_source_url (x5)`
+  - `tests/unit/test_lithos_client.py -> influx.lithos_client._existing_id_from_detail (x4)`
+  - `tests/unit/test_repair_hooks_production.py -> influx.repair_hooks._rss_item_id_from_note (x3)`
+  - `tests/unit/test_repair_sweep.py -> influx.repair._doc_title (x3)`
+  - `tests/integration/test_event_loop_responsiveness.py -> influx.filter._acall_filter_model_with_retry (x2)`
+  - `tests/unit/test_canonical_note.py -> influx.canonical_note._has_title_heading (x2)`
+  - `tests/unit/test_lithos_client.py -> influx.lithos_client._format_unresolved_detail (x2)`
+  - `tests/unit/test_rss_cooldown.py -> influx.sources.rss._RSS_COOLDOWN_LOCK (x2)`
+  - `tests/unit/test_rss_cooldown.py -> influx.sources.rss._RSS_COOLDOWN_STATE (x2)`
+  - `tests/unit/test_rss_fetcher.py -> influx.sources.rss._parse_published (x2)`
+  - `tests/integration/test_event_loop_responsiveness.py -> influx.repair._process_sweep_note`
+  - `tests/integration/test_fetch_dedup.py -> influx.sources.rss._fetch_rss_feed`
+  - `tests/integration/test_pre_write_dedup_fallback.py -> influx.run._run_ingest_stage`
+  - `tests/unit/test_article_extraction.py -> influx.extraction.article._recover_html_title`
+  - `tests/unit/test_arxiv_cooldown.py -> influx.sources.arxiv._arxiv_cooldown_snapshot`
+  - `tests/unit/test_arxiv_cooldown.py -> influx.sources.arxiv._fetch_with_retry`
+  - `tests/unit/test_arxiv_cooldown.py -> influx.sources.arxiv._record_429_final_failure`
+  - `tests/unit/test_arxiv_cooldown.py -> influx.sources.arxiv._record_arxiv_fetch_success`
+  - `tests/unit/test_arxiv_cooldown.py -> influx.sources.arxiv._reset_arxiv_cooldown_for_tests`
+  - `tests/unit/test_arxiv_cooldown.py -> influx.sources.arxiv._reset_fetch_pacing_for_tests`
+  - `tests/unit/test_arxiv_cooldown.py -> influx.sources.arxiv._should_skip_for_cooldown`
+  - `tests/unit/test_arxiv_cooldown_integration.py -> influx.sources.arxiv._record_429_final_failure`
+  - `tests/unit/test_arxiv_cooldown_integration.py -> influx.sources.arxiv._record_arxiv_fetch_success`
+  - `tests/unit/test_arxiv_cooldown_integration.py -> influx.sources.arxiv._reset_arxiv_cooldown_for_tests`
+  - `tests/unit/test_arxiv_cooldown_integration.py -> influx.sources.arxiv._reset_fetch_pacing_for_tests`
+  - `tests/unit/test_arxiv_fetcher.py -> influx.sources.arxiv._apply_min_interval`
+  - `tests/unit/test_arxiv_fetcher.py -> influx.sources.arxiv._classify_arxiv_429`
+  - `tests/unit/test_arxiv_fetcher.py -> influx.sources.arxiv._extract_arxiv_429_classification`
+  - … (list capped at 30 pairs)
+
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.53** (70237 test lines / 27757 source lines)
+- Test-to-source line ratio: **2.54** (70546 test lines / 27757 source lines)
