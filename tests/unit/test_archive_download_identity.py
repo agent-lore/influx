@@ -127,12 +127,37 @@ class TestRssArchiveDownloadIdentity:
         identity = _rss().archive_download_identity(note)
         assert identity is not None
         assert identity.url == url
-        # Matches acquisition's id == rss-{feed_slug}-{url_hash(url)}.
+        # The retry item_id is the date-free ``{feed-slug}-{url-hash}`` — it
+        # equals the note *id* minus its ``rss-`` prefix, NOT acquisition's
+        # dated archive item_id (see test_retry_item_id_omits_acquisition_date).
         assert identity.item_id == f"ai-alignment-forum-{url_hash(url)}"
         assert identity.published_year == 2026
         assert identity.published_month == 5
         assert identity.ext == ".html"
         assert identity.expected_content_type == "html"
+
+    def test_retry_item_id_omits_acquisition_date(self) -> None:
+        # Honest divergence (finding 3b review): acquisition archives RSS
+        # HTML under item_id ``{feed-slug}-{YYYY-MM-DD}-{url-hash}``
+        # (build_rss_note_item), but read_note does not persist that
+        # publication *day*.  The retry identity is the deterministic,
+        # date-free ``{feed-slug}-{url-hash}``, so re-download lands at a
+        # different (still deterministic) archive path than the original —
+        # fine, since the archive is missing and nothing lives at the
+        # original dated path.  The co-located, drift-proof part is the
+        # shared feed-slug + url_hash *scheme*, not the day.
+        url = "https://example.com/post"
+        note = {
+            "id": f"rss-techcrunch-{url_hash(url)}",
+            "source_url": url,
+            "path": "articles/rss-techcrunch/2026/05",
+            "tags": ["source:rss", "feed-slug:techcrunch"],
+        }
+        identity = _rss().archive_download_identity(note)
+        assert identity is not None
+        assert identity.item_id == f"techcrunch-{url_hash(url)}"
+        # Explicitly NOT acquisition's dated ``{feed-slug}-2026-05-DD-{hash}``.
+        assert "2026-05" not in identity.item_id
 
     def test_none_when_no_source_url(self) -> None:
         note = {"id": "rss-x-abc", "tags": ["source:rss"]}

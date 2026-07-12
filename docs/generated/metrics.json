@@ -443,10 +443,10 @@
         "functions": 82,
         "largest_module": "influx.sources.arxiv",
         "largest_module_lines": 1830,
-        "lines": 4331,
+        "lines": 4340,
         "modules": 10,
         "public_symbols": 32,
-        "sloc": 3312
+        "sloc": 3320
       },
       "Storage": {
         "classes": 2,
@@ -475,13 +475,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 27951,
+    "total_lines": 27960,
     "total_modules": 57,
-    "total_sloc": 21697
+    "total_sloc": 21705
   },
   "tests": {
     "ratio": 2.53,
-    "src_lines": 27951,
-    "test_lines": 70731
+    "src_lines": 27960,
+    "test_lines": 70756
   }
 }

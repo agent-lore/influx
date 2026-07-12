@@ -916,12 +916,21 @@ class RssSource:
     ) -> ArchiveDownloadIdentity | None:
         """Rebuild the RSS archive-download identity from a note (finding 3b).
 
-        The inverse of the acquire-time identity built in
-        :func:`build_rss_note_item`: the archive is re-fetched from the
-        note's doc-level ``source_url`` as ``.html``, and the ``item_id``
-        is the ``{feed-slug}-{url-hash}`` reconstruction (see
-        :func:`_rss_item_id_from_note`).  The ``(year, month)`` bucket
-        falls back path -> ``created_at``.
+        Re-fetches the archive from the note's doc-level ``source_url`` as
+        ``.html``; the ``item_id`` is the date-free ``{feed-slug}-{url-hash}``
+        reconstruction (see :func:`_rss_item_id_from_note`).
+
+        This is a *deterministic retry* identity, **not** a byte-exact
+        inverse of acquisition: unlike arXiv (whose acquire-time archive
+        ``item_id`` is the bare arxiv id, so it round-trips exactly),
+        :func:`build_rss_note_item` embeds a ``YYYY-MM-DD`` in the RSS
+        archive ``item_id`` (``{feed-slug}-{YYYY-MM-DD}-{url-hash}``) that
+        the note does not persist — so re-download lands at a different
+        (still deterministic) archive path.  That is fine: the archive is
+        missing, so nothing lives at the original dated path to collide
+        with.  What is co-located and drift-proof is the shared
+        ``feed-slug`` + ``url_hash`` *scheme*, not the day.  The
+        ``(year, month)`` bucket falls back path -> ``created_at``.
 
         Returns ``None`` when the note lacks a doc-level ``source_url``, a
         recoverable ``item_id``, or any resolvable ``(year, month)``.
