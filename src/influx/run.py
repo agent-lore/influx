@@ -113,6 +113,32 @@ class RunPlan:
     ledger_id: str | None = None
     request_id: str | None = None
 
+    @classmethod
+    def for_request(
+        cls,
+        profile: str,
+        kind: RunKind,
+        *,
+        run_range: dict[str, str | int] | None = None,
+    ) -> RunPlan:
+        """Build the RunPlan for a request of the given kind.
+
+        The single place that maps a :class:`RunKind` to the plan's
+        behaviour flags — the mapping the three entry points (cron tick,
+        ``POST /runs``, ``POST /backfills``) share. A backfill skips the
+        repair sweep and cache-hit writes and suppresses notifications;
+        every other kind runs the full pipeline and notifies.
+        """
+        is_backfill = kind == RunKind.BACKFILL
+        return cls(
+            profile=profile,
+            kind=kind,
+            date_window=run_range,
+            skip_repair=is_backfill,
+            skip_cache_hits=is_backfill,
+            notify=not is_backfill,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class RunOutcome:

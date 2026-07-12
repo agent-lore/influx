@@ -119,18 +119,21 @@ async def run_profile(
     run_id: str | None = None,
     run_ledger: RunLedger | None = None,
 ) -> ProfileRunResult | None:
-    """Backward-compatible thin wrapper over :class:`influx.run_service.RunService`.
+    """The per-Profile Run entry point: build a :class:`RunPlan` and drive it.
 
-    Existing callers (HTTP admin handlers, ``InfluxScheduler._fire_profile``,
-    integration tests) still call
-    ``run_profile`` with the legacy signature.  Internally we now build
-    a :class:`RunPlan`, hand it to :class:`RunService`, and unwrap the
-    :class:`RunOutcome` back into a legacy :class:`ProfileRunResult` so
-    no caller has to change.
+    The three scheduler entry points (cron tick via
+    :meth:`InfluxScheduler._fire_profile`, ``POST /runs`` and
+    ``POST /backfills`` via :class:`~influx.run_dispatch.RunDispatcher`)
+    route through here.  It builds the plan with
+    :meth:`RunPlan.for_request` — the single home of the ``RunKind`` →
+    flag mapping — hands it to :class:`~influx.run_service.RunService`,
+    and unwraps the :class:`~influx.run.RunOutcome` back into the legacy
+    :class:`ProfileRunResult` the post-run webhook hook + integration
+    tests still consume.
 
     The full lifecycle (skip gates, ledger entry, metrics, contextvars,
     tracer span, body, ``ledger.complete`` / ``ledger.fail`` / ``ledger.skip``)
-    lives in :class:`RunService` (#61).  The body itself runs through
+    lives in :class:`RunService` (#61); the body runs through
     :class:`influx.run.Run`.
 
     ``config=None`` remains a no-op so tests that exercise the scheduler
@@ -139,18 +142,22 @@ async def run_profile(
     if config is None:
         return None
 
-    from influx.run_service import run_via_service
+    from influx.run import RunPlan
+    from influx.run_service import RunService
 
-    return await run_via_service(
-        profile,
-        kind,
-        run_range,
+    plan = RunPlan.for_request(profile, kind, run_range=run_range)
+    service = RunService(
         config=config,
         item_provider=item_provider,
         probe_loop=probe_loop,
-        run_id=run_id,
-        run_ledger=run_ledger,
+        ledger=run_ledger,
     )
+    outcome = await service.execute(plan, run_id=run_id)
+    # ``RunService.execute`` can return ``None`` when a test patches the
+    # Run body out; preserve that legacy contract for the callers above.
+    if outcome is None:
+        return None
+    return outcome.profile_run_result
 
 
 class InfluxScheduler:

@@ -52,7 +52,7 @@ One end-to-end execution of the ingestion pipeline for one Profile. Constructed 
 _Avoid_: job, task (Lithos has its own `lithos_task_*`), tick.
 
 **RunPlan**:
-The data-driven specification a Run executes: profile, kind, date window, `skip_repair`, `skip_cache_hits`, `notify`, ledger ID, request ID. Built once per request type by the scheduler.
+The data-driven specification a Run executes: profile, kind, date window, `skip_repair`, `skip_cache_hits`, `notify`, ledger ID, request ID. Built once per request by `RunPlan.for_request`, the single home of the RunKind → flag mapping (a backfill skips repair + cache-hit writes and suppresses notifications; every other kind runs the full pipeline and notifies).
 
 **RunKind**:
 One of `scheduled`, `manual`, `backfill`, `inbox`. Carried as a tag for ledger and metric labels even though behaviour is driven by the boolean flags on the RunPlan. `inbox` marks the per-(item, Profile) Runs an InboxTick dispatches; it is excluded from the scheduled-only stall heuristics.
@@ -70,7 +70,7 @@ A Run over an explicit date window that skips the repair sweep, skips already-ca
 The post-write step that calls `lithos_retrieve` for related notes, upserts `related_to` edges above `thresholds.lcma_edge_score`, and resolves Tier 3 `builds_on` entries via `lithos_cache_lookup` to upsert `builds_on` edges. Runs after every successful write. _(proposed as a separate collaborator of the Run module)_
 
 **RunService**:
-The collaborator that owns "build RunPlan → execute Run → dispatch notifications → record outcome" for one request. The scheduler's three entry points (scheduled tick, `POST /runs`, `POST /backfills`) are thin RunPlan builders that hand off to RunService. Lives in `src/influx/run_service.py` as `RunService.execute()`.
+The collaborator that owns "build RunPlan → execute Run → dispatch notifications → record outcome" for one request. The scheduler's three entry points (scheduled tick, `POST /runs`, `POST /backfills`) route through `scheduler.run_profile`, which builds the RunPlan via `RunPlan.for_request` and hands it to RunService. Lives in `src/influx/run_service.py` as `RunService.execute()`.
 
 **RunDispatcher**:
 The request-orchestration collaborator that turns an admin `POST /runs` or `POST /backfills` request into background Runs. Acquires the per-Profile Coordinator locks all-or-nothing (any busy Profile releases everything acquired so far and rejects the request — no partial fan-out), launches the Run(s) as tracked background tasks so the response returns immediately, registers them on the shutdown-grace set so `InfluxService.stop` can drain them, and releases the locks. Kind-agnostic — manual runs and backfills share one lock lifecycle and one fan-out path — so the HTTP router stays thin translation, turning a `RunAccepted` / `RunRejectedBusy` outcome into a `202` / `409`. Lives in `src/influx/run_dispatch.py`.

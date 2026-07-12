@@ -7,9 +7,10 @@ Covers the request lifecycle that wraps :class:`influx.run.Run`:
 - Happy path: ledger entry opened on enter, completed on exit, body
   runs and returns its outcome.
 - Failure path: the body's exception propagates after ``ledger.fail``.
-- ``run_via_service`` builds the right :class:`RunPlan` shape per
+- ``RunPlan.for_request`` builds the right :class:`RunPlan` shape per
   :class:`RunKind` (BACKFILL flips ``skip_repair`` /
-  ``skip_cache_hits`` / ``notify``).
+  ``skip_cache_hits`` / ``notify``), and ``scheduler.run_profile``
+  drives it through :class:`RunService` and unwraps the legacy result.
 - ``run completed`` log line reflects degraded state (issue #79):
   the ``degraded=`` field tracks the structured ``degraded_reasons``
   list so ``ingestion_stall`` / ``fetch_stall`` show up as
@@ -37,7 +38,8 @@ from influx.coordinator import RunKind
 from influx.errors import LithosError
 from influx.run import RunOutcome, RunPlan
 from influx.run_ledger import RunLedger
-from influx.run_service import RunService, run_via_service
+from influx.run_service import RunService
+from influx.scheduler import run_profile
 from influx.telemetry import (
     current_fetched_total,
     current_filter_errors,
@@ -336,29 +338,13 @@ async def test_failed_run_ledger_error_carries_lithos_detail(
     assert "'<' not supported" in failed_records[0].getMessage()
 
 
-# ── run_via_service: kind → RunPlan flag mapping ───────────────────
+# ── RunPlan.for_request: kind → RunPlan flag mapping ───────────────
 
 
-async def test_run_via_service_backfill_uses_backfill_flags(tmp_path: Any) -> None:
+def test_for_request_backfill_uses_backfill_flags() -> None:
     """BACKFILL → skip_repair=True, skip_cache_hits=True, notify=False."""
-    config = _make_config()
-    ledger = RunLedger(tmp_path)
-    captured: dict[str, RunPlan] = {}
+    plan = RunPlan.for_request("alpha", RunKind.BACKFILL, run_range={"days": 7})
 
-    async def capture_execute(self: Any) -> RunOutcome:
-        captured["plan"] = self.plan
-        return RunOutcome()
-
-    with patch("influx.run.Run.execute", new=capture_execute):
-        await run_via_service(
-            "alpha",
-            RunKind.BACKFILL,
-            run_range={"days": 7},
-            config=config,
-            run_ledger=ledger,
-        )
-
-    plan = captured["plan"]
     assert plan.kind == RunKind.BACKFILL
     assert plan.skip_repair is True
     assert plan.skip_cache_hits is True
@@ -366,32 +352,22 @@ async def test_run_via_service_backfill_uses_backfill_flags(tmp_path: Any) -> No
     assert plan.date_window == {"days": 7}
 
 
-async def test_run_via_service_scheduled_uses_full_run_flags(tmp_path: Any) -> None:
+def test_for_request_scheduled_uses_full_run_flags() -> None:
     """SCHEDULED → skip_repair=False, skip_cache_hits=False, notify=True."""
-    config = _make_config()
-    ledger = RunLedger(tmp_path)
-    captured: dict[str, RunPlan] = {}
+    plan = RunPlan.for_request("alpha", RunKind.SCHEDULED)
 
-    async def capture_execute(self: Any) -> RunOutcome:
-        captured["plan"] = self.plan
-        return RunOutcome()
-
-    with patch("influx.run.Run.execute", new=capture_execute):
-        await run_via_service(
-            "alpha",
-            RunKind.SCHEDULED,
-            config=config,
-            run_ledger=ledger,
-        )
-
-    plan = captured["plan"]
+    assert plan.profile == "alpha"
     assert plan.skip_repair is False
     assert plan.skip_cache_hits is False
     assert plan.notify is True
+    assert plan.date_window is None
 
 
-async def test_run_via_service_returns_profile_run_result(tmp_path: Any) -> None:
-    """``run_via_service`` unwraps RunOutcome.profile_run_result for legacy callers."""
+# ── run_profile: drive RunService + unwrap the legacy result ───────
+
+
+async def test_run_profile_returns_profile_run_result(tmp_path: Any) -> None:
+    """``run_profile`` unwraps RunOutcome.profile_run_result for legacy callers."""
     from influx.notifications import ProfileRunResult, RunStats
 
     config = _make_config()
@@ -409,7 +385,7 @@ async def test_run_via_service_returns_profile_run_result(tmp_path: Any) -> None
         new_callable=AsyncMock,
         return_value=body_outcome,
     ):
-        result = await run_via_service(
+        result = await run_profile(
             "alpha",
             RunKind.SCHEDULED,
             config=config,
@@ -419,7 +395,7 @@ async def test_run_via_service_returns_profile_run_result(tmp_path: Any) -> None
     assert result is legacy_result
 
 
-async def test_run_via_service_returns_none_when_body_returns_none(
+async def test_run_profile_returns_none_when_body_returns_none(
     tmp_path: Any,
 ) -> None:
     """Legacy contract: ``Run.execute()`` may return None (test patches)."""
@@ -431,7 +407,7 @@ async def test_run_via_service_returns_none_when_body_returns_none(
         new_callable=AsyncMock,
         return_value=None,
     ):
-        result = await run_via_service(
+        result = await run_profile(
             "alpha",
             RunKind.SCHEDULED,
             config=config,
@@ -1381,7 +1357,7 @@ async def test_write_outcomes_recorded_during_run_flow_into_ledger(
     assert entry["degraded"] is True
 
 
-async def test_duplicate_only_run_via_service_not_degraded(
+async def test_duplicate_only_scheduled_run_not_degraded(
     tmp_path: Path,
 ) -> None:
     """End-to-end regression (#152 review / PR #153 contract): a
