@@ -577,7 +577,11 @@ Tier 2 and Tier 3 hook failures are partitioned into transient (HTTP, transport,
 
 When `tier{N}_attempts` reaches the cap (currently 3), `influx:tier{N}-terminal` is added to the note's tags and that stage is skipped on subsequent sweeps. Transient failures never advance the counter, so flaky network conditions do not burn the cap.
 
-To re-enable a stage on a single note, an operator removes the `influx:tier{N}-terminal` tag (and optionally clears the `## Repair` section) — the next sweep retries from a clean slate. This mirrors the existing `influx:text-terminal` escape hatch.
+To re-enable a stage on a single note, an operator removes the `influx:tier{N}-terminal` tag (and optionally clears the `## Repair` section) **and re-adds `influx:repair-needed`** — the next sweep then retries from a clean slate.
+
+Both steps are required. Sweeps select candidates by the `influx:repair-needed` tag alone, and a terminal flip waives the clearing condition that tag gated (§5.3), so the note drops out of the sweep set when it goes terminal. Removing the terminal tag on its own leaves a note no sweep will ever select again.
+
+This mirrors the existing `influx:text-terminal` escape hatch, which has always behaved this way: `audit_invalid_source.reconstruct_tags` drops `influx:text-terminal` **and** re-adds `influx:repair-needed` for exactly this reason, and is the reference implementation for a re-arm.
 
 ---
 

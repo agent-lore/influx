@@ -537,6 +537,9 @@ class TestPerStageTerminalExemptions:
             max_profile_score=LOW_SCORE,
         )
         assert d.clear_repair_needed is True
+        # Pins the decoupling: the waiver releases the note from the
+        # sweep without asserting an archive exists.
+        assert d.clear_archive_missing is False
 
     def test_tier_terminal_does_not_waive_text_condition(self) -> None:
         """Terminal tiers must not paper over an un-terminal text stage.
@@ -557,9 +560,22 @@ class TestPerStageTerminalExemptions:
         assert d.clear_repair_needed is False
 
     def test_archive_terminal_does_not_clear_archive_missing(self) -> None:
-        """``influx:archive-missing`` stays factual: no path is no path."""
+        """``influx:archive-missing`` stays factual: no path is no path.
+
+        The terminal tag must be present for this to test what it
+        claims — without it the assertion would hold for the trivial
+        reason that nothing waives anything.
+        """
         d = _clear(
-            ["influx:repair-needed", "influx:archive-missing", "text:html"],
+            [
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "influx:archive-terminal",
+                "text:html",
+            ],
             archive_path=None,
         )
         assert d.clear_archive_missing is False
+        # The note still leaves the sweep — the two decisions are
+        # independent.
+        assert d.clear_repair_needed is True
