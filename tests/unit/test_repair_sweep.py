@@ -1077,8 +1077,13 @@ class TestSweepTier2RecoveryViaCascade:
         rewritten = self._last_write_args(client)
         assert "influx:tier2-terminal" in rewritten["tags"]
         assert "tier2_attempts: 3" in rewritten["content"]
-        # Stage still failed → repair-needed stays for the (now-capped) note.
-        assert "influx:repair-needed" in rewritten["tags"]
+        # At the cap, Tier 2 can never succeed, so the condition it gates
+        # is waived and the note leaves the sweep.  Keeping
+        # influx:repair-needed here is what made capped notes immortal
+        # sweep candidates: re-selected every run, and rewritten every
+        # run for retry-order advancement (AC-X-8), which pinned
+        # updated_at to "now" forever and dominated retrieval ranking.
+        assert "influx:repair-needed" not in rewritten["tags"]
 
         flip_logs = [
             r
