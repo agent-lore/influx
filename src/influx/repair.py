@@ -692,10 +692,12 @@ def compute_clearing(
     is_text_terminal = "influx:text-terminal" in tag_set
 
     # FR-NOTE-9: clear influx:archive-missing iff archive path stored.
-    # Deliberately NOT waived by influx:archive-terminal — that tag is a
-    # factual statement about the note (no path is stored), whereas the
-    # terminal waivers below are statements about whether a *stage* can
-    # still make progress.
+    # Deliberately NOT waived by influx:archive-terminal.
+    # ``influx:archive-missing`` is a factual statement about the note —
+    # no ``path:`` line is stored — and stays true however many times
+    # the archive stage has given up.  ``influx:archive-terminal`` is a
+    # statement about stage reachability, and only that second kind of
+    # claim can waive a repair condition (see below).
     clear_archive_missing = archive_path is not None
 
     # §5.3: clear influx:repair-needed iff ALL four conditions hold.

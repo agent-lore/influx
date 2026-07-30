@@ -288,12 +288,32 @@ prints the exact restart command for the current environment.
 Influx never clears `influx:*-terminal` tags by itself. To re-arm a
 note after fixing the underlying cause:
 
-| Tag                          | Cap counter (`## Repair`) | Re-arm steps                                                                                       |
-| ---------------------------- | ------------------------- | -------------------------------------------------------------------------------------------------- |
-| `influx:archive-terminal`    | `archive_attempts`        | Remove the tag in Lithos. Optionally also delete the `## Repair` block. Next sweep retries from 0. |
-| `influx:tier2-terminal`      | `tier2_attempts`          | Same — remove the tag, optionally clear the counter, next sweep retries Tier 2.                    |
-| `influx:tier3-terminal`      | `tier3_attempts`          | Same — remove the tag, optionally clear the counter, next sweep retries Tier 3.                    |
-| `influx:text-terminal`       | _n/a_ (set explicitly when abstract-only re-extraction returns TERMINAL) | Remove the tag — abstract-only re-extraction will run next sweep. |
+**Resetting the counter is not optional.** `Cascade.enrich` checks
+`tier{N}_attempts >= cap` *before* calling the extractor, so a note whose
+tag you removed but whose counter is still at the cap gets no recovery
+attempt — the stage is skipped, the terminal tag is re-applied, and the
+note drops back out of the sweep set having tried nothing.
+
+**Re-adding `influx:repair-needed` is also required.** A terminal flip
+waives that stage's clearing condition, so the note loses
+`influx:repair-needed` when it goes terminal, and sweeps only ever select
+notes that carry it.
+
+| Tag                       | Cap counter (`## Repair`) | Re-arm steps                                                                                                             |
+| ------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `influx:tier2-terminal`   | `tier2_attempts`          | **All three:** reset `tier2_attempts` below the cap, remove the tag, re-add `influx:repair-needed`.                       |
+| `influx:tier3-terminal`   | `tier3_attempts`          | **All three:** reset `tier3_attempts` below the cap, remove the tag, re-add `influx:repair-needed`.                       |
+| `influx:archive-terminal` | `archive_attempts`        | Remove the tag + re-add `influx:repair-needed` buys one attempt; also reset `archive_attempts` or the first counted failure re-terminates it. |
+| `influx:text-terminal`    | _n/a_ (set explicitly when abstract-only re-extraction returns TERMINAL) | Remove the tag + re-add `influx:repair-needed`. No counter to reset.        |
+
+Reset only the counter for the stage you are re-arming — deleting the
+whole `## Repair` block discards the other stages' attempt history and
+last-error diagnostics. `audit_invalid_source.reconstruct_tags` is the
+reference implementation of a correct re-arm.
+
+Candidate selection is profile-qualified (`influx:repair-needed` **and**
+`profile:<profile>`), so a note missing its `profile:*` tag is
+unreachable by any sweep whatever its repair tags say.
 
 The full per-stage cap contract lives in
 [`docs/SPECIFICATION.md` §11.1](../SPECIFICATION.md#111-per-stage-cap-and-self-repair).

@@ -579,3 +579,34 @@ class TestPerStageTerminalExemptions:
         # The note still leaves the sweep — the two decisions are
         # independent.
         assert d.clear_repair_needed is True
+
+    def test_tier2_terminal_alone_does_not_waive_tier3(self) -> None:
+        """Each tier's waiver is scoped to its own condition.
+
+        Guards against an "either tier terminal waives both tiers"
+        implementation, which the positive cases above cannot detect.
+        """
+        d = _clear(
+            ["influx:repair-needed", "text:html", "influx:tier2-terminal"],
+            archive_path="/archives/doc.html",
+            max_profile_score=HIGH_SCORE,
+        )
+        # Tier 2 waived, but deep-extract is still outstanding.
+        assert d.clear_repair_needed is False
+
+    def test_tier3_terminal_alone_does_not_waive_tier2(self) -> None:
+        d = _clear(
+            ["influx:repair-needed", "text:html", "influx:tier3-terminal"],
+            archive_path="/archives/doc.html",
+            max_profile_score=HIGH_SCORE,
+        )
+        # Tier 3 waived, but full-text is still outstanding.
+        assert d.clear_repair_needed is False
+
+    def test_archive_terminal_alone_does_not_waive_tiers(self) -> None:
+        d = _clear(
+            ["influx:repair-needed", "text:html", "influx:archive-terminal"],
+            archive_path=None,
+            max_profile_score=HIGH_SCORE,
+        )
+        assert d.clear_repair_needed is False

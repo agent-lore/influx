@@ -137,7 +137,7 @@ _Avoid_: probes (one input to Health), readiness (one output of Health).
 >
 > **Dev:** "If **Tier 2** extraction fails three times for one Acquired, what happens on the next scheduled Run?"
 >
-> **Domain expert:** "**RepairCounters** sees `tier2_attempts >= cap`, the **Cascade** skips Tier 2, the **Renderer** emits the note with `influx:tier2-terminal`, and the note drops out of the sweep set. To re-enable that stage on that note an operator removes the terminal tag *and* re-adds `influx:repair-needed` — sweeps select on that tag alone, so dropping the terminal tag by itself re-arms nothing."
+> **Domain expert:** "**RepairCounters** sees `tier2_attempts >= cap`, the **Cascade** skips Tier 2, the **Renderer** emits the note with `influx:tier2-terminal`, and the note drops out of the sweep set. Re-arming that stage takes three edits: reset the counter below the cap, remove the terminal tag, re-add `influx:repair-needed`. The counter is the authoritative gate — the **Cascade** checks it before calling the extractor, so removing the tag alone gets you a sweep that attempts nothing and re-terminates."
 
 ## Flagged ambiguities
 
