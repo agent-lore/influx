@@ -222,8 +222,28 @@ def upsert_repair_section(content: str, counters: RepairCounters) -> str:
 # size violations (oversize) which won't shrink on retry.
 _COUNTED_STAGES: frozenset[str] = frozenset({"parse", "validate", "oversize"})
 
+# Discriminators that are permanent for *one* stage but not globally.
+#
+# ``unsupported_source``: the note's ``source:*`` tag has no registered
+# reacquirer, so ``repair_hooks._reacquirer_for_note`` returns ``None``
+# and the archive hook raises before any network call.  Nothing about a
+# retry changes that — it is fixed only by shipping a resolver — so for
+# the archive stage it advances the cap rather than retrying forever.
+#
+# The text-extraction path deliberately keeps classifying it transient:
+# it has its own terminal handling in
+# ``repair._terminate_unsupported_text_source``, which flips
+# ``influx:text-terminal`` directly instead of going through a counter.
+_STAGE_SCOPED_COUNTED_STAGES: dict[CountedStage, frozenset[str]] = {
+    "archive": frozenset({"unsupported_source"}),
+}
 
-def classify_failure(exc: BaseException) -> Literal["transient", "counted"]:
+
+def classify_failure(
+    exc: BaseException,
+    *,
+    repair_stage: CountedStage | None = None,
+) -> Literal["transient", "counted"]:
     """Partition a sweep stage failure into transient vs counted.
 
     *Counted* failures advance the per-stage attempt counter and
@@ -235,10 +255,28 @@ def classify_failure(exc: BaseException) -> Literal["transient", "counted"]:
     *Transient* failures (HTTP, transport, resolve, archive_read, or
     anything we don't specifically recognise) leave the counter alone.
     The next sweep retries them indefinitely.
+
+    Parameters
+    ----------
+    exc:
+        The stage failure to classify.
+    repair_stage:
+        The *repair* stage that raised, when known — deliberately not
+        named ``stage``, which on the exception means the failure
+        discriminator (``parse`` / ``http`` / ``unsupported_source``).
+        Some discriminators are permanent for one repair stage and
+        transient for another — see
+        :data:`_STAGE_SCOPED_COUNTED_STAGES`.  Omitting it yields the
+        global classification.
     """
     if isinstance(exc, (LCMAError, ExtractionError)):
-        stage = getattr(exc, "stage", "") or ""
-        if stage in _COUNTED_STAGES:
+        exc_stage = getattr(exc, "stage", "") or ""
+        counted = _COUNTED_STAGES
+        if repair_stage is not None:
+            counted = counted | _STAGE_SCOPED_COUNTED_STAGES.get(
+                repair_stage, frozenset()
+            )
+        if exc_stage in counted:
             return "counted"
     return "transient"
 

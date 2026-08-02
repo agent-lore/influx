@@ -522,7 +522,7 @@ def _apply_counted_failure(
     stage flip in logs.  The ``<stage>_attempts`` log field is named per
     *stage* so existing log-filter rules keep matching.
     """
-    if classify_failure(exc) != "counted":
+    if classify_failure(exc, repair_stage=stage) != "counted":
         return current_tags
     advance = record_counted_failure(
         content=str(note.get("content", "")),

@@ -577,6 +577,20 @@ Tier 2 and Tier 3 hook failures are partitioned into transient (HTTP, transport,
 
 When `tier{N}_attempts` reaches the cap (currently 3), `influx:tier{N}-terminal` is added to the note's tags and that stage is skipped on subsequent sweeps. Transient failures never advance the counter, so flaky network conditions do not burn the cap.
 
+#### Stage-scoped counting: `unsupported_source` on archive
+
+Most discriminators classify the same way everywhere. `unsupported_source` does not — it is **counted for the archive stage only**.
+
+The archive-download hook raises it when no registered adapter owns the note, i.e. `repair_hooks._reacquirer_for_note` returns `None`. That is not a failed attempt but the absence of a code path, so retrying cannot change it — only shipping a resolver can. Left transient, such a note was re-selected and rewritten on every sweep indefinitely (observed in production at v108 after 36 days, with `archive_attempts` still 0), which pinned `updated_at` to "now" and dominated retrieval ranking.
+
+Counted, it converges: `archive_attempts` reaches the cap, `influx:archive-terminal` is applied, the archive clearing condition is waived (§5.3), `influx:repair-needed` is cleared, and the note leaves the sweep set. **`influx:archive-missing` is retained** — it remains factually true that no archive is stored.
+
+Dispatch resolves ownership by source-tag family (`arxiv`; `rss` / `blog` / `rss-<feed>`) **and** by durable identity markers on the note — an `rss-` id, or a `feed-slug:` tag plus a doc-level `source_url`. The identity fallback exists precisely because this failure is now permanent: dispatching on the tag alone would terminalise notes `archive_download_identity` could actually resolve.
+
+Text extraction keeps classifying `unsupported_source` as transient. It has its own terminal path (`repair._terminate_unsupported_text_source` applies `influx:text-terminal` directly rather than through a counter), and counting it globally would double-handle that.
+
+**Operational consequence:** adding a resolver no longer recovers already-terminalised notes automatically. They must be re-armed — see below.
+
 #### Re-arming a terminal stage
 
 **The persisted counter is authoritative, not the tag.** Two different mechanisms read the terminal state, and a re-arm has to satisfy both:

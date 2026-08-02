@@ -333,3 +333,48 @@ class TestCountedFailureResultShape:
         assert isinstance(result.cap_reached, bool)
         assert result.terminal_tag == "influx:tier2-terminal"
         assert isinstance(result.terminal_tag_added, bool)
+
+
+# ── Archive-scoped counted stages (unsupported_source) ─────────────
+
+
+class TestArchiveScopedCountedStages:
+    """``unsupported_source`` is counted for the archive stage only.
+
+    A note whose ``source:*`` tag has no registered reacquirer raises
+    ``ExtractionError(stage="unsupported_source")`` from the archive
+    hook on every pass.  Treated as transient it retries forever, which
+    kept notes in the sweep set indefinitely.  It is definitionally
+    permanent — unlike an HTTP 5xx, re-running changes nothing until
+    code ships — so the archive stage counts it toward the cap.
+
+    The text-extraction path must keep classifying it transient: it has
+    its own terminal handling in
+    ``repair._terminate_unsupported_text_source``, which flips
+    ``influx:text-terminal`` directly rather than via the counter.
+    """
+
+    def test_unsupported_source_counted_for_archive_stage(self) -> None:
+        exc = ExtractionError("source 'x' not supported", stage="unsupported_source")
+        assert classify_failure(exc, repair_stage="archive") == "counted"
+
+    def test_unsupported_source_transient_without_stage(self) -> None:
+        """Default (text-extraction) classification is unchanged."""
+        exc = ExtractionError("source 'x' not supported", stage="unsupported_source")
+        assert classify_failure(exc) == "transient"
+
+    def test_unsupported_source_transient_for_tier_stages(self) -> None:
+        exc = ExtractionError("source 'x' not supported", stage="unsupported_source")
+        assert classify_failure(exc, repair_stage="tier2") == "transient"
+        assert classify_failure(exc, repair_stage="tier3") == "transient"
+
+    def test_archive_stage_does_not_widen_other_transients(self) -> None:
+        """Only ``unsupported_source`` is added for archive — not all stages."""
+        for stage in ("http", "resolve", "archive_read"):
+            exc = ExtractionError("boom", stage=stage)
+            assert classify_failure(exc, repair_stage="archive") == "transient", stage
+
+    def test_archive_stage_keeps_globally_counted_stages(self) -> None:
+        for stage in ("parse", "validate", "oversize"):
+            exc = ExtractionError("boom", stage=stage)
+            assert classify_failure(exc, repair_stage="archive") == "counted", stage

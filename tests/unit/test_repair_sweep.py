@@ -2043,3 +2043,111 @@ class TestSweepNoteParse:
             str(note.get("content") or ""), fallback_title=_doc_title(note)
         )
         assert parsed.title == "T"
+
+
+class TestSweepUnsupportedSourceArchiveConvergence:
+    """A source with no reacquirer converges instead of churning forever.
+
+    Reproduces the production shape that survived the terminal-waiver
+    fix: ``influx:archive-missing`` + ``text:abstract-only`` +
+    ``influx:text-terminal``, whose ``source:*`` tag has no registered
+    reacquirer.  ``_reacquirer_for_note`` returns ``None``, the archive
+    hook raises ``ExtractionError(stage="unsupported_source")`` before
+    any network call, and — while that was classified transient — the
+    counter never moved, the note never reached a cap, and every sweep
+    rewrote it (observed at v108/v101 after ~36 days).
+    """
+
+    @staticmethod
+    def _note(archive_attempts: int) -> dict[str, Any]:
+        body = (
+            "---\n"
+            "source_url: https://origintrail.io/blog/shared-context-graphs\n"
+            "tags: []\n"
+            "confidence: 1.0\n"
+            "---\n"
+            "# Shared Context Graphs\n\n"
+            "## Archive\n\n"
+            "## Summary\nSummary\n\n"
+            "## Repair\n"
+            f"- archive_attempts: {archive_attempts}\n"
+            '- archive_last_kind: "unsupported_source"\n'
+            '- archive_last_error: "earlier failure"\n\n'
+            "## Profile Relevance\n"
+            "### ai-robotics\nScore: 9/10\nRelevant\n\n"
+            "## User Notes\n"
+        )
+        return {
+            "id": "n1",
+            "title": "Shared Context Graphs",
+            "content": body,
+            "tags": [
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "text:abstract-only",
+                "influx:text-terminal",
+            ],
+            "source_url": "https://origintrail.io/blog/shared-context-graphs",
+            "confidence": 1.0,
+        }
+
+    @staticmethod
+    def _unsupported(note: dict[str, object]) -> str:
+        del note
+        raise ExtractionError(
+            "archive_download retry: source 'ai-agents-briefing' not supported",
+            stage="unsupported_source",
+        )
+
+    @staticmethod
+    def _write_args(client: AsyncMock) -> dict[str, Any]:
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        return dict(write_calls[-1].args[1])
+
+    async def test_unsupported_source_advances_archive_counter(self) -> None:
+        """Below the cap: counter moves, note stays in the sweep."""
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "n1", "title": "Shared Context Graphs"}],
+            read_responses=[self._note(0)],
+        )
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=self._unsupported),
+        )
+
+        rewritten = self._write_args(client)
+        assert "archive_attempts: 1" in rewritten["content"]
+        assert "influx:archive-terminal" not in rewritten["tags"]
+        assert "influx:repair-needed" in rewritten["tags"]
+
+    async def test_at_cap_flips_terminal_and_releases_note(self) -> None:
+        """At the cap the note goes terminal and leaves the sweep set."""
+        from influx.repair_counters import REPAIR_COUNTED_CAP
+
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "n1", "title": "Shared Context Graphs"}],
+            read_responses=[self._note(REPAIR_COUNTED_CAP - 1)],
+        )
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=self._unsupported),
+        )
+
+        rewritten = self._write_args(client)
+        assert f"archive_attempts: {REPAIR_COUNTED_CAP}" in rewritten["content"]
+        assert "influx:archive-terminal" in rewritten["tags"]
+        # The whole point: it stops being an immortal sweep candidate.
+        assert "influx:repair-needed" not in rewritten["tags"]
+        # Still factually archive-less.
+        assert "influx:archive-missing" in rewritten["tags"]
