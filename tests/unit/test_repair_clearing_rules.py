@@ -471,3 +471,142 @@ class TestPartialRepair:
             max_profile_score=HIGH_SCORE,
         )
         assert d.clear_repair_needed is False
+
+
+# ── Per-stage terminal exemptions (repeat-recommendation bug) ────────
+
+
+class TestPerStageTerminalExemptions:
+    """A stage that has gone terminal can never improve again.
+
+    ``compute_clearing`` historically honoured only
+    ``influx:text-terminal``, so a note whose Tier 2 / Tier 3 stages had
+    already exhausted ``REPAIR_COUNTED_CAP`` kept ``influx:repair-needed``
+    forever and was re-selected by every sweep.  Combined with the
+    unconditional rewrite that pinned ``updated_at`` to "now" on every
+    pass, permanently outranking every other note in retrieval.
+    """
+
+    def test_tier2_terminal_waives_full_text_requirement(self) -> None:
+        d = _clear(
+            ["influx:repair-needed", "text:html", "influx:tier2-terminal"],
+            archive_path="/archives/doc.html",
+            max_profile_score=FULL_TEXT_THRESHOLD,
+        )
+        assert d.clear_repair_needed is True
+
+    def test_tier3_terminal_waives_deep_extract_requirement(self) -> None:
+        d = _clear(
+            [
+                "influx:repair-needed",
+                "text:html",
+                "full-text",
+                "influx:tier3-terminal",
+            ],
+            archive_path="/archives/doc.html",
+            max_profile_score=HIGH_SCORE,
+        )
+        assert d.clear_repair_needed is True
+
+    def test_both_tier_terminals_clear_at_high_score(self) -> None:
+        """Regression for note 0a3a8e2b (v125, rewritten ~2.5x/day).
+
+        Both tiers terminal + text:html + archive stored -> nothing
+        further is achievable, so the note must exit the sweep.
+        """
+        d = _clear(
+            [
+                "influx:repair-needed",
+                "text:html",
+                "influx:tier2-terminal",
+                "influx:tier3-terminal",
+            ],
+            archive_path="/archives/doc.html",
+            max_profile_score=HIGH_SCORE,
+        )
+        assert d.clear_repair_needed is True
+
+    def test_archive_terminal_waives_archive_path_requirement(self) -> None:
+        d = _clear(
+            [
+                "influx:repair-needed",
+                "text:html",
+                "influx:archive-terminal",
+            ],
+            archive_path=None,
+            max_profile_score=LOW_SCORE,
+        )
+        assert d.clear_repair_needed is True
+        # Pins the decoupling: the waiver releases the note from the
+        # sweep without asserting an archive exists.
+        assert d.clear_archive_missing is False
+
+    def test_tier_terminal_does_not_waive_text_condition(self) -> None:
+        """Terminal tiers must not paper over an un-terminal text stage.
+
+        ``text:abstract-only`` without ``influx:text-terminal`` still
+        locks the note per AC-06-C.
+        """
+        d = _clear(
+            [
+                "influx:repair-needed",
+                "text:abstract-only",
+                "influx:tier2-terminal",
+                "influx:tier3-terminal",
+            ],
+            archive_path="/archives/doc.html",
+            max_profile_score=HIGH_SCORE,
+        )
+        assert d.clear_repair_needed is False
+
+    def test_archive_terminal_does_not_clear_archive_missing(self) -> None:
+        """``influx:archive-missing`` stays factual: no path is no path.
+
+        The terminal tag must be present for this to test what it
+        claims — without it the assertion would hold for the trivial
+        reason that nothing waives anything.
+        """
+        d = _clear(
+            [
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "influx:archive-terminal",
+                "text:html",
+            ],
+            archive_path=None,
+        )
+        assert d.clear_archive_missing is False
+        # The note still leaves the sweep — the two decisions are
+        # independent.
+        assert d.clear_repair_needed is True
+
+    def test_tier2_terminal_alone_does_not_waive_tier3(self) -> None:
+        """Each tier's waiver is scoped to its own condition.
+
+        Guards against an "either tier terminal waives both tiers"
+        implementation, which the positive cases above cannot detect.
+        """
+        d = _clear(
+            ["influx:repair-needed", "text:html", "influx:tier2-terminal"],
+            archive_path="/archives/doc.html",
+            max_profile_score=HIGH_SCORE,
+        )
+        # Tier 2 waived, but deep-extract is still outstanding.
+        assert d.clear_repair_needed is False
+
+    def test_tier3_terminal_alone_does_not_waive_tier2(self) -> None:
+        d = _clear(
+            ["influx:repair-needed", "text:html", "influx:tier3-terminal"],
+            archive_path="/archives/doc.html",
+            max_profile_score=HIGH_SCORE,
+        )
+        # Tier 3 waived, but full-text is still outstanding.
+        assert d.clear_repair_needed is False
+
+    def test_archive_terminal_alone_does_not_waive_tiers(self) -> None:
+        d = _clear(
+            ["influx:repair-needed", "text:html", "influx:archive-terminal"],
+            archive_path=None,
+            max_profile_score=HIGH_SCORE,
+        )
+        assert d.clear_repair_needed is False

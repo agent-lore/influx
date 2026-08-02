@@ -692,12 +692,29 @@ def compute_clearing(
     is_text_terminal = "influx:text-terminal" in tag_set
 
     # FR-NOTE-9: clear influx:archive-missing iff archive path stored.
+    # Deliberately NOT waived by influx:archive-terminal.
+    # ``influx:archive-missing`` is a factual statement about the note —
+    # no ``path:`` line is stored — and stays true however many times
+    # the archive stage has given up.  ``influx:archive-terminal`` is a
+    # statement about stage reachability, and only that second kind of
+    # claim can waive a repair condition (see below).
     clear_archive_missing = archive_path is not None
 
     # §5.3: clear influx:repair-needed iff ALL four conditions hold.
+    #
+    # Each condition is additionally waived by its own
+    # ``influx:<stage>-terminal`` tag.  ``record_counted_failure``
+    # applies those at ``REPAIR_COUNTED_CAP``: the stage has exhausted
+    # its retries and can never satisfy the condition.  Without the
+    # waiver the note keeps ``influx:repair-needed`` forever and is
+    # re-selected by every sweep, which — because the sweep rewrites
+    # every visited note to advance retry order (AC-X-8) — pins its
+    # ``updated_at`` to "now" on each pass and permanently outranks
+    # genuinely fresh material in retrieval.  Mirrors the pre-existing
+    # ``influx:text-terminal`` exemption (AC-X-7).
 
     # (a) Non-empty path: line in ## Archive.
-    archive_ok = archive_path is not None
+    archive_ok = archive_path is not None or "influx:archive-terminal" in tag_set
 
     # (b) Text quality: text:html or text:pdf, OR (text:abstract-only
     #     accompanied by influx:text-terminal).
@@ -712,7 +729,11 @@ def compute_clearing(
     # (c) Tier 2 satisfied: only required when score ≥ full_text
     #     threshold AND influx:text-terminal absent.
     #     AC-X-7: terminal exemption waives Tier 2.
-    if is_text_terminal or max_profile_score < full_text_threshold:
+    if (
+        is_text_terminal
+        or "influx:tier2-terminal" in tag_set
+        or max_profile_score < full_text_threshold
+    ):
         tier2_ok = True
     else:
         tier2_ok = "full-text" in tag_set
@@ -720,7 +741,11 @@ def compute_clearing(
     # (d) Tier 3 satisfied: only required when score ≥ deep_extract
     #     threshold AND influx:text-terminal absent.
     #     AC-X-7: terminal exemption waives Tier 3.
-    if is_text_terminal or max_profile_score < deep_extract_threshold:
+    if (
+        is_text_terminal
+        or "influx:tier3-terminal" in tag_set
+        or max_profile_score < deep_extract_threshold
+    ):
         tier3_ok = True
     else:
         tier3_ok = "influx:deep-extracted" in tag_set

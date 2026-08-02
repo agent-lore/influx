@@ -577,7 +577,32 @@ Tier 2 and Tier 3 hook failures are partitioned into transient (HTTP, transport,
 
 When `tier{N}_attempts` reaches the cap (currently 3), `influx:tier{N}-terminal` is added to the note's tags and that stage is skipped on subsequent sweeps. Transient failures never advance the counter, so flaky network conditions do not burn the cap.
 
-To re-enable a stage on a single note, an operator removes the `influx:tier{N}-terminal` tag (and optionally clears the `## Repair` section) — the next sweep retries from a clean slate. This mirrors the existing `influx:text-terminal` escape hatch.
+#### Re-arming a terminal stage
+
+**The persisted counter is authoritative, not the tag.** Two different mechanisms read the terminal state, and a re-arm has to satisfy both:
+
+| State | Read by | Effect |
+| ----- | ------- | ------ |
+| `tier{N}_attempts >= cap` in `## Repair` | `Cascade.enrich` | Skips the extractor and **re-emits** `influx:tier{N}-terminal` |
+| `influx:tier{N}-terminal` tag | `select_stages` | Excludes the stage from the sweep pass |
+| `influx:tier{N}-terminal` tag | `compute_clearing` (§5.3) | Waives that stage's clearing condition, so `influx:repair-needed` is dropped |
+
+Re-arming Tier 2 or Tier 3 therefore takes **three** edits, all required:
+
+1. **Reset `tier{N}_attempts` below the cap** in the `## Repair` section. Reset only the stage you are re-arming — the other stages' counters and error history are still wanted.
+2. **Remove the `influx:tier{N}-terminal` tag.**
+3. **Re-add `influx:repair-needed`.**
+
+Omitting (1) is the trap: the sweep selects the note, `Cascade.enrich` sees the capped counter, skips the extractor without attempting recovery, re-applies the terminal tag, and the §5.3 waiver drops `influx:repair-needed` again. The note returns to its terminal state having tried nothing. Omitting (3) is equally silent — sweeps only ever select notes carrying `influx:repair-needed`, so the note is never visited at all.
+
+Two stage-specific notes:
+
+- **`influx:archive-terminal`** — removing the tag and re-adding `influx:repair-needed` does permit one download attempt, because the archive cap is enforced at failure-recording time rather than before the attempt. But a counter left at the cap re-terminates on the first counted failure, so reset `archive_attempts` too for a genuine clean slate.
+- **`influx:text-terminal`** — has no counter, so only steps (2) and (3) apply. `audit_invalid_source.reconstruct_tags` is the reference implementation: it drops `influx:text-terminal` **and** re-adds `influx:repair-needed` for exactly this reason.
+
+Sweep candidate selection is profile-qualified: the query filters on `influx:repair-needed` **and** `profile:<profile>`. A note that has lost its `profile:*` tag is unreachable by any sweep regardless of its repair tags.
+
+See `docs/operations/runbook.md` §6 for the per-tag operator table.
 
 ---
 

@@ -1077,8 +1077,13 @@ class TestSweepTier2RecoveryViaCascade:
         rewritten = self._last_write_args(client)
         assert "influx:tier2-terminal" in rewritten["tags"]
         assert "tier2_attempts: 3" in rewritten["content"]
-        # Stage still failed → repair-needed stays for the (now-capped) note.
-        assert "influx:repair-needed" in rewritten["tags"]
+        # At the cap, Tier 2 can never succeed, so the condition it gates
+        # is waived and the note leaves the sweep.  Keeping
+        # influx:repair-needed here is what made capped notes immortal
+        # sweep candidates: re-selected every run, and rewritten every
+        # run for retry-order advancement (AC-X-8), which pinned
+        # updated_at to "now" forever and dominated retrieval ranking.
+        assert "influx:repair-needed" not in rewritten["tags"]
 
         flip_logs = [
             r
@@ -1092,6 +1097,117 @@ class TestSweepTier2RecoveryViaCascade:
 
 
 # ── Layer 2 self-repair: counter + terminal flip ─────────────────────
+
+
+class TestSweepTier2ReArmContract:
+    """The persisted counter — not the terminal tag — gates execution.
+
+    ``Cascade.enrich`` checks ``counters.tier2_attempts >=
+    REPAIR_COUNTED_CAP`` *before* calling the extractor
+    (``cascade.py``), so an operator who removes
+    ``influx:tier2-terminal`` and re-adds ``influx:repair-needed`` but
+    leaves the counter at the cap gets no recovery attempt: the stage is
+    skipped, the terminal tag is re-emitted, the clearing waiver drops
+    ``influx:repair-needed`` again, and the note leaves the sweep
+    unchanged in substance.
+
+    These two tests pin that contract in both directions so the
+    documented re-arm procedure in ``docs/SPECIFICATION.md`` §11.1 and
+    ``docs/operations/runbook.md`` §6 cannot silently drift from it.
+    """
+
+    @staticmethod
+    def _note(repair_section: str) -> dict[str, Any]:
+        return TestSweepTier2RecoveryViaCascade._note_for_tier2(
+            "n1", score=8, repair_section=repair_section
+        )
+
+    @staticmethod
+    def _repair_section(attempts: int) -> str:
+        return (
+            "## Repair\n"
+            f"- tier2_attempts: {attempts}\n"
+            '- tier2_last_stage: "parse"\n'
+            '- tier2_last_error: "earlier failure"\n'
+            "- tier3_attempts: 0\n"
+            '- tier3_last_stage: ""\n'
+            '- tier3_last_error: ""\n\n'
+        )
+
+    async def test_removing_terminal_tag_alone_does_not_re_run_tier2(self) -> None:
+        """Tag removed, counter still at cap -> extractor never invoked."""
+        from influx.repair_counters import REPAIR_COUNTED_CAP
+
+        note = self._note(self._repair_section(REPAIR_COUNTED_CAP))
+        # Operator removed influx:tier2-terminal and left repair-needed.
+        assert "influx:tier2-terminal" not in note["tags"]
+        assert "influx:repair-needed" in note["tags"]
+
+        calls = 0
+
+        def extractor(acquired: Acquired) -> Tier2Result:
+            nonlocal calls
+            calls += 1
+            del acquired
+            return Tier2Result(text="recovered", flavour="pdf", text_tag="text:pdf")
+
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "n1", "title": "Paper"}], read_responses=[note]
+        )
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(),
+            cascade=_build_sweep_cascade(
+                config, "ai-robotics", tier2_extractor=extractor
+            ),
+        )
+
+        # The capped counter wins: no recovery attempt at all.
+        assert calls == 0
+        rewritten = TestSweepTier2RecoveryViaCascade._last_write_args(client)
+        # And the terminal tag is immediately re-applied, so the note
+        # drops straight back out of the sweep set.
+        assert "influx:tier2-terminal" in rewritten["tags"]
+        assert "influx:repair-needed" not in rewritten["tags"]
+
+    async def test_resetting_counter_below_cap_re_runs_tier2(self) -> None:
+        """Counter reset -> extractor runs and the note actually recovers."""
+        note = self._note(self._repair_section(0))
+
+        calls = 0
+
+        def extractor(acquired: Acquired) -> Tier2Result:
+            nonlocal calls
+            calls += 1
+            del acquired
+            return Tier2Result(
+                text="recovered body", flavour="pdf", text_tag="text:pdf"
+            )
+
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "n1", "title": "Paper"}], read_responses=[note]
+        )
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(),
+            cascade=_build_sweep_cascade(
+                config, "ai-robotics", tier2_extractor=extractor
+            ),
+        )
+
+        assert calls == 1
+        rewritten = TestSweepTier2RecoveryViaCascade._last_write_args(client)
+        assert "influx:tier2-terminal" not in rewritten["tags"]
+        assert "full-text" in rewritten["tags"]
+        assert "recovered body" in rewritten["content"]
 
 
 class TestSweepCapCounterAndTerminalFlip:
@@ -1241,6 +1357,12 @@ class TestSweepCapCounterAndTerminalFlip:
         rewritten = self._last_write_args(client)
         assert "influx:tier3-terminal" in rewritten["tags"]
         assert "tier3_attempts: 3" in rewritten["content"]
+        # This fixture is otherwise complete (archive + text:html +
+        # full-text), so the Tier 3 waiver is the last outstanding
+        # condition and the note must leave the sweep set.  Asserted at
+        # the sweep level, not just on compute_clearing, because the
+        # regression is the tag surviving into the persisted write.
+        assert "influx:repair-needed" not in rewritten["tags"]
 
         flip_logs = [
             r
@@ -1430,6 +1552,61 @@ class TestSweepArchiveTerminalCap:
         rec = flip_logs[0]
         assert getattr(rec, "archive_attempts", None) == 3
         assert getattr(rec, "kind", None) == "oversize"
+
+    async def test_archive_terminal_releases_otherwise_complete_note(self) -> None:
+        """Archive cap on a note with every *other* condition satisfied.
+
+        ``_note_for_archive`` carries no ``text:*`` tag, so its cap-flip
+        test cannot show that ``influx:archive-terminal`` actually
+        releases a note — condition (b) fails independently.  This
+        fixture satisfies text and both tiers, leaving the archive
+        waiver as the only thing standing between the note and the exit,
+        and pins that ``influx:archive-missing`` survives the release.
+        """
+        items = [{"id": "n1", "title": "Paper"}]
+        note = self._note_for_archive("n1")
+        note["tags"] = [
+            "influx:repair-needed",
+            "influx:archive-missing",
+            "text:html",
+            "full-text",
+            "influx:deep-extracted",
+        ]
+        note["content"] = note["content"].replace(
+            "## User Notes\n",
+            (
+                "## Repair\n"
+                "- archive_attempts: 2\n"
+                '- archive_last_kind: "oversize"\n'
+                '- archive_last_error: "earlier failure"\n\n'
+                "## User Notes\n"
+            ),
+        )
+
+        def failing(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                "Response body exceeds 100000000 bytes",
+                url="https://arxiv.org/pdf/x.pdf",
+                stage="oversize",
+            )
+
+        config = _make_config()
+        client = _make_client(list_items=items, read_responses=[note])
+
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=failing),
+        )
+
+        rewritten = self._last_write_args(client)
+        assert "influx:archive-terminal" in rewritten["tags"]
+        # Released from the sweep set...
+        assert "influx:repair-needed" not in rewritten["tags"]
+        # ...but the factual "no archive stored" tag is retained.
+        assert "influx:archive-missing" in rewritten["tags"]
 
     async def test_archive_terminal_present_skips_archive_retry(self) -> None:
         """Once ``influx:archive-terminal`` is set, archive_download is not called."""
