@@ -371,11 +371,22 @@ def _raise_unsupported_source(
 ) -> None:
     """Raise ``ExtractionError(stage="unsupported_source")`` for an unknown source.
 
-    The text-extraction path flips this to terminal via
-    :func:`influx.repair._terminate_unsupported_text_source`; the
-    archive-download path leaves it transient (the note re-enters the
-    sweep next pass and is repaired automatically once a per-source
-    resolver is added).
+    Both paths treat this as permanent, by different mechanisms:
+
+    * text extraction flips ``influx:text-terminal`` directly via
+      :func:`influx.repair._terminate_unsupported_text_source`;
+    * archive download counts it toward the per-stage cap (see
+      ``_STAGE_SCOPED_COUNTED_STAGES`` in ``influx.repair_counters``),
+      flipping ``influx:archive-terminal`` at
+      ``REPAIR_COUNTED_CAP``.
+
+    The archive path classified this transient until the note churn it
+    caused was measured in production: a note whose source has no
+    resolver was re-swept and rewritten on every pass indefinitely,
+    pinning ``updated_at`` to "now" and dominating retrieval ranking.
+    Retrying cannot help — only shipping a resolver can — so it now
+    advances the cap.  Once a resolver lands, re-arm affected notes per
+    ``docs/operations/runbook.md`` §6.
     """
     raise ExtractionError(
         f"{stage_label}: source {source!r} not supported",
@@ -468,10 +479,11 @@ def _make_archive_download_hook(
     :meth:`~influx.source.Source.archive_download_identity` (finding 3b)
     — so the acquire-time identity scheme and its repair-time
     reconstruction live in one module and cannot drift.  A note whose
-    source has no registered reacquirer raises
-    ``ExtractionError(stage="unsupported_source")`` (transient) — the
-    note re-enters the sweep next pass, preserving the pre-3b behaviour
-    for sources without a resolver (e.g. inbox — GH #248).  A note whose
+    source has no registered reacquirer (e.g. inbox — GH #248) raises
+    ``ExtractionError(stage="unsupported_source")``, which is *counted*
+    for the archive stage: the note reaches ``influx:archive-terminal``
+    at the cap and leaves the sweep instead of re-entering it forever.
+    A note whose
     reacquirer cannot rebuild the identity (missing fields) raises
     ``ExtractionError(stage="resolve")`` (also transient) awaiting an
     operator hand-fix.
