@@ -634,8 +634,125 @@ class TestArchiveDownloadHookMetadataRecovery:
         with pytest.raises(ExtractionError) as exc_info:
             hooks.archive_download(note)
         assert exc_info.value.stage == "unsupported_source"
-        # Transient — future sources can land later without a forced cap.
+        # Counted for the archive stage: no adapter can resolve this note,
+        # so retrying cannot help and the note converges to
+        # influx:archive-terminal at the cap rather than churning forever.
+        # Landing a resolver later requires re-arming affected notes per
+        # docs/operations/runbook.md §6.
+        assert classify_failure(exc_info.value, repair_stage="archive") == "counted"
+        # Context-free (and text-extraction) classification is unchanged —
+        # that path has its own terminal handling via
+        # repair._terminate_unsupported_text_source.
         assert classify_failure(exc_info.value) == "transient"
+
+    def test_blog_source_reaches_rss_reacquirer(self, tmp_path: Path) -> None:
+        """``source:blog`` is a valid RssSourceEntry source_tag (#281 review).
+
+        581 notes in production carry it.  Dispatching on ``source:rss*``
+        alone routed them to ``unsupported_source``, which is now counted
+        — so they would have been permanently terminalised despite
+        ``RssSource.archive_download_identity`` being able to rebuild
+        their retry identity from ``feed-slug`` + ``source_url``.
+        """
+        from influx.repair_counters import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(
+            config, archive_reacquirers=_reacquirers(config)
+        )
+        note = _make_archive_missing_note()
+        note["id"] = "550e8400-e29b-41d4-a716-446655440000"
+        note["tags"] = [
+            "profile:ai-robotics",
+            "ingested-by:influx",
+            "source:blog",
+            "feed-slug:openai-news",
+            "influx:repair-needed",
+            "influx:archive-missing",
+        ]
+        note["source_url"] = "https://openai.com/index/concrete-ai-safety-problems"
+        note["path"] = "articles/blog/2016/06/concrete-ai-safety-problems.md"
+
+        assert hooks.archive_download is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.archive_download(note)
+        # Reached RssSource and attempted a real download — NOT rejected
+        # at dispatch.  The network failure here is transient, so the
+        # note stays recoverable.
+        assert exc_info.value.stage != "unsupported_source"
+        assert classify_failure(exc_info.value, repair_stage="archive") == "transient"
+
+    def test_unknown_source_with_feed_slug_reaches_rss_reacquirer(
+        self, tmp_path: Path
+    ) -> None:
+        """Identity markers win over an unrecognised source tag.
+
+        A note whose ``source:*`` value the dispatcher does not name is
+        still reacquirable when it carries ``feed-slug`` + ``source_url``
+        — the exact inputs ``archive_download_identity`` needs.
+        """
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(
+            config, archive_reacquirers=_reacquirers(config)
+        )
+        note = _make_archive_missing_note()
+        note["id"] = "550e8400-e29b-41d4-a716-446655440001"
+        note["tags"] = [
+            "profile:ai-robotics",
+            "ingested-by:influx",
+            "source:some-renamed-feed",
+            "feed-slug:some-renamed-feed",
+            "influx:repair-needed",
+        ]
+        note["source_url"] = "https://example.com/post"
+        note["path"] = "articles/some-renamed-feed/2026/06/post.md"
+
+        assert hooks.archive_download is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.archive_download(note)
+        assert exc_info.value.stage != "unsupported_source"
+
+    def test_inbox_shape_without_rss_identity_is_unsupported(
+        self, tmp_path: Path
+    ) -> None:
+        """The real production shape behind #279 — no RSS identity at all.
+
+        Mirrors notes 0cff8956 / 3b1500c5: ``source:ai-agents-briefing``
+        with a ``submitter:`` tag, a UUID id, and NO ``feed-slug``.
+        ``_rss_item_id_from_note`` needs an ``rss-`` id or feed-slug +
+        source_url and has neither, so routing this to RssSource would
+        only swap ``unsupported_source`` for ``resolve`` — both would
+        churn.  It is genuinely unsupported, and counting it is what
+        makes it converge.
+        """
+        from influx.repair_counters import classify_failure
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(
+            config, archive_reacquirers=_reacquirers(config)
+        )
+        note = _make_archive_missing_note()
+        note["id"] = "0cff8956-c5b7-4a8f-8086-1de58fd3b1ef"
+        note["tags"] = [
+            "profile:knowledge-systems",
+            "ingested-by:influx",
+            "source:ai-agents-briefing",
+            "submitter:ai-agents-briefing",
+            "influx:repair-needed",
+            "influx:archive-missing",
+            "text:abstract-only",
+            "influx:text-terminal",
+        ]
+        note["source_url"] = (
+            "https://origintrail.io/blog/the-next-big-shift-in-ai-agents"
+        )
+        note["path"] = "articles/ai-agents-briefing/2026/06/shared-context-graphs.md"
+
+        assert hooks.archive_download is not None
+        with pytest.raises(ExtractionError) as exc_info:
+            hooks.archive_download(note)
+        assert exc_info.value.stage == "unsupported_source"
+        assert classify_failure(exc_info.value, repair_stage="archive") == "counted"
 
 
 # ── text_extraction hook (issue #24, FR-REP-1 stage 2) ───────────────

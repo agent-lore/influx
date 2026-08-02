@@ -225,7 +225,7 @@ _COUNTED_STAGES: frozenset[str] = frozenset({"parse", "validate", "oversize"})
 # Discriminators that are permanent for *one* stage but not globally.
 #
 # ``unsupported_source``: the note's ``source:*`` tag has no registered
-# reacquirer, so ``repair_hooks._reacquirer_for_source`` returns ``None``
+# reacquirer, so ``repair_hooks._reacquirer_for_note`` returns ``None``
 # and the archive hook raises before any network call.  Nothing about a
 # retry changes that — it is fixed only by shipping a resolver — so for
 # the archive stage it advances the cap rather than retrying forever.
@@ -242,7 +242,7 @@ _STAGE_SCOPED_COUNTED_STAGES: dict[CountedStage, frozenset[str]] = {
 def classify_failure(
     exc: BaseException,
     *,
-    stage: CountedStage | None = None,
+    repair_stage: CountedStage | None = None,
 ) -> Literal["transient", "counted"]:
     """Partition a sweep stage failure into transient vs counted.
 
@@ -260,17 +260,22 @@ def classify_failure(
     ----------
     exc:
         The stage failure to classify.
-    stage:
-        The sweep stage that raised, when known.  Some discriminators
-        are permanent for one stage and transient for another — see
+    repair_stage:
+        The *repair* stage that raised, when known — deliberately not
+        named ``stage``, which on the exception means the failure
+        discriminator (``parse`` / ``http`` / ``unsupported_source``).
+        Some discriminators are permanent for one repair stage and
+        transient for another — see
         :data:`_STAGE_SCOPED_COUNTED_STAGES`.  Omitting it yields the
         global classification.
     """
     if isinstance(exc, (LCMAError, ExtractionError)):
         exc_stage = getattr(exc, "stage", "") or ""
         counted = _COUNTED_STAGES
-        if stage is not None:
-            counted = counted | _STAGE_SCOPED_COUNTED_STAGES.get(stage, frozenset())
+        if repair_stage is not None:
+            counted = counted | _STAGE_SCOPED_COUNTED_STAGES.get(
+                repair_stage, frozenset()
+            )
         if exc_stage in counted:
             return "counted"
     return "transient"

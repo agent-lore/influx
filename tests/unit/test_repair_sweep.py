@@ -2051,7 +2051,7 @@ class TestSweepUnsupportedSourceArchiveConvergence:
     Reproduces the production shape that survived the terminal-waiver
     fix: ``influx:archive-missing`` + ``text:abstract-only`` +
     ``influx:text-terminal``, whose ``source:*`` tag has no registered
-    reacquirer.  ``_reacquirer_for_source`` returns ``None``, the archive
+    reacquirer.  ``_reacquirer_for_note`` returns ``None``, the archive
     hook raises ``ExtractionError(stage="unsupported_source")`` before
     any network call, and — while that was classified transient — the
     counter never moved, the note never reached a cap, and every sweep

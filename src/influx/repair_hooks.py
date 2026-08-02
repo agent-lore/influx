@@ -142,6 +142,10 @@ def _extract_from_archive(
 _SOURCE_TAG_PREFIX = "source:"
 _NOTE_PATH_SOURCE_RE = re.compile(r"(?:^|/)(?:papers|articles)/(?P<source>[^/]+)/")
 _RSS_NOTE_ID_PREFIX = "rss-"
+# Mirrors ``influx.sources.rss._FEED_SLUG_TAG_PREFIX``.  Duplicated
+# rather than imported because ``sources.*`` already import from this
+# module, so importing back would close a cycle.
+_FEED_SLUG_TAG_PREFIX = "feed-slug:"
 _ARXIV_NOTE_ID_PREFIX = "arxiv-"
 _ARXIV_HOSTNAMES: frozenset[str] = frozenset({"arxiv.org", "www.arxiv.org"})
 
@@ -165,9 +169,33 @@ def _is_rss_source(source: str) -> bool:
 
     Production RSS notes carry ``source:rss-<feed-slug>``; the bare
     ``source:rss`` sentinel is accepted to keep the dispatcher robust
-    to historical or hand-edited notes.
+    to historical or hand-edited notes.  ``source:blog`` is the other
+    value :class:`~influx.config.RssSourceEntry` permits for
+    ``source_tag`` (``Literal["rss", "blog"]``) and is written verbatim
+    by RSS acquisition, so it names the same family.
     """
-    return source == "rss" or source.startswith(_RSS_NOTE_ID_PREFIX)
+    return source in ("rss", "blog") or source.startswith(_RSS_NOTE_ID_PREFIX)
+
+
+def _has_rss_identity(note: dict[str, object]) -> bool:
+    """Return whether *note* carries recoverable RSS archive identity.
+
+    :meth:`~influx.sources.rss.RssSource.archive_download_identity`
+    rebuilds the retry identity from an ``rss-`` note id, or from a
+    ``feed-slug:`` tag plus a doc-level ``source_url``.  Neither
+    requires a recognised ``source:*`` tag, so a note can be
+    reacquirable even when its source tag is one the dispatcher does
+    not name — e.g. a feed whose ``source_tag`` was renamed, or a
+    historical value predating the current vocabulary.
+
+    Checking identity rather than the tag alone keeps recoverable notes
+    out of the ``unsupported_source`` path, which is now *counted* for
+    the archive stage and therefore permanent at the cap.
+    """
+    if str(note.get("id", "")).startswith(_RSS_NOTE_ID_PREFIX):
+        return True
+    has_feed_slug = find_note_tag(note_tags(note), _FEED_SLUG_TAG_PREFIX) is not None
+    return has_feed_slug and bool(note_source_url(note))
 
 
 # ── Source metadata invariant (#150) ────────────────────────────────
@@ -441,19 +469,33 @@ def _classify_download_kind(error: str) -> str:
 # ── Hook factories ──────────────────────────────────────────────────
 
 
-def _reacquirer_for_source(
-    source: str, reacquirers: Mapping[str, Source]
+def _reacquirer_for_note(
+    note: dict[str, object],
+    source: str,
+    reacquirers: Mapping[str, Source],
 ) -> Source | None:
-    """Pick the Source that owns *source*'s archive-identity scheme.
+    """Pick the Source that owns *note*'s archive-identity scheme.
 
-    Maps the note's ``source:*`` tag suffix to a canonical family key —
-    ``"arxiv"`` or ``"rss"`` (any ``rss-<feed>`` variant).  Returns
-    ``None`` for a source with no registered reacquirer (e.g. inbox),
-    which the hook treats as ``unsupported_source`` (transient).
+    Resolution is by source-tag family first (``"arxiv"``; ``"rss"`` for
+    any of ``rss`` / ``blog`` / ``rss-<feed>``), then by durable RSS
+    identity markers on the note itself — an ``rss-`` id, or a
+    ``feed-slug:`` tag plus a doc-level ``source_url``.
+
+    The identity fallback matters because the archive stage now *counts*
+    ``unsupported_source`` toward its cap, making it permanent at the
+    cap.  Dispatching on the tag alone would terminalise notes that
+    :meth:`~influx.source.Source.archive_download_identity` could in
+    fact resolve — ``source:blog`` is a currently-valid
+    :class:`~influx.config.RssSourceEntry` ``source_tag`` and was the
+    concrete instance of this.
+
+    Returns ``None`` only when no registered adapter can own the note
+    (e.g. inbox — GH #248), which the hook raises as
+    ``unsupported_source``.
     """
     if source == "arxiv":
         return reacquirers.get("arxiv")
-    if _is_rss_source(source):
+    if _is_rss_source(source) or _has_rss_identity(note):
         return reacquirers.get("rss")
     return None
 
@@ -503,7 +545,7 @@ def _make_archive_download_hook(
 
     def hook(note: dict[str, object]) -> str:
         source = _note_source_tag(note)
-        reacquirer = _reacquirer_for_source(source, archive_reacquirers)
+        reacquirer = _reacquirer_for_note(note, source, archive_reacquirers)
         if reacquirer is None:
             _raise_unsupported_source(
                 note, stage_label="archive_download retry", source=source

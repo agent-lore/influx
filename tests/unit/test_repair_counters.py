@@ -356,7 +356,7 @@ class TestArchiveScopedCountedStages:
 
     def test_unsupported_source_counted_for_archive_stage(self) -> None:
         exc = ExtractionError("source 'x' not supported", stage="unsupported_source")
-        assert classify_failure(exc, stage="archive") == "counted"
+        assert classify_failure(exc, repair_stage="archive") == "counted"
 
     def test_unsupported_source_transient_without_stage(self) -> None:
         """Default (text-extraction) classification is unchanged."""
@@ -365,16 +365,16 @@ class TestArchiveScopedCountedStages:
 
     def test_unsupported_source_transient_for_tier_stages(self) -> None:
         exc = ExtractionError("source 'x' not supported", stage="unsupported_source")
-        assert classify_failure(exc, stage="tier2") == "transient"
-        assert classify_failure(exc, stage="tier3") == "transient"
+        assert classify_failure(exc, repair_stage="tier2") == "transient"
+        assert classify_failure(exc, repair_stage="tier3") == "transient"
 
     def test_archive_stage_does_not_widen_other_transients(self) -> None:
         """Only ``unsupported_source`` is added for archive — not all stages."""
         for stage in ("http", "resolve", "archive_read"):
             exc = ExtractionError("boom", stage=stage)
-            assert classify_failure(exc, stage="archive") == "transient", stage
+            assert classify_failure(exc, repair_stage="archive") == "transient", stage
 
     def test_archive_stage_keeps_globally_counted_stages(self) -> None:
         for stage in ("parse", "validate", "oversize"):
             exc = ExtractionError("boom", stage=stage)
-            assert classify_failure(exc, stage="archive") == "counted", stage
+            assert classify_failure(exc, repair_stage="archive") == "counted", stage
