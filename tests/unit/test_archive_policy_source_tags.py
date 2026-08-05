@@ -505,3 +505,98 @@ class TestPolicyModeTagCrossProduct:
             assert "influx:archive-terminal" in tags
         else:
             assert "influx:archive-terminal" not in tags
+
+
+# ── Blocked-policy lifecycle: acquisition → sweep selection ──────────
+
+
+class TestBlockedPolicyReachesTheSweep:
+    """Which blocked notes reach the archive counter, and which never do.
+
+    Issue #282 added ``blocked`` to the archive stage's counted set, but
+    that entry is a *backstop*: a note acquired while its domain already
+    carried a ``blocked`` policy is stamped ``influx:archive-terminal``
+    at acquisition, and :func:`influx.repair.select_stages` then excludes
+    it from the archive stage entirely — the classifier is never
+    consulted.
+
+    These tests bridge the two halves, feeding real acquisition output
+    into the real stage selector, so the two mechanisms cannot silently
+    drift into either double-handling or a gap.
+    """
+
+    @patch("influx.sources.rss.download_archive")
+    def test_note_acquired_under_a_block_never_enters_the_archive_stage(
+        self, mock_dl: object
+    ) -> None:
+        from influx.repair import select_stages
+
+        mock_dl.return_value = ArchiveResult(  # type: ignore[union-attr]
+            ok=False,
+            rel_posix_path=None,
+            error="HTTP 403 for https://science.example/x",
+            failure_kind="blocked",
+            policy_mode="blocked",
+            domain="science.example",
+        )
+        config = _make_config(blocked={"science.example": ""})
+
+        result = build_rss_note_item(
+            item=_make_rss_item(url="https://science.example/article"),
+            profile_name="ai-robotics",
+            config=config,
+        )
+        assert result is not None
+        tags = cast(list[str], result["tags"])
+
+        # Acquisition already said "doomed": archive-missing is factual,
+        # archive-terminal records that we will not keep asking.
+        assert "influx:archive-missing" in tags
+        assert "influx:archive-terminal" in tags
+
+        stages = select_stages(
+            tags=tags,
+            archive_path=None,
+            archive_succeeded_this_pass=False,
+            max_profile_score=5,
+            full_text_threshold=8,
+            deep_extract_threshold=9,
+        )
+        # No download is attempted, so no counted failure is ever
+        # recorded and ``archive_attempts`` stays at 0 by design.
+        assert stages.archive_retry is False
+
+    def test_note_acquired_before_the_block_does_enter_the_archive_stage(self) -> None:
+        """The case the counted ``blocked`` entry exists for.
+
+        The note was acquired when the domain was still fair game, so it
+        carries no policy tag and no terminal marker.  The operator then
+        blocks the domain.  Every subsequent sweep attempts the download,
+        the registry reclassifies the 403 to ``blocked``, and without the
+        counted entry the note would retry a newly-doomed path forever.
+        """
+        from influx.errors import ExtractionError
+        from influx.repair import select_stages
+        from influx.repair_counters import classify_failure
+
+        pre_block_tags = [
+            "profile:ai-robotics",
+            "source:rss-example",
+            "influx:archive-missing",
+            "influx:repair-needed",
+            "text:html",
+        ]
+
+        stages = select_stages(
+            tags=pre_block_tags,
+            archive_path=None,
+            archive_succeeded_this_pass=False,
+            max_profile_score=5,
+            full_text_threshold=8,
+            deep_extract_threshold=9,
+        )
+        assert stages.archive_retry is True
+
+        # …and the failure it now gets is counted, so it converges.
+        exc = ExtractionError("archive_download retry failed", stage="blocked")
+        assert classify_failure(exc, repair_stage="archive") == "counted"

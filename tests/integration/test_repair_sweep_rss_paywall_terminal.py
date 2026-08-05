@@ -265,15 +265,59 @@ class TestRssPaywalledArchiveConverges:
             assert "influx:archive-missing" in p3["tags"]
             assert "text:abstract-only" in p3["tags"]
 
-            # ── Pass 4: no longer a sweep candidate at all. ──
+            # ── Pass 4: the terminal gate holds even if forced. ──
             #
-            # The selector queries on influx:repair-needed, so a released
-            # note is never read or rewritten again — which is the point:
-            # its updated_at stops being pinned to "now" and it stops
-            # outranking fresh material in retrieval.
+            # In production the note is simply never selected again — the
+            # sweep queries on influx:repair-needed, which pass 3 removed.
+            # Queueing it back deliberately bypasses that (the fake
+            # returns whatever we hand it, so asserting on an empty queue
+            # would prove nothing) and tests the *second* line of defence:
+            # select_stages gates archive_retry on the terminal tag, so
+            # even a forced re-visit performs no download.
             fake_lithos.calls.clear()
+            archive_calls: list[str] = []
+
+            def _track(note: dict[str, object]) -> str:
+                archive_calls.append(str(note.get("id", "")))
+                raise ExtractionError("should not be called", stage="http_403")
+
+            _queue_single_note(fake_lithos, _next_pass_note(note, p3))
+            await sweep(
+                "ai-coding",
+                client=client,
+                config=config,
+                hooks=SweepHooks(archive_download=_track),
+            )
+            assert archive_calls == []
+
+            # And the counter stayed put — nothing was recorded, so a
+            # re-armed note starts from the cap rather than from a
+            # counter that kept climbing while the stage was skipped.
+            p4 = next(c[1] for c in fake_lithos.calls if c[0] == "lithos_write")
+            assert _archive_attempt_count(p4["content"]) == 3
+        finally:
+            await client.close()
+
+    async def test_selector_query_targets_repair_needed(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """Why a released note stops being visited at all.
+
+        The convergence above is only worth anything if dropping
+        ``influx:repair-needed`` actually removes the note from the sweep
+        set.  That is a property of the ``lithos_list`` query, so assert
+        it directly rather than inferring it from a fake's empty queue.
+        """
+        config = _make_config(lithos_url=fake_lithos_url)
+        client = LithosClient(url=fake_lithos_url)
+
+        try:
             fake_lithos.list_responses.append(json.dumps({"items": []}))
-            await sweep("ai-coding", client=client, config=config, hooks=hooks)
-            assert [c for c in fake_lithos.calls if c[0] == "lithos_write"] == []
+            await sweep("ai-coding", client=client, config=config, hooks=SweepHooks())
+
+            list_call = next(c for c in fake_lithos.calls if c[0] == "lithos_list")
+            assert "influx:repair-needed" in list_call[1]["tags"]
         finally:
             await client.close()

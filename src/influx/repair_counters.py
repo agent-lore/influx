@@ -243,6 +243,15 @@ _COUNTED_STAGES: frozenset[str] = frozenset({"parse", "validate", "oversize"})
 # at ``archive_attempts: 0`` indefinitely and was rewritten by every
 # sweep (observed in production at v43, gaining two versions per day).
 #
+# ``blocked`` is a backstop rather than the primary path: a note acquired
+# while its domain already carried a ``blocked`` policy is stamped
+# ``influx:archive-terminal`` by the source adapter, and
+# ``repair.select_stages`` then excludes it from the archive stage
+# entirely — it never reaches this classifier.  What it does catch are
+# notes acquired *before* the operator blocked the domain: those carry
+# ``influx:archive-missing`` with no terminal tag, so without this entry
+# they would retry the newly-doomed path forever.
+#
 # Deliberately NOT counted, because retrying genuinely can succeed:
 #
 # * ``http_429`` / ``rate_limited`` — rate limiting is temporary by

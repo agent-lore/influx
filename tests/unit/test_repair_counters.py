@@ -453,3 +453,51 @@ class TestArchiveScopedPermanentHttpStages:
         assert "influx:archive-terminal" in result.new_tags
         # The richer discriminator is persisted for the operator.
         assert result.counters.archive_last_kind == "http_403"
+
+
+class TestArchiveScopedSetIntegrity:
+    """Guards the archive scope against silent drift.
+
+    The counted set is written as string literals in the code, in the
+    tests above, and in ``docs/SPECIFICATION.md`` / ``runbook.md``.
+    Nothing fails if they disagree: an unrecognised discriminator simply
+    never matches, and the note quietly goes back to churning.
+
+    So rather than re-assert the set, walk the *whole* public
+    ``ArchiveFailureKind`` taxonomy and pin the classification of every
+    member. Adding a kind to the taxonomy without deciding whether it is
+    permanent fails here, which set-equality against a private constant
+    would not catch.
+    """
+
+    # Permanent for the archive stage specifically.  ``unsupported_source``
+    # is not an ArchiveFailureKind — the repair hook raises it before any
+    # download — but it shares the scope, so it belongs in this table.
+    PERMANENT_FOR_ARCHIVE = frozenset(
+        {"http_403", "http_404", "http_410", "blocked", "unsupported_source"}
+    )
+    # Permanent everywhere, so counted regardless of stage.
+    GLOBALLY_COUNTED = frozenset({"oversize"})
+
+    @staticmethod
+    def _all_kinds() -> frozenset[str]:
+        from typing import get_args
+
+        from influx.archive_policy import ArchiveFailureKind
+
+        return frozenset(get_args(ArchiveFailureKind)) | {"unsupported_source"}
+
+    def test_every_failure_kind_has_a_decided_classification(self) -> None:
+        counted = self.PERMANENT_FOR_ARCHIVE | self.GLOBALLY_COUNTED
+        for kind in sorted(self._all_kinds()):
+            exc = ExtractionError("archive_download retry failed", stage=kind)
+            expected = "counted" if kind in counted else "transient"
+            assert classify_failure(exc, repair_stage="archive") == expected, kind
+
+    def test_no_failure_kind_is_counted_outside_the_archive_stage(self) -> None:
+        """The scope really is a scope — tier stages see none of this."""
+        for kind in sorted(self._all_kinds() - self.GLOBALLY_COUNTED):
+            exc = ExtractionError("archive_download retry failed", stage=kind)
+            assert classify_failure(exc, repair_stage="tier2") == "transient", kind
+            assert classify_failure(exc, repair_stage="tier3") == "transient", kind
+            assert classify_failure(exc) == "transient", kind

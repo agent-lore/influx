@@ -245,7 +245,7 @@ The arXiv provider:
 
 Archive failures do not abort note creation. The note is tagged `influx:archive-missing` and `influx:repair-needed`, and the Archive section is left empty.
 
-Issue #149: archive acquisition consults a per-domain policy registry built from `[storage.archive_policy]`. Domains classified as `blocked` (HTTP 403 / WAF challenge), `rate_limited` (HTTP 429 under normal cadence), or `skip` (no attempt made at all) produce distinct note tags — `influx:archive-blocked`, `influx:archive-rate-limited`, or `influx:archive-skipped-by-policy` — alongside the generic `influx:archive-missing`. `blocked` notes converge out of the sweep via the archive cap (§ stage-scoped counting below), reaching `influx:archive-terminal` after three attempts so the doomed path is not re-attempted forever. The defaults set covers staging hot offenders (`science.org`, `alignmentforum.org`, `therobotreport.com`, …).
+Issue #149: archive acquisition consults a per-domain policy registry built from `[storage.archive_policy]`. Domains classified as `blocked` (HTTP 403 / WAF challenge), `rate_limited` (HTTP 429 under normal cadence), or `skip` (no attempt made at all) produce distinct note tags — `influx:archive-blocked`, `influx:archive-rate-limited`, or `influx:archive-skipped-by-policy` — alongside the generic `influx:archive-missing`. `blocked` and `skip` notes additionally carry `influx:archive-terminal` **at acquisition time** so the repair sweep stops re-attempting the doomed path. The defaults set covers staging hot offenders (`science.org`, `alignmentforum.org`, `therobotreport.com`, …).
 
 ### 6.2 RSS and Atom Feeds
 
@@ -603,6 +603,14 @@ The partition is by permanence, not by severity:
 | `blocked` — operator-declared refusal | `network`, `timeout`, `dns`, `write` |
 
 `http_410` is split out of the `http_4xx` catch-all specifically so it can be counted without dragging its retryable neighbours along.
+
+**`blocked` is a backstop, not the primary path.** A note acquired while its domain already carried a `blocked` policy is stamped `influx:archive-terminal` at acquisition (§6.1), and `select_stages` then excludes it from archive retry entirely — it never reaches the counter. Counting `blocked` covers the notes that *do* reach the sweep without that tag:
+
+- notes acquired **before** the operator added the domain to `[storage.archive_policy] blocked`, which carry `influx:archive-missing` + `influx:repair-needed` and would otherwise retry the newly-doomed path forever;
+- notes re-armed per the re-arming section below;
+- hand-edited or legacy notes predating the acquisition-time stamp.
+
+The two mechanisms are complementary: acquisition-time terminalisation avoids the retries entirely when the policy is known up front, and the cap converges the notes that predate it. The consequence of the acquisition-time stamp is that removing a domain from the blocked list does **not** automatically re-attempt already-terminalised notes; they need re-arming.
 
 ##### Text clearing under an unreachable archive
 
