@@ -610,3 +610,98 @@ class TestPerStageTerminalExemptions:
             max_profile_score=HIGH_SCORE,
         )
         assert d.clear_repair_needed is False
+
+
+# ── #282: abstract-only + unreachable archive ────────────────────────
+
+
+class TestAbstractOnlyWithUnreachableArchive:
+    """An unreachable archive waives the text condition for abstract-only.
+
+    ``text:abstract-only`` is upgraded only by
+    ``apply_abstract_only_reextraction``, which the sweep runs solely
+    when an archive path is stored — and that same hook is the only
+    thing that applies ``influx:text-terminal`` on its ``exhausted``
+    outcome.  So a note that is archive-terminal with no path has no
+    route to *either* escape from AC-06-C.  Requiring the text condition
+    of such a note demands something the pipeline cannot produce, and it
+    kept ``influx:repair-needed`` — plus the sweep's unconditional
+    rewrite — forever.
+
+    Production instance: ``b53b7ad4`` (``ft.com``, 403 paywall), which
+    reached v43 at two versions per day.  Counting the 403 toward the
+    archive cap is necessary but not sufficient: without this waiver the
+    note gains ``influx:archive-terminal`` and keeps churning anyway.
+    """
+
+    def test_cleared_when_archive_terminal_and_no_path(self) -> None:
+        d = _clear(
+            [
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "influx:archive-terminal",
+                "text:abstract-only",
+                "influx:tier2-terminal",
+            ],
+            archive_path=None,
+            max_profile_score=FULL_TEXT_THRESHOLD,
+        )
+        assert d.clear_repair_needed is True
+        # Still factually true — no path was ever stored.
+        assert d.clear_archive_missing is False
+
+    def test_not_cleared_when_archive_terminal_absent(self) -> None:
+        """AC-06-C intact: abstract-only with no terminal of any kind locks.
+
+        The archive is still being retried, so the re-extraction route
+        to text:html remains open and the note must stay in the sweep.
+        """
+        d = _clear(
+            [
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "text:abstract-only",
+                "influx:tier2-terminal",
+            ],
+            archive_path=None,
+            max_profile_score=FULL_TEXT_THRESHOLD,
+        )
+        assert d.clear_repair_needed is False
+
+    def test_not_cleared_when_archive_path_exists(self) -> None:
+        """A stored path means re-extraction can still run — no waiver.
+
+        This is the case AC-06-C was written for and it is unchanged:
+        the terminal tag is present but the archive is *reachable*, so
+        ``text:abstract-only`` is still an unresolved state rather than
+        a final one.
+        """
+        d = _clear(
+            [
+                "influx:repair-needed",
+                "influx:archive-terminal",
+                "text:abstract-only",
+            ],
+            archive_path="/archives/doc.html",
+            max_profile_score=LOW_SCORE,
+        )
+        assert d.clear_repair_needed is False
+
+    def test_tiers_still_required(self) -> None:
+        """The waiver is scoped to the text condition only.
+
+        An outstanding Tier 2 at a qualifying score still holds the note
+        in the sweep — the archive being unreachable says nothing about
+        whether the model can extract from what text there is.
+        """
+        d = _clear(
+            [
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "influx:archive-terminal",
+                "text:abstract-only",
+            ],
+            archive_path=None,
+            max_profile_score=HIGH_SCORE,
+        )
+        assert d.clear_repair_needed is False

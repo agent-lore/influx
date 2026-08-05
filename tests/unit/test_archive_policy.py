@@ -164,7 +164,14 @@ class TestClassifyFailureKind:
             ("HTTP 403 for https://example.com/x", "http_403"),
             ("HTTP 429 for https://example.com/x", "http_429"),
             ("HTTP 404 for https://example.com/x", "http_404"),
+            # Issue #282: 410 Gone is broken out of the ``http_4xx``
+            # catch-all because it is unambiguously permanent and the
+            # repair sweep counts it toward the archive cap.
+            ("HTTP 410 for https://example.com/x", "http_410"),
+            # …while its neighbours stay in the catch-all: 451 is
+            # permanent-ish but jurisdictional, 408 is plainly retryable.
             ("HTTP 451 for https://example.com/x", "http_4xx"),
+            ("HTTP 408 for https://example.com/x", "http_4xx"),
             ("HTTP 503 for https://example.com/x", "http_5xx"),
             ("HTTP 600 for https://example.com/x", "network"),
             ("oversize: Response body exceeds 1000 bytes", "oversize"),

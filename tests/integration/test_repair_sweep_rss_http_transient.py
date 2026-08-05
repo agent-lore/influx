@@ -1,8 +1,9 @@
 """Integration tests for RSS archive HTTP-transient retry recovery (issue #138).
 
-A transient stage (``stage="http"``) classifies as transient per
-:func:`influx.repair_counters.classify_failure` (the counted set is
-``{"parse", "validate", "oversize"}``).  The sweep must therefore:
+A recoverable status (``stage="http_5xx"``) classifies as transient per
+:func:`influx.repair_counters.classify_failure`, which counts only
+``{"parse", "validate", "oversize"}`` globally plus the permanent
+archive-stage kinds (issue #282).  The sweep must therefore:
 
 - not flip ``influx:archive-terminal``,
 - not bump ``archive_attempts``,
@@ -189,7 +190,7 @@ def _next_pass_note(
 
 
 class TestRssArchiveHttpTransientRetry:
-    """``stage="http"`` failures are transient — no terminal flip, recover next pass."""
+    """5xx failures are transient — no terminal flip, recover next pass."""
 
     async def test_transient_keeps_tags_then_next_pass_recovers(
         self,
@@ -213,7 +214,7 @@ class TestRssArchiveHttpTransientRetry:
             raise ExtractionError(
                 "upstream 503",
                 url=str(note.get("source_url", "")),
-                stage="http",
+                stage="http_5xx",
             )
 
         def _archive_lands(note: dict[str, object]) -> str:

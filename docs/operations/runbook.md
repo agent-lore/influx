@@ -233,6 +233,21 @@ Stage is one of: `archive_download`, `text_extraction`, `tier2_enrichment`,
 `{parse, validate, oversize}` is **counted** (advances the per-stage
 attempt counter); everything else is **transient** (no counter bump).
 
+Five discriminators are counted **for the archive stage only**, because
+they are permanent there and not elsewhere:
+`{unsupported_source, http_403, http_404, http_410, blocked}`. A
+paywall, a dead link, a withdrawn resource, an operator-blocked domain,
+and a missing resolver all return the same answer however many times we
+ask. Recoverable statuses — `http_429`, `http_5xx`, and the `http_4xx`
+catch-all (which holds retryable codes such as 408 and 425) — stay
+transient and retry indefinitely.
+
+`blocked` rarely reaches the counter: a note acquired under an existing
+`blocked` policy is stamped `influx:archive-terminal` at acquisition and
+never enters the archive stage. Counting it catches the notes acquired
+*before* the domain was blocked, which would otherwise retry the
+newly-doomed path forever.
+
 ### 4.4 Terminal-flip events
 
 When a per-stage counter reaches `REPAIR_COUNTED_CAP=3`, the sweep adds

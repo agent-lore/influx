@@ -713,17 +713,42 @@ def compute_clearing(
     # genuinely fresh material in retrieval.  Mirrors the pre-existing
     # ``influx:text-terminal`` exemption (AC-X-7).
 
+    is_archive_terminal = "influx:archive-terminal" in tag_set
+
+    # An archive-terminal note with no ``path:`` line can never gain one:
+    # the archive stage is gated off by the terminal tag
+    # (:func:`select_stages`), so no future sweep will even attempt a
+    # download.  That makes it a statement about stage reachability, and
+    # it is what condition (b) below leans on.
+    is_archive_unreachable = archive_path is None and is_archive_terminal
+
     # (a) Non-empty path: line in ## Archive.
-    archive_ok = archive_path is not None or "influx:archive-terminal" in tag_set
+    archive_ok = archive_path is not None or is_archive_terminal
 
     # (b) Text quality: text:html or text:pdf, OR (text:abstract-only
-    #     accompanied by influx:text-terminal).
-    #     AC-06-C: text:abstract-only WITHOUT influx:text-terminal
+    #     accompanied by influx:text-terminal or an unreachable archive).
+    #     AC-06-C: text:abstract-only WITHOUT any terminal marker
     #     → NEVER clear influx:repair-needed.
+    #
+    #     Issue #282: the archive-unreachable waiver closes a deadlock.
+    #     ``text:abstract-only`` is upgraded only by
+    #     :func:`apply_abstract_only_reextraction`, which ``_sweep_one``
+    #     runs solely when ``archive_path is not None``.  A note that is
+    #     archive-terminal with no stored path therefore has no route to
+    #     text:html/text:pdf and no route to influx:text-terminal either
+    #     (that tag is applied by the same re-extraction hook, on its
+    #     ``exhausted`` outcome).  Requiring condition (b) of such a note
+    #     demands something the pipeline cannot produce, so it kept
+    #     influx:repair-needed — and the sweep's unconditional rewrite
+    #     (AC-X-8) — forever, which is exactly the churn the terminal
+    #     waivers exist to stop.
     text_ok = (
         "text:html" in tag_set
         or "text:pdf" in tag_set
-        or ("text:abstract-only" in tag_set and is_text_terminal)
+        or (
+            "text:abstract-only" in tag_set
+            and (is_text_terminal or is_archive_unreachable)
+        )
     )
 
     # (c) Tier 2 satisfied: only required when score ≥ full_text

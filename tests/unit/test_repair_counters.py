@@ -369,8 +369,8 @@ class TestArchiveScopedCountedStages:
         assert classify_failure(exc, repair_stage="tier3") == "transient"
 
     def test_archive_stage_does_not_widen_other_transients(self) -> None:
-        """Only ``unsupported_source`` is added for archive — not all stages."""
-        for stage in ("http", "resolve", "archive_read"):
+        """The archive scope is an explicit list, not "anything archive-ish"."""
+        for stage in ("http_5xx", "resolve", "archive_read"):
             exc = ExtractionError("boom", stage=stage)
             assert classify_failure(exc, repair_stage="archive") == "transient", stage
 
@@ -378,3 +378,126 @@ class TestArchiveScopedCountedStages:
         for stage in ("parse", "validate", "oversize"):
             exc = ExtractionError("boom", stage=stage)
             assert classify_failure(exc, repair_stage="archive") == "counted", stage
+
+
+# ── Archive-scoped counted stages (permanent HTTP — issue #282) ────
+
+
+class TestArchiveScopedPermanentHttpStages:
+    """Permanently-failing HTTP statuses are counted for archive only.
+
+    Before #282 the archive hook flattened every HTTP failure to a bare
+    ``"http"``, so a paywalled URL (403) was indistinguishable from a
+    recoverable 503.  ``archive_attempts`` never advanced,
+    ``influx:archive-terminal`` was never applied, and the note was
+    re-selected and rewritten by every sweep — the production instance
+    reached v43 at two versions per day.
+
+    The partition is by *permanence*, not by "is it an error": a 403
+    paywall, a 404, a 410 Gone, and an operator-declared ``blocked``
+    domain all return the same answer however many times we ask.  A 429,
+    a 5xx, or a 408 do not.
+    """
+
+    PERMANENT = ("http_403", "http_404", "http_410", "blocked")
+    RECOVERABLE = ("http_429", "rate_limited", "http_4xx", "http_5xx", "network")
+
+    @pytest.mark.parametrize("stage", PERMANENT)
+    def test_permanent_kinds_counted_for_archive_stage(self, stage: str) -> None:
+        exc = ExtractionError("archive_download retry failed", stage=stage)
+        assert classify_failure(exc, repair_stage="archive") == "counted"
+
+    @pytest.mark.parametrize("stage", PERMANENT)
+    def test_permanent_kinds_transient_elsewhere(self, stage: str) -> None:
+        """Stage-scoped: the tier and text paths are untouched.
+
+        A 403 on a text-extraction fetch has its own terminal handling
+        and must not be pulled into the global counted set.
+        """
+        exc = ExtractionError("archive_download retry failed", stage=stage)
+        assert classify_failure(exc) == "transient"
+        assert classify_failure(exc, repair_stage="tier2") == "transient"
+        assert classify_failure(exc, repair_stage="tier3") == "transient"
+
+    @pytest.mark.parametrize("stage", RECOVERABLE)
+    def test_recoverable_kinds_stay_transient_everywhere(self, stage: str) -> None:
+        exc = ExtractionError("archive_download retry failed", stage=stage)
+        assert classify_failure(exc, repair_stage="archive") == "transient"
+        assert classify_failure(exc, repair_stage="tier2") == "transient"
+        assert classify_failure(exc) == "transient"
+
+    def test_permanent_http_reaches_the_cap(self) -> None:
+        """Three recorded 403s flip ``influx:archive-terminal``."""
+
+        def record(content: str, tags: list[str]) -> CountedFailureResult:
+            return record_counted_failure(
+                content=content,
+                tags=tags,
+                stage="archive",
+                failure_stage="http_403",
+                failure_error="HTTP 403 for https://www.ft.com/content/x",
+            )
+
+        result = record(_BASE_NOTE, list(_BASE_TAGS))
+        assert result.attempts == 1
+        assert result.cap_reached is False
+
+        result = record(result.new_content, result.new_tags)
+        assert result.attempts == 2
+        assert result.cap_reached is False
+
+        result = record(result.new_content, result.new_tags)
+        assert result.attempts == REPAIR_COUNTED_CAP
+        assert result.cap_reached is True
+        assert result.terminal_tag_added is True
+        assert "influx:archive-terminal" in result.new_tags
+        # The richer discriminator is persisted for the operator.
+        assert result.counters.archive_last_kind == "http_403"
+
+
+class TestArchiveScopedSetIntegrity:
+    """Guards the archive scope against silent drift.
+
+    The counted set is written as string literals in the code, in the
+    tests above, and in ``docs/SPECIFICATION.md`` / ``runbook.md``.
+    Nothing fails if they disagree: an unrecognised discriminator simply
+    never matches, and the note quietly goes back to churning.
+
+    So rather than re-assert the set, walk the *whole* public
+    ``ArchiveFailureKind`` taxonomy and pin the classification of every
+    member. Adding a kind to the taxonomy without deciding whether it is
+    permanent fails here, which set-equality against a private constant
+    would not catch.
+    """
+
+    # Permanent for the archive stage specifically.  ``unsupported_source``
+    # is not an ArchiveFailureKind — the repair hook raises it before any
+    # download — but it shares the scope, so it belongs in this table.
+    PERMANENT_FOR_ARCHIVE = frozenset(
+        {"http_403", "http_404", "http_410", "blocked", "unsupported_source"}
+    )
+    # Permanent everywhere, so counted regardless of stage.
+    GLOBALLY_COUNTED = frozenset({"oversize"})
+
+    @staticmethod
+    def _all_kinds() -> frozenset[str]:
+        from typing import get_args
+
+        from influx.archive_policy import ArchiveFailureKind
+
+        return frozenset(get_args(ArchiveFailureKind)) | {"unsupported_source"}
+
+    def test_every_failure_kind_has_a_decided_classification(self) -> None:
+        counted = self.PERMANENT_FOR_ARCHIVE | self.GLOBALLY_COUNTED
+        for kind in sorted(self._all_kinds()):
+            exc = ExtractionError("archive_download retry failed", stage=kind)
+            expected = "counted" if kind in counted else "transient"
+            assert classify_failure(exc, repair_stage="archive") == expected, kind
+
+    def test_no_failure_kind_is_counted_outside_the_archive_stage(self) -> None:
+        """The scope really is a scope — tier stages see none of this."""
+        for kind in sorted(self._all_kinds() - self.GLOBALLY_COUNTED):
+            exc = ExtractionError("archive_download retry failed", stage=kind)
+            assert classify_failure(exc, repair_stage="tier2") == "transient", kind
+            assert classify_failure(exc, repair_stage="tier3") == "transient", kind
+            assert classify_failure(exc) == "transient", kind

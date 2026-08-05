@@ -234,8 +234,44 @@ _COUNTED_STAGES: frozenset[str] = frozenset({"parse", "validate", "oversize"})
 # it has its own terminal handling in
 # ``repair._terminate_unsupported_text_source``, which flips
 # ``influx:text-terminal`` directly instead of going through a counter.
+#
+# ``http_403`` / ``http_404`` / ``http_410`` / ``blocked`` (issue #282):
+# the origin has given a permanent answer — a paywall, a dead link, a
+# withdrawn resource, or (``blocked``) a domain the operator has already
+# declared as refusing archive downloads.  Retrying cannot change any of
+# them; only a different URL can.  Left transient, a paywalled note sat
+# at ``archive_attempts: 0`` indefinitely and was rewritten by every
+# sweep (observed in production at v43, gaining two versions per day).
+#
+# ``blocked`` is a backstop rather than the primary path: a note acquired
+# while its domain already carried a ``blocked`` policy is stamped
+# ``influx:archive-terminal`` by the source adapter, and
+# ``repair.select_stages`` then excludes it from the archive stage
+# entirely — it never reaches this classifier.  What it does catch are
+# notes acquired *before* the operator blocked the domain: those carry
+# ``influx:archive-missing`` with no terminal tag, so without this entry
+# they would retry the newly-doomed path forever.
+#
+# Deliberately NOT counted, because retrying genuinely can succeed:
+#
+# * ``http_429`` / ``rate_limited`` — rate limiting is temporary by
+#   definition; the sweep's own cadence is the cool-down.
+# * ``http_5xx`` — server-side, recovers without our involvement.
+# * ``http_4xx`` — the catch-all bucket, which holds retryable statuses
+#   such as 408 Request Timeout and 425 Too Early.  Only the three 4xx
+#   codes with permanent semantics are broken out above.
+# * ``network`` / ``timeout`` / ``dns`` / ``write`` /
+#   ``content_type_mismatch`` — transport or local conditions.
 _STAGE_SCOPED_COUNTED_STAGES: dict[CountedStage, frozenset[str]] = {
-    "archive": frozenset({"unsupported_source"}),
+    "archive": frozenset(
+        {
+            "unsupported_source",
+            "http_403",
+            "http_404",
+            "http_410",
+            "blocked",
+        }
+    ),
 }
 
 
@@ -252,9 +288,12 @@ def classify_failure(
     ``validate``).  Re-running the same prompt on the same input will
     almost certainly keep failing.
 
-    *Transient* failures (HTTP, transport, resolve, archive_read, or
-    anything we don't specifically recognise) leave the counter alone.
-    The next sweep retries them indefinitely.
+    *Transient* failures (recoverable HTTP, transport, resolve,
+    archive_read, or anything we don't specifically recognise) leave the
+    counter alone.  The next sweep retries them indefinitely.  Note that
+    "HTTP" is no longer transient wholesale: the archive stage counts the
+    permanently-failing statuses — see
+    :data:`_STAGE_SCOPED_COUNTED_STAGES`.
 
     Parameters
     ----------
