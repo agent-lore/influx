@@ -532,8 +532,12 @@ class TestArchiveDownloadHookFailures:
         assert exc_info.value.stage == "oversize"
         assert classify_failure(exc_info.value) == "counted"
 
-    def test_http_error_raises_transient(self, tmp_path: Path) -> None:
-        """HTTP 4xx/5xx is currently transient — the note retries next sweep."""
+    def test_http_5xx_raises_transient(self, tmp_path: Path) -> None:
+        """HTTP 5xx is transient — the note retries next sweep.
+
+        The fake omits ``failure_kind`` deliberately, exercising the
+        string-derivation fallback in ``_classify_download_kind``.
+        """
         from influx.repair_counters import classify_failure
         from influx.storage import ArchiveResult
 
@@ -553,8 +557,109 @@ class TestArchiveDownloadHookFailures:
             with pytest.raises(ExtractionError) as exc_info:
                 hooks.archive_download(note)
 
-        assert exc_info.value.stage == "http"
+        assert exc_info.value.stage == "http_5xx"
+        assert classify_failure(exc_info.value, repair_stage="archive") == "transient"
+
+    @pytest.mark.parametrize(
+        ("status", "expected_stage"),
+        [
+            (403, "http_403"),
+            (404, "http_404"),
+            (410, "http_410"),
+        ],
+    )
+    def test_permanent_http_status_is_counted(
+        self, tmp_path: Path, status: int, expected_stage: str
+    ) -> None:
+        """Issue #282: a permanently-failing status advances the archive cap.
+
+        Flattened to a bare ``"http"``, these were indistinguishable from
+        a recoverable 503, so ``archive_attempts`` never advanced and the
+        note was rewritten by every sweep forever.
+        """
+        from influx.repair_counters import classify_failure
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(
+            config, archive_reacquirers=_reacquirers(config)
+        )
+        note = _make_archive_missing_note()
+
+        url = "https://arxiv.org/pdf/2604.26946.pdf"
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error=f"HTTP {status} for {url}",
+                failure_kind=expected_stage,
+                policy_mode="attempt",
+                domain="arxiv.org",
+            )
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.archive_download(note)
+
+        assert exc_info.value.stage == expected_stage
+        assert classify_failure(exc_info.value, repair_stage="archive") == "counted"
+        # Stage-scoped: the same discriminator stays transient elsewhere,
+        # where the text path owns its own terminal handling.
+        assert classify_failure(exc_info.value, repair_stage="tier2") == "transient"
         assert classify_failure(exc_info.value) == "transient"
+
+    def test_http_429_stays_transient(self, tmp_path: Path) -> None:
+        """Rate limiting is temporary — never counted, however often it recurs."""
+        from influx.repair_counters import classify_failure
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(
+            config, archive_reacquirers=_reacquirers(config)
+        )
+        note = _make_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error="HTTP 429 for https://arxiv.org/pdf/2604.26946.pdf",
+                failure_kind="http_429",
+                policy_mode="attempt",
+                domain="arxiv.org",
+            )
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.archive_download(note)
+
+        assert exc_info.value.stage == "http_429"
+        assert classify_failure(exc_info.value, repair_stage="archive") == "transient"
+
+    def test_other_4xx_stays_transient(self, tmp_path: Path) -> None:
+        """408 lands in the ``http_4xx`` catch-all and is genuinely retryable."""
+        from influx.repair_counters import classify_failure
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(
+            config, archive_reacquirers=_reacquirers(config)
+        )
+        note = _make_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error="HTTP 408 for https://arxiv.org/pdf/2604.26946.pdf",
+                failure_kind="http_4xx",
+                policy_mode="attempt",
+                domain="arxiv.org",
+            )
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.archive_download(note)
+
+        assert exc_info.value.stage == "http_4xx"
+        assert classify_failure(exc_info.value, repair_stage="archive") == "transient"
 
     def test_timeout_is_transient(self, tmp_path: Path) -> None:
         from influx.repair_counters import classify_failure
@@ -1074,8 +1179,8 @@ class TestArchiveDownloadHookRssFailures:
         assert exc_info.value.stage == "oversize"
         assert classify_failure(exc_info.value) == "counted"
 
-    def test_http_error_is_transient(self, tmp_path: Path) -> None:
-        """HTTP 4xx/5xx leaves the RSS note re-enterable next sweep."""
+    def test_http_5xx_is_transient(self, tmp_path: Path) -> None:
+        """HTTP 5xx leaves the RSS note re-enterable next sweep."""
         from influx.repair_counters import classify_failure
         from influx.storage import ArchiveResult
 
@@ -1095,8 +1200,40 @@ class TestArchiveDownloadHookRssFailures:
             with pytest.raises(ExtractionError) as exc_info:
                 hooks.archive_download(note)
 
-        assert exc_info.value.stage == "http"
-        assert classify_failure(exc_info.value) == "transient"
+        assert exc_info.value.stage == "http_5xx"
+        assert classify_failure(exc_info.value, repair_stage="archive") == "transient"
+
+    def test_paywalled_403_is_counted(self, tmp_path: Path) -> None:
+        """Issue #282: the production shape — an RSS item behind a paywall.
+
+        ``b53b7ad4`` ("Who cleans up after the vibe-coding party?",
+        ``ft.com``) sat at ``archive_attempts: 0`` for weeks because this
+        403 was classified transient.
+        """
+        from influx.repair_counters import classify_failure
+        from influx.storage import ArchiveResult
+
+        config = _make_config(tmp_path)
+        hooks = make_default_sweep_hooks(
+            config, archive_reacquirers=_reacquirers(config)
+        )
+        note = _make_rss_archive_missing_note()
+
+        with patch("influx.repair_hooks.download_archive") as mock_dl:
+            mock_dl.return_value = ArchiveResult(
+                ok=False,
+                rel_posix_path=None,
+                error="HTTP 403 for https://example.com/article-42",
+                failure_kind="http_403",
+                policy_mode="attempt",
+                domain="example.com",
+            )
+            assert hooks.archive_download is not None
+            with pytest.raises(ExtractionError) as exc_info:
+                hooks.archive_download(note)
+
+        assert exc_info.value.stage == "http_403"
+        assert classify_failure(exc_info.value, repair_stage="archive") == "counted"
 
 
 class TestArchiveDownloadHookRssMetadataRecovery:
@@ -1712,6 +1849,7 @@ class TestArchiveDownloadHookPolicyRegistry:
         path on repair sweeps.  We expect the policy_mode on the
         :class:`ArchiveResult` to reflect the operator setting.
         """
+        from influx.repair_counters import classify_failure
         from influx.storage import ArchiveResult
 
         policy = ArchivePolicyConfig(
@@ -1748,8 +1886,16 @@ class TestArchiveDownloadHookPolicyRegistry:
             "influx.repair_hooks.download_archive", side_effect=fake_download_archive
         ):
             assert hooks.archive_download is not None
-            with pytest.raises(ExtractionError):
+            with pytest.raises(ExtractionError) as exc_info:
                 hooks.archive_download(note)
+
+        # Issue #282: the policy-aware kind survives to the sweep rather
+        # than being re-derived from the error string (which would have
+        # yielded ``http_403``, losing the operator's blocked decision).
+        # ``blocked`` is counted for the archive stage — the operator has
+        # declared the domain refuses downloads, so retrying is pointless.
+        assert exc_info.value.stage == "blocked"
+        assert classify_failure(exc_info.value, repair_stage="archive") == "counted"
 
         registry = captured["registry"]
         # The registry the hook threaded through resolves arxiv.org to

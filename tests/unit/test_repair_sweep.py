@@ -2151,3 +2151,162 @@ class TestSweepUnsupportedSourceArchiveConvergence:
         assert "influx:repair-needed" not in rewritten["tags"]
         # Still factually archive-less.
         assert "influx:archive-missing" in rewritten["tags"]
+
+
+class TestSweepPaywalledArchiveConvergence:
+    """A permanently-403 URL converges instead of churning forever (#282).
+
+    Reproduces ``b53b7ad4`` ("Who cleans up after the vibe-coding party?",
+    ``ft.com``) exactly, because it is the shape that survived *both*
+    prior fixes:
+
+    * unlike the #281 class above, the source is a perfectly valid
+      ``source:rss`` with a registered reacquirer — the archive attempt
+      really is made, and really does return HTTP 403 every time;
+    * unlike every note released by #278, it carries
+      ``text:abstract-only`` **without** ``influx:text-terminal``.  Text
+      extraction ran and succeeded as far as it could; nothing was left
+      to flip the terminal tag.
+
+    That second point is the trap.  Counting the 403 alone gets the note
+    to ``influx:archive-terminal`` and no further: the text condition in
+    ``compute_clearing`` still fails, and the note keeps being rewritten
+    on every pass looking, from the tags, as though it had converged.
+    """
+
+    @staticmethod
+    def _note(archive_attempts: int) -> dict[str, object]:
+        body = (
+            "---\n"
+            "source_url: https://www.ft.com/content/cec8df9e\n"
+            "tags: []\n"
+            "confidence: 1.0\n"
+            "---\n"
+            "# Who cleans up after the vibe-coding party?\n\n"
+            "## Archive\n\n"
+            "## Summary\nSummary\n\n"
+            "## Repair\n"
+            "- tier2_attempts: 3\n"
+            '- tier2_last_stage: "parse"\n'
+            '- tier2_last_error: "No archive path found in note"\n'
+            f"- archive_attempts: {archive_attempts}\n"
+            '- archive_last_kind: "http_403"\n'
+            '- archive_last_error: "HTTP 403 for https://www.ft.com/content/x"\n\n'
+            "## Profile Relevance\n"
+            "### ai-coding\nScore: 8/10\nRelevant\n\n"
+            "## User Notes\n"
+        )
+        return {
+            "id": "n1",
+            "title": "Who cleans up after the vibe-coding party?",
+            "content": body,
+            "tags": [
+                "influx:repair-needed",
+                "influx:archive-missing",
+                "text:abstract-only",
+                "influx:tier2-terminal",
+                "source:rss",
+                "feed-slug:hacker-news-vibe-coding-5-pts",
+            ],
+            "source_url": "https://www.ft.com/content/cec8df9e",
+            "confidence": 1.0,
+        }
+
+    @staticmethod
+    def _paywalled(note: dict[str, object]) -> str:
+        del note
+        raise ExtractionError(
+            "archive_download retry failed: "
+            "HTTP 403 for https://www.ft.com/content/cec8df9e",
+            stage="http_403",
+        )
+
+    @staticmethod
+    def _write_args(client: AsyncMock) -> dict[str, Any]:
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        return dict(write_calls[-1].args[1])
+
+    async def test_paywall_advances_archive_counter(self) -> None:
+        """Below the cap: counter moves, note stays in the sweep."""
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "n1", "title": "Who cleans up"}],
+            read_responses=[self._note(0)],
+        )
+
+        await sweep(
+            "ai-coding",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=self._paywalled),
+        )
+
+        rewritten = self._write_args(client)
+        assert "archive_attempts: 1" in rewritten["content"]
+        assert 'archive_last_kind: "http_403"' in rewritten["content"]
+        assert "influx:archive-terminal" not in rewritten["tags"]
+        assert "influx:repair-needed" in rewritten["tags"]
+
+    async def test_at_cap_flips_terminal_and_releases_note(self) -> None:
+        """At the cap the note goes terminal AND actually leaves the sweep.
+
+        The ``repair-needed`` assertion is the one that matters: it fails
+        on the classification fix alone, because ``text:abstract-only``
+        with an unreachable archive cannot satisfy the text condition.
+        """
+        from influx.repair_counters import REPAIR_COUNTED_CAP
+
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "n1", "title": "Who cleans up"}],
+            read_responses=[self._note(REPAIR_COUNTED_CAP - 1)],
+        )
+
+        await sweep(
+            "ai-coding",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=self._paywalled),
+        )
+
+        rewritten = self._write_args(client)
+        assert f"archive_attempts: {REPAIR_COUNTED_CAP}" in rewritten["content"]
+        assert "influx:archive-terminal" in rewritten["tags"]
+        assert "influx:repair-needed" not in rewritten["tags"]
+        # No archive was ever stored, and no text upgrade ever happened —
+        # both remain visible to an operator.
+        assert "influx:archive-missing" in rewritten["tags"]
+        assert "text:abstract-only" in rewritten["tags"]
+
+    async def test_transient_5xx_never_converges(self) -> None:
+        """Regression guard: a recoverable status must NOT terminalise.
+
+        The fix partitions on permanence, not on "the download failed".
+        """
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "n1", "title": "Who cleans up"}],
+            read_responses=[self._note(0)],
+        )
+
+        def unavailable(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                "archive_download retry failed: HTTP 503 for https://x",
+                stage="http_5xx",
+            )
+
+        await sweep(
+            "ai-coding",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=unavailable),
+        )
+
+        rewritten = self._write_args(client)
+        assert "archive_attempts: 0" in rewritten["content"]
+        assert "influx:archive-terminal" not in rewritten["tags"]
+        assert "influx:repair-needed" in rewritten["tags"]

@@ -245,7 +245,7 @@ The arXiv provider:
 
 Archive failures do not abort note creation. The note is tagged `influx:archive-missing` and `influx:repair-needed`, and the Archive section is left empty.
 
-Issue #149: archive acquisition consults a per-domain policy registry built from `[storage.archive_policy]`. Domains classified as `blocked` (HTTP 403 / WAF challenge), `rate_limited` (HTTP 429 under normal cadence), or `skip` (no attempt made at all) produce distinct note tags — `influx:archive-blocked`, `influx:archive-rate-limited`, or `influx:archive-skipped-by-policy` — alongside the generic `influx:archive-missing`. `blocked` and `skip` notes additionally carry `influx:archive-terminal` so the repair sweep stops re-attempting the doomed path. The defaults set covers staging hot offenders (`science.org`, `alignmentforum.org`, `therobotreport.com`, …).
+Issue #149: archive acquisition consults a per-domain policy registry built from `[storage.archive_policy]`. Domains classified as `blocked` (HTTP 403 / WAF challenge), `rate_limited` (HTTP 429 under normal cadence), or `skip` (no attempt made at all) produce distinct note tags — `influx:archive-blocked`, `influx:archive-rate-limited`, or `influx:archive-skipped-by-policy` — alongside the generic `influx:archive-missing`. `blocked` notes converge out of the sweep via the archive cap (§ stage-scoped counting below), reaching `influx:archive-terminal` after three attempts so the doomed path is not re-attempted forever. The defaults set covers staging hot offenders (`science.org`, `alignmentforum.org`, `therobotreport.com`, …).
 
 ### 6.2 RSS and Atom Feeds
 
@@ -577,9 +577,9 @@ Tier 2 and Tier 3 hook failures are partitioned into transient (HTTP, transport,
 
 When `tier{N}_attempts` reaches the cap (currently 3), `influx:tier{N}-terminal` is added to the note's tags and that stage is skipped on subsequent sweeps. Transient failures never advance the counter, so flaky network conditions do not burn the cap.
 
-#### Stage-scoped counting: `unsupported_source` on archive
+#### Stage-scoped counting on archive
 
-Most discriminators classify the same way everywhere. `unsupported_source` does not — it is **counted for the archive stage only**.
+Most discriminators classify the same way everywhere. Five do not — `unsupported_source`, `http_403`, `http_404`, `http_410`, and `blocked` are **counted for the archive stage only**. All five share one property: retrying returns the same answer forever.
 
 The archive-download hook raises it when no registered adapter owns the note, i.e. `repair_hooks._reacquirer_for_note` returns `None`. That is not a failed attempt but the absence of a code path, so retrying cannot change it — only shipping a resolver can. Left transient, such a note was re-selected and rewritten on every sweep indefinitely (observed in production at v108 after 36 days, with `archive_attempts` still 0), which pinned `updated_at` to "now" and dominated retrieval ranking.
 
@@ -588,6 +588,29 @@ Counted, it converges: `archive_attempts` reaches the cap, `influx:archive-termi
 Dispatch resolves ownership by source-tag family (`arxiv`; `rss` / `blog` / `rss-<feed>`) **and** by durable identity markers on the note — an `rss-` id, or a `feed-slug:` tag plus a doc-level `source_url`. The identity fallback exists precisely because this failure is now permanent: dispatching on the tag alone would terminalise notes `archive_download_identity` could actually resolve.
 
 Text extraction keeps classifying `unsupported_source` as transient. It has its own terminal path (`repair._terminate_unsupported_text_source` applies `influx:text-terminal` directly rather than through a counter), and counting it globally would double-handle that.
+
+##### Permanent HTTP statuses (issue #282)
+
+The archive hook used to flatten every `HTTP <code> for …` failure to a bare `http`, discarding the `ArchiveResult.failure_kind` the archive layer had just computed. A paywalled URL was therefore indistinguishable from a recoverable 503: `archive_attempts` never left 0, so the cap was unreachable and the note was rewritten by every sweep (observed in production at v43, gaining two versions per day). The hook now passes the archive layer's own kind straight through — which also keeps it policy-aware, since a 403 under a `blocked` policy is already collapsed to `blocked` upstream.
+
+The partition is by permanence, not by severity:
+
+| Counted (archive stage) | Transient |
+|---|---|
+| `http_403` — paywall / hard refusal | `http_429`, `rate_limited` — temporary by definition |
+| `http_404` — no such resource | `http_5xx` — server-side, recovers |
+| `http_410` — deliberately withdrawn | `http_4xx` — catch-all, holds retryable 408 / 425 |
+| `blocked` — operator-declared refusal | `network`, `timeout`, `dns`, `write` |
+
+`http_410` is split out of the `http_4xx` catch-all specifically so it can be counted without dragging its retryable neighbours along.
+
+##### Text clearing under an unreachable archive
+
+Counting the failure is necessary but not sufficient. A note that reaches `influx:archive-terminal` while holding `text:abstract-only` **without** `influx:text-terminal` cannot satisfy the §5.3 text condition, and cannot ever come to: `text:abstract-only` is upgraded only by `apply_abstract_only_reextraction`, which the sweep runs solely when an archive path is stored, and that same hook is the only thing that applies `influx:text-terminal`. Both escapes require the archive that is now permanently unavailable.
+
+So `compute_clearing` treats an archive-terminal note with no stored path as waiving the text condition, on the same principle as the other terminal waivers: only a claim about *stage reachability* may waive a repair condition. Notes released this way keep both `influx:archive-missing` and `text:abstract-only`, so the shortfall stays visible.
+
+The notes released by the `unsupported_source` fix above did not hit this, because their unsupported source had already terminalised the text stage too.
 
 **Operational consequence:** adding a resolver no longer recovers already-terminalised notes automatically. They must be re-armed — see below.
 

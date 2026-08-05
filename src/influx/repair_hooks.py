@@ -20,9 +20,14 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import trafilatura
 
+from influx.archive_policy import (
+    ArchivePolicyMode,
+    classify_failure_kind,
+)
 from influx.archive_policy import (
     registry_from_config as _archive_policy_registry_from_config,
 )
@@ -48,7 +53,7 @@ from influx.source import (
     note_source_url,
     note_tags,
 )
-from influx.storage import download_archive
+from influx.storage import ArchiveResult, download_archive
 
 __all__ = [
     "DefaultSweepHooks",
@@ -451,19 +456,37 @@ def _raise_invalid_source_metadata(
     )
 
 
-def _classify_download_kind(error: str) -> str:
-    """Return the ``kind`` discriminator from an ``ArchiveResult.error`` string.
+def _classify_download_kind(result: ArchiveResult) -> str:
+    """Return the ``kind`` discriminator for a failed archive download.
 
-    ``download_archive`` packs ``"<kind>: <message>"`` for ``NetworkError``
-    cases and ``"HTTP <code> for ..."`` / ``"write: ..."`` for the other
-    failure paths.  We surface a stable ``stage`` value to the sweep so
-    :func:`influx.repair.classify_failure` can decide counted vs transient.
+    We surface a stable ``stage`` value to the sweep so
+    :func:`influx.repair.classify_failure` can decide counted vs
+    transient.
+
+    :attr:`~influx.storage.ArchiveResult.failure_kind` is preferred
+    because :func:`~influx.storage.download_archive` has already computed
+    it *policy-aware*: under ``policy_mode="blocked"`` an HTTP 403
+    collapses to ``blocked`` rather than ``http_403``, and re-deriving
+    from the error string here would silently lose that.
+
+    Issue #282: this used to flatten every ``"HTTP <code> for ..."``
+    error to a bare ``"http"``, discarding the distinction the archive
+    layer had just made.  A permanently-403 URL (paywall) was therefore
+    indistinguishable from a transient 503, so ``archive_attempts`` never
+    advanced and the note was re-swept and rewritten forever.
+
+    The string-derivation fallback covers results built without a
+    ``failure_kind`` (older call sites and test fakes); ``""`` with no
+    error at all keeps the historical ``"archive_failed"`` sentinel.
     """
-    if error.startswith("HTTP "):
-        return "http"
-    head, _, _rest = error.partition(":")
-    head = head.strip()
-    return head or "archive_failed"
+    if result.failure_kind:
+        return result.failure_kind
+    if not result.error:
+        return "archive_failed"
+    # ``ArchiveResult.policy_mode`` is typed ``str`` (it is ``""`` when no
+    # registry was threaded through) rather than the narrower literal.
+    policy_mode = cast("ArchivePolicyMode", result.policy_mode or "attempt")
+    return classify_failure_kind(error=result.error, policy_mode=policy_mode)
 
 
 # ── Hook factories ──────────────────────────────────────────────────
@@ -511,8 +534,10 @@ def _make_archive_download_hook(
     path on success.  On failure it raises :class:`ExtractionError` so
     the sweep's existing ``(ExtractionError, LithosError)`` branch
     bumps the per-note ``archive_attempts`` counter (only for
-    counted-class kinds — currently ``"oversize"``) and flips
-    ``influx:archive-terminal`` once the cap is reached.
+    counted-class kinds — ``"oversize"`` globally, plus
+    ``unsupported_source`` and the permanent HTTP statuses for this
+    stage) and flips ``influx:archive-terminal`` once the cap is
+    reached.
 
     *archive_reacquirers* maps a canonical source family (``"arxiv"`` /
     ``"rss"``) to the :class:`~influx.source.Source` that owns that
@@ -585,10 +610,11 @@ def _make_archive_download_hook(
 
         # The sweep classifies counted vs transient via
         # ``influx.repair.classify_failure`` based on the ``stage``
-        # attribute below; surface the discriminator from
-        # ``ArchiveResult.error`` verbatim so e.g. ``"oversize"`` lines
-        # up with ``influx.repair._COUNTED_STAGES`` and bumps the cap.
-        stage = _classify_download_kind(result.error) or "archive_failed"
+        # attribute below; surface the archive layer's own failure kind
+        # so e.g. ``"oversize"`` lines up with
+        # ``influx.repair_counters._COUNTED_STAGES`` and ``"http_403"``
+        # with the archive entry of ``_STAGE_SCOPED_COUNTED_STAGES``.
+        stage = _classify_download_kind(result)
         raise ExtractionError(
             f"archive_download retry failed: {result.error}",
             url=identity.url,

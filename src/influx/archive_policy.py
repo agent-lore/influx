@@ -121,6 +121,12 @@ ArchiveFailureKind = Literal[
     "unsupported",
     "http_403",
     "http_404",
+    # Issue #282: 410 Gone is the one 4xx besides 403/404 that is
+    # unambiguously permanent — the origin is asserting the resource is
+    # deliberately and irreversibly withdrawn.  Split out of ``http_4xx``
+    # so the repair sweep can count it toward the archive cap without
+    # also counting genuinely-retryable siblings like 408 / 425.
+    "http_410",
     "http_429",
     "http_4xx",
     "http_5xx",
@@ -506,6 +512,8 @@ def classify_failure_kind(
             return "http_429"
         if code == 404:
             return "http_404"
+        if code == 410:
+            return "http_410"
         if 400 <= code < 500:
             return "http_4xx"
         if 500 <= code < 600:
