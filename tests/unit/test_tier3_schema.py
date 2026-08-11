@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from pydantic import ValidationError
 
-from influx.schemas import TIER3_LIST_MAX, Tier3Extraction
+from influx.schemas import TIER3_LIST_MAX, TIER3_SHORT_LIST_MAX, Tier3Extraction
 
 
 def _valid(**overrides: list[str]) -> dict[str, list[str]]:
@@ -133,42 +135,8 @@ class TestTier3ExtractionNegative:
         with pytest.raises(ValidationError):
             Tier3Extraction(**_valid(claims=[]))
 
-    def test_claims_length_over_cap(self) -> None:
-        """Issue #186: claims length TIER3_LIST_MAX + 1 is still rejected
-        (raised the bound, did not remove it)."""
-        with pytest.raises(ValidationError):
-            Tier3Extraction(
-                **_valid(claims=[f"c{i}" for i in range(TIER3_LIST_MAX + 1)])
-            )
-
-    def test_datasets_length_over_cap(self) -> None:
-        """Issue #81: datasets length TIER3_LIST_MAX + 1 is still rejected."""
-        with pytest.raises(ValidationError):
-            Tier3Extraction(
-                **_valid(datasets=[f"d{i}" for i in range(TIER3_LIST_MAX + 1)])
-            )
-
-    def test_builds_on_length_over_cap(self) -> None:
-        """Issue #81: builds_on length TIER3_LIST_MAX + 1 is still rejected."""
-        with pytest.raises(ValidationError):
-            Tier3Extraction(
-                **_valid(builds_on=[f"b{i}" for i in range(TIER3_LIST_MAX + 1)])
-            )
-
-    def test_observed_39_item_case_still_rejected(self) -> None:
-        """Issue #81: 39-item datasets case from the bug report still fails."""
-        with pytest.raises(ValidationError):
-            Tier3Extraction(**_valid(datasets=[f"d{i}" for i in range(39)]))
-
-    def test_open_questions_length_11(self) -> None:
-        with pytest.raises(ValidationError):
-            Tier3Extraction(**_valid(open_questions=[f"q{i}" for i in range(11)]))
-
-    def test_potential_connections_length_11(self) -> None:
-        with pytest.raises(ValidationError):
-            Tier3Extraction(
-                **_valid(potential_connections=[f"p{i}" for i in range(11)])
-            )
+    # Over-cap list lengths are no longer a rejection path — issue #288
+    # moved them to truncation.  See ``TestTier3ListTruncation``.
 
     def test_empty_string_in_claims(self) -> None:
         with pytest.raises(ValidationError):
@@ -225,6 +193,114 @@ class TestTier3ExtractionNegative:
                 open_questions=["q"],
                 potential_connections=["p"],
             )  # type: ignore[call-arg]
+
+
+class TestTier3ListTruncation:
+    """Issue #288: over-long lists are truncated, not rejected.
+
+    Rejecting the whole object for list length discarded otherwise-valid
+    extractions.  Because ``validate`` is a counted repair stage, three
+    such rejections applied ``influx:tier3-terminal`` and lost the
+    extraction permanently — which is what happened to
+    ``9eee59f3`` ("Context-Aware RL for Agentic and Multimodal LLMs").
+    """
+
+    @pytest.mark.parametrize("field", ["claims", "datasets", "builds_on"])
+    def test_over_cap_truncates_to_cap(self, field: str) -> None:
+        items = [f"{field}-{i}" for i in range(TIER3_LIST_MAX + 1)]
+        t = Tier3Extraction(**_valid(**{field: items}))
+        assert len(getattr(t, field)) == TIER3_LIST_MAX
+
+    @pytest.mark.parametrize("field", ["claims", "datasets", "builds_on"])
+    def test_truncation_keeps_the_leading_items_in_order(self, field: str) -> None:
+        """The prompt asks for items 'prioritised by relevance', so the
+        head of the list is the part worth keeping."""
+        items = [f"{field}-{i}" for i in range(TIER3_LIST_MAX + 5)]
+        t = Tier3Extraction(**_valid(**{field: items}))
+        assert getattr(t, field) == items[:TIER3_LIST_MAX]
+
+    @pytest.mark.parametrize(
+        ("field", "size"),
+        [
+            ("datasets", 35),
+            ("builds_on", 79),
+            ("builds_on", 32),
+            ("claims", 31),
+        ],
+    )
+    def test_observed_production_overflows_now_survive(
+        self, field: str, size: int
+    ) -> None:
+        """The four real overflows found in the prod corpus — every
+        recorded ``tier3_last_stage: "validate"`` failure was one of
+        these, none was a genuine schema violation."""
+        items = [f"{field}-{i}" for i in range(size)]
+        t = Tier3Extraction(**_valid(**{field: items}))
+        assert getattr(t, field) == items[:TIER3_LIST_MAX]
+
+    def test_issue_81_39_item_case_now_survives(self) -> None:
+        """The 39-item datasets case from #81's bug report was the
+        original reason the cap was raised 10 → 30; it no longer needs a
+        cap large enough to contain it."""
+        items = [f"d{i}" for i in range(39)]
+        t = Tier3Extraction(**_valid(datasets=items))
+        assert t.datasets == items[:TIER3_LIST_MAX]
+
+    @pytest.mark.parametrize("field", ["open_questions", "potential_connections"])
+    def test_short_capped_fields_truncate_too(self, field: str) -> None:
+        items = [f"{field}-{i}" for i in range(TIER3_SHORT_LIST_MAX + 7)]
+        t = Tier3Extraction(**_valid(**{field: items}))
+        assert getattr(t, field) == items[:TIER3_SHORT_LIST_MAX]
+
+    def test_truncation_is_logged_with_field_and_dropped_count(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Silent truncation would trade one invisible failure for
+        another; the drop must stay observable."""
+        with caplog.at_level(logging.INFO, logger="influx.schemas"):
+            Tier3Extraction(
+                **_valid(datasets=[f"d{i}" for i in range(35)]),
+            )
+        records = [r for r in caplog.records if "truncat" in r.getMessage().lower()]
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert "datasets" in message
+        assert "35" in message
+        assert "5" in message
+
+    def test_no_log_when_within_cap(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="influx.schemas"):
+            Tier3Extraction(**_valid(datasets=[f"d{i}" for i in range(TIER3_LIST_MAX)]))
+        assert not [r for r in caplog.records if "truncat" in r.getMessage().lower()]
+
+    def test_empty_claims_still_rejected(self) -> None:
+        """AC-07-C is untouched: an empty extraction is a real failure.
+        Truncation can never empty a non-empty list, so ``min_length``
+        remains the meaningful bound."""
+        with pytest.raises(ValidationError):
+            Tier3Extraction(**_valid(claims=[]))
+
+    def test_invalid_element_within_the_cap_still_rejects(self) -> None:
+        """Truncation must not become a way to smuggle malformed items
+        past the element-level rules."""
+        items = [f"c{i}" for i in range(TIER3_LIST_MAX + 5)]
+        items[0] = "   "
+        with pytest.raises(ValidationError):
+            Tier3Extraction(**_valid(claims=items))
+
+    def test_invalid_element_beyond_the_cap_is_dropped_not_raised(self) -> None:
+        """Capping happens before element validation, so junk in the
+        discarded tail cannot fail an extraction we are keeping."""
+        items: list[object] = [f"c{i}" for i in range(TIER3_LIST_MAX)]
+        items.append({"claim": "structured instead of string"})
+        t = Tier3Extraction(**_valid(claims=items))  # type: ignore[arg-type]
+        assert len(t.claims) == TIER3_LIST_MAX
+
+    def test_non_list_input_still_raises_validation_error(self) -> None:
+        """Staging incident 2026-05-01: the failure must stay a
+        ``ValidationError``, never a raw ``TypeError``."""
+        with pytest.raises(ValidationError):
+            Tier3Extraction(**_valid(claims={"not": "a list"}))  # type: ignore[arg-type]
 
 
 class TestTier3ListMaxConstant:

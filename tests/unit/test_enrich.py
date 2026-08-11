@@ -474,24 +474,50 @@ class TestTier3ExtractValidationFailure:
                 config=config,
             )
 
-    def test_too_many_claims_raises(
+    def test_over_cap_claims_truncate_instead_of_failing(
         self, influx_config_env: Any, tmp_path: Any
     ) -> None:
-        config = load_config()
-        # Over the raised cap (issue #186): TIER3_LIST_MAX + 1 still hard-fails.
+        """Issue #288: an over-long list must not take the whole
+        extraction down.
+
+        This is the end-to-end shape of the production data loss — a
+        model response that is valid in every respect except list
+        length used to raise ``LCMAError(stage="validate")``, which the
+        repair counters treat as a counted failure.  Three of those
+        applied ``influx:tier3-terminal`` and the extraction was gone.
+        """
         payload = _valid_tier3_response(
             claims=[f"c{i}" for i in range(TIER3_LIST_MAX + 1)]
         )
 
-        with (
-            patch("influx.enrich._call_json_model", return_value=payload),
-            pytest.raises(LCMAError, match="validation"),
-        ):
-            tier3_extract(
+        with patch("influx.enrich._call_json_model", return_value=payload):
+            result = tier3_extract(
                 title="Title",
                 full_text="Full text",
-                config=config,
+                config=load_config(),
             )
+
+        assert len(result.claims) == TIER3_LIST_MAX
+        assert result.claims[0] == "c0"
+        # The rest of the extraction survives intact — the whole point.
+        assert result.datasets == ["SCROLLS", "LongBench"]
+
+    def test_observed_35_dataset_overflow_survives(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """The exact payload shape that lost ``9eee59f3``'s extraction
+        ("Context-Aware RL for Agentic and Multimodal LLMs", 35 datasets
+        against a cap of 30, three attempts, then terminal)."""
+        payload = _valid_tier3_response(datasets=[f"dataset-{i}" for i in range(35)])
+
+        with patch("influx.enrich._call_json_model", return_value=payload):
+            result = tier3_extract(
+                title="Context-Aware RL for Agentic and Multimodal LLMs",
+                full_text="Full text",
+                config=load_config(),
+            )
+
+        assert len(result.datasets) == TIER3_LIST_MAX
 
     def test_lcma_error_has_validate_stage(
         self, influx_config_env: Any, tmp_path: Any
