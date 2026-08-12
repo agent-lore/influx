@@ -263,10 +263,10 @@ class TestTier3ListTruncation:
             )
         records = [r for r in caplog.records if "truncat" in r.getMessage().lower()]
         assert len(records) == 1
-        message = records[0].getMessage()
-        assert "datasets" in message
-        assert "35" in message
-        assert "5" in message
+        # Assert the log *arguments* rather than substrings of the
+        # formatted message: "5" is a substring of "35", so a substring
+        # check would pass even if the dropped count were wrong.
+        assert records[0].args == ("datasets", 35, TIER3_LIST_MAX, 5)
 
     def test_no_log_when_within_cap(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="influx.schemas"):
@@ -296,11 +296,31 @@ class TestTier3ListTruncation:
         t = Tier3Extraction(**_valid(claims=items))  # type: ignore[arg-type]
         assert len(t.claims) == TIER3_LIST_MAX
 
-    def test_non_list_input_still_raises_validation_error(self) -> None:
+    def test_over_cap_tuple_is_truncated_like_a_list(self) -> None:
+        """Pydantic coerces a tuple into ``list[str]``, so the cap has to
+        apply to it too — otherwise a direct Python caller skips
+        truncation and hits ``max_length``, the exact rejection this
+        validator exists to avoid."""
+        items = tuple(f"c{i}" for i in range(TIER3_LIST_MAX + 5))
+        t = Tier3Extraction(**_valid(claims=items))  # type: ignore[arg-type]
+        assert t.claims == list(items[:TIER3_LIST_MAX])
+
+    def test_over_cap_set_is_truncated_not_rejected(self) -> None:
+        """Sets have no meaningful head, but truncating beats rejecting."""
+        items = {f"c{i}" for i in range(TIER3_LIST_MAX + 5)}
+        t = Tier3Extraction(**_valid(claims=items))  # type: ignore[arg-type]
+        assert len(t.claims) == TIER3_LIST_MAX
+
+    def test_mapping_input_still_raises_validation_error(self) -> None:
         """Staging incident 2026-05-01: the failure must stay a
         ``ValidationError``, never a raw ``TypeError``."""
         with pytest.raises(ValidationError):
             Tier3Extraction(**_valid(claims={"not": "a list"}))  # type: ignore[arg-type]
+
+    def test_string_input_still_raises_validation_error(self) -> None:
+        """A bare string must not be split into a list of characters."""
+        with pytest.raises(ValidationError):
+            Tier3Extraction(**_valid(claims="not a list"))  # type: ignore[arg-type]
 
 
 class TestTier3ListMaxConstant:

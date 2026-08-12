@@ -26,7 +26,12 @@ from influx.config import AppConfig, load_config
 from influx.enrich import _call_json_model, tier1_enrich, tier3_extract
 from influx.errors import LCMAError
 from influx.http_client import FetchResult
-from influx.schemas import TIER3_LIST_MAX, Tier1Enrichment, Tier3Extraction
+from influx.schemas import (
+    TIER3_LIST_MAX,
+    TIER3_SHORT_LIST_MAX,
+    Tier1Enrichment,
+    Tier3Extraction,
+)
 
 
 def _valid_tier1_response(**overrides: Any) -> dict[str, Any]:
@@ -613,13 +618,7 @@ class TestTier3ExtractPromptRendering:
         # Issue #81: a constant-derived cap reminder is appended after.
         assert captured[0].startswith("Extract: T F")
 
-    def test_prompt_includes_list_cap_reminder(
-        self, influx_config_env: Any, tmp_path: Any
-    ) -> None:
-        """Issue #81: rendered prompt must include the cap value sourced from
-        ``TIER3_LIST_MAX`` so future bumps propagate without code drift.
-        """
-        config = load_config()
+    def _render_tier3_prompt(self, config: Any) -> str:
         payload = _valid_tier3_response()
         captured: list[str] = []
 
@@ -631,11 +630,45 @@ class TestTier3ExtractPromptRendering:
 
         with patch("influx.enrich._call_json_model", side_effect=fake_call):
             tier3_extract(title="T", full_text="F", config=config)
+        return captured[0]
 
-        rendered = captured[0]
+    def test_prompt_includes_list_cap_reminder(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Issue #81: rendered prompt must include the cap values sourced
+        from the schema constants so future bumps propagate without code
+        drift.
+        """
+        rendered = self._render_tier3_prompt(load_config())
         assert str(TIER3_LIST_MAX) in rendered
-        assert "datasets" in rendered
-        assert "builds_on" in rendered
+        assert str(TIER3_SHORT_LIST_MAX) in rendered
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "claims",
+            "datasets",
+            "builds_on",
+            "open_questions",
+            "potential_connections",
+        ],
+    )
+    def test_prompt_names_every_truncated_field(
+        self, field: str, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Issue #288: all five capped fields are truncated from the tail,
+        so the prompt must state the limit for each of them — not just the
+        two that #81 raised."""
+        assert field in self._render_tier3_prompt(load_config())
+
+    def test_prompt_states_the_ordering_contract(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Truncation keeps the head, which is only the right call if the
+        model has been told to put the important items first."""
+        rendered = self._render_tier3_prompt(load_config()).lower()
+        assert "most-important-first" in rendered
+        assert "dropped" in rendered
 
 
 class TestTier3ExtractModelSlot:

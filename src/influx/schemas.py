@@ -32,6 +32,13 @@ TIER3_LIST_MAX = 30
 # held to a shorter list than the evidence fields.
 TIER3_SHORT_LIST_MAX = 10
 
+# Sequence types Pydantic coerces into ``list[str]`` in non-strict mode.
+# The ``mode="before"`` validator normalises all of them so the length cap
+# applies uniformly rather than only to inputs that arrive already as a
+# list.  Deliberately excludes ``str``/``bytes`` (which Pydantic rejects
+# for a list field rather than splitting) and mappings.
+_COERCIBLE_SEQUENCE_TYPES = (list, tuple, set, frozenset)
+
 # Per-field list-length caps, keyed by Pydantic field name.  Consulted by
 # the ``mode="before"`` validator via ``ValidationInfo.field_name``.
 _TIER3_FIELD_CAPS: dict[str, int] = {
@@ -149,14 +156,25 @@ class Tier3Extraction(BaseModel):
         """Cap list length, then trim and truncate each element.
 
         Length capping runs *first* so a malformed item in the discarded
-        tail cannot fail an extraction we are keeping.  Non-list input is
+        tail cannot fail an extraction we are keeping.
+
+        Every sequence type Pydantic would coerce into ``list[str]`` is
+        normalised here so the cap applies uniformly: model responses
+        always arrive as JSON arrays, but a direct Python caller passing
+        a tuple would otherwise skip truncation and hit ``max_length``
+        instead — the very rejection this validator exists to avoid.
+        Truncation order is only meaningful for the ordered types; a set
+        has no head to keep, but Pydantic's coercion order is arbitrary
+        for those anyway.
+
+        Anything else — including ``str``, ``bytes`` and mappings — is
         passed through untouched for Pydantic to reject, so the failure
         stays a ``ValidationError`` rather than a ``TypeError`` escaping
         the ``LCMAError``-only callers (staging incident 2026-05-01).
         """
-        if not isinstance(v, list):
+        if not isinstance(v, _COERCIBLE_SEQUENCE_TYPES):
             return v
-        capped = _cap_list_length(v, field_name=info.field_name or "")
+        capped = _cap_list_length(list(v), field_name=info.field_name or "")
         return _trim_and_truncate(capped)
 
     @field_validator(
