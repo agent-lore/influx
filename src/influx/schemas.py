@@ -6,20 +6,48 @@ with bounded score and tag-list constraints.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
+
+_log = logging.getLogger(__name__)
 
 _TIER3_MAX_CHARS = 500
 _FILTER_MAX_TAGS = 5
 
-# Single source of truth for the upper bound on Tier-3 ``datasets`` and
-# ``builds_on`` list lengths (FR-ENR-5, issue #81).  Bumped from 10 → 30
-# after structured-output models routinely returned 14-39 items, breaking
-# validation.  Both the schema's ``max_length`` and the constant-derived
-# cap reminder appended to the rendered Tier-3 prompt read from this
-# value, so a future bump propagates automatically.
+# Single source of truth for the upper bound on Tier-3 ``claims``,
+# ``datasets`` and ``builds_on`` list lengths (FR-ENR-5, issue #81).
+# Bumped from 10 → 30 after structured-output models routinely returned
+# 14-39 items, breaking validation.  Both the schema's ``max_length`` and
+# the constant-derived cap reminder appended to the rendered Tier-3
+# prompt read from this value, so a future bump propagates automatically.
+#
+# Since issue #288 the cap is enforced by *truncation* rather than
+# rejection, so its value is no longer load-bearing for whether an
+# extraction survives — only for how much of its tail is kept.
 TIER3_LIST_MAX = 30
+
+# The same bound for the two narrative fields, which have always been
+# held to a shorter list than the evidence fields.
+TIER3_SHORT_LIST_MAX = 10
+
+# Sequence types Pydantic coerces into ``list[str]`` in non-strict mode.
+# The ``mode="before"`` validator normalises all of them so the length cap
+# applies uniformly rather than only to inputs that arrive already as a
+# list.  Deliberately excludes ``str``/``bytes`` (which Pydantic rejects
+# for a list field rather than splitting) and mappings.
+_COERCIBLE_SEQUENCE_TYPES = (list, tuple, set, frozenset)
+
+# Per-field list-length caps, keyed by Pydantic field name.  Consulted by
+# the ``mode="before"`` validator via ``ValidationInfo.field_name``.
+_TIER3_FIELD_CAPS: dict[str, int] = {
+    "claims": TIER3_LIST_MAX,
+    "datasets": TIER3_LIST_MAX,
+    "builds_on": TIER3_LIST_MAX,
+    "open_questions": TIER3_SHORT_LIST_MAX,
+    "potential_connections": TIER3_SHORT_LIST_MAX,
+}
 
 
 def _trim_and_truncate(values: list[str]) -> list[str]:
@@ -40,6 +68,38 @@ def _trim_and_truncate(values: list[str]) -> list[str]:
     return out
 
 
+def _cap_list_length(values: list[Any], *, field_name: str) -> list[Any]:
+    """Truncate *values* to the cap for *field_name* (FR-ENR-5, issue #288).
+
+    Over-length lists used to fail ``max_length`` and take the whole
+    extraction down with them.  Because ``validate`` is a counted repair
+    stage, three such failures applied ``influx:tier3-terminal`` and the
+    deep extraction was lost for good — observed in production on
+    ``9eee59f3`` ("Context-Aware RL for Agentic and Multimodal LLMs"),
+    whose model output was otherwise entirely well-formed.
+
+    Truncating instead follows the precedent already set for element
+    *content* by ``_trim_and_truncate``: over-long input is bounded, not
+    rejected.  The prompt asks for items "prioritised by relevance", so
+    the discarded tail is the least valuable part of the list.
+
+    Raising the cap again is not a fix — it has been raised twice (#81,
+    #186) and the largest observed overflow since is 79 items against a
+    prompt that already states the limit.
+    """
+    cap = _TIER3_FIELD_CAPS.get(field_name)
+    if cap is None or len(values) <= cap:
+        return values
+    _log.info(
+        "tier3 list truncated field=%s returned=%d cap=%d dropped=%d",
+        field_name,
+        len(values),
+        cap,
+        len(values) - cap,
+    )
+    return values[:cap]
+
+
 def _check_non_empty(values: list[str]) -> list[str]:
     """Reject empty/whitespace-only elements after trim (FR-ENR-5)."""
     for v in values:
@@ -53,25 +113,35 @@ class Tier3Extraction(BaseModel):
     """Tier-3 deep extraction output validated against FR-ENR-5 (PRD 07 §5.3).
 
     Constraints:
-    - ``claims`` length must be in ``[1, TIER3_LIST_MAX]`` inclusive
-      (issue #186 — raised from 10 for the same reason as #81 below;
-      models returned up to 20 claims on claim-rich papers, discarding
-      the whole extraction).
-    - ``datasets`` and ``builds_on`` lengths must be in
-      ``[0, TIER3_LIST_MAX]`` inclusive (issue #81 — raised from 10 to
-      accommodate structured-output models routinely returning 14-39
-      items).
-    - ``open_questions`` and ``potential_connections`` lengths must be
-      in ``[0, 10]`` inclusive.
+    - ``claims`` must have at least 1 element; an empty extraction is a
+      real failure and still rejects (AC-07-C).
+    - ``claims``, ``datasets`` and ``builds_on`` are **truncated** to
+      ``TIER3_LIST_MAX`` items on ingest; ``open_questions`` and
+      ``potential_connections`` to ``TIER3_SHORT_LIST_MAX`` (issue #288).
+      Over-length lists used to fail validation and discard the entire
+      extraction — see ``_cap_list_length`` for why that was worse than
+      losing the tail.
     - All string elements are trimmed and truncated to 500 characters on ingest.
     - Empty/whitespace-only elements fail validation.
+
+    The declared ``max_length`` bounds are therefore unreachable in
+    normal operation.  They are kept deliberately, as a post-condition
+    on the truncation step and as the documented shape of the model: if
+    capping ever regresses, validation fails loudly instead of silently
+    admitting unbounded lists.  ``maxItems`` is stripped from the
+    outbound OpenAI strict schema by ``_harden_for_openai_strict``, so
+    keeping them costs nothing at the API boundary.
     """
 
     claims: list[str] = Field(min_length=1, max_length=TIER3_LIST_MAX)
     datasets: list[str] = Field(default_factory=list, max_length=TIER3_LIST_MAX)
     builds_on: list[str] = Field(default_factory=list, max_length=TIER3_LIST_MAX)
-    open_questions: list[str] = Field(default_factory=list, max_length=10)
-    potential_connections: list[str] = Field(default_factory=list, max_length=10)
+    open_questions: list[str] = Field(
+        default_factory=list, max_length=TIER3_SHORT_LIST_MAX
+    )
+    potential_connections: list[str] = Field(
+        default_factory=list, max_length=TIER3_SHORT_LIST_MAX
+    )
 
     @field_validator(
         "claims",
@@ -82,9 +152,30 @@ class Tier3Extraction(BaseModel):
         mode="before",
     )
     @classmethod
-    def trim_and_truncate(cls, v: list[str]) -> list[str]:
-        """Trim whitespace and truncate to 500 chars per element."""
-        return _trim_and_truncate(v)
+    def trim_and_truncate(cls, v: object, info: ValidationInfo) -> object:
+        """Cap list length, then trim and truncate each element.
+
+        Length capping runs *first* so a malformed item in the discarded
+        tail cannot fail an extraction we are keeping.
+
+        Every sequence type Pydantic would coerce into ``list[str]`` is
+        normalised here so the cap applies uniformly: model responses
+        always arrive as JSON arrays, but a direct Python caller passing
+        a tuple would otherwise skip truncation and hit ``max_length``
+        instead — the very rejection this validator exists to avoid.
+        Truncation order is only meaningful for the ordered types; a set
+        has no head to keep, but Pydantic's coercion order is arbitrary
+        for those anyway.
+
+        Anything else — including ``str``, ``bytes`` and mappings — is
+        passed through untouched for Pydantic to reject, so the failure
+        stays a ``ValidationError`` rather than a ``TypeError`` escaping
+        the ``LCMAError``-only callers (staging incident 2026-05-01).
+        """
+        if not isinstance(v, _COERCIBLE_SEQUENCE_TYPES):
+            return v
+        capped = _cap_list_length(list(v), field_name=info.field_name or "")
+        return _trim_and_truncate(capped)
 
     @field_validator(
         "claims",

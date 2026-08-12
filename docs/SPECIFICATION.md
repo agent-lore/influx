@@ -577,6 +577,20 @@ Tier 2 and Tier 3 hook failures are partitioned into transient (HTTP, transport,
 
 When `tier{N}_attempts` reaches the cap (currently 3), `influx:tier{N}-terminal` is added to the note's tags and that stage is skipped on subsequent sweeps. Transient failures never advance the counter, so flaky network conditions do not burn the cap.
 
+#### Tier 3 list overflow is truncated, not counted (issue #288)
+
+`Tier3Extraction` bounds its list fields — `claims`, `datasets` and `builds_on` at 30 items, `open_questions` and `potential_connections` at 10. Exceeding a bound used to fail validation and discard the **entire** extraction, which made it a counted `validate` failure: three overflows applied `influx:tier3-terminal` and the deep extraction was lost permanently, with no `influx:repair-needed` left behind to signal it.
+
+That was the only way Tier 3 validation ever failed in production. All four recorded `tier3_last_stage: "validate"` notes were length overflows — `builds_on` at 79, `datasets` at 35, `builds_on` at 32, `claims` at 31 — and none was a genuine schema violation. One note (`9eee59f3`) exhausted its attempts and lost a well-formed extraction over five surplus dataset names.
+
+Over-length lists are now **truncated to the cap on ingest**, keeping the leading items. The constant-derived reminder appended to the Tier-3 prompt states the limit for all five capped fields and instructs the model to order every one of them most-important-first, so the discarded tail is the cheapest part to drop; before #288 only `datasets` and `builds_on` were asked to come back ordered, while all five were bounded. Truncation is logged at INFO with the field name and the number of items dropped, so the loss stays observable. This follows the precedent already set for element *content*, which has always been truncated to 500 characters rather than rejected.
+
+The cap applies to every sequence type Pydantic coerces into `list[str]`, not only inputs that already arrive as a list. Model responses are always JSON arrays, but normalising means a direct Python caller passing a tuple gets truncation rather than the `max_length` rejection the change exists to remove. Strings, bytes and mappings still fall through to Pydantic, so malformed input remains a `ValidationError` rather than a `TypeError` escaping the `LCMAError`-only callers.
+
+Raising the cap is not an alternative: it has been raised twice (#81 took it 10 → 30, #186 did the same for `claims`) and the largest observed overflow since is 79, against a prompt that already states the limit. Model compliance here is approximate and non-deterministic — three of the four overflows above returned a conforming list on a later attempt for the same paper and prompt.
+
+`claims` retains `min_length=1`. An empty extraction is a real failure and still rejects; truncation can never empty a non-empty list, so that bound stays meaningful. The declared `max_length` bounds are retained as post-conditions on the truncation step rather than as live rejection paths.
+
 #### Stage-scoped counting on archive
 
 Most discriminators classify the same way everywhere. Five do not — `unsupported_source`, `http_403`, `http_404`, `http_410`, and `blocked` are **counted for the archive stage only**. All five share one property: retrying returns the same answer forever.

@@ -25,20 +25,30 @@ from influx.http_client import guarded_post_json_fetch
 from influx.prompts import load_prompt
 from influx.schemas import (
     TIER3_LIST_MAX,
+    TIER3_SHORT_LIST_MAX,
     Tier1Enrichment,
     Tier3Extraction,
     openai_strict_response_format,
 )
 
 # Constant-derived suffix appended to the rendered Tier-3 prompt so the
-# "at most N" instruction stays in lockstep with the schema cap (issue
+# "at most N" instruction stays in lockstep with the schema caps (issue
 # #81).  Kept in code rather than the user's TOML so existing operator
 # configs continue to validate against ``REQUIRED_VARIABLES`` without
 # requiring a new ``{max_list_items}`` template variable.
+#
+# Covers all five capped fields, not just the two that #81 raised.  Since
+# #288 the schema truncates over-length lists from the tail, so the
+# head-is-most-valuable assumption has to be stated for every field it
+# applies to — previously only ``datasets`` and ``builds_on`` were asked
+# to come back ordered, while all five are truncated the same way.
 _TIER3_CAP_REMINDER = (
-    f"\n\nReturn at most {TIER3_LIST_MAX} items in datasets and at most "
-    f"{TIER3_LIST_MAX} items in builds_on, prioritised by relevance and "
-    "centrality to the paper's contribution.  Drop the rest."
+    f"\n\nReturn at most {TIER3_LIST_MAX} items each in claims, datasets "
+    f"and builds_on, and at most {TIER3_SHORT_LIST_MAX} items each in "
+    "open_questions and potential_connections.  Order every one of those "
+    "lists most-important-first, by relevance and centrality to the "
+    "paper's contribution: anything past the limit is dropped, so the "
+    "leading items must be the ones worth keeping."
 )
 
 __all__ = [

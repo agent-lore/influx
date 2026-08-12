@@ -28,7 +28,7 @@ from influx.cascade import (
 )
 from influx.errors import ExtractionError, LCMAError
 from influx.repair_counters import REPAIR_COUNTED_CAP, RepairCounters
-from influx.schemas import Tier1Enrichment, Tier3Extraction
+from influx.schemas import TIER3_LIST_MAX, Tier1Enrichment, Tier3Extraction
 
 
 def _make_config() -> Any:
@@ -544,6 +544,56 @@ class TestCounterLifecycle:
         assert sections.counters.tier3_attempts == 1  # unchanged
         assert "influx:tier3-terminal" not in sections.terminal_flags
         assert "influx:repair-needed" in sections.repair_flags
+
+    def test_over_cap_tier3_response_does_not_advance_or_terminalise(self) -> None:
+        """Issue #288, end to end across the schema boundary.
+
+        The other counter tests patch ``influx.cascade.tier3_extract``
+        and so never send a raw model response through the real schema.
+        This one patches only the model call underneath it, feeding the
+        exact payload shape that lost ``9eee59f3``'s extraction — 35
+        datasets against a cap of 30 — and asserts the whole state
+        transition the fix is *for*, not merely that no ``LCMAError``
+        escaped:
+
+        - the extraction survives, truncated to the cap;
+        - ``tier3_attempts`` does not advance;
+        - no ``influx:tier3-terminal`` is emitted at cap-1;
+        - no ``influx:repair-needed`` is emitted at all.
+
+        Entering at ``REPAIR_COUNTED_CAP - 1`` is deliberate: under the
+        old behaviour this single response would have both advanced the
+        counter to the cap and terminalised the note.
+        """
+
+        def extractor(_acq: Acquired) -> Tier2Result:
+            return Tier2Result(text="body", flavour="html", text_tag="text:html")
+
+        counters = RepairCounters(tier3_attempts=REPAIR_COUNTED_CAP - 1)
+        tier1 = Tier1Enrichment(
+            contributions=["c"], method="m", result="r", relevance="rel"
+        )
+        raw_response = {
+            "claims": ["A claim"],
+            "datasets": [f"dataset-{i}" for i in range(35)],
+            "builds_on": [],
+            "open_questions": [],
+            "potential_connections": [],
+        }
+        with (
+            patch("influx.cascade.tier1_enrich", return_value=tier1),
+            patch("influx.enrich._call_json_model", return_value=raw_response),
+        ):
+            sections = _make_cascade(tier2_extractor=extractor).enrich(
+                _make_acquired(), score=10, counters=counters
+            )
+
+        assert sections.tier3 is not None
+        assert len(sections.tier3.datasets) == TIER3_LIST_MAX
+        assert sections.tier3.claims == ["A claim"]
+        assert sections.counters.tier3_attempts == REPAIR_COUNTED_CAP - 1
+        assert "influx:tier3-terminal" not in sections.terminal_flags
+        assert "influx:repair-needed" not in sections.repair_flags
 
     def test_unexpected_tier3_exception_does_not_advance(self) -> None:
         # The defensive ``except Exception`` path feeds a non-LCMA /

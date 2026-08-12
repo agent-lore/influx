@@ -11,7 +11,7 @@ The LLM extraction contracts (Pydantic filter / enrichment / extraction models).
 
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
-| `influx.schemas` | S | 4 | 1 |
+| `influx.schemas` | M | 4 | 1 |
 
 ## Public API
 

@@ -26,7 +26,12 @@ from influx.config import AppConfig, load_config
 from influx.enrich import _call_json_model, tier1_enrich, tier3_extract
 from influx.errors import LCMAError
 from influx.http_client import FetchResult
-from influx.schemas import TIER3_LIST_MAX, Tier1Enrichment, Tier3Extraction
+from influx.schemas import (
+    TIER3_LIST_MAX,
+    TIER3_SHORT_LIST_MAX,
+    Tier1Enrichment,
+    Tier3Extraction,
+)
 
 
 def _valid_tier1_response(**overrides: Any) -> dict[str, Any]:
@@ -474,24 +479,50 @@ class TestTier3ExtractValidationFailure:
                 config=config,
             )
 
-    def test_too_many_claims_raises(
+    def test_over_cap_claims_truncate_instead_of_failing(
         self, influx_config_env: Any, tmp_path: Any
     ) -> None:
-        config = load_config()
-        # Over the raised cap (issue #186): TIER3_LIST_MAX + 1 still hard-fails.
+        """Issue #288: an over-long list must not take the whole
+        extraction down.
+
+        This is the end-to-end shape of the production data loss — a
+        model response that is valid in every respect except list
+        length used to raise ``LCMAError(stage="validate")``, which the
+        repair counters treat as a counted failure.  Three of those
+        applied ``influx:tier3-terminal`` and the extraction was gone.
+        """
         payload = _valid_tier3_response(
             claims=[f"c{i}" for i in range(TIER3_LIST_MAX + 1)]
         )
 
-        with (
-            patch("influx.enrich._call_json_model", return_value=payload),
-            pytest.raises(LCMAError, match="validation"),
-        ):
-            tier3_extract(
+        with patch("influx.enrich._call_json_model", return_value=payload):
+            result = tier3_extract(
                 title="Title",
                 full_text="Full text",
-                config=config,
+                config=load_config(),
             )
+
+        assert len(result.claims) == TIER3_LIST_MAX
+        assert result.claims[0] == "c0"
+        # The rest of the extraction survives intact — the whole point.
+        assert result.datasets == ["SCROLLS", "LongBench"]
+
+    def test_observed_35_dataset_overflow_survives(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """The exact payload shape that lost ``9eee59f3``'s extraction
+        ("Context-Aware RL for Agentic and Multimodal LLMs", 35 datasets
+        against a cap of 30, three attempts, then terminal)."""
+        payload = _valid_tier3_response(datasets=[f"dataset-{i}" for i in range(35)])
+
+        with patch("influx.enrich._call_json_model", return_value=payload):
+            result = tier3_extract(
+                title="Context-Aware RL for Agentic and Multimodal LLMs",
+                full_text="Full text",
+                config=load_config(),
+            )
+
+        assert len(result.datasets) == TIER3_LIST_MAX
 
     def test_lcma_error_has_validate_stage(
         self, influx_config_env: Any, tmp_path: Any
@@ -587,13 +618,7 @@ class TestTier3ExtractPromptRendering:
         # Issue #81: a constant-derived cap reminder is appended after.
         assert captured[0].startswith("Extract: T F")
 
-    def test_prompt_includes_list_cap_reminder(
-        self, influx_config_env: Any, tmp_path: Any
-    ) -> None:
-        """Issue #81: rendered prompt must include the cap value sourced from
-        ``TIER3_LIST_MAX`` so future bumps propagate without code drift.
-        """
-        config = load_config()
+    def _render_tier3_prompt(self, config: Any) -> str:
         payload = _valid_tier3_response()
         captured: list[str] = []
 
@@ -605,11 +630,45 @@ class TestTier3ExtractPromptRendering:
 
         with patch("influx.enrich._call_json_model", side_effect=fake_call):
             tier3_extract(title="T", full_text="F", config=config)
+        return captured[0]
 
-        rendered = captured[0]
+    def test_prompt_includes_list_cap_reminder(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Issue #81: rendered prompt must include the cap values sourced
+        from the schema constants so future bumps propagate without code
+        drift.
+        """
+        rendered = self._render_tier3_prompt(load_config())
         assert str(TIER3_LIST_MAX) in rendered
-        assert "datasets" in rendered
-        assert "builds_on" in rendered
+        assert str(TIER3_SHORT_LIST_MAX) in rendered
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "claims",
+            "datasets",
+            "builds_on",
+            "open_questions",
+            "potential_connections",
+        ],
+    )
+    def test_prompt_names_every_truncated_field(
+        self, field: str, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Issue #288: all five capped fields are truncated from the tail,
+        so the prompt must state the limit for each of them — not just the
+        two that #81 raised."""
+        assert field in self._render_tier3_prompt(load_config())
+
+    def test_prompt_states_the_ordering_contract(
+        self, influx_config_env: Any, tmp_path: Any
+    ) -> None:
+        """Truncation keeps the head, which is only the right call if the
+        model has been told to put the important items first."""
+        rendered = self._render_tier3_prompt(load_config()).lower()
+        assert "most-important-first" in rendered
+        assert "dropped" in rendered
 
 
 class TestTier3ExtractModelSlot:

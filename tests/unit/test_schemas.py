@@ -179,20 +179,22 @@ class TestTier3Extraction:
         with pytest.raises(ValidationError):
             Tier3Extraction(claims=["   "])
 
-    def test_too_many_claims(self) -> None:
-        with pytest.raises(ValidationError):
-            Tier3Extraction(claims=[f"c{i}" for i in range(TIER3_LIST_MAX + 1)])
+    def test_too_many_claims_truncates(self) -> None:
+        """Issue #288: over-cap lists are truncated, not rejected."""
+        t = Tier3Extraction(claims=[f"c{i}" for i in range(TIER3_LIST_MAX + 1)])
+        assert len(t.claims) == TIER3_LIST_MAX
 
     def test_no_claims_rejected(self) -> None:
         with pytest.raises(ValidationError):
             Tier3Extraction(claims=[])
 
-    def test_too_many_datasets(self) -> None:
-        with pytest.raises(ValidationError):
-            Tier3Extraction(
-                claims=["c"],
-                datasets=[f"d{i}" for i in range(TIER3_LIST_MAX + 1)],
-            )
+    def test_too_many_datasets_truncates(self) -> None:
+        """Issue #288: over-cap lists are truncated, not rejected."""
+        t = Tier3Extraction(
+            claims=["c"],
+            datasets=[f"d{i}" for i in range(TIER3_LIST_MAX + 1)],
+        )
+        assert len(t.datasets) == TIER3_LIST_MAX
 
 
 # ── OpenAI structured-outputs response_format builder ────────────────

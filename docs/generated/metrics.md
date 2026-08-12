@@ -36,7 +36,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 |---|---:|---:|---:|---:|---:|---:|---|---:|
 | Common | 7 | 2837 | 2075 | 12 | 1 | 0.08 | 47 (`influx.run_ledger.RunLedger.complete`) | 4 |
 | Config | 4 | 1567 | 1134 | 11 | 1 | 0.08 | 14 (`influx.config.NotificationWebhookConfig._validate_type_specific_fields`) | 1 |
-| Enrich | 2 | 988 | 800 | 2 | 5 | 0.71 | 22 (`influx.cascade.Cascade.enrich`) | 2 |
+| Enrich | 2 | 998 | 804 | 2 | 5 | 0.71 | 22 (`influx.cascade.Cascade.enrich`) | 2 |
 | Entrypoint | 2 | 573 | 454 | 0 | 5 | 1.00 | 14 (`influx.main._cmd_backfill`) | 2 |
 | Feedback | 3 | 571 | 450 | 1 | 4 | 0.80 | 15 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
 | Filter | 1 | 474 | 398 | 3 | 4 | 0.57 | 11 (`influx.filter.make_default_batch_scorer._scorer`) | 1 |
@@ -46,13 +46,13 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Observability | 3 | 1912 | 1401 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
 | Orchestration | 6 | 4103 | 3241 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
 | Repair | 5 | 3984 | 3041 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
-| Schemas | 1 | 240 | 183 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
+| Schemas | 1 | 331 | 247 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
 | Sources | 10 | 4343 | 3323 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
 | Storage | 1 | 720 | 588 | 3 | 3 | 0.50 | 14 (`influx.storage.download_archive`) | 2 |
 
 ## Size
 
-- Modules: **58**, lines: **28139**, SLOC: **21775**
+- Modules: **58**, lines: **28240**, SLOC: **21843**
 - Largest module: `influx.sources.arxiv` (1830 lines)
 - Modules over 800 lines: **11**
   - `influx.config`
@@ -69,7 +69,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **653**, cyclomatic > 10: **47**
+- Functions: **654**, cyclomatic > 10: **47**
 
 Top 10 most complex functions:
 
@@ -133,4 +133,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.58** (72713 test lines / 28139 source lines)
+- Test-to-source line ratio: **2.58** (72920 test lines / 28240 source lines)

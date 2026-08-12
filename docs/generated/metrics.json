@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 653
+    "total_functions": 654
   },
   "domain": {
     "associations": 5,
@@ -333,10 +333,10 @@
         "functions": 12,
         "largest_module": "influx.cascade",
         "largest_module_lines": 685,
-        "lines": 988,
+        "lines": 998,
         "modules": 2,
         "public_symbols": 6,
-        "sloc": 800
+        "sloc": 804
       },
       "Entrypoint": {
         "classes": 0,
@@ -430,13 +430,13 @@
       },
       "Schemas": {
         "classes": 4,
-        "functions": 7,
+        "functions": 8,
         "largest_module": "influx.schemas",
-        "largest_module_lines": 240,
-        "lines": 240,
+        "largest_module_lines": 331,
+        "lines": 331,
         "modules": 1,
         "public_symbols": 5,
-        "sloc": 183
+        "sloc": 247
       },
       "Sources": {
         "classes": 13,
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 28139,
+    "total_lines": 28240,
     "total_modules": 58,
-    "total_sloc": 21775
+    "total_sloc": 21843
   },
   "tests": {
     "ratio": 2.58,
-    "src_lines": 28139,
-    "test_lines": 72713
+    "src_lines": 28240,
+    "test_lines": 72920
   }
 }
