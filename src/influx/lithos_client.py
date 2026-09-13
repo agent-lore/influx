@@ -1725,6 +1725,38 @@ class LithosClient:
             operation="task_claim",
         )
 
+    async def task_release(
+        self,
+        *,
+        task_id: str,
+        agent: str,
+        aspect: str,
+    ) -> mcp_types.CallToolResult:
+        """Call ``lithos_task_release`` (inbox retry deferral, #292).
+
+        Drops the tick's ``ingest`` claim on a task it is *not* completing
+        so the task's claim state reflects reality while it waits out its
+        retry backoff.  Completion never needs this — Lithos clears claims
+        on ``lithos_task_complete``.
+        """
+        return await self._call_lcma_tool(
+            "lithos_task_release",
+            {"task_id": task_id, "aspect": aspect, "agent": agent},
+        )
+
+    async def task_release_body(
+        self,
+        *,
+        task_id: str,
+        agent: str,
+        aspect: str,
+    ) -> dict[str, Any]:
+        """Run ``task_release`` and decode the JSON body (``{"success", …}``)."""
+        return self._result_json_dict(
+            await self.task_release(task_id=task_id, agent=agent, aspect=aspect),
+            operation="task_release",
+        )
+
     async def task_update(
         self,
         *,

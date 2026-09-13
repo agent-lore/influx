@@ -23,7 +23,8 @@ Label values are bounded by construction:
   ``"degraded"``.  :func:`inbox_items_processed` reuses the ``outcome``
   attribute name with a *distinct* bounded enum (see its docstring).
 * ``phase`` — inbox task-lifecycle stage: ``"list"`` / ``"claim"`` /
-  ``"update"`` / ``"complete"`` (:func:`inbox_task_call_failures`).
+  ``"update"`` / ``"release"`` / ``"complete"``
+  (:func:`inbox_task_call_failures`).
 
 Per-item identifiers (``run_id``, ``note_id``, ``arxiv_id``,
 ``source_url``, ``title``) are **not** label values for any instrument
@@ -121,9 +122,13 @@ def inbox_items_processed() -> Any:
 
     Labels: ``outcome`` — one of ``ingested`` | ``filtered_out`` |
     ``cache_hit`` | ``profile_busy_skipped`` | ``error`` |
-    ``invalid_submission`` | ``invalid_source_tag`` | ``pdf_rejected``.  The
-    last three (#212) cover validation-terminal completions so a bad-submission
-    rate is visible in metrics rather than only in logs.
+    ``invalid_submission`` | ``invalid_source_tag`` | ``pdf_rejected`` |
+    ``filter_unavailable_deferred`` | ``filter_unavailable``.  The
+    validation-terminal trio (#212) makes a bad-submission rate visible in
+    metrics rather than only in logs; the ``filter_unavailable*`` pair (#292)
+    counts items no profile could score — deferred for retry, or abandoned
+    once the retry budget is spent — so an LLM-slot outage is visible on the
+    inbox side instead of hiding inside ``filtered_out``.
     """
     return get_meter().counter(
         "influx_inbox_items_processed_total",
@@ -134,12 +139,14 @@ def inbox_items_processed() -> Any:
 def inbox_task_call_failures() -> Any:
     """Counter of failed Lithos task-lifecycle calls in the inbox tick (#212).
 
-    Labels: ``phase`` (``list`` | ``claim`` | ``update`` | ``complete``).
-    Lets an operator distinguish "claims are failing" from "queue is backing
-    up" without log-spelunking.  Severity differs by phase: ``update``
-    failures are non-fatal (the task still completes; only the structured
-    ``inbox_result`` metadata is lost), whereas ``complete`` failures leave the
-    task open for a later tick to re-claim.
+    Labels: ``phase`` (``list`` | ``claim`` | ``update`` | ``release`` |
+    ``complete``).  Lets an operator distinguish "claims are failing" from
+    "queue is backing up" without log-spelunking.  Severity differs by phase:
+    ``update`` failures are non-fatal (the task still completes; only the
+    structured ``inbox_result`` metadata — or, on a #292 deferral, the retry
+    backoff — is lost), ``release`` failures just leave a deferred task's
+    claim to expire, whereas ``complete`` failures leave the task open for a
+    later tick to re-claim.
     """
     return get_meter().counter(
         "influx_inbox_task_call_failures_total",

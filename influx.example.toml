@@ -391,6 +391,15 @@ timezone = "UTC"
 max_items_per_tick = 20         # cap on items claimed+processed per tick
 agent_id = "influx-inbox"       # agent id used for task claim/update/complete
 # task_tag is the fixed protocol constant "influx:inbox" (not tunable)
+# When *every* profile's filter call fails for an item (LLM slot outage —
+# HTTP 402/5xx, network) the item has no verdict: it is deferred with
+# exponential backoff (backoff_minutes doubling per attempt, capped at
+# backoff_max_minutes) rather than completed as filtered-out, and after
+# max_retries deferrals completes with "error: filter_unavailable" so the
+# submitter knows to resubmit. Defaults keep an item alive for about a week.
+# filter_unavailable_max_retries = 48
+# filter_unavailable_backoff_minutes = 15
+# filter_unavailable_backoff_max_minutes = 240
 # Local-PDF intake (v2): root directory under which submitted kind="pdf"
 # local_path values must resolve. Unset (the default) disables local-PDF
 # submissions — such tasks complete with "error: pdf_root_not_configured".

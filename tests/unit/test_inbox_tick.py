@@ -10,12 +10,16 @@ scorer, ``build_filter_prompt``, ``dispatch_profile``):
 - invalid submission / invalid source_tag: terminal error completion;
 - already-claimed task: skipped silently;
 - lithos circuit open: whole tick skipped, no list/claim;
-- per-item failure isolation: a crashing item does not sink siblings.
+- per-item failure isolation: a crashing item does not sink siblings;
+- filter unavailable (#292): an item no profile could score is deferred
+  with backoff, never completed as filtered-out, and fails explicitly once
+  its retry budget is spent.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -85,6 +89,7 @@ class FakeClient:
         self._existing_note = existing_note or {"content": "", "tags": []}
         self._gated: set[str] = set()
         self.claimed: list[str] = []
+        self.released: list[str] = []
         self.updated: list[tuple[str, dict[str, Any]]] = []
         self.completed: list[dict[str, Any]] = []
         self.list_calls = 0
@@ -97,6 +102,12 @@ class FakeClient:
     async def task_claim_body(self, *, task_id: str, **_: Any) -> dict[str, Any]:
         self.claimed.append(task_id)
         return {"success": self._claim_success}
+
+    async def task_release_body(
+        self, *, task_id: str, agent: str, aspect: str
+    ) -> dict[str, Any]:
+        self.released.append(task_id)
+        return {"success": True}
 
     async def task_update_body(
         self, *, task_id: str, agent: str, metadata: dict[str, Any]
@@ -1316,3 +1327,391 @@ async def test_busy_skip_logs_deferral_with_source(caplog: Any) -> None:
     assert len(deferred) == 1
     assert getattr(deferred[0], "source_url", None) == "https://example.com/article"
     assert sorted(getattr(deferred[0], "profiles", [])) == ["a", "b"]
+
+
+# ── #292: filter unavailable → deferred retry, never filtered_out ────
+
+
+def _retry_block(
+    *,
+    attempts: int,
+    not_before: datetime | str | None = None,
+    reason: str = "filter_unavailable",
+) -> dict[str, Any]:
+    """An ``inbox_retry`` metadata block as a previous tick would have left it."""
+    block: dict[str, Any] = {"reason": reason, "attempts": attempts}
+    if isinstance(not_before, datetime):
+        block["not_before"] = not_before.isoformat()
+    elif not_before is not None:
+        block["not_before"] = not_before
+    return block
+
+
+def _task_with_retry(retry: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    task = _task(**kwargs)
+    task["metadata"]["inbox_retry"] = retry
+    return task
+
+
+def _inbox_config(**inbox: Any) -> AppConfig:
+    """Two-profile config with ``[inbox]`` overrides."""
+    base = _make_config([("a", 7), ("b", 7)])
+    return base.model_copy(update={"inbox": InboxConfig(**inbox)})
+
+
+def _all_failing_patches(client: FakeClient):
+    """Both profiles' filter calls raise (the 402-outage shape)."""
+    return (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({}, raise_for={"a", "b"}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile"),
+    )
+
+
+def _retry_metadata(client: FakeClient) -> dict[str, Any]:
+    blocks = [m["inbox_retry"] for _tid, m in client.updated if "inbox_retry" in m]
+    assert len(blocks) == 1, client.updated
+    return blocks[0]
+
+
+async def test_all_profiles_filter_error_defers_instead_of_filtered_out() -> None:
+    """The #292 bug: every profile errors → previously ``filtered out: no
+    profile scored the item`` + task completed.  Now: no completion, retry
+    state recorded, claim released, distinct metric outcome."""
+    config = _inbox_config()
+    client = FakeClient(tasks=[_task()])
+    a, b, c, d = _all_failing_patches(client)
+    with (
+        a,
+        b,
+        c,
+        d as mock_dispatch,
+        patch("influx.metrics.inbox_items_processed") as m,
+    ):
+        await _tick(client, config).execute()
+
+    mock_dispatch.assert_not_called()
+    assert client.completed == []  # never asserts a verdict it doesn't have
+    assert client.released == ["task-1"]
+    retry = _retry_metadata(client)
+    assert retry["reason"] == "filter_unavailable"
+    assert retry["attempts"] == 1
+    last = datetime.fromisoformat(retry["last_attempt_at"])
+    not_before = datetime.fromisoformat(retry["not_before"])
+    assert not_before - last == timedelta(minutes=15)  # first backoff step
+    assert _outcomes(m) == ["filter_unavailable_deferred"]
+
+
+async def test_filter_unavailable_backoff_doubles_then_caps() -> None:
+    """attempt n waits ``15 * 2**(n-1)`` minutes, capped at 240."""
+    config = _inbox_config()
+    for prior, expected_minutes in ((3, 120), (4, 240), (10, 240)):
+        client = FakeClient(tasks=[_task_with_retry(_retry_block(attempts=prior))])
+        a, b, c, d = _all_failing_patches(client)
+        with a, b, c, d:
+            await _tick(client, config).execute()
+        retry = _retry_metadata(client)
+        assert retry["attempts"] == prior + 1
+        gap = datetime.fromisoformat(retry["not_before"]) - datetime.fromisoformat(
+            retry["last_attempt_at"]
+        )
+        assert gap == timedelta(minutes=expected_minutes), prior
+
+
+async def test_filter_unavailable_exhausted_completes_with_explicit_error() -> None:
+    """Past the retry budget the task completes as ``error: filter_unavailable``
+    — an honest terminal outcome the submitter can act on, not a rejection."""
+    config = _inbox_config(filter_unavailable_max_retries=2)
+    client = FakeClient(tasks=[_task_with_retry(_retry_block(attempts=2))])
+    a, b, c, d = _all_failing_patches(client)
+    with a, b, c, d, patch("influx.metrics.inbox_items_processed") as m:
+        await _tick(client, config).execute()
+
+    assert client.released == []  # completion clears the claim server-side
+    assert len(client.completed) == 1
+    done = client.completed[0]
+    assert done["outcome"] == (
+        "error: filter_unavailable after 3 attempt(s) (a, b filter failed)"
+    )
+    assert "filtered out" not in done["outcome"]
+    assert done["cited_nodes"] is None
+    result = client.updated[-1][1]["inbox_result"]
+    assert result["error"] == "filter_unavailable"
+    assert result["attempts"] == 3
+    assert result["cache_hit"] is False
+    assert result["per_profile"] == {
+        "a": {"ingested": False, "reason": "filter_error"},
+        "b": {"ingested": False, "reason": "filter_error"},
+    }
+    assert "processing_time_ms" in result
+    assert _outcomes(m) == ["filter_unavailable"]
+
+
+async def test_filter_unavailable_zero_retries_is_terminal_first_time() -> None:
+    """``filter_unavailable_max_retries = 0`` opts out of deferral but still
+    gets the honest outcome (never ``filtered_out``)."""
+    config = _inbox_config(filter_unavailable_max_retries=0)
+    client = FakeClient(tasks=[_task()])
+    a, b, c, d = _all_failing_patches(client)
+    with a, b, c, d:
+        await _tick(client, config).execute()
+
+    assert len(client.completed) == 1
+    assert client.completed[0]["outcome"].startswith(
+        "error: filter_unavailable after 1 attempt(s)"
+    )
+    assert not any("inbox_retry" in m for _tid, m in client.updated)
+
+
+async def test_foreign_retry_block_does_not_count_toward_budget() -> None:
+    """Only an ``inbox_retry`` block with our reason counts; anything else is
+    treated as a fresh item (attempt 1)."""
+    config = _inbox_config()
+    client = FakeClient(
+        tasks=[_task_with_retry(_retry_block(attempts=40, reason="something_else"))]
+    )
+    a, b, c, d = _all_failing_patches(client)
+    with a, b, c, d:
+        await _tick(client, config).execute()
+    assert _retry_metadata(client)["attempts"] == 1
+
+
+async def test_foreign_or_malformed_block_with_future_stamp_is_still_due() -> None:
+    """Review of #293: ``not_before`` is honoured only from a block Influx
+    wrote (our reason + a valid attempt count).  Submitter-supplied
+    metadata with a far-future stamp under a foreign reason — or under our
+    reason but with a malformed ``attempts`` — must not park the task."""
+    from influx.inbox import InboxStatus
+
+    future = datetime.now(UTC) + timedelta(days=3650)
+    blocks = [
+        _retry_block(attempts=1, not_before=future, reason="something_else"),
+        {"not_before": future.isoformat()},  # no reason at all
+        {
+            "reason": "filter_unavailable",
+            "attempts": "3",
+            "not_before": future.isoformat(),
+        },
+        {
+            "reason": "filter_unavailable",
+            "attempts": -1,
+            "not_before": future.isoformat(),
+        },
+        {"reason": "filter_unavailable", "not_before": future.isoformat()},
+    ]
+    for block in blocks:
+        status = InboxStatus(enabled=True)
+        client = FakeClient(tasks=[_task_with_retry(block)])
+        tick = InboxTick(
+            config=_inbox_config(),
+            coordinator=Coordinator(),
+            status=status,
+            client_factory=lambda c=client: c,  # type: ignore[arg-type]
+        )
+        a, b, c, d = _all_failing_patches(client)
+        with a, b, c, d:
+            await tick.execute()
+        assert client.claimed == ["task-1"], block
+        assert status.awaiting_retry == 0, block
+        # …and it is treated as a fresh item: the stray block did not
+        # pre-spend the retry budget.
+        assert _retry_metadata(client)["attempts"] == 1, block
+
+
+async def test_task_in_backoff_is_left_unclaimed_and_counted() -> None:
+    """A task whose ``not_before`` is in the future is skipped without a
+    claim; ``/status`` sees it in ``pending`` *and* ``awaiting_retry``."""
+    from influx.inbox import InboxStatus
+
+    future = datetime.now(UTC) + timedelta(minutes=30)
+    status = InboxStatus(enabled=True)
+    client = FakeClient(
+        tasks=[_task_with_retry(_retry_block(attempts=1, not_before=future))]
+    )
+    tick = InboxTick(
+        config=_inbox_config(),
+        coordinator=Coordinator(),
+        status=status,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    )
+    a, b, c, d = _all_failing_patches(client)
+    with a as mock_acquire, b, c, d:
+        await tick.execute()
+
+    assert client.claimed == []
+    mock_acquire.assert_not_called()  # no re-download while waiting
+    assert client.completed == []
+    assert status.pending == 1
+    assert status.awaiting_retry == 1
+    assert status.last_tick_outcome == "success"
+
+
+async def test_backoff_tasks_do_not_consume_per_tick_slots() -> None:
+    """Waiting tasks are filtered out *before* the ``max_items_per_tick``
+    slice, so a backlog in backoff cannot starve fresh submissions."""
+    future = datetime.now(UTC) + timedelta(minutes=30)
+    config = _inbox_config(max_items_per_tick=1)
+    waiting = _task_with_retry(
+        _retry_block(attempts=1, not_before=future), task_id="waiting"
+    )
+    fresh = _task(task_id="fresh", url="https://example.com/fresh")
+    client = FakeClient(tasks=[waiting, fresh], note_id="note-1")
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"a": 8, "b": 8}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile", return_value=RunOutcome(ingested=1)),
+    ):
+        await _tick(client, config).execute()
+
+    assert client.claimed == ["fresh"]
+    assert [c["task_id"] for c in client.completed] == ["fresh"]
+
+
+async def test_elapsed_or_unparseable_not_before_is_due() -> None:
+    """A past stamp, a naive (tz-less) past stamp, or garbage all read as
+    *due*: a corrupt backoff stamp must never strand a task."""
+    past = datetime.now(UTC) - timedelta(minutes=1)
+    stamps: list[datetime | str] = [
+        past,
+        past.replace(tzinfo=None).isoformat(),
+        "not-a-timestamp",
+    ]
+    for stamp in stamps:
+        client = FakeClient(
+            tasks=[_task_with_retry(_retry_block(attempts=1, not_before=stamp))]
+        )
+        a, b, c, d = _all_failing_patches(client)
+        with a, b, c, d:
+            await _tick(client, _inbox_config()).execute()
+        assert client.claimed == ["task-1"], stamp
+        assert _retry_metadata(client)["attempts"] == 2, stamp
+
+
+async def test_partial_filter_failure_still_filters_out_but_is_auditable() -> None:
+    """One profile errored, the other gave a real below-threshold verdict:
+    the §5.5 isolation stands (terminal filtered_out), but the outcome
+    names the profile whose verdict is missing."""
+    config = _inbox_config()
+    client = FakeClient(tasks=[_task()])
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"a": 3}, raise_for={"b"}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile") as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+
+    mock_dispatch.assert_not_called()
+    assert client.released == []
+    assert client.completed[0]["outcome"] == (
+        "filtered out: top score 3 (a) below threshold 7; b filter failed"
+    )
+
+
+async def test_cache_hit_complement_all_filters_error_defers() -> None:
+    """Replay path: the only not-yet-ingested profile errors → deferred, not
+    ``cache_hit … no new profiles matched``."""
+    config = _inbox_config()
+    client = FakeClient(
+        tasks=[_task()],
+        existing_note_id="note-1",
+        existing_note={"content": _note_content(["a"]), "tags": []},
+    )
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({}, raise_for={"b"}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile"),
+    ):
+        await _tick(client, config).execute()
+
+    assert client.completed == []
+    assert client.released == ["task-1"]
+    assert _retry_metadata(client)["attempts"] == 1
+
+
+async def test_cache_hit_filter_unavailable_exhausted_cites_existing_note() -> None:
+    config = _inbox_config(filter_unavailable_max_retries=0)
+    client = FakeClient(
+        tasks=[_task()],
+        existing_note_id="note-1",
+        existing_note={"content": _note_content(["a"]), "tags": []},
+    )
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({}, raise_for={"b"}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile"),
+    ):
+        await _tick(client, config).execute()
+
+    done = client.completed[0]
+    assert done["outcome"] == (
+        "error: filter_unavailable after 1 attempt(s) (b filter failed)"
+    )
+    assert done["cited_nodes"] == ["note-1"]
+    assert client.updated[-1][1]["inbox_result"]["cache_hit"] is True
+
+
+async def test_filter_unavailable_update_and_release_failures_are_non_fatal() -> None:
+    """Losing the backoff write or the release just means a noisier retry;
+    neither crashes the item, and both are counted as call failures."""
+    from influx.errors import LithosError
+
+    client = FakeClient(tasks=[_task()])
+
+    async def _update_boom(**_: Any) -> dict[str, Any]:
+        raise LithosError("update boom")
+
+    async def _release_boom(**_: Any) -> dict[str, Any]:
+        raise LithosError("release boom")
+
+    client.task_update_body = _update_boom  # type: ignore[method-assign]
+    client.task_release_body = _release_boom  # type: ignore[method-assign]
+    a, b, c, d = _all_failing_patches(client)
+    with a, b, c, d, patch("influx.metrics.inbox_task_call_failures") as m:
+        await _tick(client, _inbox_config()).execute()
+
+    assert client.completed == []
+    assert sorted(_phases(m)) == ["release", "update"]
+
+
+async def test_filter_unavailable_deferral_is_logged_with_source(
+    caplog: Any,
+) -> None:
+    """The deferral never reaches ``_complete``, so it logs its own line —
+    at WARNING, because a stuck item is the actionable signal."""
+    client = FakeClient(tasks=[_task()])
+    a, b, c, d = _all_failing_patches(client)
+    with caplog.at_level(logging.INFO, logger="influx.inbox"), a, b, c, d:
+        await _tick(client, _inbox_config()).execute()
+
+    assert _summary_records(caplog) == []  # no completion → no "item done"
+    deferred = [
+        r for r in caplog.records if "deferred: filter unavailable" in r.message
+    ]
+    assert len(deferred) == 1
+    rec = deferred[0]
+    assert rec.levelno == logging.WARNING
+    assert getattr(rec, "source_url", None) == "https://example.com/article"
+    assert getattr(rec, "outcome", None) == "filter_unavailable_deferred"
+    assert getattr(rec, "attempt", None) == 1
+    assert sorted(getattr(rec, "profiles", [])) == ["a", "b"]
+    assert getattr(rec, "task_id", None) == "task-1"

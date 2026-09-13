@@ -1,7 +1,7 @@
 """Unit tests for the inbox ``LithosClient`` task wrappers (Inbox v1 slice 1).
 
 Verifies arg-shaping + JSON decode for ``task_list`` / ``task_claim`` /
-``task_update`` and the new ``cited_nodes`` pass-through on
+``task_release`` / ``task_update`` and the new ``cited_nodes`` pass-through on
 ``task_complete`` — mirroring the existing ``task_create`` wrapper
 semantics (decode via ``_result_json_dict``).
 """
@@ -58,6 +58,21 @@ async def test_task_claim_shapes_args_and_decodes() -> None:
         "agent": "influx-inbox",
         "ttl_minutes": 60,
     }
+
+
+async def test_task_release_shapes_args_and_decodes() -> None:
+    """#292: the deferral path drops its ``ingest`` claim via lithos_task_release."""
+    client = _client()
+    client.call_tool = AsyncMock(  # type: ignore[method-assign]
+        return_value=_tool_result({"success": True, "task_id": "t1", "title": "x"})
+    )
+    body = await client.task_release_body(
+        task_id="t1", agent="influx-inbox", aspect="ingest"
+    )
+    assert body["success"] is True
+    name, args = client.call_tool.call_args.args
+    assert name == "lithos_task_release"
+    assert args == {"task_id": "t1", "aspect": "ingest", "agent": "influx-inbox"}
 
 
 async def test_task_update_shapes_args_and_decodes() -> None:
