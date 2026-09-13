@@ -44,7 +44,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | LithosBridge | 8 | 4129 | 3283 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 4 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1919 | 1408 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
-| Orchestration | 6 | 4368 | 3467 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
+| Orchestration | 6 | 4377 | 3476 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
 | Repair | 5 | 3984 | 3041 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 331 | 247 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
 | Sources | 10 | 4343 | 3323 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
@@ -52,7 +52,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **58**, lines: **28585**, SLOC: **22131**
+- Modules: **58**, lines: **28594**, SLOC: **22140**
 - Largest module: `influx.sources.arxiv` (1830 lines)
 - Modules over 800 lines: **11**
   - `influx.config`
@@ -133,4 +133,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.57** (73412 test lines / 28585 source lines)
+- Test-to-source line ratio: **2.57** (73454 test lines / 28594 source lines)

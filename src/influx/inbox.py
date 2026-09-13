@@ -104,36 +104,45 @@ def _sanitise_submitter(value: str) -> str:
     return cleaned or "unknown"
 
 
-def _retry_state(metadata: dict[str, Any]) -> dict[str, Any] | None:
-    """The task's ``inbox_retry`` block, or ``None`` when absent / malformed."""
+def _owned_retry_state(metadata: object) -> dict[str, Any] | None:
+    """The task's ``inbox_retry`` block **if Influx wrote it**, else ``None``.
+
+    Task metadata is submitter-supplied, so a block is trusted only when it is
+    well-formed and carries our ``filter_unavailable`` reason with a valid
+    non-negative ``attempts`` count.  Anything else — absent, foreign reason,
+    malformed — is ignored *wholesale*: neither its attempt count nor its
+    ``not_before`` is honoured, so a stray block can never strand a task or
+    pre-spend its retry budget.  Both readers below share this predicate.
+    """
+    if not isinstance(metadata, dict):
+        return None
     state = metadata.get(_RETRY_METADATA_KEY)
-    return state if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        return None
+    if state.get("reason") != _RETRY_REASON_FILTER_UNAVAILABLE:
+        return None
+    attempts = state.get("attempts")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+        return None
+    return state
 
 
 def _retry_attempts(metadata: dict[str, Any]) -> int:
-    """Deferred filter-unavailable attempts already recorded on the task (#292).
-
-    Only a block carrying the ``filter_unavailable`` reason counts; anything
-    else (absent, foreign, malformed) reads as zero so the item is treated
-    as fresh rather than crashing the tick.
-    """
-    state = _retry_state(metadata)
-    if state is None or state.get("reason") != _RETRY_REASON_FILTER_UNAVAILABLE:
-        return 0
-    attempts = state.get("attempts")
-    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
-        return 0
-    return attempts
+    """Deferred filter-unavailable attempts already recorded on the task (#292);
+    zero for a fresh item (see :func:`_owned_retry_state`)."""
+    state = _owned_retry_state(metadata)
+    return 0 if state is None else int(state["attempts"])
 
 
 def _retry_due(task: dict[str, Any], now: datetime) -> bool:
-    """``True`` unless the task carries a future ``inbox_retry.not_before`` (#292).
+    """``True`` unless an Influx-owned ``inbox_retry.not_before`` is still in the
+    future (#292).
 
-    Any unparseable / naive timestamp counts as due (naive is read as UTC):
-    a corrupt backoff stamp must never strand a task.
+    Only a block :func:`_owned_retry_state` accepts is consulted, and within
+    it any unparseable / naive timestamp counts as due (naive is read as
+    UTC): a corrupt or foreign backoff stamp must never strand a task.
     """
-    metadata = task.get("metadata") if isinstance(task, dict) else None
-    state = _retry_state(metadata) if isinstance(metadata, dict) else None
+    state = _owned_retry_state(task.get("metadata") if isinstance(task, dict) else None)
     raw = state.get("not_before") if state is not None else None
     if not isinstance(raw, str):
         return True

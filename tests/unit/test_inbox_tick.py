@@ -1480,6 +1480,48 @@ async def test_foreign_retry_block_does_not_count_toward_budget() -> None:
     assert _retry_metadata(client)["attempts"] == 1
 
 
+async def test_foreign_or_malformed_block_with_future_stamp_is_still_due() -> None:
+    """Review of #293: ``not_before`` is honoured only from a block Influx
+    wrote (our reason + a valid attempt count).  Submitter-supplied
+    metadata with a far-future stamp under a foreign reason — or under our
+    reason but with a malformed ``attempts`` — must not park the task."""
+    from influx.inbox import InboxStatus
+
+    future = datetime.now(UTC) + timedelta(days=3650)
+    blocks = [
+        _retry_block(attempts=1, not_before=future, reason="something_else"),
+        {"not_before": future.isoformat()},  # no reason at all
+        {
+            "reason": "filter_unavailable",
+            "attempts": "3",
+            "not_before": future.isoformat(),
+        },
+        {
+            "reason": "filter_unavailable",
+            "attempts": -1,
+            "not_before": future.isoformat(),
+        },
+        {"reason": "filter_unavailable", "not_before": future.isoformat()},
+    ]
+    for block in blocks:
+        status = InboxStatus(enabled=True)
+        client = FakeClient(tasks=[_task_with_retry(block)])
+        tick = InboxTick(
+            config=_inbox_config(),
+            coordinator=Coordinator(),
+            status=status,
+            client_factory=lambda c=client: c,  # type: ignore[arg-type]
+        )
+        a, b, c, d = _all_failing_patches(client)
+        with a, b, c, d:
+            await tick.execute()
+        assert client.claimed == ["task-1"], block
+        assert status.awaiting_retry == 0, block
+        # …and it is treated as a fresh item: the stray block did not
+        # pre-spend the retry budget.
+        assert _retry_metadata(client)["attempts"] == 1, block
+
+
 async def test_task_in_backoff_is_left_unclaimed_and_counted() -> None:
     """A task whose ``not_before`` is in the future is skipped without a
     claim; ``/status`` sees it in ``pending`` *and* ``awaiting_retry``."""
