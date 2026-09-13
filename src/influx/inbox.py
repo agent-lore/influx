@@ -33,7 +33,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -76,6 +76,13 @@ _REJECTED_TAG_PREFIX = "influx:rejected:"
 # Cap source identifiers in the per-item summary log so a pathological URL
 # can't bloat the line; the full value still rides in the ``extra`` field.
 _LOG_SOURCE_MAX = 200
+# #292: task-metadata key under which a deferred item's retry state lives
+# (``{"reason", "attempts", "last_attempt_at", "not_before"}``).  Written via
+# ``task_update`` (additive per-key merge) and read back from ``task_list``
+# on later ticks; an operator clears it (``metadata={"inbox_retry": null}``)
+# to force an immediate retry.
+_RETRY_METADATA_KEY = "inbox_retry"
+_RETRY_REASON_FILTER_UNAVAILABLE = "filter_unavailable"
 
 
 def _log_source(value: object) -> str:
@@ -95,6 +102,57 @@ def _sanitise_submitter(value: str) -> str:
     """Reduce a submitter id to a safe, single-token tag value (≤64 chars)."""
     cleaned = _SUBMITTER_STRIP_RE.sub("-", value).strip("-")[:64]
     return cleaned or "unknown"
+
+
+def _retry_state(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    """The task's ``inbox_retry`` block, or ``None`` when absent / malformed."""
+    state = metadata.get(_RETRY_METADATA_KEY)
+    return state if isinstance(state, dict) else None
+
+
+def _retry_attempts(metadata: dict[str, Any]) -> int:
+    """Deferred filter-unavailable attempts already recorded on the task (#292).
+
+    Only a block carrying the ``filter_unavailable`` reason counts; anything
+    else (absent, foreign, malformed) reads as zero so the item is treated
+    as fresh rather than crashing the tick.
+    """
+    state = _retry_state(metadata)
+    if state is None or state.get("reason") != _RETRY_REASON_FILTER_UNAVAILABLE:
+        return 0
+    attempts = state.get("attempts")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+        return 0
+    return attempts
+
+
+def _retry_due(task: dict[str, Any], now: datetime) -> bool:
+    """``True`` unless the task carries a future ``inbox_retry.not_before`` (#292).
+
+    Any unparseable / naive timestamp counts as due (naive is read as UTC):
+    a corrupt backoff stamp must never strand a task.
+    """
+    metadata = task.get("metadata") if isinstance(task, dict) else None
+    state = _retry_state(metadata) if isinstance(metadata, dict) else None
+    raw = state.get("not_before") if state is not None else None
+    if not isinstance(raw, str):
+        return True
+    try:
+        not_before = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if not_before.tzinfo is None:
+        not_before = not_before.replace(tzinfo=UTC)
+    return not_before <= now
+
+
+def _backoff_minutes(attempt: int, *, base: int, cap: int) -> int:
+    """Wait before deferred attempt *attempt* + 1: ``base * 2**(attempt-1)``, capped.
+
+    The exponent is clamped so an operator-set huge retry budget cannot
+    drive an absurd power — the cap binds long before 2**40 anyway.
+    """
+    return min(base * 2 ** min(attempt - 1, 40), cap)
 
 
 def _extract_note_id(body: dict[str, Any]) -> str | None:
@@ -220,6 +278,9 @@ class InboxStatus:
     enabled: bool = False
     pending: int = 0
     in_flight: int = 0
+    # Open tasks the last tick left alone because their filter-unavailable
+    # retry backoff (#292) had not elapsed; a subset of ``pending``.
+    awaiting_retry: int = 0
     last_tick_at: str | None = None
     last_tick_outcome: str | None = None
 
@@ -230,6 +291,7 @@ class InboxStatus:
             "enabled": self.enabled,
             "pending": self.pending,
             "in_flight": self.in_flight,
+            "awaiting_retry": self.awaiting_retry,
             "last_tick_at": self.last_tick_at,
             "last_tick_outcome": self.last_tick_outcome,
         }
@@ -269,6 +331,30 @@ class _ProfileScore:
     @property
     def clears(self) -> bool:
         return self.scored is not None and self.scored.score >= self.threshold
+
+
+@dataclass(frozen=True)
+class _FilterUnavailable:
+    """Signal from :meth:`InboxTick._ingest_item`: no verdict was possible (#292).
+
+    Every candidate profile's filter call raised, so the item was neither
+    cleared nor rejected — completing it as ``filtered_out`` would assert a
+    verdict the model never gave.  :meth:`InboxTick._process_task` turns this
+    into a deferred retry (backoff recorded in task metadata) or, once the
+    retry budget is spent, an explicit ``filter_unavailable`` terminal
+    outcome.
+    """
+
+    acquired: InboxAcquisition
+    scored_profiles: list[_ProfileScore]
+    cache_note_id: str | None
+    started: float
+
+
+# What ``_ingest_item`` (and the per-kind wrappers) hand back to
+# ``_process_task``: a completable outcome, the #292 no-verdict signal, or
+# ``None`` for "already completed terminally / skip this tick".
+_IngestResult = _ItemOutcome | _FilterUnavailable | None
 
 
 @dataclass
@@ -338,9 +424,21 @@ class InboxTick:
                 return
 
             all_tasks = list(body.get("tasks", []))
+            # #292: tasks waiting out a filter-unavailable backoff are left
+            # unclaimed this tick — and filtered *before* the per-tick slice
+            # so they never crowd out fresh submissions.
+            now = datetime.now(UTC)
+            due_tasks = [t for t in all_tasks if _retry_due(t, now)]
+            awaiting_retry = len(all_tasks) - len(due_tasks)
             if status is not None:
                 status.pending = len(all_tasks)
-            tasks = all_tasks[: self.config.inbox.max_items_per_tick]
+                status.awaiting_retry = awaiting_retry
+            if awaiting_retry:
+                logger.debug(
+                    "inbox tick: %d item(s) waiting on filter retry backoff",
+                    awaiting_retry,
+                )
+            tasks = due_tasks[: self.config.inbox.max_items_per_tick]
             # Record the full open backlog returned by task_list (not just the
             # processed slice) so queue pressure is observable (#212); the
             # per-tick processed count is ``inbox_tasks_claimed``.  Both are
@@ -438,6 +536,9 @@ class InboxTick:
         # leave completion alone here.  A real per-item outcome is completed.
         if result is None:
             return
+        if isinstance(result, _FilterUnavailable):
+            await self._resolve_filter_unavailable(client, task_id, metadata, result)
+            return
         await self._complete(client, task_id, result)
 
     async def _process_url_task(
@@ -450,7 +551,7 @@ class InboxTick:
         title_hint: str | None,
         summary_hint: str | None,
         source_tag: str,
-    ) -> _ItemOutcome | None:
+    ) -> _IngestResult:
         """Validate a ``kind="url"`` submission and ingest it (v1 path).
 
         Returns the per-item outcome, or ``None`` when the task was already
@@ -506,7 +607,7 @@ class InboxTick:
         title_hint: str | None,
         summary_hint: str | None,
         source_tag: str,
-    ) -> _ItemOutcome | None:
+    ) -> _IngestResult:
         """Validate a ``kind="pdf"`` submission and ingest it (v2 §16).
 
         Validates ``local_path`` against ``[inbox] pdf_root`` and the file's
@@ -634,7 +735,7 @@ class InboxTick:
         source_tag: str,
         acquire: Callable[[], InboxAcquisition] | None = None,
         acquired: InboxAcquisition | None = None,
-    ) -> _ItemOutcome | None:
+    ) -> _IngestResult:
         """Acquire once, score every enabled profile, fan out, and report.
 
         The item is identified by *source_url* (used for the cache lookup).
@@ -652,6 +753,9 @@ class InboxTick:
         Returns the per-item outcome used to complete the task, or ``None``
         to signal skip-this-tick — used when *every* clearing profile is busy
         (§5.5 / §10): the task is left un-completed so a later tick retries.
+        Returns :class:`_FilterUnavailable` when every candidate profile's
+        filter call raised (#292): there is no verdict to complete with, and
+        the caller decides between a deferred retry and a terminal error.
         """
         started = time.monotonic()
         profiles = self.config.profiles
@@ -762,6 +866,17 @@ class InboxTick:
         scored_profiles = list(
             await asyncio.gather(*(_score(p) for p in candidate_profiles))
         )
+        # #292: the §5.5 isolation is only meaningful while *some* profile
+        # produced a verdict.  When every filter call raised there is nothing
+        # to isolate to — an LLM-slot outage must not masquerade as a
+        # below-threshold rejection (which would complete the task for good).
+        if all(ps.error for ps in scored_profiles):
+            return _FilterUnavailable(
+                acquired=acquired,
+                scored_profiles=scored_profiles,
+                cache_note_id=cache_note_id,
+                started=started,
+            )
         clearing = [ps for ps in scored_profiles if ps.clears]
 
         if not clearing:
@@ -884,6 +999,9 @@ class InboxTick:
 
         Frames as a cache-hit replay (``no new profiles matched``) when this
         URL is already a note, else a fresh ``filtered out: top score …``.
+        Profiles whose filter call raised are appended (``; a, b filter
+        failed``, #292) so a verdict reached with some profiles missing is
+        auditable — the all-failed case never gets here (it is deferred).
         """
         if cache_note_id is not None:
             metric_outcome = "cache_hit"
@@ -908,6 +1026,9 @@ class InboxTick:
                 )
             else:
                 outcome = "filtered out: no profile scored the item"
+        filter_errors = [ps.name for ps in scored_profiles if ps.error]
+        if filter_errors:
+            outcome += f"; {', '.join(filter_errors)} filter failed"
         return _ItemOutcome(
             outcome=outcome,
             cited_nodes=[cache_note_id] if cache_note_id else [],
@@ -922,6 +1043,150 @@ class InboxTick:
             },
             metric_outcome=metric_outcome,
         )
+
+    async def _resolve_filter_unavailable(
+        self,
+        client: LithosClient,
+        task_id: str,
+        metadata: dict[str, Any],
+        signal: _FilterUnavailable,
+    ) -> None:
+        """Defer or terminally fail an item no profile could score (#292).
+
+        Counts this attempt on top of the ``inbox_retry`` block the task
+        already carries.  Within ``[inbox] filter_unavailable_max_retries``
+        the task is left ``open`` with its backoff recorded
+        (:meth:`_defer_filter_unavailable`); past the budget it completes
+        with an explicit ``error: filter_unavailable`` — never
+        ``filtered_out`` — so the submitter can tell "unscored" from
+        "rejected" and resubmit (:meth:`_abandon_filter_unavailable`).
+        """
+        attempts = _retry_attempts(metadata) + 1
+        if attempts > self.config.inbox.filter_unavailable_max_retries:
+            await self._abandon_filter_unavailable(client, task_id, signal, attempts)
+        else:
+            await self._defer_filter_unavailable(client, task_id, signal, attempts)
+
+    async def _abandon_filter_unavailable(
+        self,
+        client: LithosClient,
+        task_id: str,
+        signal: _FilterUnavailable,
+        attempts: int,
+    ) -> None:
+        """Complete an item whose filter-unavailable retry budget is spent."""
+        failed = [ps.name for ps in signal.scored_profiles]
+        logger.warning(
+            "inbox item abandoned: filter unavailable for every profile on "
+            "%d attempt(s) source_url=%s profiles=%s task_id=%s",
+            attempts,
+            _log_source(signal.acquired.source_url),
+            failed,
+            task_id,
+        )
+        metrics.inbox_items_processed().add(
+            1, {"outcome": _RETRY_REASON_FILTER_UNAVAILABLE}
+        )
+        await self._complete(
+            client,
+            task_id,
+            _ItemOutcome(
+                outcome=(
+                    f"error: filter_unavailable after {attempts} attempt(s) "
+                    f"({', '.join(failed)} filter failed)"
+                ),
+                cited_nodes=[signal.cache_note_id] if signal.cache_note_id else [],
+                inbox_result={
+                    "source_url": signal.acquired.source_url,
+                    "archive_path": signal.acquired.archive_path,
+                    "cache_hit": signal.cache_note_id is not None,
+                    "error": _RETRY_REASON_FILTER_UNAVAILABLE,
+                    "attempts": attempts,
+                    "per_profile": self._build_per_profile(
+                        signal.scored_profiles, {}, [], {}, None
+                    ),
+                    "processing_time_ms": int(
+                        (time.monotonic() - signal.started) * 1000
+                    ),
+                },
+                metric_outcome=_RETRY_REASON_FILTER_UNAVAILABLE,
+            ),
+        )
+
+    async def _defer_filter_unavailable(
+        self,
+        client: LithosClient,
+        task_id: str,
+        signal: _FilterUnavailable,
+        attempts: int,
+    ) -> None:
+        """Leave an unscorable item ``open`` with its retry backoff recorded.
+
+        Writes the ``inbox_retry`` block (attempt count + ``not_before``)
+        and releases the ``ingest`` claim; the tick skips the task until the
+        stamp passes.  Both Lithos calls are best-effort: a lost update just
+        means a retry next tick without backoff, a lost release leaves the
+        lease to expire.
+        """
+        cfg = self.config.inbox
+        failed = [ps.name for ps in signal.scored_profiles]
+        now = datetime.now(UTC)
+        not_before = now + timedelta(
+            minutes=_backoff_minutes(
+                attempts,
+                base=cfg.filter_unavailable_backoff_minutes,
+                cap=cfg.filter_unavailable_backoff_max_minutes,
+            )
+        )
+        deferred_outcome = f"{_RETRY_REASON_FILTER_UNAVAILABLE}_deferred"
+        metrics.inbox_items_processed().add(1, {"outcome": deferred_outcome})
+        logger.warning(
+            "inbox item deferred: filter unavailable for every profile "
+            "source_url=%s attempt=%d/%d retry_after=%s profiles=%s task_id=%s",
+            _log_source(signal.acquired.source_url),
+            attempts,
+            cfg.filter_unavailable_max_retries + 1,
+            not_before.isoformat(),
+            failed,
+            task_id,
+            extra={
+                "source_url": signal.acquired.source_url,
+                "outcome": deferred_outcome,
+                "profiles": failed,
+                "task_id": task_id,
+                "attempt": attempts,
+                "not_before": not_before.isoformat(),
+            },
+        )
+        try:
+            await client.task_update_body(
+                task_id=task_id,
+                agent=cfg.agent_id,
+                metadata={
+                    _RETRY_METADATA_KEY: {
+                        "reason": _RETRY_REASON_FILTER_UNAVAILABLE,
+                        "attempts": attempts,
+                        "last_attempt_at": now.isoformat(),
+                        "not_before": not_before.isoformat(),
+                    }
+                },
+            )
+        except (LithosError, LCMAError):
+            logger.warning(
+                "inbox task_update failed task_id=%s; retry backoff not recorded",
+                task_id,
+                exc_info=True,
+            )
+            metrics.inbox_task_call_failures().add(1, {"phase": "update"})
+        try:
+            await client.task_release_body(
+                task_id=task_id, agent=cfg.agent_id, aspect=_CLAIM_ASPECT
+            )
+        except (LithosError, LCMAError):
+            logger.warning(
+                "inbox task_release failed task_id=%s", task_id, exc_info=True
+            )
+            metrics.inbox_task_call_failures().add(1, {"phase": "release"})
 
     async def _lookup_existing(
         self, client: LithosClient, source_url: str

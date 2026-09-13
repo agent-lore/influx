@@ -324,6 +324,20 @@ class FakeLithosServer:
                 return task_claim_responses.pop(0)
             return _json.dumps({"success": True, "expires_at": "2099-01-01T00:00:00Z"})
 
+        @self._mcp.tool(name="lithos_task_release")
+        async def lithos_task_release(
+            task_id: str = "",
+            aspect: str = "",
+            agent: str = "",
+        ) -> str:
+            calls.append(
+                (
+                    "lithos_task_release",
+                    {"task_id": task_id, "aspect": aspect, "agent": agent},
+                )
+            )
+            return _json.dumps({"success": True, "task_id": task_id, "title": ""})
+
         @self._mcp.tool(name="lithos_task_update")
         async def lithos_task_update(
             task_id: str = "",

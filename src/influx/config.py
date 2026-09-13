@@ -121,6 +121,18 @@ class InboxConfig(BaseModel):
     # default) disables local-PDF intake — such tasks complete terminally
     # with ``error: pdf_root_not_configured``.
     pdf_root: str | None = None
+    # #292: when *every* candidate profile's filter call fails for an item
+    # (an LLM-slot outage — HTTP 402/5xx, network), the item has no verdict
+    # and is deferred rather than completed as ``filtered_out``.  The tick
+    # records the attempt in task metadata and skips the task until an
+    # exponential backoff (``backoff_minutes * 2**(attempt-1)``, capped at
+    # ``backoff_max_minutes``) has elapsed; after ``max_retries`` deferred
+    # attempts it completes terminally with ``error: filter_unavailable`` so a
+    # poison item cannot spin forever (§5.6).  The defaults (15 min doubling
+    # to a 4 h ceiling, 48 retries) keep an item alive for roughly a week.
+    filter_unavailable_max_retries: int = 48
+    filter_unavailable_backoff_minutes: int = 15
+    filter_unavailable_backoff_max_minutes: int = 240
 
     @field_validator("poll_cron")
     @classmethod
@@ -142,6 +154,35 @@ class InboxConfig(BaseModel):
         if v < 1:
             raise ConfigError("inbox.max_items_per_tick must be >= 1")
         return v
+
+    @field_validator("filter_unavailable_max_retries")
+    @classmethod
+    def _non_negative_retries(cls, v: int) -> int:
+        # 0 is a legitimate operator choice: no deferral, complete terminally
+        # (with the honest ``filter_unavailable`` outcome) on the first
+        # all-profile filter failure.
+        if v < 0:
+            raise ConfigError("inbox.filter_unavailable_max_retries must be >= 0")
+        return v
+
+    @field_validator("filter_unavailable_backoff_minutes")
+    @classmethod
+    def _positive_backoff(cls, v: int) -> int:
+        if v < 1:
+            raise ConfigError("inbox.filter_unavailable_backoff_minutes must be >= 1")
+        return v
+
+    @model_validator(mode="after")
+    def _backoff_cap_not_below_base(self) -> InboxConfig:
+        if (
+            self.filter_unavailable_backoff_max_minutes
+            < self.filter_unavailable_backoff_minutes
+        ):
+            raise ConfigError(
+                "inbox.filter_unavailable_backoff_max_minutes must be >= "
+                "inbox.filter_unavailable_backoff_minutes"
+            )
+        return self
 
     @field_validator("pdf_root")
     @classmethod

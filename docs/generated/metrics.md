@@ -35,16 +35,16 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Component | Modules | Lines | SLOC | Fan-in | Fan-out | Instability | Max complexity | Functions > 10 |
 |---|---:|---:|---:|---:|---:|---:|---|---:|
 | Common | 7 | 2837 | 2075 | 12 | 1 | 0.08 | 47 (`influx.run_ledger.RunLedger.complete`) | 4 |
-| Config | 4 | 1567 | 1134 | 11 | 1 | 0.08 | 14 (`influx.config.NotificationWebhookConfig._validate_type_specific_fields`) | 1 |
+| Config | 4 | 1608 | 1160 | 11 | 1 | 0.08 | 14 (`influx.config.NotificationWebhookConfig._validate_type_specific_fields`) | 1 |
 | Enrich | 2 | 998 | 804 | 2 | 5 | 0.71 | 22 (`influx.cascade.Cascade.enrich`) | 2 |
 | Entrypoint | 2 | 573 | 454 | 0 | 5 | 1.00 | 14 (`influx.main._cmd_backfill`) | 2 |
 | Feedback | 3 | 571 | 450 | 1 | 4 | 0.80 | 15 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
 | Filter | 1 | 474 | 398 | 3 | 4 | 0.57 | 11 (`influx.filter.make_default_batch_scorer._scorer`) | 1 |
 | HttpApi | 3 | 1141 | 918 | 2 | 8 | 0.80 | 15 (`influx.http_api.post_backfills`) | 3 |
-| LithosBridge | 8 | 4097 | 3254 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 4 |
+| LithosBridge | 8 | 4129 | 3283 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 4 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
-| Observability | 3 | 1912 | 1401 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
-| Orchestration | 6 | 4103 | 3241 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
+| Observability | 3 | 1919 | 1408 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
+| Orchestration | 6 | 4368 | 3467 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
 | Repair | 5 | 3984 | 3041 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 331 | 247 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
 | Sources | 10 | 4343 | 3323 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
@@ -52,7 +52,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **58**, lines: **28240**, SLOC: **21843**
+- Modules: **58**, lines: **28585**, SLOC: **22131**
 - Largest module: `influx.sources.arxiv` (1830 lines)
 - Modules over 800 lines: **11**
   - `influx.config`
@@ -69,7 +69,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **654**, cyclomatic > 10: **47**
+- Functions: **666**, cyclomatic > 10: **47**
 
 Top 10 most complex functions:
 
@@ -77,7 +77,7 @@ Top 10 most complex functions:
 |---:|---|
 | 52 | `influx.run_service.ledger_lifecycle` |
 | 47 | `influx.run_ledger.RunLedger.complete` |
-| 32 | `influx.inbox.InboxTick._ingest_item` |
+| 34 | `influx.inbox.InboxTick._ingest_item` |
 | 28 | `influx.sources.arxiv.build_arxiv_note_item` |
 | 28 | `influx.sources.rss.build_rss_note_item` |
 | 26 | `influx.repair._process_sweep_note` |
@@ -133,4 +133,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.58** (72920 test lines / 28240 source lines)
+- Test-to-source line ratio: **2.57** (73412 test lines / 28585 source lines)

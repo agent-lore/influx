@@ -188,15 +188,31 @@ The document intentionally says "execution" rather than assuming the current `Ru
 
 Per-item, per-Profile isolation:
 
-- A filter timeout for Profile A on item 7 doesn't fail item 7 — proceeds with the remaining Profiles' scores, ingests where they matched, reports the partial result in the outcome string.
+- A filter timeout for Profile A on item 7 doesn't fail item 7 — proceeds with the remaining Profiles' scores, ingests where they matched, reports the partial result in the outcome string (a below-threshold verdict reached with some Profiles missing is still terminal, but names them: `filtered out: top score 4 (web-tech) below threshold 7; ai-robotics filter failed`).
 - A failure on item 7 doesn't fail items 8–20.
 - A whole-tick failure (e.g. lithos circuit opens mid-tick) leaves un-completed task claims to expire naturally via lithos's task lease semantics; next tick re-claims any that re-open.
+
+Isolation presupposes that *some* Profile produced a verdict. When **every** candidate Profile's filter call raises (an LLM-slot outage — HTTP 402/5xx, network — rather than a per-Profile blip) there is nothing to isolate to, and the item must not be completed as `filtered_out`: that asserts a rejection the model never made and, because completed tasks are never re-claimed, loses the submission for good (#292 — ten submissions lost during the 2026-09 402 outage). Instead the tick treats it as **filter unavailable** (§5.7).
 
 ### 5.6 No auto-retry on terminal failure
 
 InboxTasks that complete with `outcome="error"` are NOT re-claimed by a future tick. Submitters resubmit if they want. This avoids the poison-item failure mode where a malformed item burns inbox quota every tick.
 
 Transient retries inside the existing per-call retry machinery (e.g. `arxiv_429_backoff_seconds` for filter-model rate limits) still apply — "no auto-retry" means "no inbox-level retry after the per-call retries exhaust."
+
+The one deliberate exception is §5.7: an item that was never scored is not a terminal failure, so it is retried — with a backoff and a budget, precisely so the poison-item argument above still holds.
+
+### 5.7 Filter unavailable: deferred retry with backoff (#292)
+
+When every candidate Profile's filter call raises for an item, `_ingest_item` yields no outcome; `_process_task` instead:
+
+1. Reads the attempt count from the task's `inbox_retry` metadata block (absent → this is attempt 1).
+2. **Within budget** (`attempts ≤ [inbox] filter_unavailable_max_retries`): leaves the task `open`. It writes `metadata.inbox_retry = {"reason": "filter_unavailable", "attempts": n, "last_attempt_at": …, "not_before": …}` via `task_update` (additive merge, so `inbox_result` from any later completion coexists), releases its `ingest` claim via `lithos_task_release`, and emits `inbox_items_processed{outcome="filter_unavailable_deferred"}`. `not_before` is `now + min(backoff_minutes × 2^(n−1), backoff_max_minutes)` — 15 min doubling to a 4 h ceiling by default.
+3. **Over budget**: completes the task with `outcome="error: filter_unavailable after N attempt(s) (a, b filter failed)"`, `inbox_result.error="filter_unavailable"`, `inbox_result.attempts=N`, the per-Profile `filter_error` reasons, and `inbox_items_processed{outcome="filter_unavailable"}`. Never `filtered_out`. On a cache-hit replay `cited_nodes` still carries the existing note.
+
+On later ticks, tasks whose `inbox_retry.not_before` is in the future are skipped **before** claiming and **before** the `max_items_per_tick` slice, so a backlog waiting out an outage neither re-downloads its URL every 5 minutes nor crowds out fresh submissions; they are reported in `/status` as `inbox.awaiting_retry`. A missing, naive, or unparseable `not_before` counts as due. Only a block carrying `reason="filter_unavailable"` contributes to the attempt count; an operator forces an immediate retry by clearing the block (`lithos_task_update … metadata={"inbox_retry": null}`), or gives up on it with `lithos_task_cancel`.
+
+The defaults (48 retries) keep an item alive for roughly a week (`15+30+60+120 + 44×240` min); `filter_unavailable_max_retries = 0` turns deferral off but still yields the honest `filter_unavailable` outcome. The scheduled RSS/arXiv path needs none of this: it never marks items seen, so the next run simply re-fetches.
 
 ---
 
@@ -403,11 +419,11 @@ New tick-level metrics emitted by the InboxTick orchestrator (NOT by Runs):
 inbox_tick_started{}                                       # counter, ticks/min
 inbox_tasks_listed{}                                       # counter, full open backlog returned by task_list
 inbox_tasks_claimed{}                                      # counter, claims/tick (processed slice)
-inbox_items_processed{outcome=ingested|filtered_out|cache_hit|profile_busy_skipped|error|invalid_submission|invalid_source_tag|pdf_rejected}  # counter
-inbox_task_call_failures{phase=list|claim|update|complete}  # counter (#212)
+inbox_items_processed{outcome=ingested|filtered_out|cache_hit|profile_busy_skipped|error|invalid_submission|invalid_source_tag|pdf_rejected|filter_unavailable_deferred|filter_unavailable}  # counter
+inbox_task_call_failures{phase=list|claim|update|release|complete}  # counter (#212; release: #292)
 ```
 
-The `profile_busy_skipped` outcome captures the §10.1 skip case; `invalid_submission` / `invalid_source_tag` / `pdf_rejected` cover the validation-terminal completions (#212) so a bad-submission rate is visible in metrics, not just logs. `inbox_tasks_listed` records the full open backlog each tick; since both it and `inbox_tasks_claimed` are monotonic counters, compare their per-tick deltas (e.g. `increase(influx_inbox_tasks_listed_total[w]) − increase(influx_inbox_tasks_claimed_total[w])` over a window `w`) to see queue pressure — not raw cumulative totals.
+The `profile_busy_skipped` outcome captures the §10.1 skip case; `invalid_submission` / `invalid_source_tag` / `pdf_rejected` cover the validation-terminal completions (#212) so a bad-submission rate is visible in metrics, not just logs; `filter_unavailable_deferred` / `filter_unavailable` (§5.7, #292) count items no Profile could score — deferred, or abandoned after the retry budget — so an LLM-slot outage shows up on the inbox side instead of hiding inside `filtered_out`. `inbox_tasks_listed` records the full open backlog each tick; since both it and `inbox_tasks_claimed` are monotonic counters, compare their per-tick deltas (e.g. `increase(influx_inbox_tasks_listed_total[w]) − increase(influx_inbox_tasks_claimed_total[w])` over a window `w`) to see queue pressure — not raw cumulative totals.
 
 ### 13.6 `/status` endpoint
 
@@ -419,13 +435,14 @@ Adds an `inbox` section:
     "enabled": true,
     "pending": 7,
     "in_flight": 2,
+    "awaiting_retry": 3,
     "last_tick_at": "2026-05-09T12:35:00Z",
     "last_tick_outcome": "success"
   }
 }
 ```
 
-`pending` comes from `LithosClient.task_list(tags=["influx:inbox"], status="open")`. The read is cached on the same tick the probe loop refreshes other `/status` data — `/status` MUST NOT issue a fresh `lithos_task_list` per request (consistent with FR-HTTP-7).
+`pending` comes from `LithosClient.task_list(tags=["influx:inbox"], status="open")`; `awaiting_retry` is the subset of those the last tick left unclaimed because their §5.7 backoff had not elapsed. The read is cached on the same tick the probe loop refreshes other `/status` data — `/status` MUST NOT issue a fresh `lithos_task_list` per request (consistent with FR-HTTP-7).
 
 The existing per-Profile `/status` last-run state continues to compute as today (http_api.py:184). Inbox-driven Runs land in those per-Profile fields naturally because they ARE per-Profile Runs.
 
@@ -450,6 +467,11 @@ poll_cron = "*/5 * * * *"             # 5-minute tick
 max_items_per_tick = 20
 agent_id = "influx-inbox"
 # task_tag = "influx:inbox"           # constant; not operator-tunable
+# §5.7 filter-unavailable retry (#292): deferred attempts before giving up,
+# and the exponential backoff between them (base, doubling, ceiling).
+filter_unavailable_max_retries = 48
+filter_unavailable_backoff_minutes = 15
+filter_unavailable_backoff_max_minutes = 240
 ```
 
 `enabled=false` is the default to preserve backwards compatibility with current configs.

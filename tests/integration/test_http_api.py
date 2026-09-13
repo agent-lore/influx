@@ -1143,6 +1143,7 @@ class TestStatusInboxSection:
             enabled=True,
             pending=7,
             in_flight=2,
+            awaiting_retry=3,
             last_tick_at="2026-06-02T12:00:00+00:00",
             last_tick_outcome="success",
         )
@@ -1151,6 +1152,7 @@ class TestStatusInboxSection:
             "enabled": True,
             "pending": 7,
             "in_flight": 2,
+            "awaiting_retry": 3,
             "last_tick_at": "2026-06-02T12:00:00+00:00",
             "last_tick_outcome": "success",
         }

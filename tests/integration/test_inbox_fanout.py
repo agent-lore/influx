@@ -251,3 +251,64 @@ def test_local_pdf_fanout_with_synthetic_source_url(
     ]
     assert len(inbox_complete) == 1
     assert "ingested into 3 profile(s)" in inbox_complete[0]["outcome"]
+
+
+def _failing_scorer():
+    """Every profile's filter call raises — the all-profile 402 outage shape."""
+
+    async def _scorer(
+        candidates: list[Candidate], profile: str, filter_prompt: str
+    ) -> dict[str, ScoredCandidate]:
+        raise RuntimeError("filter slot HTTP 402")
+
+    return _scorer
+
+
+def test_all_profile_filter_failure_defers_task_over_real_client(
+    fake_lithos: FakeLithosServer,
+    fake_lithos_url: str,
+    tmp_path: Path,
+) -> None:
+    """#292 end-to-end over the real ``LithosClient``: an item no profile
+    could score is left ``open`` with its retry state written and the claim
+    released — no write, no ledger entry, and above all no ``task_complete``
+    calling it filtered-out."""
+    config = _make_config(fake_lithos_url)
+    ledger = RunLedger(tmp_path)
+    fake_lithos.task_list_responses.append(
+        '{"tasks": [{"id": "task-1", "metadata": '
+        '{"kind": "url", "url": "' + _URL + '", "submitted_by": "agent:test"}}]}'
+    )
+
+    tick = InboxTick(
+        config=config,
+        coordinator=Coordinator(),
+        probe_loop=None,
+        ledger=ledger,
+        client_factory=lambda: LithosClient(url=fake_lithos_url),
+    )
+
+    with (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch("influx.inbox.make_default_batch_scorer", return_value=_failing_scorer()),
+    ):
+        asyncio.run(tick.execute())
+
+    assert ledger.recent(limit=10) == []
+    assert _calls(fake_lithos, "lithos_write") == []
+    assert [
+        c
+        for c in _calls(fake_lithos, "lithos_task_complete")
+        if c["agent"] == "influx-inbox"
+    ] == []
+
+    updates = _calls(fake_lithos, "lithos_task_update")
+    assert len(updates) == 1
+    retry = updates[0]["metadata"]["inbox_retry"]
+    assert retry["reason"] == "filter_unavailable"
+    assert retry["attempts"] == 1
+    assert "not_before" in retry
+
+    assert _calls(fake_lithos, "lithos_task_release") == [
+        {"task_id": "task-1", "aspect": "ingest", "agent": "influx-inbox"}
+    ]

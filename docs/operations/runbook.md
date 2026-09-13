@@ -32,6 +32,7 @@ against both environments — just pass the right `--env`. Run
 | Slug-collision squatters / zombie notes | [§8 Cleaning up slug-collision squatters](#8-cleaning-up-slug-collision-squatters) |
 | Notes with empty/invalid source metadata | [§8b Invalid-source notes](#8b-cleaning-up-invalid-source-metadata-notes-issue-162) |
 | Lithos unreachable / inbox-tick errors | [§4 Common log shapes](#4-common-log-shapes) (connection failures surface as `LithosError`) |
+| Inbox items stuck / `filter_unavailable` outcomes | [§6b Inbox items the filter could not score](#6b-inbox-items-the-filter-could-not-score-issue-292) |
 
 ---
 
@@ -332,6 +333,51 @@ unreachable by any sweep whatever its repair tags say.
 
 The full per-stage cap contract lives in
 [`docs/SPECIFICATION.md` §11.1](../SPECIFICATION.md#111-per-stage-cap-and-self-repair).
+
+## 6b. Inbox items the filter could not score (issue #292)
+
+When the filter model slot is down for *every* profile (the recurring
+OpenRouter HTTP 402 shape, #285), inbox submissions have no verdict. Since
+#292 the tick no longer completes them as `filtered out` — it defers them:
+
+```
+WARNING influx.inbox  inbox item deferred: filter unavailable for every profile source_url=… attempt=3/49 retry_after=2026-09-14T02:12:00+00:00 profiles=[…] task_id=…
+```
+
+The task stays `open`, its claim is released, and `metadata.inbox_retry`
+records `attempts` and `not_before`; the tick skips it (no claim, no
+re-download) until `not_before` passes. Backoff is 15 min doubling to a
+4 h ceiling, for up to 48 retries (~1 week) — `[inbox]
+filter_unavailable_*` in `influx.toml`. Once the slot is back the next due
+tick scores the item normally; nothing to do.
+
+What to look at:
+
+* `GET /status` → `inbox.awaiting_retry`: how many open items are waiting
+  out a backoff right now. Non-zero for more than an hour or two means the
+  LLM slot is down — check `filter slot HTTP <code>` in the logs (§4) and
+  the provider's credit balance.
+* `influx_inbox_items_processed_total{outcome="filter_unavailable_deferred"}`
+  rising: same signal, in metrics.
+* `outcome="filter_unavailable"` (no suffix) / a task completed with
+  `error: filter_unavailable after N attempt(s) (…)`: the budget ran out. The
+  item is **lost to the inbox** and must be resubmitted
+  (`scripts/influx-inbox-submit.py --env prod`) once the slot is healthy.
+
+Escape hatches (Lithos MCP tools, agent `influx-inbox`):
+
+* Force an immediate retry (the slot is back, don't wait for the backoff):
+  `lithos_task_update(task_id, agent="influx-inbox", metadata={"inbox_retry": null})`
+  — the next tick treats it as a fresh item.
+* Give up on a poison item: `lithos_task_cancel`, or set
+  `filter_unavailable_max_retries = 0` to disable deferral entirely (items
+  then complete with the explicit `filter_unavailable` error on first
+  failure — still never `filtered_out`).
+
+A *partial* filter failure (some profiles errored, the rest gave a real
+below-threshold verdict) is still terminal, but the outcome names the
+missing profiles — `filtered out: top score 4 (ai-agents) below threshold
+7; robotics filter failed` — so you can judge whether to resubmit.
 
 ## 7. Reading metrics from the OTEL backend
 
