@@ -206,7 +206,11 @@ api_key_env = "OPENAI_API_KEY"
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
-extra_headers = { "HTTP-Referer" = "https://example.invalid/influx", "X-Title" = "Influx" }
+# OpenRouter app attribution. HTTP-Referer is required (without it spend is
+# reported as "unknown") and is the app's identity, so give each deployment
+# its own URL (e.g. append /staging) to see their spend separately;
+# X-OpenRouter-Title is the display name.
+extra_headers = { "HTTP-Referer" = "https://github.com/agent-lore/influx", "X-OpenRouter-Title" = "influx" }
 
 # ---------------------------------------------------------------------------
 # Models (filter / enrich / extract)
