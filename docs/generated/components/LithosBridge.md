@@ -12,7 +12,7 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
 | `influx.canonical_note` | L | 4 | 18 |
-| `influx.dedup` | S | 0 | 5 |
+| `influx.dedup` | S | 0 | 6 |
 | `influx.lcma` | M | 0 | 4 |
 | `influx.lcma_wiring` | S | 2 | 1 |
 | `influx.lithos_client` | XL | 3 | 0 |
@@ -51,6 +51,7 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 - def `compose_dedup_query` — Compose the ``query`` argument for ``lithos_cache_lookup``.
 - def `arxiv_id_from_url` — Return the arxiv id from a URL like ``https://arxiv.org/abs/2604.28197``.
 - def `same_source_reason` — Say why an existing doc is the same source as *incoming_source_url*.
+- def `verify_cache_hit` — Keep a ``lithos_cache_lookup`` hit only if it is the same source.
 - def `cache_hit_document` — Return the hit's ``document`` (``id``, ``source_url``, ``tags``, ...).
 
 ### `influx.lcma`

@@ -26,7 +26,7 @@ from influx.run_dedup import (
     dedup_scored_candidates,
 )
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
-from influx.telemetry import current_dedup_lookup_errors
+from influx.telemetry import current_cache_hits, current_dedup_lookup_errors
 from tests._lithos_bodies import cache_hit_body
 
 _URL = "https://example.org/paper-1"
@@ -458,6 +458,31 @@ async def test_metric_incremented_per_hit(monkeypatch: pytest.MonkeyPatch) -> No
     )
 
     assert counter.add.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_hits_recorded_in_run_ledger_including_backfill_skips() -> None:
+    """Lithos e4300784: hits a backfill skips never reach Ingest, so the
+    run ledger's ``cache_hits`` is counted here, next to the metric."""
+    counter = [0]
+    token = current_cache_hits.set(counter)
+    try:
+        await dedup_scored_candidates(
+            [
+                _make_bound(item_id="hit-1"),
+                _make_bound(item_id="miss-1"),
+                _make_bound(item_id="hit-2"),
+            ],
+            client=_client_with_responses(
+                cache_hit_body(_URL), {"hit": False}, cache_hit_body(_URL)
+            ),
+            profile="p1",
+            skip_cache_hits=True,
+        )
+    finally:
+        current_cache_hits.reset(token)
+
+    assert counter == [2]
 
 
 @pytest.mark.asyncio

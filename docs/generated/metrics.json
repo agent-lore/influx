@@ -104,7 +104,7 @@
         "qualname": "influx.repair._process_sweep_note"
       },
       {
-        "complexity": 24,
+        "complexity": 23,
         "qualname": "influx.run._run_ingest_stage"
       },
       {
@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 669
+    "total_functions": 670
   },
   "domain": {
     "associations": 5,
@@ -352,11 +352,11 @@
         "classes": 2,
         "functions": 10,
         "largest_module": "influx.run_dedup",
-        "largest_module_lines": 251,
-        "lines": 571,
+        "largest_module_lines": 259,
+        "lines": 579,
         "modules": 3,
         "public_symbols": 10,
-        "sloc": 450
+        "sloc": 457
       },
       "Filter": {
         "classes": 2,
@@ -380,13 +380,13 @@
       },
       "LithosBridge": {
         "classes": 13,
-        "functions": 120,
+        "functions": 121,
         "largest_module": "influx.lithos_client",
-        "largest_module_lines": 1751,
-        "lines": 4153,
+        "largest_module_lines": 1771,
+        "lines": 4213,
         "modules": 8,
-        "public_symbols": 56,
-        "sloc": 3307
+        "public_symbols": 57,
+        "sloc": 3362
       },
       "Notifications": {
         "classes": 5,
@@ -416,7 +416,7 @@
         "lines": 4376,
         "modules": 6,
         "public_symbols": 32,
-        "sloc": 3475
+        "sloc": 3473
       },
       "Repair": {
         "classes": 17,
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 28617,
+    "total_lines": 28685,
     "total_modules": 58,
-    "total_sloc": 22163
+    "total_sloc": 22223
   },
   "tests": {
-    "ratio": 2.57,
-    "src_lines": 28617,
-    "test_lines": 73589
+    "ratio": 2.58,
+    "src_lines": 28685,
+    "test_lines": 73877
   }
 }

@@ -6,8 +6,13 @@ Composes the source-agnostic ``query`` string for
 RSS sources so dedup behaviour is identical (AC-05-B).
 
 Also decides whether an existing Lithos document is the *same source*
-as an incoming URL (:func:`same_source_reason`); slug-collision
-recovery uses it to classify squatters (#31, #148).
+as an incoming URL (:func:`same_source_reason`).  Slug-collision
+recovery uses it to classify squatters (#31, #148), and
+:func:`verify_cache_hit` uses it to reject ``lithos_cache_lookup``
+hits that are only semantic neighbours: when Lithos's ``source_url``
+fast path misses it falls back to a threshold-0.0 semantic search, so
+``hit: true`` alone does not mean the URL is already stored (Lithos
+task e4300784).
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ __all__ = [
     "compose_dedup_query",
     "first_sentence",
     "same_source_reason",
+    "verify_cache_hit",
 ]
 
 _ARXIV_ID_RE = re.compile(r"arxiv\.org/abs/([^\s?#]+)")
@@ -132,6 +138,40 @@ def same_source_reason(
             f"({doc_source_url} ≡ {incoming_source_url})"
         )
     return None
+
+
+def verify_cache_hit(body: Mapping[str, Any], *, source_url: str) -> dict[str, Any]:
+    """Keep a ``lithos_cache_lookup`` hit only if it is the same source.
+
+    A hit whose ``document`` is not the same source as *source_url* (see
+    :func:`same_source_reason`) is a semantic neighbour.  It comes back as
+    a miss (``hit: False``, ``document: None``) with the neighbour's id,
+    ``source_url`` and title under ``ignored_neighbour`` so callers can
+    log it.  Misses and same-source hits are returned as copies,
+    unchanged.
+    """
+    if not body.get("hit"):
+        return dict(body)
+    raw_doc = body.get("document")
+    doc: Mapping[str, Any] = raw_doc if isinstance(raw_doc, Mapping) else {}
+    raw_tags = doc.get("tags")
+    tags = [str(t) for t in raw_tags] if isinstance(raw_tags, list) else []
+    raw_url = doc.get("source_url")
+    doc_url = raw_url if isinstance(raw_url, str) and raw_url else None
+    if same_source_reason(
+        doc_tags=tags, doc_source_url=doc_url, incoming_source_url=source_url
+    ):
+        return dict(body)
+    return {
+        **body,
+        "hit": False,
+        "document": None,
+        "ignored_neighbour": {
+            "id": doc.get("id"),
+            "source_url": doc_url,
+            "title": doc.get("title"),
+        },
+    }
 
 
 def cache_hit_document(body: Mapping[str, Any]) -> dict[str, Any] | None:

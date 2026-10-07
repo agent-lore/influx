@@ -38,6 +38,7 @@ from influx.dedup import (
     cache_hit_document,
     compose_dedup_query,
     same_source_reason,
+    verify_cache_hit,
 )
 from influx.errors import ConfigError, LCMAError, LithosError
 from influx.notes import (
@@ -609,11 +610,34 @@ class LithosClient:
     async def cache_lookup_body(
         self, *, query: str | None, source_url: str | None
     ) -> dict[str, Any]:
-        """Run ``cache_lookup`` and decode the JSON body."""
-        return self._result_json_dict(
+        """Run ``cache_lookup``, decode the JSON body, and verify the hit.
+
+        Every decoded lookup goes through here.  ``hit`` in the returned
+        body means Lithos holds a note for the *same source* as
+        *source_url* (:func:`influx.dedup.verify_cache_hit`).  When
+        Lithos's ``source_url`` fast path misses it falls back to a
+        threshold-0.0 semantic search and reports the nearest unrelated
+        note as a hit; that comes back here as a miss carrying
+        ``ignored_neighbour`` (Lithos task e4300784).
+        """
+        body = self._result_json_dict(
             await self.cache_lookup(query=query, source_url=source_url),
             operation="cache_lookup",
         )
+        # ``cache_lookup`` has already rejected an empty source_url.
+        verified = verify_cache_hit(body, source_url=source_url or "")
+        if body.get("hit") and not verified.get("hit"):
+            neighbour = verified["ignored_neighbour"]
+            logger.info(
+                "cache_lookup semantic neighbour ignored requested_source_url=%s "
+                "neighbour_id=%s neighbour_source_url=%s neighbour_title=%r "
+                "reason=semantic_neighbour_ignored",
+                source_url,
+                neighbour["id"],
+                neighbour["source_url"],
+                neighbour["title"],
+            )
+        return verified
 
     async def cache_lookup_for_item(
         self,
@@ -666,14 +690,10 @@ class LithosClient:
         source_url: str | None,
         abstract_or_summary: str | None = None,
     ) -> dict[str, Any]:
-        """Run ``cache_lookup_for_item`` and decode the JSON body."""
-        return self._result_json_dict(
-            await self.cache_lookup_for_item(
-                title=title,
-                source_url=source_url,
-                abstract_or_summary=abstract_or_summary,
-            ),
-            operation="cache_lookup",
+        """Item-identity lookup through the verified :meth:`cache_lookup_body`."""
+        return await self.cache_lookup_body(
+            query=_item_dedup_query(title, abstract_or_summary),
+            source_url=source_url,
         )
 
     async def read_note(self, *, note_id: str) -> dict[str, Any]:

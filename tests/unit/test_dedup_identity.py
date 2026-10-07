@@ -1,8 +1,14 @@
-"""Same-source identity and ``lithos_cache_lookup`` document access."""
+"""Same-source identity checks on ``lithos_cache_lookup`` hits (Lithos e4300784).
+
+Lithos's ``cache_lookup`` falls back to a threshold-0.0 semantic search when
+the ``source_url`` fast path misses, so it reports ``hit: true`` for the
+nearest unrelated note.  Influx only trusts a hit whose document is the same
+source as the URL it asked about.
+"""
 
 from __future__ import annotations
 
-from influx.dedup import cache_hit_document, same_source_reason
+from influx.dedup import cache_hit_document, same_source_reason, verify_cache_hit
 from tests._lithos_bodies import cache_hit_body, cache_miss_body
 
 ARXIV_URL = "https://arxiv.org/abs/2610.00710"
@@ -59,6 +65,50 @@ class TestSameSourceReason:
             )
             is None
         )
+
+
+class TestVerifyCacheHit:
+    def test_same_source_hit_returned_unchanged(self) -> None:
+        body = cache_hit_body(ARXIV_URL, note_id="n-1")
+        assert verify_cache_hit(body, source_url=ARXIV_URL) == body
+
+    def test_semantic_neighbour_downgraded_to_miss(self) -> None:
+        """The incident: a semantically close note at another URL is a miss."""
+        body = cache_hit_body(
+            "https://scazlab.yale.edu/to-help-or-not",
+            note_id="8c0a21ae",
+            title="To Help or Not to Help?",
+        )
+        verified = verify_cache_hit(
+            body,
+            source_url="https://www.frontiersin.org/articles/10.3389/frobt.2026.1938840",
+        )
+        assert verified["hit"] is False
+        assert verified["document"] is None
+        assert verified["ignored_neighbour"] == {
+            "id": "8c0a21ae",
+            "source_url": "https://scazlab.yale.edu/to-help-or-not",
+            "title": "To Help or Not to Help?",
+        }
+
+    def test_input_body_not_mutated(self) -> None:
+        body = cache_hit_body("https://other.example/x")
+        verify_cache_hit(body, source_url=ARXIV_URL)
+        assert body["hit"] is True
+        assert body["document"] is not None
+
+    def test_hit_without_document_is_a_miss(self) -> None:
+        verified = verify_cache_hit({"hit": True}, source_url=ARXIV_URL)
+        assert verified["hit"] is False
+        assert verified["ignored_neighbour"] == {
+            "id": None,
+            "source_url": None,
+            "title": None,
+        }
+
+    def test_miss_passes_through(self) -> None:
+        body = cache_miss_body()
+        assert verify_cache_hit(body, source_url=ARXIV_URL) == body
 
 
 class TestCacheHitDocument:

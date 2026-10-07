@@ -518,7 +518,9 @@ Before writing, Influx calls `lithos_cache_lookup` using:
 - `source_url`
 - a composed query from title plus the first sentence of the abstract or summary
 
-Backfills skip cache hits entirely. Scheduled/manual runs still attempt a write on cache hits so multi-profile note metadata can merge.
+A response counts as a cache hit only when its `document` is the same source as the candidate: matching `arxiv-id:<id>` tag, the same arXiv id in its `source_url`, or an exact or canonical (`normalise_url`) `source_url` match. When Lithos's `source_url` lookup misses, it falls back to an unthresholded semantic search and reports the nearest note as `hit: true`. Influx treats such a semantic neighbour as a miss and logs `cache_lookup semantic neighbour ignored`. Every caller (pre-acquire dedup, the source-URL fallback, slug-collision and `content_too_large` recovery, inbox cache-hit replay, `builds_on` resolution) goes through this check in `LithosClient.cache_lookup_body`. Note fields are read from `document` (`id`, `source_url`, `tags`).
+
+Backfills skip cache hits entirely. Scheduled/manual runs still attempt a write on cache hits so multi-profile note metadata can merge. The run ledger's `cache_hits` counts every verified hit, including the ones a backfill skips.
 
 ### 10.4 Write Envelope Handling
 
@@ -527,7 +529,7 @@ Backfills skip cache hits entirely. Scheduled/manual runs still attempt a write 
 - `created` / `updated`: success; note ID is used for LCMA hooks.
 - `duplicate`: treated as already-ingested.
 - `invalid_input`: logged and skipped.
-- `slug_collision`: recovered via squatter-shape dispatch.  When Lithos returns the colliding `existing_id`, Influx reads that doc and routes:
+- `slug_collision`: first, a `source_url` cache lookup (subject to the same-source check in §10.3). If it hits, Lithos already holds the URL and the outcome is `duplicate`. Otherwise recovery uses squatter-shape dispatch.  When Lithos returns the colliding `existing_id`, Influx reads that doc and routes:
   - **duplicate** — squatter carries matching `arxiv-id:<id>` tag or matching `source_url` → treat as `duplicate` outcome (the URL/cache dedup missed; metric `influx_slug_collision_dedup_recovery_total` ticks).
   - **reclaimable** — squatter is empty residue (no tags, no `source_url`, empty body, typically a stale aborted-write artefact) → `lithos_delete(existing_id)` then re-issue the original write (metric `influx_slug_collision_reclaimed_total`).
   - **distinct** — genuinely different paper that slugifies the same → fall back to the AC-05-D `[arXiv <id>]` (or `[<host>]`) suffix retry.  If THAT also collides and the suffixed-slug squatter is itself reclaimable, delete-and-retry once more.
