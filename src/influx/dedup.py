@@ -149,8 +149,14 @@ def verify_cache_hit(body: Mapping[str, Any], *, source_url: str) -> dict[str, A
     ``source_url`` and title under ``ignored_neighbour`` so callers can
     log it.  Misses and same-source hits are returned as copies,
     unchanged.
+
+    Newer Lithos reports how it matched (lithos-core d0392561).  A
+    ``match: "source_url"`` hit came from Lithos's own URL index, whose
+    normaliser differs from ours (it drops fragments and sorts query
+    params), so it is trusted as is.  Without ``match`` (Lithos 0.6.0) or
+    with ``match: "semantic"``, the document is checked here.
     """
-    if not body.get("hit"):
+    if not body.get("hit") or body.get("match") == "source_url":
         return dict(body)
     raw_doc = body.get("document")
     doc: Mapping[str, Any] = raw_doc if isinstance(raw_doc, Mapping) else {}

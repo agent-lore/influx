@@ -20,9 +20,15 @@ def cache_hit_body(
     note_id: str = "note-1",
     title: str = "Existing note",
     tags: Sequence[str] = (),
+    match: str | None = None,
 ) -> dict[str, Any]:
-    """A Lithos cache hit whose document is stored under *source_url*."""
-    return {
+    """A Lithos cache hit whose document is stored under *source_url*.
+
+    *match* (``"source_url"`` / ``"semantic"``) adds the ``match`` and
+    ``score`` keys newer Lithos returns (lithos-core d0392561); without it
+    the body has the Lithos 0.6.0 shape, which has no ``match``.
+    """
+    body: dict[str, Any] = {
         "hit": True,
         "document": {
             "id": note_id,
@@ -37,6 +43,10 @@ def cache_hit_body(
         "stale_exists": False,
         "stale_id": None,
     }
+    if match is not None:
+        body["match"] = match
+        body["score"] = None if match == "source_url" else 0.81
+    return body
 
 
 def cache_miss_body() -> dict[str, Any]:

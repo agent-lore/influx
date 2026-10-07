@@ -383,10 +383,10 @@
         "functions": 121,
         "largest_module": "influx.lithos_client",
         "largest_module_lines": 1771,
-        "lines": 4213,
+        "lines": 4219,
         "modules": 8,
         "public_symbols": 57,
-        "sloc": 3362
+        "sloc": 3367
       },
       "Notifications": {
         "classes": 5,
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 28685,
+    "total_lines": 28691,
     "total_modules": 58,
-    "total_sloc": 22223
+    "total_sloc": 22228
   },
   "tests": {
     "ratio": 2.58,
-    "src_lines": 28685,
-    "test_lines": 73877
+    "src_lines": 28691,
+    "test_lines": 73913
   }
 }

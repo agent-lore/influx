@@ -106,6 +106,32 @@ class TestVerifyCacheHit:
             "title": None,
         }
 
+    def test_lithos_source_url_match_trusted(self) -> None:
+        """Newer Lithos says how it matched; a ``source_url`` match is its own
+        identity check (its normaliser drops fragments and sorts params, ours
+        does not), so it is kept even when our canonical forms differ."""
+        body = cache_hit_body(
+            "https://example.com/post?a=1&b=2", note_id="n-1", match="source_url"
+        )
+        verified = verify_cache_hit(
+            body, source_url="https://example.com/post?b=2&a=1#x"
+        )
+        assert verified == body
+
+    def test_lithos_semantic_match_still_verified(self) -> None:
+        body = cache_hit_body("https://other.example/x", match="semantic")
+        verified = verify_cache_hit(body, source_url=ARXIV_URL)
+        assert verified["hit"] is False
+        assert verified["ignored_neighbour"]["source_url"] == "https://other.example/x"
+
+    def test_lithos_semantic_match_of_same_paper_kept(self) -> None:
+        body = cache_hit_body(
+            "https://www.arxiv.org/abs/2610.00710",
+            tags=["arxiv-id:2610.00710"],
+            match="semantic",
+        )
+        assert verify_cache_hit(body, source_url=ARXIV_URL) == body
+
     def test_miss_passes_through(self) -> None:
         body = cache_miss_body()
         assert verify_cache_hit(body, source_url=ARXIV_URL) == body
