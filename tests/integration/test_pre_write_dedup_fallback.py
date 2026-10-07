@@ -27,6 +27,7 @@ from influx.coordinator import RunKind
 from influx.lcma_wiring import LcmaWiringDeps
 from influx.lithos_client import LithosClient
 from influx.run import RunPlan, _run_ingest_stage
+from tests._lithos_bodies import cache_hit_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 PROFILE = "alpha"
@@ -157,9 +158,7 @@ class TestPreWriteDedupFallback:
         fake_lithos.cache_lookup_responses.append(
             json.dumps({"hit": False, "stale_exists": False})
         )
-        fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
-        )
+        fake_lithos.cache_lookup_responses.append(cache_hit_json(ARXIV_URL))
 
         with patch("influx.run.metrics.cache_hits_via_url_fallback") as fallback_metric:
             _run_ingest(
@@ -210,9 +209,7 @@ class TestPreWriteDedupFallback:
         fake_lithos_url: str,
     ) -> None:
         """Primary lookup hits → fallback RPC is skipped (no extra cost)."""
-        fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
-        )
+        fake_lithos.cache_lookup_responses.append(cache_hit_json(ARXIV_URL))
 
         with patch("influx.run.metrics.cache_hits_via_url_fallback") as fallback_metric:
             _run_ingest(
@@ -237,9 +234,7 @@ class TestPreWriteDedupFallback:
         fake_lithos.cache_lookup_responses.append(
             json.dumps({"hit": False, "stale_exists": False})
         )
-        fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
-        )
+        fake_lithos.cache_lookup_responses.append(cache_hit_json(ARXIV_URL))
 
         _run_ingest(
             fake_lithos_url=fake_lithos_url,
@@ -266,9 +261,7 @@ class TestPreWriteDedupFallback:
         fake_lithos.cache_lookup_responses.append(
             json.dumps({"hit": False, "stale_exists": False})
         )
-        fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
-        )
+        fake_lithos.cache_lookup_responses.append(cache_hit_json(ARXIV_URL))
 
         _run_ingest(
             fake_lithos_url=fake_lithos_url,

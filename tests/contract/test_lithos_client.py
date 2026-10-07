@@ -22,6 +22,7 @@ from influx.feedback import (
     fetch_rejection_titles,
 )
 from influx.lithos_client import LithosClient
+from tests._lithos_bodies import cache_hit_body, cache_hit_json
 
 # ── Fake Lithos SSE server ──────────────────────────────────────────
 
@@ -681,6 +682,27 @@ class TestCacheLookupChokepoint:
         finally:
             await client.close()
 
+    async def test_same_source_hit_kept(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """A hit whose document carries the requested URL stays a hit."""
+        url = "https://arxiv.org/abs/2610.00710"
+        fake_lithos_server.cache_lookup_responses.append(
+            cache_hit_json(url, note_id="n-1")
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            body = await client.cache_lookup_for_item_body(
+                title="ReLiveGym", source_url=url
+            )
+        finally:
+            await client.close()
+
+        assert body == cache_hit_body(url, note_id="n-1")
+
 
 # ── Source-URL cache lookup chokepoint (#128) ─────────────────────
 
@@ -716,11 +738,9 @@ class TestCacheLookupByUrlBody:
         client = LithosClient(url=fake_lithos_url)
         try:
             url = "https://arxiv.org/abs/1706.03762"
-            fake_lithos_server.cache_lookup_responses.append(
-                '{"hit": true, "stale_exists": false}'
-            )
+            fake_lithos_server.cache_lookup_responses.append(cache_hit_json(url))
             body = await client.cache_lookup_by_url_body(source_url=url)
-            assert body == {"hit": True, "stale_exists": False}
+            assert body == cache_hit_body(url)
             lookup_calls = [
                 c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
             ]
@@ -1715,7 +1735,9 @@ class TestSlugCollisionUrlIdentityRecovery:
             ' "message": "Slug already in use", "warnings": []}'
         )
         fake_lithos_server.cache_lookup_responses.append(
-            '{"hit": true, "id": "note-existing-99", "stale_exists": false}'
+            cache_hit_json(
+                "https://arxiv.org/abs/2604.28197", note_id="note-existing-99"
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1866,8 +1888,12 @@ class TestSlugCollisionUrlIdentityRecovery:
         )
         fake_lithos_server.cache_lookup_responses.extend(
             [
-                '{"hit": true, "id": "note-already", "stale_exists": false}',
-                '{"hit": true, "id": "note-already", "stale_exists": false}',
+                cache_hit_json(
+                    "https://arxiv.org/abs/2604.99999", note_id="note-already"
+                ),
+                cache_hit_json(
+                    "https://arxiv.org/abs/2604.99999", note_id="note-already"
+                ),
             ]
         )
         client = LithosClient(url=fake_lithos_url)
@@ -2459,7 +2485,6 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         repair-path Tier-1-only retry.  Asserts repair-needed
         tag present and existing tags preserved (AC-05-F).
         """
-        import json as _json
 
         # 1st write → content_too_large
         # 2nd write (Tier 2 dropped) → content_too_large
@@ -2475,16 +2500,14 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         # Existing rejection guards a *different* profile so the canonical
         # merge contract (FR-NOTE-6) preserves profile:ml-research.
         fake_lithos_server.cache_lookup_responses.append(
-            _json.dumps(
-                {
-                    "hit": True,
-                    "id": "note-repair-001",
-                    "tags": [
-                        "profile:ml-research",
-                        "user-custom-tag",
-                        "influx:rejected:robotics",
-                    ],
-                }
+            cache_hit_json(
+                "https://arxiv.org/abs/2601.60001",
+                note_id="note-repair-001",
+                tags=[
+                    "profile:ml-research",
+                    "user-custom-tag",
+                    "influx:rejected:robotics",
+                ],
             )
         )
         client = LithosClient(url=fake_lithos_url)
@@ -2545,7 +2568,6 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         Existing note untouched, counter incremented, no abort,
         updated_at unchanged (AC-05-F repair path).
         """
-        import json as _json
         import logging
 
         # 1st write → content_too_large
@@ -2560,12 +2582,10 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         )
         # cache_lookup returns hit → existing note found (repair path).
         fake_lithos_server.cache_lookup_responses.append(
-            _json.dumps(
-                {
-                    "hit": True,
-                    "id": "note-repair-002",
-                    "tags": ["profile:ml-research"],
-                }
+            cache_hit_json(
+                "https://arxiv.org/abs/2601.60002",
+                note_id="note-repair-002",
+                tags=["profile:ml-research"],
             )
         )
         client = LithosClient(url=fake_lithos_url)

@@ -58,6 +58,7 @@ from influx.source import ScoredCandidate
 from influx.sources import FetchCache, make_item_provider
 from influx.sources.arxiv import ArxivItem
 from influx.sources.rss import RssFeedItem
+from tests._lithos_bodies import cache_hit_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 PROFILE = "ai-robotics"
@@ -238,7 +239,7 @@ class TestPreAcquireDedupArxivBackfill:
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         # Pre-acquire primary lookup → hit.
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2701.00001")
         )
 
         with (
@@ -310,7 +311,7 @@ class TestPreAcquireDedupRssBackfill:
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         # Pre-acquire primary lookup → hit.
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://example.org/already-ingested")
         )
 
         with (
@@ -366,7 +367,7 @@ class TestPreAcquireDedupNormalRun:
         fake_lithos.list_responses.append(json.dumps({"items": []}))  # repair sweep
         # Pre-acquire primary lookup → hit (normal run, so merge path).
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2701.00001")
         )
         # Lithos write succeeds (multi-profile merge).
         fake_lithos.write_responses.append(

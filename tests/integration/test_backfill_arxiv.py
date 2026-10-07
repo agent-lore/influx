@@ -48,6 +48,7 @@ from influx.scheduler import run_profile
 from influx.source import ScoredCandidate
 from influx.sources import FetchCache, make_item_provider
 from influx.sources.arxiv import ArxivItem
+from tests._lithos_bodies import cache_hit_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ───────────��────────────────────────────────────────────
@@ -302,7 +303,7 @@ class TestBackfillCacheLookupSkip:
             json.dumps({"hit": False, "stale_exists": False})
         )
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2601.00011")
         )
         fake_lithos.cache_lookup_responses.append(
             json.dumps({"hit": False, "stale_exists": False})
@@ -355,10 +356,10 @@ class TestBackfillCacheLookupSkip:
 
         # Both items: cache hit
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2601.00010")
         )
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2601.00011")
         )
 
         with patch(
@@ -518,10 +519,10 @@ class TestNonBackfillCacheHitStillWrites:
 
         # Both items: cache hit — but manual run should still write.
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2601.00010")
         )
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2601.00011")
         )
 
         with patch(

@@ -27,6 +27,9 @@ from influx.run_dedup import (
 )
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.telemetry import current_dedup_lookup_errors
+from tests._lithos_bodies import cache_hit_body
+
+_URL = "https://example.org/paper-1"
 
 
 def _make_bound(
@@ -34,7 +37,7 @@ def _make_bound(
     item_id: str = "id-1",
     title: str = "A relevant paper",
     abstract: str = "We propose a new method for X.",
-    source_url: str = "https://example.org/paper-1",
+    source_url: str = _URL,
     score: int = 8,
     source_label: str = "arxiv",
 ) -> BoundScoredCandidate:
@@ -150,7 +153,7 @@ async def test_cache_miss_lands_in_to_acquire() -> None:
 async def test_cache_hit_with_skip_drops_to_hits_to_skip() -> None:
     """Backfill (skip_cache_hits=True) drops cache hits pre-acquire."""
     bound = _make_bound()
-    body = {"hit": True}
+    body = cache_hit_body(_URL)
     client = _client_with_responses(body)
 
     outcome = await dedup_scored_candidates(
@@ -173,7 +176,7 @@ async def test_cache_hit_with_skip_drops_to_hits_to_skip() -> None:
 async def test_cache_hit_without_skip_lands_in_to_acquire_for_merge() -> None:
     """Normal run preserves multi-profile merge: hit still goes to acquire."""
     bound = _make_bound()
-    body = {"hit": True, "id": "note-123"}
+    body = cache_hit_body(_URL, note_id="note-123")
     client = _client_with_responses(body)
 
     outcome = await dedup_scored_candidates(
@@ -204,7 +207,7 @@ async def test_mixed_batch_partitions_correctly() -> None:
     # the three-way partition we run two passes.
     client = _client_with_responses(
         {"hit": False},  # miss
-        {"hit": True},  # skip (with skip_cache_hits=True)
+        cache_hit_body(_URL),  # skip (with skip_cache_hits=True)
     )
     outcome_backfill = await dedup_scored_candidates(
         [miss_bound, skip_bound],
@@ -220,7 +223,7 @@ async def test_mixed_batch_partitions_correctly() -> None:
     ] == ["skip"]
 
     # Normal run: same hit goes to to_acquire (merge path).
-    client2 = _client_with_responses({"hit": True}, {"hit": False})
+    client2 = _client_with_responses(cache_hit_body(_URL), {"hit": False})
     outcome_normal = await dedup_scored_candidates(
         [merge_bound, miss_bound],
         client=client2,
@@ -442,9 +445,9 @@ async def test_metric_incremented_per_hit(monkeypatch: pytest.MonkeyPatch) -> No
         _make_bound(item_id="hit-2"),
     ]
     client = _client_with_responses(
-        {"hit": True},
+        cache_hit_body(_URL),
         {"hit": False},
-        {"hit": True},
+        cache_hit_body(_URL),
     )
 
     await dedup_scored_candidates(
@@ -471,7 +474,7 @@ async def test_metric_source_label_bounded_for_rss_feed(
 
     rss_bound = _make_bound(item_id="rss-hit", source_label="rss:Mozilla Hacks")
     arxiv_bound = _make_bound(item_id="arxiv-hit", source_label="arxiv")
-    client = _client_with_responses({"hit": True}, {"hit": True})
+    client = _client_with_responses(cache_hit_body(_URL), cache_hit_body(_URL))
 
     await dedup_scored_candidates(
         [rss_bound, arxiv_bound],

@@ -24,6 +24,7 @@ import pytest
 
 from influx.errors import LCMAError
 from influx.lcma_wiring import CascadeOutput, LcmaWiringDeps, wire
+from tests._lithos_bodies import cache_hit_body
 
 
 def _make_client(
@@ -181,11 +182,9 @@ class TestBuildsOnResolution:
     @pytest.mark.asyncio
     async def test_arxiv_match_upserts_builds_on_edge(self) -> None:
         client = _make_client(
-            cache_lookup_payload={
-                "hit": True,
-                "source_url": "https://arxiv.org/abs/2412.12345",
-                "note_id": "note-prior",
-            }
+            cache_lookup_payload=cache_hit_body(
+                "https://arxiv.org/abs/2412.12345", note_id="note-prior"
+            )
         )
         deps = _make_deps(client)
 
@@ -319,11 +318,10 @@ class TestBuildsOnResolution:
         """source_url mismatch log carries item identity for diagnosis (#108)."""
         caplog.set_level("INFO")
         client = _make_client(
-            cache_lookup_payload={
-                "hit": True,
-                "source_url": "https://arxiv.org/abs/9999.99999",
-                "note_id": "note-other",
-            }
+            cache_lookup_payload=cache_hit_body(
+                "https://arxiv.org/abs/9999.99999",  # different paper
+                note_id="note-other",
+            )
         )
         deps = _make_deps(client)
 
@@ -355,11 +353,10 @@ class TestBuildsOnResolution:
         """AC-M2-8: cache hit with a different source_url is treated as miss."""
         caplog.set_level("INFO")
         client = _make_client(
-            cache_lookup_payload={
-                "hit": True,
-                "source_url": "https://arxiv.org/abs/9999.99999",  # different paper
-                "note_id": "note-other",
-            }
+            cache_lookup_payload=cache_hit_body(
+                "https://arxiv.org/abs/9999.99999",  # different paper
+                note_id="note-other",
+            )
         )
         deps = _make_deps(client)
 

@@ -46,6 +46,7 @@ from influx.probes import ProbeLoop
 from influx.scheduler import InfluxScheduler
 from influx.service import post_run_webhook_hook
 from tests._bound_helpers import bounds_for
+from tests._lithos_bodies import cache_hit_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Fake webhook receiver ──────────────────────────────────────────
@@ -414,7 +415,7 @@ class TestDedupSkip:
 
         # Queue cache_lookup to return hit for the second run.
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/1706.03762")
         )
         # US-005: cache hit still triggers a write; server returns duplicate
         # for same-profile re-write (content unchanged).

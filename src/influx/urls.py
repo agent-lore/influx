@@ -76,6 +76,21 @@ def normalise_url(raw: str) -> str:
     return urlunparse((scheme, netloc, path, "", query, parsed.fragment))
 
 
+def safe_normalise_url(url: str) -> str:
+    """Return :func:`normalise_url` output, falling back to *url* on error.
+
+    For hot paths (write loop, slug-collision recovery, cache-hit
+    verification) where a malformed URL must not crash the caller.
+    Empty input returns ``""``.
+    """
+    if not url:
+        return ""
+    try:
+        return normalise_url(url)
+    except Exception:  # noqa: BLE001 — defensive: never crash callers on bad URLs
+        return url
+
+
 # ── URL hash for archive filename disambiguation ────────────────────
 
 _URL_HASH_LEN = 10

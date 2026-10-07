@@ -33,6 +33,7 @@ from influx.coordinator import RunKind
 from influx.probes import ProbeLoop
 from influx.scheduler import run_profile
 from tests._bound_helpers import bounds_for
+from tests._lithos_bodies import cache_hit_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -452,13 +453,10 @@ class TestBuildsOnResolver:
         )
         # Third cache_lookup is the builds_on resolver (hit).
         fake_lithos.cache_lookup_responses.append(
-            _json.dumps(
-                {
-                    "hit": True,
-                    "source_url": "https://arxiv.org/abs/2412.12345",
-                    "note_id": "note-foonet",
-                    "title": "FooNet",
-                }
+            cache_hit_json(
+                "https://arxiv.org/abs/2412.12345",
+                note_id="note-foonet",
+                title="FooNet",
             )
         )
 
