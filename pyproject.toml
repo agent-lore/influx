@@ -182,6 +182,9 @@ forbidden_modules = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Dump every thread's stack if one test runs longer than this, so a CI
+# hang shows where it is stuck (2026-10-08).
+faulthandler_timeout = 300
 # Make Influx-owned warnings fail CI.  The unawaited-coroutine pattern
 # from issue #3 is emitted from a destructor and pytest wraps it as a
 # ``PytestUnraisableExceptionWarning``, so we error on both that and

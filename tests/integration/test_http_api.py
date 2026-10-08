@@ -16,6 +16,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from influx import run_dispatch
 from influx.config import (
     AppConfig,
     LithosConfig,
@@ -86,6 +87,25 @@ def app_with_state(fake_lithos_sse_url: str, tmp_path: Path) -> FastAPI:
 def client(app_with_state: FastAPI) -> TestClient:
     """Provide a TestClient for the wired-up app."""
     return TestClient(app_with_state)
+
+
+@pytest.fixture(autouse=True)
+def _park_background_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``POST /runs`` and ``POST /backfills`` from doing real work.
+
+    These tests cover the HTTP layer, but a default profile has arXiv
+    enabled, so an unstubbed run fetches arXiv over the network with
+    blocking pacing sleeps.  Locally the TestClient cancels the task
+    before it gets that far; on CI it sometimes did not, and the job hung
+    for hours (2026-10-08).  The parked run holds its coordinator slot
+    until the TestClient cancels it, as the 409 tests expect.  Tests that
+    need other run behaviour patch ``run_profile`` again themselves.
+    """
+
+    async def _parked_run_profile(*args: Any, **kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(run_dispatch, "run_profile", _parked_run_profile)
 
 
 # ── GET /live ────────────────────────────────────────────────────────
