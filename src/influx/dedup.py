@@ -6,13 +6,10 @@ Composes the source-agnostic ``query`` string for
 RSS sources so dedup behaviour is identical (AC-05-B).
 
 Also decides whether an existing Lithos document is the *same source*
-as an incoming URL (:func:`same_source_reason`).  Slug-collision
-recovery uses it to classify squatters (#31, #148), and
-:func:`verify_cache_hit` uses it to reject ``lithos_cache_lookup``
-hits that are only semantic neighbours: when Lithos's ``source_url``
-fast path misses it falls back to a threshold-0.0 semantic search, so
-``hit: true`` alone does not mean the URL is already stored (Lithos
-task e4300784).
+as an incoming URL (:func:`same_source_reason`); slug-collision
+recovery uses it to classify squatters (#31, #148).
+:func:`verify_cache_hit` keeps only the ``lithos_cache_lookup`` hits
+Lithos found in its URL index (Lithos task e4300784).
 """
 
 from __future__ import annotations
@@ -140,42 +137,32 @@ def same_source_reason(
     return None
 
 
-def verify_cache_hit(body: Mapping[str, Any], *, source_url: str) -> dict[str, Any]:
-    """Keep a ``lithos_cache_lookup`` hit only if it is the same source.
+def verify_cache_hit(body: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep a ``lithos_cache_lookup`` hit only if Lithos matched it by URL.
 
-    A hit whose ``document`` is not the same source as *source_url* (see
-    :func:`same_source_reason`) is a semantic neighbour.  It comes back as
-    a miss (``hit: False``, ``document: None``) with the neighbour's id,
-    ``source_url`` and title under ``ignored_neighbour`` so callers can
-    log it.  Misses and same-source hits are returned as copies,
-    unchanged.
-
-    Newer Lithos reports how it matched (lithos-core d0392561).  A
-    ``match: "source_url"`` hit came from Lithos's own URL index, whose
-    normaliser differs from ours (it drops fragments and sorts query
-    params), so it is trusted as is.  Without ``match`` (Lithos 0.6.0) or
-    with ``match: "semantic"``, the document is checked here.
+    Influx always passes ``source_url``, which Lithos answers from its
+    URL index alone and reports as ``match: "source_url"`` (lithos-core
+    d0392561).  Any other hit is not proof the URL is stored: a Lithos
+    older than that sends no ``match`` and fell back to a threshold-0.0
+    semantic search that reported the nearest unrelated note as a hit
+    (e4300784).  Such a hit comes back as a miss (``hit: False``,
+    ``document: None``) with the document's id, ``source_url`` and title
+    and the ``match`` under ``ignored_neighbour`` so callers can log it.
+    Misses and URL hits are returned as copies, unchanged.
     """
     if not body.get("hit") or body.get("match") == "source_url":
         return dict(body)
     raw_doc = body.get("document")
     doc: Mapping[str, Any] = raw_doc if isinstance(raw_doc, Mapping) else {}
-    raw_tags = doc.get("tags")
-    tags = [str(t) for t in raw_tags] if isinstance(raw_tags, list) else []
-    raw_url = doc.get("source_url")
-    doc_url = raw_url if isinstance(raw_url, str) and raw_url else None
-    if same_source_reason(
-        doc_tags=tags, doc_source_url=doc_url, incoming_source_url=source_url
-    ):
-        return dict(body)
     return {
         **body,
         "hit": False,
         "document": None,
         "ignored_neighbour": {
             "id": doc.get("id"),
-            "source_url": doc_url,
+            "source_url": doc.get("source_url"),
             "title": doc.get("title"),
+            "match": body.get("match"),
         },
     }
 

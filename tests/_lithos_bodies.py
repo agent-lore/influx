@@ -20,13 +20,14 @@ def cache_hit_body(
     note_id: str = "note-1",
     title: str = "Existing note",
     tags: Sequence[str] = (),
-    match: str | None = None,
+    match: str | None = "source_url",
 ) -> dict[str, Any]:
     """A Lithos cache hit whose document is stored under *source_url*.
 
-    *match* (``"source_url"`` / ``"semantic"``) adds the ``match`` and
-    ``score`` keys newer Lithos returns (lithos-core d0392561); without it
-    the body has the Lithos 0.6.0 shape, which has no ``match``.
+    *match* (``"source_url"`` / ``"semantic"``) sets the ``match`` and
+    ``score`` keys Lithos returns since lithos-core d0392561; the default
+    is a URL-index hit.  ``match=None`` gives the Lithos 0.6.0 shape, which
+    has no ``match``.
     """
     body: dict[str, Any] = {
         "hit": True,

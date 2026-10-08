@@ -689,10 +689,11 @@ class TestCacheLookupChokepoint:
         clear_fake_calls: None,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Lithos e4300784: a hit for a *different* source_url is a miss.
+        """Lithos e4300784: a hit Lithos did not match by URL is a miss.
 
-        Lithos falls back to a threshold-0.0 semantic search when its
-        source_url fast path misses and reports the nearest note as a hit.
+        A Lithos older than d0392561 sends no ``match`` and falls back to a
+        threshold-0.0 semantic search when its source_url index misses,
+        reporting the nearest note as a hit.
         """
         import logging
 
@@ -701,12 +702,13 @@ class TestCacheLookupChokepoint:
                 "https://scazlab.yale.edu/to-help-or-not",
                 note_id="8c0a21ae",
                 title="To Help or Not to Help?",
+                match=None,
             )
         )
         incoming = "https://www.frontiersin.org/articles/10.3389/frobt.2026.1938840"
         client = LithosClient(url=fake_lithos_url)
         try:
-            with caplog.at_level(logging.INFO, logger="influx.lithos_client"):
+            with caplog.at_level(logging.WARNING, logger="influx.lithos_client"):
                 body = await client.cache_lookup_for_item_body(
                     title="Robots that help", source_url=incoming
                 )
@@ -716,8 +718,9 @@ class TestCacheLookupChokepoint:
         assert body["hit"] is False
         assert body["document"] is None
         assert body["ignored_neighbour"]["id"] == "8c0a21ae"
-        assert "semantic neighbour ignored" in caplog.text
-        assert "reason=semantic_neighbour_ignored" in caplog.text
+        assert "cache_lookup hit ignored" in caplog.text
+        assert "match=None" in caplog.text
+        assert "reason=not_source_url_match" in caplog.text
         assert "8c0a21ae" in caplog.text
 
     async def test_same_source_hit_kept(
@@ -793,9 +796,11 @@ class TestCacheLookupByUrlBody:
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
     ) -> None:
-        """``query=source_url`` still hits Lithos's semantic fallback (e4300784)."""
+        """An older Lithos answers ``query=source_url`` semantically (e4300784)."""
         fake_lithos_server.cache_lookup_responses.append(
-            cache_hit_json("https://example.com/mars-curiosity-rover", note_id="m-1")
+            cache_hit_json(
+                "https://example.com/mars-curiosity-rover", note_id="m-1", match=None
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1893,7 +1898,9 @@ class TestSlugCollisionUrlIdentityRecovery:
             ]
         )
         fake_lithos_server.cache_lookup_responses.append(
-            cache_hit_json("https://arxiv.org/abs/2501.11111", note_id="doc-other")
+            cache_hit_json(
+                "https://arxiv.org/abs/2501.11111", note_id="doc-other", match=None
+            )
         )
         fake_lithos_server.read_responses.append(
             '{"id": "doc-other", "title": "Some Paper",'
@@ -2554,7 +2561,9 @@ class TestWriteEnvelopeContentTooLarge:
             ]
         )
         fake_lithos_server.cache_lookup_responses.append(
-            cache_hit_json("https://arxiv.org/abs/2401.00001", note_id="other")
+            cache_hit_json(
+                "https://arxiv.org/abs/2401.00001", note_id="other", match=None
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:

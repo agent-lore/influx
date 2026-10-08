@@ -360,13 +360,14 @@ class TestPreAcquireDedupSemanticNeighbour:
         )
 
         fake_lithos.list_responses.append(json.dumps({"items": []}))
-        # Lithos's source_url fast path missed and its threshold-0.0
+        # An older Lithos: its source_url index missed and its threshold-0.0
         # semantic fallback returned the nearest unrelated note.
         fake_lithos.cache_lookup_responses.append(
             cache_hit_json(
                 "https://scazlab.yale.edu/to-help-or-not",
                 note_id="8c0a21ae",
                 title="To Help or Not to Help?",
+                match=None,
             )
         )
         fake_lithos.write_responses.append(

@@ -566,9 +566,9 @@ async def _run_ingest_stage(
         )
         # #125: the Acquire stage now performs the primary
         # ``lithos_cache_lookup`` *before* ``Source.acquire`` and stamps
-        # the verdict on the ProfileItem.  A hit is a verified same-source
-        # match; ``LithosClient.cache_lookup_body`` turns Lithos's
-        # semantic-neighbour fallback into a miss (Lithos e4300784).  The
+        # the verdict on the ProfileItem.  A hit is a verified URL match;
+        # ``LithosClient.cache_lookup_body`` drops any hit Lithos did not
+        # match by ``source_url`` (Lithos e4300784).  The
         # legacy primary-lookup branch below is reached only when
         # ``cache_hit`` is absent —
         # i.e. tests that hand-build ProfileItems and call

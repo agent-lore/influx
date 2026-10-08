@@ -1,9 +1,8 @@
-"""Same-source identity checks on ``lithos_cache_lookup`` hits (Lithos e4300784).
+"""Identity checks on ``lithos_cache_lookup`` hits (Lithos e4300784).
 
-Lithos's ``cache_lookup`` falls back to a threshold-0.0 semantic search when
-the ``source_url`` fast path misses, so it reports ``hit: true`` for the
-nearest unrelated note.  Influx only trusts a hit whose document is the same
-source as the URL it asked about.
+Influx always looks notes up by ``source_url`` and only trusts a hit Lithos
+found in its URL index (``match: "source_url"``, lithos-core d0392561).
+``same_source_reason`` is the slug-collision identity check.
 """
 
 from __future__ import annotations
@@ -68,73 +67,62 @@ class TestSameSourceReason:
 
 
 class TestVerifyCacheHit:
-    def test_same_source_hit_returned_unchanged(self) -> None:
+    def test_source_url_match_returned_unchanged(self) -> None:
         body = cache_hit_body(ARXIV_URL, note_id="n-1")
-        assert verify_cache_hit(body, source_url=ARXIV_URL) == body
+        assert verify_cache_hit(body) == body
 
-    def test_semantic_neighbour_downgraded_to_miss(self) -> None:
-        """The incident: a semantically close note at another URL is a miss."""
+    def test_hit_without_match_is_a_miss(self) -> None:
+        """The e4300784 incident: a Lithos older than d0392561 sends no
+        ``match`` and its threshold-0.0 semantic fallback reported the
+        nearest unrelated note as a hit."""
         body = cache_hit_body(
             "https://scazlab.yale.edu/to-help-or-not",
             note_id="8c0a21ae",
             title="To Help or Not to Help?",
+            match=None,
         )
-        verified = verify_cache_hit(
-            body,
-            source_url="https://www.frontiersin.org/articles/10.3389/frobt.2026.1938840",
-        )
+        verified = verify_cache_hit(body)
         assert verified["hit"] is False
         assert verified["document"] is None
         assert verified["ignored_neighbour"] == {
             "id": "8c0a21ae",
             "source_url": "https://scazlab.yale.edu/to-help-or-not",
             "title": "To Help or Not to Help?",
+            "match": None,
         }
 
-    def test_input_body_not_mutated(self) -> None:
-        body = cache_hit_body("https://other.example/x")
-        verify_cache_hit(body, source_url=ARXIV_URL)
-        assert body["hit"] is True
-        assert body["document"] is not None
-
-    def test_hit_without_document_is_a_miss(self) -> None:
-        verified = verify_cache_hit({"hit": True}, source_url=ARXIV_URL)
-        assert verified["hit"] is False
-        assert verified["ignored_neighbour"] == {
-            "id": None,
-            "source_url": None,
-            "title": None,
-        }
-
-    def test_lithos_source_url_match_trusted(self) -> None:
-        """Newer Lithos says how it matched; a ``source_url`` match is its own
-        identity check (its normaliser drops fragments and sorts params, ours
-        does not), so it is kept even when our canonical forms differ."""
-        body = cache_hit_body(
-            "https://example.com/post?a=1&b=2", note_id="n-1", match="source_url"
-        )
-        verified = verify_cache_hit(
-            body, source_url="https://example.com/post?b=2&a=1#x"
-        )
-        assert verified == body
-
-    def test_lithos_semantic_match_still_verified(self) -> None:
-        body = cache_hit_body("https://other.example/x", match="semantic")
-        verified = verify_cache_hit(body, source_url=ARXIV_URL)
-        assert verified["hit"] is False
-        assert verified["ignored_neighbour"]["source_url"] == "https://other.example/x"
-
-    def test_lithos_semantic_match_of_same_paper_kept(self) -> None:
+    def test_semantic_match_is_a_miss_even_for_the_same_paper(self) -> None:
+        """Lithos answers a source_url lookup semantically only when asked
+        (``semantic_fallback``), which Influx never does.  A similar note is
+        not proof the URL is stored."""
         body = cache_hit_body(
             "https://www.arxiv.org/abs/2610.00710",
             tags=["arxiv-id:2610.00710"],
             match="semantic",
         )
-        assert verify_cache_hit(body, source_url=ARXIV_URL) == body
+        verified = verify_cache_hit(body)
+        assert verified["hit"] is False
+        assert verified["ignored_neighbour"]["match"] == "semantic"
+
+    def test_input_body_not_mutated(self) -> None:
+        body = cache_hit_body("https://other.example/x", match=None)
+        verify_cache_hit(body)
+        assert body["hit"] is True
+        assert body["document"] is not None
+
+    def test_hit_without_document_is_a_miss(self) -> None:
+        verified = verify_cache_hit({"hit": True})
+        assert verified["hit"] is False
+        assert verified["ignored_neighbour"] == {
+            "id": None,
+            "source_url": None,
+            "title": None,
+            "match": None,
+        }
 
     def test_miss_passes_through(self) -> None:
         body = cache_miss_body()
-        assert verify_cache_hit(body, source_url=ARXIV_URL) == body
+        assert verify_cache_hit(body) == body
 
 
 class TestCacheHitDocument:
