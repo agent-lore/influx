@@ -44,15 +44,15 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | LithosBridge | 8 | 4245 | 3385 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1919 | 1408 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
-| Orchestration | 7 | 4757 | 3804 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
+| Orchestration | 7 | 4767 | 3808 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
 | Repair | 5 | 3984 | 3041 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 331 | 247 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
-| Sources | 10 | 4485 | 3448 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
+| Sources | 10 | 4490 | 3450 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
 | Storage | 1 | 720 | 588 | 3 | 3 | 0.50 | 14 (`influx.storage.download_archive`) | 2 |
 
 ## Size
 
-- Modules: **59**, lines: **29240**, SLOC: **22702**
+- Modules: **59**, lines: **29255**, SLOC: **22708**
 - Largest module: `influx.sources.arxiv` (1863 lines)
 - Modules over 800 lines: **11**
   - `influx.config`
@@ -77,7 +77,7 @@ Top 10 most complex functions:
 |---:|---|
 | 52 | `influx.run_service.ledger_lifecycle` |
 | 47 | `influx.run_ledger.RunLedger.complete` |
-| 31 | `influx.inbox.InboxTick._ingest_item` |
+| 32 | `influx.inbox.InboxTick._ingest_item` |
 | 28 | `influx.sources.arxiv.build_arxiv_note_item` |
 | 28 | `influx.sources.rss.build_rss_note_item` |
 | 26 | `influx.repair._process_sweep_note` |
@@ -133,4 +133,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.56** (74841 test lines / 29240 source lines)
+- Test-to-source line ratio: **2.56** (74985 test lines / 29255 source lines)

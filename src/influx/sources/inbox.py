@@ -431,6 +431,11 @@ def build_inbox_note_item(
         tags.append("influx:archive-missing")
         if "influx:repair-needed" not in tags:
             tags.append("influx:repair-needed")
+    # An acquisition that ran the full-text cascade (it sets ``text_tag``) and
+    # got nothing: flag it so the sweep re-extracts from the archived PDF.
+    # Without a tier2_extractor the Cascade never records this failure.
+    if acquired.text_tag == "text:abstract-only" and "influx:repair-needed" not in tags:
+        tags.append("influx:repair-needed")
     if sections.full_text is not None:
         tags.append("full-text")
     append_cascade_outcome_tags(tags, sections)

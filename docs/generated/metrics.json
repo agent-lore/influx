@@ -88,7 +88,7 @@
         "qualname": "influx.run_ledger.RunLedger.complete"
       },
       {
-        "complexity": 31,
+        "complexity": 32,
         "qualname": "influx.inbox.InboxTick._ingest_item"
       },
       {
@@ -412,11 +412,11 @@
         "classes": 28,
         "functions": 90,
         "largest_module": "influx.inbox",
-        "largest_module_lines": 1732,
-        "lines": 4757,
+        "largest_module_lines": 1742,
+        "lines": 4767,
         "modules": 7,
         "public_symbols": 38,
-        "sloc": 3804
+        "sloc": 3808
       },
       "Repair": {
         "classes": 17,
@@ -443,10 +443,10 @@
         "functions": 85,
         "largest_module": "influx.sources.arxiv",
         "largest_module_lines": 1863,
-        "lines": 4485,
+        "lines": 4490,
         "modules": 10,
         "public_symbols": 34,
-        "sloc": 3448
+        "sloc": 3450
       },
       "Storage": {
         "classes": 2,
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 29240,
+    "total_lines": 29255,
     "total_modules": 59,
-    "total_sloc": 22702
+    "total_sloc": 22708
   },
   "tests": {
     "ratio": 2.56,
-    "src_lines": 29240,
-    "test_lines": 74841
+    "src_lines": 29255,
+    "test_lines": 74985
   }
 }

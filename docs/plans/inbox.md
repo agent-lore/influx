@@ -292,7 +292,7 @@ When the task carried an override (ADR 0002), `inbox_result` also has an `overri
 }
 ```
 
-`forced_profile` names the profile a below-threshold item was dispatched to, and `forced` is true only when that note was actually written (otherwise the outcome's `forced:` suffix ends `not ingested`); `tier_achieved` (`full` = full text + Tier 3, `full_text`, `summary`) comes from the note actually built and is `null` when nothing was written.
+`forced_profile` names the profile a below-threshold item was dispatched to, and `forced` is true only when that note was actually written (otherwise the outcome's `forced:` suffix ends `not ingested`); `tier_achieved` (`full` = full text + Tier 3, `full_text`, `summary`) comes from the last successful write (each profile's write replaces the note's sections, so that is what persisted) and is `null` when nothing was written or the URL was already a note.
 
 ### 7.4 `misleading_nodes`
 

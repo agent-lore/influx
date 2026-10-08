@@ -619,3 +619,72 @@ def test_acquire_arxiv_extraction_os_error_falls_back() -> None:
     assert acquired.extracted_text is None
     assert acquired.text_tag == "text:abstract-only"
     assert acquired.summary == _ABSTRACT
+
+
+def test_failed_arxiv_text_extraction_flags_the_note_for_repair() -> None:
+    """PR #300 review: archive + Tier 1 succeeded but the text cascade failed.
+    The note must carry ``influx:repair-needed`` so the sweep re-extracts the
+    full text from the archived PDF instead of missing it for good."""
+    from influx.cascade import Cascade
+    from influx.repair import select_stages
+
+    config = _make_config()
+    acquired = InboxAcquisition(
+        source_url=_ABS,
+        url_hash=url_hash(_ABS),
+        archive_path=f"inbox/2026/10/{url_hash(_ABS)}.pdf",
+        archive_missing=False,
+        extracted_text=None,
+        summary=_ABSTRACT + " " + _LONG_BODY,
+        text_flavour="summary-fallback",
+        identity_tags=(f"arxiv-id:{_ARXIV_ID}",),
+        text_tag="text:abstract-only",
+    )
+    native = ProfileThresholds(relevance=7, full_text=8, deep_extract=9)
+    with patch.object(Cascade, "_run_tier1", return_value=_tier1()):
+        item = _build(config, acquired, score=9, thresholds=native)
+
+    tags = item["tags"]
+    assert "text:abstract-only" in tags
+    assert "influx:repair-needed" in tags
+    assert "influx:archive-missing" not in tags
+    stages = select_stages(
+        tags=tags,
+        archive_path=acquired.archive_path,
+        max_profile_score=9,
+        full_text_threshold=8,
+        deep_extract_threshold=9,
+    )
+    assert stages.abstract_only_reextraction
+    assert stages.tier2_retry
+
+
+def test_generic_inbox_item_without_text_is_not_flagged_for_repair() -> None:
+    """Only an acquisition that attempted the full-text cascade (it sets
+    ``text_tag``) is flagged; the feed-style path is unchanged."""
+    from influx.cascade import Cascade
+
+    config = _make_config()
+    acquired = InboxAcquisition(
+        source_url=_URL,
+        url_hash="h",
+        archive_path="inbox/2026/10/h.html",
+        archive_missing=False,
+        extracted_text=None,
+        summary=_LONG_BODY,
+        text_flavour="summary-fallback",
+    )
+    with patch.object(Cascade, "_run_tier1", return_value=_tier1()):
+        item = _build(config, acquired, score=8)
+    assert "influx:repair-needed" not in item["tags"]
+
+
+def _tier1() -> object:
+    from influx.schemas import Tier1Enrichment
+
+    return Tier1Enrichment(
+        contributions=["curiosity as prediction error"],
+        method="m",
+        result="r",
+        relevance="rel",
+    )

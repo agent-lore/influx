@@ -2217,3 +2217,78 @@ async def test_force_and_tier_apply_to_a_local_pdf(tmp_path: Path) -> None:
     assert call.kwargs["forced"] is True
     assert _gates(call.kwargs["thresholds"]) == (4, 4, 4)
     assert client.updated[0][1]["inbox_result"]["override"]["forced"] is True
+
+
+async def test_tier_override_does_not_apply_to_cache_hit_replay() -> None:
+    """PR #300 review: on a resubmitted URL the complement profile is
+    dispatched at its own gates, so a replay never rewrites the existing
+    note with extra enrichment.  The request is still reported."""
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(
+        tasks=[_task(tier="full", force=True)],
+        existing_note_id="note-1",
+        existing_note={"content": _note_content(["a"]), "tags": []},
+    )
+    a, b, c, d = _override_patches(_scorer_by_profile({"b": 7}), _ingests("note-1"))
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, config).execute()
+
+    mock_dispatch.assert_called_once()
+    kwargs = mock_dispatch.call_args.kwargs
+    assert mock_dispatch.call_args.args[0] == "b"
+    assert kwargs["thresholds"] is None
+    assert kwargs["forced"] is False
+    assert kwargs["on_built"] is None
+    assert client.completed[0]["outcome"] == (
+        "cache_hit: existing note note-1; added 1 profile entry: b"
+    )
+    override = client.updated[0][1]["inbox_result"]["override"]
+    assert override["tier_requested"] == "full"
+    assert override["tier_achieved"] is None
+    assert override["forced"] is False
+
+
+async def test_tier_achieved_reports_the_last_write() -> None:
+    """PR #300 review: each profile's write rewrites the canonical note's
+    sections, so the last successful build is what persisted."""
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(tasks=[_task(tier="full")])
+    tags_by_profile = {
+        "a": ["profile:a", "full-text", "influx:deep-extracted"],
+        "b": ["profile:b", "full-text", "influx:repair-needed"],
+    }
+
+    async def _dispatch(profile: str, **kwargs: Any) -> RunOutcome:
+        kwargs["on_built"]({"tags": tags_by_profile[profile]})
+        return RunOutcome(ingested=1, written_note_ids=("note-f",))
+
+    a, b, c, d = _override_patches(
+        _scorer_by_profile({"a": 9, "b": 8}), {"side_effect": _dispatch}
+    )
+    with a, b, c, d:
+        await _tick(client, config).execute()
+
+    assert client.completed[0]["outcome"].endswith("tier full achieved: full_text")
+    override = client.updated[0][1]["inbox_result"]["override"]
+    assert override["tier_achieved"] == "full_text"
+
+
+async def test_tier_achieved_ignores_a_later_profile_that_wrote_nothing() -> None:
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(tasks=[_task(tier="full")])
+
+    async def _dispatch(profile: str, **kwargs: Any) -> RunOutcome:
+        if profile == "a":
+            kwargs["on_built"]({"tags": ["full-text", "influx:deep-extracted"]})
+            return RunOutcome(ingested=1, written_note_ids=("note-f",))
+        kwargs["on_built"]({"tags": ["full-text"]})
+        return RunOutcome(ingested=0, skip_reason="write failed")
+
+    a, b, c, d = _override_patches(
+        _scorer_by_profile({"a": 9, "b": 8}), {"side_effect": _dispatch}
+    )
+    with a, b, c, d:
+        await _tick(client, config).execute()
+
+    override = client.updated[0][1]["inbox_result"]["override"]
+    assert override["tier_achieved"] == "full"

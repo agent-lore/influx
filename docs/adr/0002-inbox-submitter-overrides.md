@@ -42,9 +42,15 @@ terminal `invalid_override` error rather than a silent fallback.
 
 ## Consequences
 
-- An override never applies to an existing note (cache hit) and never bypasses
-  the #292 filter-unavailable deferral: with no verdict at all, there is no
-  ranking to host a forced item on, and enrichment would need the same LLM slot.
+- An override never applies to an existing note (cache hit): complement
+  profiles a replay dispatches run at their own gates, so a resubmission cannot
+  rewrite the note with extra enrichment. Nor does it bypass the #292
+  filter-unavailable deferral: with no verdict at all, there is no ranking to
+  host a forced item on, and enrichment would need the same LLM slot.
+- A `tier: "full"` arXiv acquisition whose text cascade fails is tagged
+  `influx:repair-needed`, so the sweep's source-agnostic re-extraction recovers
+  the full text from the archived PDF (for scores at or above the Profile's
+  own `full_text` gate; see below).
 - Resubmitting an already-ingested URL with the flags does **not** upgrade the
   note to full text; that is follow-up work.
 - `notify_immediate` is never lowered, so a forced low-score note does not

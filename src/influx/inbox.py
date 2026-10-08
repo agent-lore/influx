@@ -475,8 +475,14 @@ def _override_report(
     """
     if not overrides.requested:
         return "", None
+    # Each successful write replaces the canonical note's sections and
+    # Influx-owned tags, so the last ingested build is what persisted.
     achieved = next(
-        (tier_achieved(built_tags[n]) for n in ingested_names if n in built_tags),
+        (
+            tier_achieved(built_tags[n])
+            for n in reversed(ingested_names)
+            if n in built_tags
+        ),
         None,
     )
     suffix = ""
@@ -1106,13 +1112,17 @@ class InboxTick:
                 acquired, scored_profiles, cache_note_id, started
             )
 
+        # Overrides never apply to an existing note (ADR 0002): a cache-hit
+        # replay dispatches the complement profiles at their own gates, so it
+        # cannot rewrite the note with extra enrichment.  The request is still
+        # reported below.
         runs = await self._dispatch_all(
             targets,
             acquired=acquired,
             source_tag=source_tag,
             submitted_by=submitted_by,
             title_hint=title_hint,
-            overrides=overrides,
+            overrides=overrides if cache_note_id is None else NO_OVERRIDES,
         )
         dispatched, busy, dispatch_failed = runs.dispatched, runs.busy, runs.failed
         if not dispatched and not dispatch_failed:
