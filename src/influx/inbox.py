@@ -32,19 +32,29 @@ import re
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from influx import metrics
-from influx.config import AppConfig, InboxConfig
+from influx.config import AppConfig, InboxConfig, ProfileThresholds
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
 from influx.dedup import cache_hit_document
 from influx.errors import LCMAError, LithosError
 from influx.feedback import build_filter_prompt
 from influx.filter import make_default_batch_scorer
+from influx.inbox_overrides import (
+    NO_OVERRIDES,
+    InboxOverrides,
+    InvalidInboxOverride,
+    effective_thresholds,
+    override_block,
+    parse_inbox_overrides,
+    tier_achieved,
+)
 from influx.lithos_client import LithosClient
 from influx.notes import parse_note, parse_profile_relevance
 from influx.run import ItemProvider, RunOutcome, RunPlan
@@ -52,12 +62,17 @@ from influx.run_service import RunService
 from influx.source import BoundScoredCandidate, Candidate, ScoredCandidate
 from influx.sources.inbox import (
     InboxAcquisition,
+    acquire_inbox_arxiv,
     acquire_inbox_bytes,
     acquire_inbox_pdf,
     build_inbox_note_item,
 )
 from influx.storage import ArchivePathError, resolve_within_root
-from influx.urls import normalise_url
+from influx.urls import (
+    arxiv_canonical_url,
+    arxiv_id_from_submission_url,
+    normalise_url,
+)
 
 if TYPE_CHECKING:
     from influx.run_ledger import RunLedger
@@ -165,6 +180,12 @@ def _backoff_minutes(attempt: int, *, base: int, cap: int) -> int:
     return min(base * 2 ** min(attempt - 1, 40), cap)
 
 
+def _record_tags(
+    store: dict[str, list[str]], profile: str, item: dict[str, Any]
+) -> None:
+    store[profile] = list(item.get("tags") or [])
+
+
 def _extract_note_id(body: dict[str, Any]) -> str | None:
     """Pull the hit's note id out of a ``lithos_cache_lookup`` body."""
     doc = cache_hit_document(body)
@@ -185,6 +206,9 @@ def make_inbox_item_provider(
     submitted_by: str,
     title_hint: str | None,
     config: AppConfig,
+    thresholds: ProfileThresholds | None = None,
+    forced: bool = False,
+    on_built: Callable[[dict[str, Any]], None] | None = None,
 ) -> ItemProvider:
     """Build a single-item :data:`ItemProvider` for one (item, profile).
 
@@ -193,7 +217,9 @@ def make_inbox_item_provider(
     acquisition — so the unchanged Run Acquire/Ingest stages run the
     cache-lookup + write + merge + LCMA wiring without modification.  The
     rendered ``filter_prompt`` is ignored: filtering already happened at
-    tick level.
+    tick level.  *thresholds* / *forced* carry a submitter override into the
+    builder (ADR 0002); *on_built* sees the built item, which is how the
+    tick learns which tiers the note actually got.
     """
 
     async def _provider(
@@ -203,7 +229,7 @@ def make_inbox_item_provider(
         filter_prompt: str,
     ) -> list[BoundScoredCandidate]:
         async def _acquire() -> dict[str, Any] | None:
-            return build_inbox_note_item(
+            item = build_inbox_note_item(
                 acquired=acquired,
                 profile_name=profile,
                 score=scored.score,
@@ -214,7 +240,12 @@ def make_inbox_item_provider(
                 submitted_by=submitted_by,
                 title_hint=title_hint,
                 config=config,
+                thresholds=thresholds,
+                forced=forced,
             )
+            if item is not None and on_built is not None:
+                on_built(item)
+            return item
 
         return [
             BoundScoredCandidate(
@@ -239,6 +270,9 @@ async def dispatch_profile(
     probe_loop: Any | None,
     ledger: RunLedger | None,
     run_id: str,
+    thresholds: ProfileThresholds | None = None,
+    forced: bool = False,
+    on_built: Callable[[dict[str, Any]], None] | None = None,
 ) -> RunOutcome:
     """Dispatch one real single-Profile ``RunKind.INBOX`` Run for this item.
 
@@ -254,6 +288,9 @@ async def dispatch_profile(
         submitted_by=submitted_by,
         title_hint=title_hint,
         config=config,
+        thresholds=thresholds,
+        forced=forced,
+        on_built=on_built,
     )
     service = RunService(
         config=config,
@@ -339,6 +376,131 @@ class _ProfileScore:
     @property
     def clears(self) -> bool:
         return self.scored is not None and self.scored.score >= self.threshold
+
+
+@dataclass(frozen=True)
+class _DispatchTarget:
+    """One profile an inbox item is dispatched to.
+
+    ``forced_why`` is set only for the host a ``force`` submission put below
+    every threshold (ADR 0002), e.g. ``"score 6 below threshold 7"``.
+    """
+
+    name: str
+    scored: ScoredCandidate
+    forced_why: str | None = None
+
+    @property
+    def forced(self) -> bool:
+        return self.forced_why is not None
+
+
+def _forced_target(
+    scored_profiles: list[_ProfileScore],
+    candidate: Candidate,
+    submitted_by: str,
+) -> _DispatchTarget | None:
+    """The profile a ``force`` submission is hosted on when none cleared.
+
+    The top scorer, ties going to config order.  When the model scored the
+    item for no profile, the first profile whose filter call worked hosts it
+    at score 0.  The reason says it was forced, so the note's Profile
+    Relevance entry does not read as a pass on merit.
+    """
+    ranked = [(ps.scored, ps) for ps in scored_profiles if ps.scored is not None]
+    if ranked:
+        scored, host = max(ranked, key=lambda pair: pair[0].score)
+        why = f"score {scored.score} below threshold {host.threshold}"
+    else:
+        fallback = next((ps for ps in scored_profiles if not ps.error), None)
+        if fallback is None:
+            return None
+        host = fallback
+        scored = ScoredCandidate(
+            candidate=candidate, score=0, confidence=1.0, reason=""
+        )
+        why = "not scored by any profile"
+    reason = f"Forced by submitter {submitted_by} ({why}). {scored.reason}".rstrip()
+    return _DispatchTarget(
+        name=host.name, scored=replace(scored, reason=reason), forced_why=why
+    )
+
+
+def _select_targets(
+    scored_profiles: list[_ProfileScore],
+    *,
+    overrides: InboxOverrides,
+    cache_note_id: str | None,
+    candidate: Candidate,
+    submitted_by: str,
+) -> list[_DispatchTarget]:
+    """The profiles to dispatch to: every clearing one, else the forced host.
+
+    ``force`` only applies to a new item; an existing note needs nothing
+    forced (ADR 0002).  Empty means filtered out.
+    """
+    clearing = [
+        _DispatchTarget(name=ps.name, scored=ps.scored)
+        for ps in scored_profiles
+        if ps.clears and ps.scored is not None
+    ]
+    if clearing or not overrides.force or cache_note_id is not None:
+        return clearing
+    forced = _forced_target(scored_profiles, candidate, submitted_by)
+    return [forced] if forced is not None else []
+
+
+@dataclass
+class _Dispatches:
+    """What the per-profile dispatch loop produced for one item."""
+
+    dispatched: dict[str, tuple[RunOutcome, str]] = field(default_factory=dict)
+    busy: list[str] = field(default_factory=list)
+    failed: dict[str, str] = field(default_factory=dict)
+    # Tags of each built note item, recorded only when an override was
+    # requested (to report which tiers the note actually got).
+    built_tags: dict[str, list[str]] = field(default_factory=dict)
+
+
+def _override_report(
+    overrides: InboxOverrides,
+    forced_target: _DispatchTarget | None,
+    built_tags: dict[str, list[str]],
+    ingested_names: list[str],
+) -> tuple[str, dict[str, Any] | None]:
+    """Outcome-string suffix and ``inbox_result.override`` for a dispatched item.
+
+    ``("", None)`` when no override was requested, so feed-style results are
+    unchanged.
+    """
+    if not overrides.requested:
+        return "", None
+    # Each successful write replaces the canonical note's sections and
+    # Influx-owned tags, so the last ingested build is what persisted.
+    achieved = next(
+        (
+            tier_achieved(built_tags[n])
+            for n in reversed(ingested_names)
+            if n in built_tags
+        ),
+        None,
+    )
+    suffix = ""
+    forced_written = False
+    if forced_target is not None:
+        forced_written = forced_target.name in ingested_names
+        suffix += f"; forced: {forced_target.name} ({forced_target.forced_why})"
+        if not forced_written:
+            suffix += " not ingested"
+    if overrides.tier is not None and achieved is not None:
+        suffix += f"; tier {overrides.tier} achieved: {achieved}"
+    block = override_block(
+        overrides,
+        forced_profile=forced_target.name if forced_target is not None else None,
+        forced=forced_written,
+        tier_achieved=achieved,
+    )
+    return suffix, block
 
 
 @dataclass(frozen=True)
@@ -507,6 +669,21 @@ class InboxTick:
         title_hint = metadata.get("title")
         summary_hint = metadata.get("summary")
         source_tag = metadata.get("source_tag") or _DEFAULT_SOURCE_TAG
+        try:
+            overrides = parse_inbox_overrides(metadata)
+        except InvalidInboxOverride as exc:
+            await self._complete_terminal(
+                client,
+                task_id,
+                outcome=f"error: invalid submission ({exc})",
+                metric_outcome="invalid_submission",
+                inbox_result={
+                    "kind": kind,
+                    "error": "invalid_override",
+                    "field": exc.field,
+                },
+            )
+            return
 
         if kind == "url":
             result = await self._process_url_task(
@@ -517,6 +694,7 @@ class InboxTick:
                 title_hint=title_hint,
                 summary_hint=summary_hint,
                 source_tag=source_tag,
+                overrides=overrides,
             )
         elif kind == "pdf":
             result = await self._process_pdf_task(
@@ -527,6 +705,7 @@ class InboxTick:
                 title_hint=title_hint,
                 summary_hint=summary_hint,
                 source_tag=source_tag,
+                overrides=overrides,
             )
         else:
             await self._complete_terminal(
@@ -547,6 +726,16 @@ class InboxTick:
         if isinstance(result, _FilterUnavailable):
             await self._resolve_filter_unavailable(client, task_id, metadata, result)
             return
+        if overrides.requested and "override" not in result.inbox_result:
+            # Paths that dispatched nothing (filtered out, cache hit) still
+            # tell the submitter their override was seen but not applied.
+            result = replace(
+                result,
+                inbox_result={
+                    **result.inbox_result,
+                    "override": override_block(overrides),
+                },
+            )
         await self._complete(client, task_id, result)
 
     async def _process_url_task(
@@ -559,12 +748,15 @@ class InboxTick:
         title_hint: str | None,
         summary_hint: str | None,
         source_tag: str,
+        overrides: InboxOverrides = NO_OVERRIDES,
     ) -> _IngestResult:
         """Validate a ``kind="url"`` submission and ingest it (v1 path).
 
         Returns the per-item outcome, or ``None`` when the task was already
         completed terminally (validation error) or should be skipped this
-        tick (profile busy).
+        tick (profile busy).  A ``tier: "full"`` arXiv URL is acquired the
+        way the scheduled arXiv source does it (ADR 0002) and looked up by
+        its canonical abs URL.
         """
         if not isinstance(url, str) or not url:
             await self._complete_terminal(
@@ -594,15 +786,30 @@ class InboxTick:
             )
             return None
 
+        arxiv_id = (
+            arxiv_id_from_submission_url(url) if overrides.tier == "full" else None
+        )
+        if arxiv_id is not None:
+            source_url = arxiv_canonical_url(arxiv_id)
+            acquire = partial(
+                acquire_inbox_arxiv,
+                arxiv_id,
+                config=self.config,
+                summary_hint=summary_hint,
+            )
+        else:
+            source_url = normalise_url(url)
+            acquire = partial(
+                acquire_inbox_bytes, url, config=self.config, summary_hint=summary_hint
+            )
         return await self._ingest_item(
             client=client,
-            source_url=normalise_url(url),
-            acquire=lambda: acquire_inbox_bytes(
-                url, config=self.config, summary_hint=summary_hint
-            ),
+            source_url=source_url,
+            acquire=acquire,
             submitted_by=submitted_by,
             title_hint=title_hint,
             source_tag=source_tag,
+            overrides=overrides,
         )
 
     async def _process_pdf_task(
@@ -615,6 +822,7 @@ class InboxTick:
         title_hint: str | None,
         summary_hint: str | None,
         source_tag: str,
+        overrides: InboxOverrides = NO_OVERRIDES,
     ) -> _IngestResult:
         """Validate a ``kind="pdf"`` submission and ingest it (v2 §16).
 
@@ -731,6 +939,7 @@ class InboxTick:
             submitted_by=submitted_by,
             title_hint=title_hint,
             source_tag=source_tag,
+            overrides=overrides,
         )
 
     async def _ingest_item(
@@ -743,6 +952,7 @@ class InboxTick:
         source_tag: str,
         acquire: Callable[[], InboxAcquisition] | None = None,
         acquired: InboxAcquisition | None = None,
+        overrides: InboxOverrides = NO_OVERRIDES,
     ) -> _IngestResult:
         """Acquire once, score every enabled profile, fan out, and report.
 
@@ -764,6 +974,11 @@ class InboxTick:
         Returns :class:`_FilterUnavailable` when every candidate profile's
         filter call raised (#292): there is no verdict to complete with, and
         the caller decides between a deferred retry and a terminal error.
+
+        *overrides* (ADR 0002): ``force`` hosts a new item that cleared no
+        profile on the top scorer instead of filtering it out; ``tier``
+        lowers the tier gates of every dispatch.  Neither applies to an
+        existing note, and neither bypasses the #292 deferral.
         """
         started = time.monotonic()
         profiles = self.config.profiles
@@ -885,51 +1100,31 @@ class InboxTick:
                 cache_note_id=cache_note_id,
                 started=started,
             )
-        clearing = [ps for ps in scored_profiles if ps.clears]
-
-        if not clearing:
+        targets = _select_targets(
+            scored_profiles,
+            overrides=overrides,
+            cache_note_id=cache_note_id,
+            candidate=candidate,
+            submitted_by=submitted_by,
+        )
+        if not targets:
             return self._filtered_out_outcome(
                 acquired, scored_profiles, cache_note_id, started
             )
 
-        # ── Per-(item, Profile) dispatch: sequential so the first write
-        # creates the canonical note and the rest merge into it ────────
-        dispatched: dict[str, tuple[RunOutcome, str]] = {}
-        busy: list[str] = []
-        dispatch_failed: dict[str, str] = {}
-        for ps in clearing:
-            if ps.scored is None:  # ps.clears guarantees this; defensive guard
-                continue
-            run_id = uuid.uuid4().hex
-            try:
-                async with self.coordinator.hold(ps.name):
-                    outcome = await dispatch_profile(
-                        ps.name,
-                        scored=ps.scored,
-                        acquired=acquired,
-                        source_tag=source_tag,
-                        submitted_by=submitted_by,
-                        title_hint=title_hint,
-                        config=self.config,
-                        probe_loop=self.probe_loop,
-                        ledger=self.ledger,
-                        run_id=run_id,
-                    )
-                dispatched[ps.name] = (outcome, run_id)
-            except ProfileBusyError:
-                busy.append(ps.name)
-                logger.info("inbox profile %s busy; skipping this tick", ps.name)
-            except Exception:  # noqa: BLE001 — per-profile dispatch isolation (§5.5)
-                # A dispatch failure for one profile must not abandon the item:
-                # the lock is already released, sibling profiles still run, and
-                # the item completes with a partial outcome.  Abandoning here
-                # would orphan an earlier profile's write and double its ledger
-                # entry on the retry.
-                logger.warning(
-                    "inbox dispatch failed for profile %s", ps.name, exc_info=True
-                )
-                dispatch_failed[ps.name] = "dispatch_error"
-
+        # Overrides never apply to an existing note (ADR 0002): a cache-hit
+        # replay dispatches the complement profiles at their own gates, so it
+        # cannot rewrite the note with extra enrichment.  The request is still
+        # reported below.
+        runs = await self._dispatch_all(
+            targets,
+            acquired=acquired,
+            source_tag=source_tag,
+            submitted_by=submitted_by,
+            title_hint=title_hint,
+            overrides=overrides if cache_note_id is None else NO_OVERRIDES,
+        )
+        dispatched, busy, dispatch_failed = runs.dispatched, runs.busy, runs.failed
         if not dispatched and not dispatch_failed:
             # Every clearing profile was busy — skip this tick and let a later
             # tick retry the whole item (§5.5 / §10); do NOT complete.  This
@@ -964,8 +1159,9 @@ class InboxTick:
                     note_id = written[0]
                     break
 
+        forced_target = next((t for t in targets if t.forced), None)
         per_profile = self._build_per_profile(
-            scored_profiles, dispatched, busy, dispatch_failed, note_id
+            scored_profiles, dispatched, busy, dispatch_failed, note_id, forced_target
         )
         filter_errors = [ps.name for ps in scored_profiles if ps.error]
         outcome_str = self._build_outcome_string(
@@ -976,24 +1172,101 @@ class InboxTick:
             filter_errors,
             cache_note_id,
         )
+        override_suffix, override = _override_report(
+            overrides, forced_target, runs.built_tags, ingested_names
+        )
+        outcome_str += override_suffix
         if cache_note_id is not None:
             metric_outcome = "cache_hit"
         else:
             metric_outcome = "ingested" if ingested_names else "error"
         metrics.inbox_items_processed().add(1, {"outcome": metric_outcome})
 
+        inbox_result: dict[str, Any] = {
+            "source_url": acquired.source_url,
+            "archive_path": acquired.archive_path,
+            "cache_hit": cache_note_id is not None,
+            "per_profile": per_profile,
+            "processing_time_ms": int((time.monotonic() - started) * 1000),
+        }
+        if override is not None:
+            inbox_result["override"] = override
         return _ItemOutcome(
             outcome=outcome_str,
             cited_nodes=[note_id] if note_id else [],
-            inbox_result={
-                "source_url": acquired.source_url,
-                "archive_path": acquired.archive_path,
-                "cache_hit": cache_note_id is not None,
-                "per_profile": per_profile,
-                "processing_time_ms": int((time.monotonic() - started) * 1000),
-            },
+            inbox_result=inbox_result,
             metric_outcome=metric_outcome,
             ingested_profiles=tuple(ingested_names),
+        )
+
+    async def _dispatch_all(
+        self,
+        targets: list[_DispatchTarget],
+        *,
+        acquired: InboxAcquisition,
+        source_tag: str,
+        submitted_by: str,
+        title_hint: str | None,
+        overrides: InboxOverrides,
+    ) -> _Dispatches:
+        """Dispatch each target in turn, isolating busy / failed profiles.
+
+        Sequential so the first write creates the canonical note and the
+        rest merge into it.
+        """
+        runs = _Dispatches()
+        for target in targets:
+            name = target.name
+            run_id = uuid.uuid4().hex
+            try:
+                async with self.coordinator.hold(name):
+                    outcome = await dispatch_profile(
+                        name,
+                        scored=target.scored,
+                        acquired=acquired,
+                        source_tag=source_tag,
+                        submitted_by=submitted_by,
+                        title_hint=title_hint,
+                        config=self.config,
+                        probe_loop=self.probe_loop,
+                        ledger=self.ledger,
+                        run_id=run_id,
+                        thresholds=self._dispatch_thresholds(target, overrides),
+                        forced=target.forced,
+                        on_built=(
+                            partial(_record_tags, runs.built_tags, name)
+                            if overrides.requested
+                            else None
+                        ),
+                    )
+                runs.dispatched[name] = (outcome, run_id)
+            except ProfileBusyError:
+                runs.busy.append(name)
+                logger.info("inbox profile %s busy; skipping this tick", name)
+            except Exception:  # noqa: BLE001 — per-profile dispatch isolation (§5.5)
+                # A dispatch failure for one profile must not abandon the item:
+                # the lock is already released, sibling profiles still run, and
+                # the item completes with a partial outcome.  Abandoning here
+                # would orphan an earlier profile's write and double its ledger
+                # entry on the retry.
+                logger.warning(
+                    "inbox dispatch failed for profile %s", name, exc_info=True
+                )
+                runs.failed[name] = "dispatch_error"
+        return runs
+
+    def _dispatch_thresholds(
+        self, target: _DispatchTarget, overrides: InboxOverrides
+    ) -> ProfileThresholds | None:
+        """Override tier gates for *target*, or ``None`` for the profile's own."""
+        if not overrides.requested:
+            return None
+        base = next(
+            (p.thresholds for p in self.config.profiles if p.name == target.name),
+            ProfileThresholds(),
+        )
+        return effective_thresholds(
+            base, target.scored.score, forced=target.forced, tier=overrides.tier
         )
 
     def _filtered_out_outcome(
@@ -1267,13 +1540,23 @@ class InboxTick:
         busy: list[str],
         dispatch_failed: dict[str, str],
         note_id: str | None,
+        forced_target: _DispatchTarget | None = None,
     ) -> dict[str, Any]:
-        """Assemble the structured ``per_profile`` payload (§7.3)."""
+        """Assemble the structured ``per_profile`` payload (§7.3).
+
+        A forced host's entry is marked ``"forced": true`` and carries the
+        score it was dispatched at (0 when no profile scored the item).
+        """
         per_profile: dict[str, Any] = {}
         for ps in scored_profiles:
+            forced = forced_target is not None and ps.name == forced_target.name
             # score is present for every dispatched / busy / failed profile
-            # (all drawn from ``clearing``, which requires a non-None score).
-            score = ps.scored.score if ps.scored is not None else None
+            # (drawn from the clearing profiles, which have a non-None score,
+            # or the forced host, whose dispatched score is used).
+            if forced and forced_target is not None:
+                score: int | None = forced_target.scored.score
+            else:
+                score = ps.scored.score if ps.scored is not None else None
             if ps.name in dispatched:
                 outcome, run_id = dispatched[ps.name]
                 ingested = outcome.ingested > 0
@@ -1288,6 +1571,8 @@ class InboxTick:
                     entry["reason"] = (
                         outcome.skip_reason or outcome.error or "not_ingested"
                     )
+                if forced:
+                    entry["forced"] = True
                 per_profile[ps.name] = entry
             elif ps.name in dispatch_failed:
                 per_profile[ps.name] = {
@@ -1295,6 +1580,8 @@ class InboxTick:
                     "ingested": False,
                     "reason": dispatch_failed[ps.name],
                 }
+                if forced:
+                    per_profile[ps.name]["forced"] = True
             elif ps.name in busy:
                 per_profile[ps.name] = {
                     "score": score,

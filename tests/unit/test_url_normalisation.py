@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from influx.urls import arxiv_canonical_url, classify_article_url, normalise_url
+from influx.urls import (
+    arxiv_canonical_url,
+    arxiv_id_from_submission_url,
+    classify_article_url,
+    normalise_url,
+)
 
 
 class TestNormaliseUrl:
@@ -229,3 +234,46 @@ class TestClassifyArticleUrl:
         """
         result = classify_article_url("https://internal.corp/x")
         assert result.ok is True
+
+
+# ── arxiv_id_from_submission_url (inbox tier override, ADR 0002) ──────
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://arxiv.org/abs/1705.05363", "1705.05363"),
+        ("https://arxiv.org/abs/1705.05363v2", "1705.05363"),
+        ("http://arxiv.org/abs/2609.35741", "2609.35741"),
+        ("https://www.arxiv.org/abs/2609.35741", "2609.35741"),
+        ("https://arxiv.org/pdf/1808.04355", "1808.04355"),
+        ("https://arxiv.org/pdf/1808.04355v1.pdf", "1808.04355"),
+        ("https://arxiv.org/pdf/1808.04355.pdf", "1808.04355"),
+        ("https://arxiv.org/html/2609.35741v1", "2609.35741"),
+        ("https://arxiv.org/html/2609.35741v1/", "2609.35741"),
+        ("https://arxiv.org/abs/1705.05363?context=cs", "1705.05363"),
+        ("https://arxiv.org/abs/0901.0001", "0901.0001"),
+        ("https://arxiv.org/abs/hep-th/9901001", "hep-th/9901001"),
+        ("https://arxiv.org/abs/math.GT/0309136v2", "math.GT/0309136"),
+    ],
+)
+def test_arxiv_id_from_submission_url_accepts_paper_urls(
+    url: str, expected: str
+) -> None:
+    assert arxiv_id_from_submission_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/abs/1705.05363",
+        "https://arxiv.org/list/cs.LG/recent",
+        "https://arxiv.org/abs/",
+        "https://arxiv.org/abs/not-an-id",
+        "https://arxiv.org/a/pathak_d_1",
+        "https://notarxiv.org/abs/1705.05363",
+        "https://arxiv.org.evil.example/abs/1705.05363",
+    ],
+)
+def test_arxiv_id_from_submission_url_rejects_other_urls(url: str) -> None:
+    assert arxiv_id_from_submission_url(url) is None

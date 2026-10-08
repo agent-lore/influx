@@ -312,3 +312,98 @@ def test_all_profile_filter_failure_defers_task_over_real_client(
     assert _calls(fake_lithos, "lithos_task_release") == [
         {"task_id": "task-1", "aspect": "ingest", "agent": "influx-inbox"}
     ]
+
+
+def test_forced_full_tier_item_is_written_below_every_threshold(
+    fake_lithos: FakeLithosServer,
+    fake_lithos_url: str,
+    tmp_path: Path,
+) -> None:
+    """ADR 0002 done-when: ``force`` + ``tier: "full"`` on an arXiv URL writes
+    a full-text note even though its best score (6) clears no profile, and
+    the task outcome says the override was applied."""
+    arxiv_url = "https://arxiv.org/abs/1705.05363"
+    body = "Full paper text about curiosity-driven exploration. " * 20
+    acquisition = InboxAcquisition(
+        source_url=arxiv_url,
+        url_hash="f00dfeed12",
+        archive_path="inbox/2026/10/f00dfeed12.pdf",
+        archive_missing=False,
+        extracted_text=body,
+        summary="We formulate curiosity as the error in predicting consequences.",
+        text_flavour="pdf",
+        extracted_title="Curiosity-driven Exploration by Self-supervised Prediction",
+        identity_tags=("arxiv-id:1705.05363",),
+        text_tag="text:pdf",
+    )
+
+    async def _one_profile_scores_six(
+        candidates: list[Candidate], profile: str, filter_prompt: str
+    ) -> dict[str, ScoredCandidate]:
+        if profile != "web-tech":
+            return {}
+        return {
+            c.item_id: ScoredCandidate(
+                candidate=c, score=6, confidence=1.0, reason="tangential"
+            )
+            for c in candidates
+        }
+
+    config = _make_config(fake_lithos_url)
+    ledger = RunLedger(tmp_path)
+    fake_lithos.task_list_responses.append(
+        '{"tasks": [{"id": "task-f", "metadata": {"kind": "url", "url": "'
+        + arxiv_url
+        + '", "submitted_by": "agent:test", "force": true, "tier": "full"}}]}'
+    )
+    tick = InboxTick(
+        config=config,
+        coordinator=Coordinator(),
+        probe_loop=None,
+        ledger=ledger,
+        client_factory=lambda: LithosClient(url=fake_lithos_url),
+    )
+
+    with (
+        patch("influx.inbox.acquire_inbox_arxiv", return_value=acquisition),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_one_profile_scores_six,
+        ),
+    ):
+        asyncio.run(tick.execute())
+
+    writes = _calls(fake_lithos, "lithos_write")
+    assert len(writes) == 1
+    tags = writes[0]["tags"]
+    for tag in (
+        "profile:web-tech",
+        "influx:forced",
+        "full-text",
+        "arxiv-id:1705.05363",
+        "text:pdf",
+    ):
+        assert tag in tags
+    assert "## Full Text" in writes[0]["content"]
+    assert "Forced by submitter agent:test" in writes[0]["content"]
+
+    recent = ledger.recent(limit=10)
+    assert [(e["kind"], e["profile"]) for e in recent] == [("inbox", "web-tech")]
+
+    inbox_complete = [
+        c
+        for c in _calls(fake_lithos, "lithos_task_complete")
+        if c["agent"] == "influx-inbox"
+    ]
+    assert len(inbox_complete) == 1
+    outcome = inbox_complete[0]["outcome"]
+    assert "forced: web-tech (score 6 below threshold 7)" in outcome
+    assert "tier full achieved: full_text" in outcome
+
+    updates = [
+        c["metadata"]["inbox_result"]
+        for c in _calls(fake_lithos, "lithos_task_update")
+        if "inbox_result" in c.get("metadata", {})
+    ]
+    assert updates[0]["override"]["forced_profile"] == "web-tech"
+    assert updates[0]["per_profile"]["web-tech"]["forced"] is True

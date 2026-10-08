@@ -88,7 +88,7 @@
         "qualname": "influx.run_ledger.RunLedger.complete"
       },
       {
-        "complexity": 34,
+        "complexity": 32,
         "qualname": "influx.inbox.InboxTick._ingest_item"
       },
       {
@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 670
+    "total_functions": 687
   },
   "domain": {
     "associations": 5,
@@ -222,7 +222,7 @@
       }
     },
     "cross_component_edges": 62,
-    "cross_component_module_edges": 188,
+    "cross_component_module_edges": 190,
     "longest_component_chain": 4,
     "module_cycle_count": 3,
     "module_cycles": [
@@ -380,13 +380,13 @@
       },
       "LithosBridge": {
         "classes": 13,
-        "functions": 121,
+        "functions": 122,
         "largest_module": "influx.lithos_client",
         "largest_module_lines": 1771,
-        "lines": 4219,
+        "lines": 4245,
         "modules": 8,
-        "public_symbols": 57,
-        "sloc": 3367
+        "public_symbols": 58,
+        "sloc": 3385
       },
       "Notifications": {
         "classes": 5,
@@ -409,14 +409,14 @@
         "sloc": 1408
       },
       "Orchestration": {
-        "classes": 24,
-        "functions": 77,
+        "classes": 28,
+        "functions": 90,
         "largest_module": "influx.inbox",
-        "largest_module_lines": 1455,
-        "lines": 4376,
-        "modules": 6,
-        "public_symbols": 32,
-        "sloc": 3473
+        "largest_module_lines": 1742,
+        "lines": 4767,
+        "modules": 7,
+        "public_symbols": 38,
+        "sloc": 3808
       },
       "Repair": {
         "classes": 17,
@@ -440,13 +440,13 @@
       },
       "Sources": {
         "classes": 13,
-        "functions": 82,
+        "functions": 85,
         "largest_module": "influx.sources.arxiv",
-        "largest_module_lines": 1830,
-        "lines": 4343,
+        "largest_module_lines": 1863,
+        "lines": 4490,
         "modules": 10,
-        "public_symbols": 32,
-        "sloc": 3323
+        "public_symbols": 34,
+        "sloc": 3450
       },
       "Storage": {
         "classes": 2,
@@ -460,7 +460,7 @@
       }
     },
     "max_module": "influx.sources.arxiv",
-    "max_module_lines": 1830,
+    "max_module_lines": 1863,
     "modules_over_800": [
       "influx.config",
       "influx.inbox",
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 28691,
-    "total_modules": 58,
-    "total_sloc": 22228
+    "total_lines": 29255,
+    "total_modules": 59,
+    "total_sloc": 22708
   },
   "tests": {
-    "ratio": 2.58,
-    "src_lines": 28691,
-    "test_lines": 73913
+    "ratio": 2.56,
+    "src_lines": 29255,
+    "test_lines": 74985
   }
 }

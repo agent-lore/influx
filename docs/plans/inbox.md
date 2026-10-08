@@ -25,7 +25,7 @@ v1 is implemented (default-off `[inbox]` block; opt in to enable). This document
 ### 1.2 Non-Goals (v1)
 
 1. **No Influx HTTP intake**: Submission is via Lithos task only. No new `POST /inbox` endpoint.
-2. **No bypass of the Filter**: Submitters cannot force ingestion. Items below the per-Profile relevance threshold are dropped, exactly as RSS-discovered items would be.
+2. ~~**No bypass of the Filter**: Submitters cannot force ingestion. Items below the per-Profile relevance threshold are dropped, exactly as RSS-discovered items would be.~~ **Superseded (2026-10, ADR 0002):** submitters may opt in with `force` / `tier` (§3.2). Without them, items below threshold are still dropped exactly as RSS-discovered items would be.
 3. **No submitter Profile selection**: Submitters cannot hint a Profile. Multi-profile fan-out is the model.
 4. **No new CLI subcommand on `influx`**: Submission uses the existing Lithos MCP surface; the operator helper is a separate script under `scripts/`.
 5. **No local PDF support**: URLs only. PDF support is a planned v2 addition (§16). A URL pointing at a publicly-accessible PDF (e.g. `https://arxiv.org/pdf/...`) DOES work in v1 because the existing `download_archive` + `extract_pdf` cascade handles content-type-based branching.
@@ -81,12 +81,15 @@ Optional fields:
 | `title` | string | Hint for the candidate's `title` slot. Used as fallback if HTML extraction can't recover one. |
 | `summary` | string | Pre-fetched summary or excerpt. Used as the candidate's `abstract` for the Filter prompt, saving an extract round-trip when reliable. |
 | `source_tag` | string | Sets the resulting note's `source:*` tag. Defaults to `"inbox"`. In v1 this does **not** control archive layout; it is validated as a conservative slug (`^[a-z0-9][a-z0-9-]{0,31}$`) and is used for note tagging only. |
+| `force` | boolean | ADR 0002. When no Profile clears its threshold, write the note anyway, hosted on the top-scoring Profile (ties → config order; nothing scored → first Profile with a working filter call, at score 0) and tagged `influx:forced`. Does nothing for an existing note. Absent/`null`/`false` = off. |
+| `tier` | `"full"` | ADR 0002. Lower the dispatch's tier gates to the item's score: Tier 1, Tier 2 full text, and Tier 3 deep extraction when full text was obtained. An arXiv abs/pdf/html URL is acquired like a scheduled arXiv item (export-API title + abstract, PDF archived, HTML → PDF text, `arxiv-id:` / `text:*` tags). Does not by itself stop the item being filtered out. |
+
+Any other `force` / `tier` value completes the task terminally (`error: invalid submission (…)`, `inbox_result.error = "invalid_override"`, `field`).
 
 Explicitly absent from the contract:
-- No `profile` hint field. Multi-profile fan-out is the model.
+- No `profile` hint field. Multi-profile fan-out is the model (a forced item is hosted on the top scorer, not a chosen Profile).
 - No `priority` field.
-- No `force` / `bypass_filter` field.
-- No `notify` override.
+- No `notify` override (an override never lowers `notify_immediate`).
 - No score / threshold / notification configuration.
 
 ### 3.3 Tag convention
@@ -249,6 +252,7 @@ Human-readable, surfaces in the lithos task UI. Conventions:
 - `filtered out: top score 4 (ai-robotics) below threshold 7`
 - `cache_hit: existing note <slug>; added 1 profile entry`
 - `cache_hit: existing note <slug>; no new profiles matched`
+- `ingested into 1 profile(s): ai-foundations; forced: ai-foundations (score 6 below threshold 7); tier full achieved: full` (ADR 0002 overrides; `achieved` is `full`, `full_text`, or `summary`)
 - `fetch failed: HTTP 404`
 - `extract failed: PDF too short (<min_web_chars>)`
 
@@ -275,6 +279,20 @@ Before completion, Influx attaches a structured `inbox_result` object to the tas
 ```
 
 The `run_id` per Profile lets a submitter cross-reference back to `/runs/recent` for the actual per-Profile Run record.
+
+When the task carried an override (ADR 0002), `inbox_result` also has an `override` block, and a forced host's `per_profile` entry carries `"forced": true`:
+
+```json
+"override": {
+  "force_requested": true,
+  "forced": true,
+  "forced_profile": "ai-foundations",
+  "tier_requested": "full",
+  "tier_achieved": "full"
+}
+```
+
+`forced_profile` names the profile a below-threshold item was dispatched to, and `forced` is true only when that note was actually written (otherwise the outcome's `forced:` suffix ends `not ingested`); `tier_achieved` (`full` = full text + Tier 3, `full_text`, `summary`) comes from the last successful write (each profile's write replaces the note's sections, so that is what persisted) and is `null` when nothing was written or the URL was already a note.
 
 ### 7.4 `misleading_nodes`
 

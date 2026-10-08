@@ -30,21 +30,28 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from influx.archive_policy import registry_from_config
 from influx.cascade import Acquired, Cascade, TextFlavour
 from influx.errors import ExtractionError, NetworkError
 from influx.extraction.article import extract_article_from_html
 from influx.extraction.pdf import extract_pdf
+from influx.extraction.pipeline import extract_arxiv_text
+from influx.sources.arxiv import ArxivItem, fetch_arxiv_entry
 from influx.sources.note_builder import (
     append_cascade_outcome_tags,
     profile_item_dict,
     render_note_content,
 )
-from influx.storage import archive_bytes, download_archive_autodetect
+from influx.storage import (
+    archive_bytes,
+    download_archive,
+    download_archive_autodetect,
+)
 from influx.thin_summary import is_thin_summary
-from influx.urls import normalise_url, url_hash
+from influx.urls import arxiv_canonical_url, normalise_url, url_hash
 
 if TYPE_CHECKING:
-    from influx.config import AppConfig
+    from influx.config import AppConfig, ProfileThresholds
 
 _log = logging.getLogger(__name__)
 
@@ -52,6 +59,9 @@ _log = logging.getLogger(__name__)
 INBOX_SOURCE = "inbox"
 # v2 local-PDF archive subtree + synthetic source-URL scheme (§16.4).
 INBOX_PDF_SOURCE = "inbox-pdf"
+# Marks a note a submitter forced in below every profile's threshold (ADR
+# 0002).  Not Influx-owned in ``merge_tags``, so a later merge keeps it.
+FORCED_TAG = "influx:forced"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +83,11 @@ class InboxAcquisition:
     # ``None`` (PDFs, extraction failure, no recoverable title).  Used as the
     # title fallback below the submitter hint and above the bare URL.
     extracted_title: str | None = None
+    # Note tags only the arXiv acquisition sets (``arxiv-id:<id>`` and the
+    # ``text:*`` provenance tag); empty for every other inbox item, whose
+    # tags stay as they were.
+    identity_tags: tuple[str, ...] = ()
+    text_tag: str | None = None
 
 
 def acquire_inbox_bytes(
@@ -166,6 +181,85 @@ def acquire_inbox_bytes(
     )
 
 
+def acquire_inbox_arxiv(
+    arxiv_id: str,
+    *,
+    config: AppConfig,
+    summary_hint: str | None = None,
+) -> InboxAcquisition:
+    """Acquire an arXiv paper the way the scheduled arXiv source does.
+
+    Used for ``tier: "full"`` submissions of an arXiv URL (ADR 0002) instead
+    of scraping the abs page: the title and abstract come from the export
+    API, the PDF is archived (under the fixed inbox subtree), and the full
+    text comes from the HTML → PDF cascade.  The abstract, not the full
+    body, is the scoring and Tier 1 summary, as for scheduled arXiv items.
+    Each step degrades on its own: no entry → the submitter's hint (else the
+    full text) as summary, no PDF → ``archive_missing``, no text →
+    ``text:abstract-only``.
+    """
+    source_url = arxiv_canonical_url(arxiv_id)
+    hash_val = url_hash(source_url)
+    now = datetime.now(UTC)
+
+    entry = _fetch_entry_or_none(arxiv_id, config)
+    archive_result = download_archive(
+        url=f"https://arxiv.org/pdf/{arxiv_id}.pdf",
+        archive_root=Path(config.storage.archive_dir),
+        source=INBOX_SOURCE,
+        item_id=hash_val,
+        published_year=now.year,
+        published_month=now.month,
+        ext=".pdf",
+        allow_private_ips=config.security.allow_private_ips,
+        max_download_bytes=config.storage.max_download_bytes,
+        timeout_seconds=config.storage.download_timeout_seconds,
+        expected_content_type="pdf",
+        policy_registry=registry_from_config(config.storage.archive_policy),
+    )
+
+    extracted_text: str | None = None
+    flavour: TextFlavour = "summary-fallback"
+    text_tag = "text:abstract-only"
+    try:
+        result = extract_arxiv_text(arxiv_id, config)
+        extracted_text = result.text
+        flavour = "html" if result.source_tag == "text:html" else "pdf"
+        text_tag = result.source_tag
+    except (ExtractionError, NetworkError, OSError) as exc:
+        _log.warning("inbox arxiv text extraction failed for %s: %s", arxiv_id, exc)
+
+    summary = entry.abstract if entry else (summary_hint or extracted_text or "")
+    return InboxAcquisition(
+        source_url=source_url,
+        url_hash=hash_val,
+        archive_path=archive_result.rel_posix_path,
+        archive_missing=not archive_result.ok,
+        extracted_text=extracted_text,
+        summary=summary,
+        text_flavour=flavour,
+        extracted_title=entry.title if entry else None,
+        identity_tags=(f"arxiv-id:{arxiv_id}",),
+        text_tag=text_tag,
+    )
+
+
+def _fetch_entry_or_none(arxiv_id: str, config: AppConfig) -> ArxivItem | None:
+    """The paper's export-API entry, or ``None`` (logged) when unavailable."""
+    try:
+        entry = fetch_arxiv_entry(
+            arxiv_id,
+            resilience=config.resilience,
+            max_download_bytes=config.storage.max_download_bytes,
+        )
+    except NetworkError as exc:
+        _log.warning("inbox arxiv metadata fetch failed for %s: %s", arxiv_id, exc)
+        return None
+    if entry is None:
+        _log.warning("inbox arxiv export API has no entry for %s", arxiv_id)
+    return entry
+
+
 def acquire_inbox_pdf(
     local_path: str | Path,
     *,
@@ -250,6 +344,8 @@ def build_inbox_note_item(
     submitted_by: str,
     title_hint: str | None,
     config: AppConfig,
+    thresholds: ProfileThresholds | None = None,
+    forced: bool = False,
 ) -> dict[str, Any] | None:
     """Build a complete ``ProfileItem`` for one (item, profile) ingestion.
 
@@ -257,6 +353,10 @@ def build_inbox_note_item(
     no body was extracted and the fallback summary is structurally thin, so
     writing a summary-only note would add no value.  ``None`` is the tick's
     signal to skip the dispatch for this profile.
+
+    *thresholds* replaces the profile's tier gates for this one item (the
+    tick lowers them for a submitter's ``force`` / ``tier`` override, ADR
+    0002); *forced* tags the note :data:`FORCED_TAG`.
     """
     from influx.config import ProfileThresholds
 
@@ -291,7 +391,7 @@ def build_inbox_note_item(
         source_url=source_url,
         title=title,
         abstract=acquired.summary,
-        identity_tags=(),
+        identity_tags=acquired.identity_tags,
         archive_path=acquired.archive_path,
         archive_missing=acquired.archive_missing,
         extracted_text=acquired.extracted_text,
@@ -306,7 +406,11 @@ def build_inbox_note_item(
         config=config,
         profile_name=profile_name,
         profile_summary=profile_cfg.description if profile_cfg else "",
-        thresholds=profile_cfg.thresholds if profile_cfg else ProfileThresholds(),
+        thresholds=(
+            thresholds
+            if thresholds is not None
+            else (profile_cfg.thresholds if profile_cfg else ProfileThresholds())
+        ),
         tier2_extractor=None,
     )
     sections = cascade.enrich(acquired_bundle, score)
@@ -317,11 +421,21 @@ def build_inbox_note_item(
         f"submitter:{submitted_by}",
         "ingested-by:influx",
         f"schema:{config.influx.note_schema_version}",
+        *acquired.identity_tags,
     ]
+    if acquired.text_tag is not None:
+        tags.append(acquired.text_tag)
+    if forced:
+        tags.append(FORCED_TAG)
     if acquired.archive_missing:
         tags.append("influx:archive-missing")
         if "influx:repair-needed" not in tags:
             tags.append("influx:repair-needed")
+    # An acquisition that ran the full-text cascade (it sets ``text_tag``) and
+    # got nothing: flag it so the sweep re-extracts from the archived PDF.
+    # Without a tier2_extractor the Cascade never records this failure.
+    if acquired.text_tag == "text:abstract-only" and "influx:repair-needed" not in tags:
+        tags.append("influx:repair-needed")
     if sections.full_text is not None:
         tags.append("full-text")
     append_cascade_outcome_tags(tags, sections)

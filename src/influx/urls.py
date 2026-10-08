@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import re
 from dataclasses import dataclass
 from urllib.parse import urlparse, urlsplit, urlunparse
 
@@ -138,6 +139,31 @@ def arxiv_canonical_url(arxiv_id: str) -> str:
     'https://arxiv.org/abs/2601.12345'
     """
     return f"https://arxiv.org/abs/{arxiv_id}"
+
+
+_ARXIV_HOSTS = frozenset({"arxiv.org", "www.arxiv.org", "export.arxiv.org"})
+# ``/abs|pdf|html/<id>[vN][.pdf][/]`` for new-style ``YYMM.NNNN[N]`` ids and
+# old-style ``archive[.SC]/YYMMNNN`` ids (arxiv.org/help/arxiv_identifier).
+_ARXIV_PAPER_PATH_RE = re.compile(
+    r"^/(?:abs|pdf|html)/"
+    r"(?P<id>\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})"
+    r"(?:v\d+)?(?:\.pdf)?/?$"
+)
+
+
+def arxiv_id_from_submission_url(url: str) -> str | None:
+    """Return the version-less arXiv id an abs / pdf / html URL names.
+
+    ``None`` for anything that is not an arXiv paper URL.
+
+    >>> arxiv_id_from_submission_url("https://arxiv.org/pdf/1705.05363v2.pdf")
+    '1705.05363'
+    """
+    parsed = urlparse(url)
+    if (parsed.hostname or "").lower() not in _ARXIV_HOSTS:
+        return None
+    match = _ARXIV_PAPER_PATH_RE.match(parsed.path)
+    return match.group("id") if match else None
 
 
 # ── Article URL validation (issue #131) ─────────────────────────────

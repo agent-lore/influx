@@ -132,6 +132,7 @@ forbidden_modules = [
     "influx.run",
     "influx.run_dispatch",
     "influx.inbox",
+    "influx.inbox_overrides",
     "influx.audit_invalid_source",
 ]
 
@@ -174,6 +175,7 @@ forbidden_modules = [
     "influx.run",
     "influx.run_dispatch",
     "influx.inbox",
+    "influx.inbox_overrides",
     "influx.audit_invalid_source",
 ]
 
