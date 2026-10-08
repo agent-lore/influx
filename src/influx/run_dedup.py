@@ -5,10 +5,10 @@ ahead of :meth:`Source.acquire` so duplicate items skip download / archive /
 extraction cost in backfill profiles and merge-bound items still flow through
 the write path with the cache-hit fact recorded.
 
-A ``hit`` here is a *verified* same-source hit:
-:meth:`~influx.lithos_client.LithosClient.cache_lookup_body` turns
-Lithos's semantic-neighbour fallback into a miss (Lithos task e4300784),
-so a backfill only skips candidates whose URL is already stored.
+A ``hit`` here is a *verified* URL hit:
+:meth:`~influx.lithos_client.LithosClient.cache_lookup_body` keeps only
+hits Lithos matched by ``source_url`` (Lithos task e4300784), so a
+backfill only skips candidates whose URL is already stored.
 
 Partition rules (one ``cache_lookup`` per scored candidate):
 

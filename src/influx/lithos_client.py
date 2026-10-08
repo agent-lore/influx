@@ -613,26 +613,28 @@ class LithosClient:
         """Run ``cache_lookup``, decode the JSON body, and verify the hit.
 
         Every decoded lookup goes through here.  ``hit`` in the returned
-        body means Lithos holds a note for the *same source* as
-        *source_url* (:func:`influx.dedup.verify_cache_hit`).  When
-        Lithos's ``source_url`` fast path misses it falls back to a
-        threshold-0.0 semantic search and reports the nearest unrelated
-        note as a hit; that comes back here as a miss carrying
-        ``ignored_neighbour`` (Lithos task e4300784).
+        body means Lithos found a note stored under *source_url* in its
+        URL index (``match: "source_url"``;
+        :func:`influx.dedup.verify_cache_hit`).  Any other hit comes back
+        as a miss carrying ``ignored_neighbour`` and is logged as a
+        warning: it means a Lithos older than lithos-core d0392561, whose
+        semantic fallback reported unrelated notes as hits (Lithos task
+        e4300784).
         """
         body = self._result_json_dict(
             await self.cache_lookup(query=query, source_url=source_url),
             operation="cache_lookup",
         )
-        # ``cache_lookup`` has already rejected an empty source_url.
-        verified = verify_cache_hit(body, source_url=source_url or "")
+        verified = verify_cache_hit(body)
         if body.get("hit") and not verified.get("hit"):
             neighbour = verified["ignored_neighbour"]
-            logger.info(
-                "cache_lookup semantic neighbour ignored requested_source_url=%s "
-                "neighbour_id=%s neighbour_source_url=%s neighbour_title=%r "
-                "reason=semantic_neighbour_ignored",
+            logger.warning(
+                "cache_lookup hit ignored: not a source_url match "
+                "requested_source_url=%s match=%s neighbour_id=%s "
+                "neighbour_source_url=%s neighbour_title=%r "
+                "reason=not_source_url_match",
                 source_url,
+                neighbour["match"],
                 neighbour["id"],
                 neighbour["source_url"],
                 neighbour["title"],
