@@ -86,7 +86,7 @@ def _resolve_lithos_url(args: argparse.Namespace, env: dict[str, str]) -> str | 
 def _add_optional_metadata(
     args: argparse.Namespace, metadata: dict[str, Any]
 ) -> dict[str, Any]:
-    """Fold the shared optional fields (title/summary/source_tag) into *metadata*."""
+    """Fold the shared optional fields (title/summary/source_tag/force/tier) in."""
     if args.title:
         metadata["title"] = args.title
     summary = args.summary
@@ -96,6 +96,10 @@ def _add_optional_metadata(
         metadata["summary"] = summary
     if args.source_tag:
         metadata["source_tag"] = args.source_tag
+    if args.force:
+        metadata["force"] = True
+    if args.tier:
+        metadata["tier"] = args.tier
     return metadata
 
 
@@ -188,6 +192,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--source-tag",
         help="resulting note's source:* tag (default: inbox); conservative slug",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="ingest even if no profile clears its relevance threshold",
+    )
+    parser.add_argument(
+        "--tier",
+        choices=["full"],
+        help="'full': full text + deep extraction whatever the score",
     )
     parser.add_argument(
         "--submitted-by",

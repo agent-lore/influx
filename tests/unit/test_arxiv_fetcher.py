@@ -24,6 +24,7 @@ from influx.sources.arxiv import (
     _reset_fetch_pacing_for_tests,
     build_query_url,
     fetch_arxiv,
+    fetch_arxiv_entry,
     resolve_backfill_range,
 )
 
@@ -1375,3 +1376,47 @@ class TestArxiv429ClassificationLedger:
         assert len(errors) == 1
         assert errors[0]["source"] == "arxiv"
         assert errors[0]["kind"] == "rate_limit_upstream_capacity"
+
+
+# ── fetch_arxiv_entry (inbox tier override, ADR 0002) ────────────────
+
+
+class TestFetchArxivEntry:
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_returns_the_matching_entry(self, mock_fetch: MagicMock) -> None:
+        mock_fetch.return_value = _make_fetch_result(_load_fixture("single_entry.atom"))
+        item = fetch_arxiv_entry("2604.77777", resilience=ResilienceConfig())
+
+        assert item is not None
+        assert item.arxiv_id == "2604.77777"
+        assert item.title == "Neural Architecture Search via Evolutionary Strategies"
+        assert item.abstract.startswith("We propose an evolutionary approach")
+        url = mock_fetch.call_args.args[0]
+        assert url.startswith("https://export.arxiv.org/api/query?")
+        assert "id_list=2604.77777" in url
+
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_other_entries_are_not_a_match(self, mock_fetch: MagicMock) -> None:
+        mock_fetch.return_value = _make_fetch_result(_load_fixture("single_entry.atom"))
+        assert fetch_arxiv_entry("1705.05363", resilience=ResilienceConfig()) is None
+
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_malformed_feed_is_none(self, mock_fetch: MagicMock) -> None:
+        mock_fetch.return_value = _make_fetch_result(b"<feed><entry>")
+        assert fetch_arxiv_entry("2604.77777", resilience=ResilienceConfig()) is None
+
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_old_style_id_is_not_percent_encoded(self, mock_fetch: MagicMock) -> None:
+        mock_fetch.return_value = _make_fetch_result(_load_fixture("empty_feed.atom"))
+        fetch_arxiv_entry("hep-th/9901001", resilience=ResilienceConfig())
+        assert "id_list=hep-th/9901001" in mock_fetch.call_args.args[0]
+
+    @patch("influx.sources.arxiv.guarded_fetch")
+    def test_unreadable_published_date_is_none(self, mock_fetch: MagicMock) -> None:
+        body = _load_fixture("single_entry.atom").replace(
+            b"<published>2026-04-24T14:00:00Z</published>",
+            b"<published>not-a-date</published>",
+        )
+        assert b"not-a-date" in body
+        mock_fetch.return_value = _make_fetch_result(body)
+        assert fetch_arxiv_entry("2604.77777", resilience=ResilienceConfig()) is None

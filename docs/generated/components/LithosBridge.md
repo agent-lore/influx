@@ -18,7 +18,7 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 | `influx.lithos_client` | XL | 3 | 0 |
 | `influx.notes` | S | 1 | 4 |
 | `influx.renderer` | M | 2 | 6 |
-| `influx.urls` | S | 1 | 5 |
+| `influx.urls` | S | 1 | 6 |
 
 ## Public API
 
@@ -92,6 +92,7 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 - def `safe_normalise_url` — Return :func:`normalise_url` output, falling back to *url* on error.
 - def `url_hash` — Return a 10-char hex SHA-256 digest of the normalised *source_url*.
 - def `arxiv_canonical_url` — Return the canonical arXiv URL for a given arXiv ID (FR-MCP-5).
+- def `arxiv_id_from_submission_url` — Return the version-less arXiv id an abs / pdf / html URL names.
 - class `UrlValidation` — Result of :func:`classify_article_url`.
 - def `classify_article_url` — Validate an article URL syntactically before expensive acquisition.
 

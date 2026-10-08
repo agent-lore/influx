@@ -46,7 +46,7 @@ Common        = "Cross-cutting foundation: errors, per-Profile run coordinator, 
 [components]
 Entrypoint    = ["influx.main", "influx.__main__"]
 HttpApi       = ["influx.http_api", "influx.service", "influx.backfill"]
-Orchestration = ["influx.scheduler", "influx.run_service", "influx.run", "influx.run_dispatch", "influx.inbox", "influx.audit_invalid_source"]
+Orchestration = ["influx.scheduler", "influx.run_service", "influx.run", "influx.run_dispatch", "influx.inbox", "influx.inbox_overrides", "influx.audit_invalid_source"]
 Sources       = ["influx.sources", "influx.extraction"]
 Filter        = ["influx.filter"]
 Enrich        = ["influx.enrich", "influx.cascade"]
@@ -105,6 +105,7 @@ exclude_modules = [
     "influx.http_api",
     "influx.http_client",
     "influx.inbox",
+    "influx.inbox_overrides",
     "influx.lithos_client",
     "influx.notes",
     "influx.notifications",

@@ -308,3 +308,24 @@ def test_url_mode_still_reports_kind_url(capsys: pytest.CaptureFixture) -> None:
     rc = _SUBMIT.main([_URL, "--dry-run"])
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["metadata"]["kind"] == "url"
+
+
+def test_dry_run_force_and_tier_flags(capsys: pytest.CaptureFixture) -> None:
+    rc = _SUBMIT.main([_URL, "--dry-run", "--force", "--tier", "full"])
+    assert rc == 0
+    md = json.loads(capsys.readouterr().out)["metadata"]
+    assert md["force"] is True
+    assert md["tier"] == "full"
+
+
+def test_overrides_absent_by_default(capsys: pytest.CaptureFixture) -> None:
+    rc = _SUBMIT.main([_URL, "--dry-run"])
+    assert rc == 0
+    md = json.loads(capsys.readouterr().out)["metadata"]
+    assert "force" not in md
+    assert "tier" not in md
+
+
+def test_unknown_tier_rejected_by_argparse() -> None:
+    with pytest.raises(SystemExit):
+        _SUBMIT.main([_URL, "--dry-run", "--tier", "deep"])

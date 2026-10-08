@@ -775,6 +775,39 @@ def fetch_arxiv(
     )
 
 
+def fetch_arxiv_entry(
+    arxiv_id: str,
+    *,
+    resilience: ResilienceConfig,
+    max_download_bytes: int | None = None,
+    timeout_seconds: int | None = None,
+) -> ArxivItem | None:
+    """Fetch one paper's Atom entry by id, or ``None`` when there is none.
+
+    The inbox's arXiv acquisition (a ``tier: "full"`` submission, ADR 0002)
+    uses this for the title and abstract the scheduled path gets from its
+    category feed.  It goes through :func:`_fetch_with_retry`, so pacing,
+    429 backoff and the cooldown apply as for :func:`fetch_arxiv`, and fetch
+    failures raise the same :class:`~influx.errors.NetworkError` family.  A
+    malformed feed (unparseable XML or an unreadable ``<published>`` date),
+    or one whose entries are for other ids (arXiv answers an unknown id with
+    an error entry), yields ``None``.
+    """
+    url = f"{_ARXIV_API_URL}?id_list={arxiv_id}&max_results=1"
+    body = _fetch_with_retry(
+        url=url,
+        resilience=resilience,
+        max_download_bytes=max_download_bytes,
+        timeout_seconds=timeout_seconds,
+    )
+    try:
+        items = _parse_atom(body)
+    except (ET.ParseError, ValueError):
+        _log.warning("arxiv entry feed unparseable for %s", arxiv_id, exc_info=True)
+        return None
+    return next((it for it in items if it.arxiv_id == arxiv_id), None)
+
+
 def _fetch_with_retry(
     *,
     url: str,

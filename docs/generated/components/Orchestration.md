@@ -12,7 +12,8 @@ Schedules ticks and drives per-Profile Runs / inbox ticks end-to-end (Run / RunS
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
 | `influx.audit_invalid_source` | S | 1 | 5 |
-| `influx.inbox` | L | 2 | 2 |
+| `influx.inbox` | XL | 2 | 2 |
+| `influx.inbox_overrides` | S | 2 | 4 |
 | `influx.run` | L | 12 | 2 |
 | `influx.run_dispatch` | M | 3 | 0 |
 | `influx.run_service` | L | 1 | 1 |
@@ -33,6 +34,14 @@ Schedules ticks and drives per-Profile Runs / inbox ticks end-to-end (Run / RunS
 - def `dispatch_profile` — Dispatch one real single-Profile ``RunKind.INBOX`` Run for this item.
 - class `InboxStatus` — Mutable snapshot of inbox-tick state for the ``/status`` endpoint.
 - class `InboxTick` — One execution of the inbox-tick orchestrator.
+
+### `influx.inbox_overrides`
+- class `InvalidInboxOverride` — A ``force`` / ``tier`` metadata value Influx does not accept.
+- class `InboxOverrides` — Opt-in submitter overrides on an InboxTask; both default off.
+- def `parse_inbox_overrides` — Read ``force`` / ``tier`` from task metadata; absent or ``null`` is off.
+- def `effective_thresholds` — The tier gates one inbox dispatch runs under.
+- def `override_block` — The ``inbox_result.override`` payload, so a forced note is distinguishable from one that passed on merit.
+- def `tier_achieved` — ``full`` (full text + Tier 3), ``full_text``, or ``summary``.
 
 ### `influx.run`
 - class `RunPlan` — The data-driven specification a Run executes (CONTEXT.md).

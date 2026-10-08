@@ -10,7 +10,8 @@ ProfileItem key set, tags, thin-summary suppression).
 
 from __future__ import annotations
 
-from typing import cast
+from datetime import UTC, datetime
+from typing import Any, cast
 from unittest.mock import patch
 
 from influx.config import (
@@ -24,9 +25,15 @@ from influx.config import (
     SecurityConfig,
     StorageConfig,
 )
+from influx.errors import ExtractionError, NetworkError
+from influx.extraction.pipeline import ArxivExtractionResult
 from influx.http_client import FetchResult
+from influx.sources.arxiv import ArxivItem
 from influx.sources.inbox import (
+    FORCED_TAG,
     INBOX_SOURCE,
+    InboxAcquisition,
+    acquire_inbox_arxiv,
     acquire_inbox_bytes,
     build_inbox_note_item,
 )
@@ -402,3 +409,213 @@ def test_build_item_thin_summary_suppressed() -> None:
         config=config,
     )
     assert item is None
+
+
+# ── Submitter overrides in the builder (ADR 0002) ────────────────────
+
+
+def _build(config: AppConfig, acquired: object, **kwargs: object) -> dict:
+    defaults: dict[str, object] = {
+        "profile_name": "ai-robotics",
+        "score": 6,
+        "confidence": 1.0,
+        "reason": "Forced by submitter x (score 6 below threshold 7).",
+        "filter_tags": (),
+        "source_tag": "morrow-literature",
+        "submitted_by": "x",
+        "title_hint": "Title",
+        "config": config,
+    }
+    item = build_inbox_note_item(acquired=acquired, **{**defaults, **kwargs})  # type: ignore[arg-type]
+    assert item is not None
+    return item
+
+
+def test_build_item_lowered_thresholds_write_full_text_and_attempt_tier3() -> None:
+    """A score-6 item under the forced/tier gates gets the full text and a
+    Tier 3 attempt the profile's own gates (100) would never allow."""
+    from influx.cascade import Cascade
+
+    config = _make_config()
+    acquired = _acquire_ok(config)
+    lowered = ProfileThresholds(relevance=6, full_text=6, deep_extract=6)
+    with patch.object(Cascade, "_run_tier3", return_value=(None, None)) as mock_tier3:
+        item = _build(config, acquired, thresholds=lowered, forced=True)
+
+    mock_tier3.assert_called_once()
+    assert "full-text" in item["tags"]
+    assert FORCED_TAG in item["tags"]
+    assert "## Full Text" in item["content"]
+    assert "Score: 6/10" in item["content"]
+
+
+def test_build_item_without_overrides_keeps_profile_gates() -> None:
+    config = _make_config()
+    acquired = _acquire_ok(config)
+    item = _build(config, acquired, score=8)
+    assert "full-text" not in item["tags"]
+    assert FORCED_TAG not in item["tags"]
+    assert not any(t.startswith(("arxiv-id:", "text:")) for t in item["tags"])
+
+
+def test_build_item_emits_acquisition_identity_and_text_tags() -> None:
+    config = _make_config()
+    acquired = InboxAcquisition(
+        source_url="https://arxiv.org/abs/1705.05363",
+        url_hash="h",
+        archive_path="inbox/2026/10/h.pdf",
+        archive_missing=False,
+        extracted_text=_LONG_BODY,
+        summary="An abstract that is long enough to stand as the summary here.",
+        text_flavour="pdf",
+        identity_tags=("arxiv-id:1705.05363",),
+        text_tag="text:pdf",
+    )
+    item = _build(config, acquired, score=8)
+    assert "arxiv-id:1705.05363" in item["tags"]
+    assert "text:pdf" in item["tags"]
+
+
+# ── acquire_inbox_arxiv (tier: "full" on an arXiv URL) ───────────────
+
+_ARXIV_ID = "1705.05363"
+_ABS = f"https://arxiv.org/abs/{_ARXIV_ID}"
+_ABSTRACT = "We formulate curiosity as the error in an agent's ability to predict."
+
+
+def _entry() -> ArxivItem:
+    return ArxivItem(
+        arxiv_id=_ARXIV_ID,
+        title="Curiosity-driven Exploration by Self-supervised Prediction",
+        abstract=_ABSTRACT,
+        published=datetime(2017, 5, 15, tzinfo=UTC),
+        categories=["cs.LG"],
+    )
+
+
+def _arxiv_patches(
+    *,
+    entry: object = None,
+    archive: ArchiveResult | None = None,
+    text: object = None,
+):
+    def _side(value: object) -> dict[str, Any]:
+        if isinstance(value, BaseException):
+            return {"side_effect": value}
+        return {"return_value": value}
+
+    return (
+        patch(
+            "influx.sources.inbox.fetch_arxiv_entry",
+            **_side(_entry() if entry is None else entry),
+        ),
+        patch(
+            "influx.sources.inbox.download_archive",
+            return_value=archive or _ok_pdf_archive(_ABS),
+        ),
+        patch(
+            "influx.sources.inbox.extract_arxiv_text",
+            **_side(
+                ArxivExtractionResult(text=_LONG_BODY, source_tag="text:html")
+                if text is None
+                else text
+            ),
+        ),
+    )
+
+
+def test_acquire_arxiv_archives_pdf_and_extracts_full_text() -> None:
+    config = _make_config()
+    a, b, c = _arxiv_patches()
+    with a, b as mock_dl, c as mock_text:
+        acquired = acquire_inbox_arxiv(_ARXIV_ID, config=config)
+
+    kwargs = mock_dl.call_args.kwargs
+    assert kwargs["url"] == f"https://arxiv.org/pdf/{_ARXIV_ID}.pdf"
+    assert kwargs["source"] == INBOX_SOURCE
+    assert kwargs["item_id"] == url_hash(_ABS)
+    assert kwargs["ext"] == ".pdf"
+    assert kwargs["expected_content_type"] == "pdf"
+    assert kwargs["policy_registry"] is not None
+    assert mock_text.call_args.args[0] == _ARXIV_ID
+
+    assert acquired.source_url == _ABS
+    assert acquired.url_hash == url_hash(_ABS)
+    assert acquired.archive_path == f"inbox/2026/06/{url_hash(_ABS)}.pdf"
+    assert acquired.archive_missing is False
+    assert acquired.extracted_title == _entry().title
+    # The abstract (not the full body) is the scoring / Tier 1 summary.
+    assert acquired.summary == _ABSTRACT
+    assert acquired.extracted_text == _LONG_BODY
+    assert acquired.text_flavour == "html"
+    assert acquired.text_tag == "text:html"
+    assert acquired.identity_tags == (f"arxiv-id:{_ARXIV_ID}",)
+
+
+def test_acquire_arxiv_pdf_text_flavour() -> None:
+    a, b, c = _arxiv_patches(
+        text=ArxivExtractionResult(text=_LONG_BODY, source_tag="text:pdf")
+    )
+    with a, b, c:
+        acquired = acquire_inbox_arxiv(_ARXIV_ID, config=_make_config())
+    assert acquired.text_flavour == "pdf"
+    assert acquired.text_tag == "text:pdf"
+
+
+def test_acquire_arxiv_degrades_each_step_independently() -> None:
+    """Export API down, PDF download failed, text extraction failed: the
+    item still carries the submitter's hint and an honest abstract-only tag."""
+    a, b, c = _arxiv_patches(
+        entry=NetworkError("boom", url=_ABS, kind="timeout"),
+        archive=_failed_archive(),
+        text=ExtractionError("both failed", url=_ABS, stage="cascade"),
+    )
+    with a, b, c:
+        acquired = acquire_inbox_arxiv(
+            _ARXIV_ID, config=_make_config(), summary_hint="a submitter hint"
+        )
+
+    assert acquired.extracted_title is None
+    assert acquired.summary == "a submitter hint"
+    assert acquired.archive_missing is True
+    assert acquired.archive_path is None
+    assert acquired.extracted_text is None
+    assert acquired.text_flavour == "summary-fallback"
+    assert acquired.text_tag == "text:abstract-only"
+    assert acquired.identity_tags == (f"arxiv-id:{_ARXIV_ID}",)
+
+
+def test_acquire_arxiv_without_entry_or_hint_scores_on_the_full_text() -> None:
+    a, b, c = _arxiv_patches(entry=NetworkError("boom", url=_ABS, kind="timeout"))
+    with a, b, c:
+        acquired = acquire_inbox_arxiv(_ARXIV_ID, config=_make_config())
+    assert acquired.summary == _LONG_BODY
+
+
+def test_acquire_arxiv_missing_entry_uses_hint() -> None:
+    """The export API answered but had no entry for this id."""
+    with (
+        patch("influx.sources.inbox.fetch_arxiv_entry", return_value=None),
+        patch(
+            "influx.sources.inbox.download_archive",
+            return_value=_ok_pdf_archive(_ABS),
+        ),
+        patch(
+            "influx.sources.inbox.extract_arxiv_text",
+            return_value=ArxivExtractionResult(text=_LONG_BODY, source_tag="text:html"),
+        ),
+    ):
+        acquired = acquire_inbox_arxiv(
+            _ARXIV_ID, config=_make_config(), summary_hint="hint"
+        )
+    assert acquired.summary == "hint"
+    assert acquired.extracted_title is None
+
+
+def test_acquire_arxiv_extraction_os_error_falls_back() -> None:
+    a, b, c = _arxiv_patches(text=OSError("disk"))
+    with a, b, c:
+        acquired = acquire_inbox_arxiv(_ARXIV_ID, config=_make_config())
+    assert acquired.extracted_text is None
+    assert acquired.text_tag == "text:abstract-only"
+    assert acquired.summary == _ABSTRACT

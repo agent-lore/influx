@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from influx.config import (
     AppConfig,
     InboxConfig,
@@ -36,6 +38,12 @@ from influx.config import (
 )
 from influx.coordinator import Coordinator
 from influx.inbox import InboxTick, _extract_note_id
+from influx.inbox_overrides import (
+    InboxOverrides,
+    InvalidInboxOverride,
+    effective_thresholds,
+    parse_inbox_overrides,
+)
 from influx.run import RunOutcome
 from influx.source import Candidate, ScoredCandidate
 from influx.sources.inbox import InboxAcquisition
@@ -95,6 +103,7 @@ class FakeClient:
         self.completed: list[dict[str, Any]] = []
         self.list_calls = 0
         self.cache_lookup_calls = 0
+        self.lookup_urls: list[str] = []
 
     async def task_list_body(self, **_: Any) -> dict[str, Any]:
         self.list_calls += 1
@@ -134,6 +143,7 @@ class FakeClient:
         # post-dispatch recovery lookup); the second-call branch is retained
         # to prove, via ``cache_lookup_calls``, that it never fires.
         self.cache_lookup_calls += 1
+        self.lookup_urls.append(source_url)
         if source_url not in self._gated:
             self._gated.add(source_url)
             if self._existing_note_id:
@@ -205,12 +215,14 @@ def _task(
     kind: str = "url",
     url: str | None = "https://example.com/article",
     source_tag: str | None = None,
+    **extra_metadata: Any,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {"kind": kind, "submitted_by": "agent:test"}
     if url is not None:
         metadata["url"] = url
     if source_tag is not None:
         metadata["source_tag"] = source_tag
+    metadata.update(extra_metadata)
     return {"id": task_id, "metadata": metadata}
 
 
@@ -1715,3 +1727,493 @@ async def test_filter_unavailable_deferral_is_logged_with_source(
     assert getattr(rec, "attempt", None) == 1
     assert sorted(getattr(rec, "profiles", [])) == ["a", "b"]
     assert getattr(rec, "task_id", None) == "task-1"
+
+
+# ── Submitter overrides: force / tier (ADR 0002, Lithos 6880a2cc) ────
+
+
+def _override_patches(scorer: Any, dispatch: Any) -> tuple[Any, Any, Any, Any]:
+    return (
+        patch("influx.inbox.acquire_inbox_bytes", return_value=_acquisition()),
+        patch("influx.inbox.make_default_batch_scorer", return_value=scorer),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile", **dispatch),
+    )
+
+
+def _ingests(note_id: str = "note-f") -> dict[str, Any]:
+    return {"return_value": RunOutcome(ingested=1, written_note_ids=(note_id,))}
+
+
+def _gates(thresholds: ProfileThresholds) -> tuple[int, int, int]:
+    return thresholds.relevance, thresholds.full_text, thresholds.deep_extract
+
+
+async def test_force_dispatches_top_scorer_when_nothing_clears() -> None:
+    config = _make_config([("a", 7), ("b", 7), ("c", 7)])
+    client = FakeClient(tasks=[_task(force=True)])
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 5, "b": 6}), _ingests())
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, config).execute()
+
+    mock_dispatch.assert_called_once()
+    call = mock_dispatch.call_args
+    assert call.args[0] == "b"
+    assert call.kwargs["forced"] is True
+    assert call.kwargs["scored"].score == 6
+    assert call.kwargs["scored"].reason.startswith(
+        "Forced by submitter agent:test (score 6 below threshold 7)."
+    )
+    # Tier 1 opens at the item's own score; the deeper gates are untouched.
+    assert _gates(call.kwargs["thresholds"]) == (6, 8, 9)
+
+    done = client.completed[0]
+    assert done["cited_nodes"] == ["note-f"]
+    assert done["outcome"] == (
+        "ingested into 1 profile(s): b; forced: b (score 6 below threshold 7)"
+    )
+    result = client.updated[0][1]["inbox_result"]
+    assert result["per_profile"]["b"]["forced"] is True
+    assert result["per_profile"]["a"]["reason"] == "below_threshold"
+    assert result["per_profile"]["c"]["reason"] == "not_scored"
+    assert result["override"] == {
+        "force_requested": True,
+        "forced": True,
+        "forced_profile": "b",
+        "tier_requested": None,
+        "tier_achieved": None,
+    }
+
+
+async def test_force_ties_go_to_the_first_profile_in_config_order() -> None:
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(tasks=[_task(force=True)])
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 6, "b": 6}), _ingests())
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, config).execute()
+    assert mock_dispatch.call_args.args[0] == "a"
+
+
+async def test_force_with_no_profile_score_hosts_on_first_scoring_profile() -> None:
+    """Nothing scored (the model omitted the item everywhere): the first
+    profile whose filter call worked hosts it at score 0 — never a profile
+    whose filter errored."""
+    config = _make_config([("a", 7), ("b", 7), ("c", 7)])
+    client = FakeClient(tasks=[_task(force=True)])
+    scorer = _scorer_by_profile({}, raise_for={"a"})
+    a, b, c, d = _override_patches(scorer, _ingests())
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, config).execute()
+
+    call = mock_dispatch.call_args
+    assert call.args[0] == "b"
+    assert call.kwargs["scored"].score == 0
+    assert "not scored by any profile" in call.kwargs["scored"].reason
+    assert _gates(call.kwargs["thresholds"])[0] == 0
+    outcome = client.completed[0]["outcome"]
+    assert "forced: b (not scored by any profile)" in outcome
+    assert "a filter failed" in outcome
+
+
+async def test_force_is_not_needed_when_a_profile_clears() -> None:
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(tasks=[_task(force=True)])
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 8, "b": 3}), _ingests())
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, config).execute()
+
+    mock_dispatch.assert_called_once()
+    assert mock_dispatch.call_args.args[0] == "a"
+    assert mock_dispatch.call_args.kwargs["forced"] is False
+    done = client.completed[0]
+    assert done["outcome"] == "ingested into 1 profile(s): a"
+    result = client.updated[0][1]["inbox_result"]
+    assert "forced" not in result["per_profile"]["a"]
+    assert result["override"]["force_requested"] is True
+    assert result["override"]["forced"] is False
+    assert result["override"]["forced_profile"] is None
+
+
+async def test_force_does_not_apply_to_an_existing_note() -> None:
+    """The note is already in Lithos — force has nothing to add (and does not
+    upgrade it; that is a separate follow-up)."""
+    config = _make_config([("a", 7), ("b", 7)])
+    client = FakeClient(
+        tasks=[_task(force=True, tier="full")],
+        existing_note_id="note-1",
+        existing_note={"content": _note_content(["a"]), "tags": []},
+    )
+    a, b, c, d = _override_patches(_scorer_by_profile({"b": 4}), _ingests())
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, config).execute()
+
+    mock_dispatch.assert_not_called()
+    done = client.completed[0]
+    assert done["outcome"] == "cache_hit: existing note note-1; no new profiles matched"
+    override = client.updated[0][1]["inbox_result"]["override"]
+    assert override["forced"] is False
+    assert override["tier_achieved"] is None
+
+
+async def test_force_full_cache_hit_still_reports_override_block() -> None:
+    client = FakeClient(
+        tasks=[_task(force=True)],
+        existing_note_id="note-1",
+        existing_note={"content": _note_content(["alpha"]), "tags": []},
+    )
+    with (
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_returning(8),
+        ),
+        patch("influx.inbox.dispatch_profile") as mock_dispatch,
+    ):
+        await _tick(client).execute()
+
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"].startswith("cache_hit: existing note note-1")
+    assert client.updated[0][1]["inbox_result"]["override"]["forced"] is False
+
+
+async def test_force_does_not_bypass_filter_unavailable_deferral() -> None:
+    """Every filter call raised: still a deferred retry (#292), never forced."""
+    client = FakeClient(tasks=[_task(force=True)])
+    a, b, c, d = _all_failing_patches(client)
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, _inbox_config()).execute()
+
+    mock_dispatch.assert_not_called()
+    assert client.completed == []
+    assert client.released == ["task-1"]
+
+
+async def test_tier_full_lowers_every_gate_to_the_score() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(tasks=[_task(tier="full")])
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 7}), _ingests())
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, config).execute()
+
+    call = mock_dispatch.call_args
+    assert call.kwargs["forced"] is False
+    assert _gates(call.kwargs["thresholds"]) == (7, 7, 7)
+    # notify_immediate is never lowered: an override is not an alert.
+    assert call.kwargs["thresholds"].notify_immediate == 8
+
+
+async def test_tier_without_force_is_still_filtered() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(tasks=[_task(tier="full")])
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 6}), _ingests())
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, config).execute()
+
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"] == (
+        "filtered out: top score 6 (a) below threshold 7"
+    )
+    assert client.updated[0][1]["inbox_result"]["override"] == {
+        "force_requested": False,
+        "forced": False,
+        "forced_profile": None,
+        "tier_requested": "full",
+        "tier_achieved": None,
+    }
+
+
+def _dispatch_building(tags: list[str]) -> dict[str, Any]:
+    """A dispatch double that reports the built note item, as the real
+    provider does once ``build_inbox_note_item`` returns."""
+
+    async def _dispatch(profile: str, **kwargs: Any) -> RunOutcome:
+        kwargs["on_built"]({"tags": tags})
+        return RunOutcome(ingested=1, written_note_ids=("note-f",))
+
+    return {"side_effect": _dispatch}
+
+
+async def test_tier_achieved_reflects_the_built_note() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(tasks=[_task(force=True, tier="full")])
+    built = _dispatch_building(["profile:a", "full-text", "influx:deep-extracted"])
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 5}), built)
+    with a, b, c, d:
+        await _tick(client, config).execute()
+
+    assert client.completed[0]["outcome"] == (
+        "ingested into 1 profile(s): a; forced: a (score 5 below threshold 7); "
+        "tier full achieved: full"
+    )
+    override = client.updated[0][1]["inbox_result"]["override"]
+    assert override["tier_achieved"] == "full"
+    assert override["forced"] is True
+
+
+async def test_tier_achieved_full_text_without_deep_extraction() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(tasks=[_task(tier="full")])
+    built = _dispatch_building(["profile:a", "full-text", "influx:repair-needed"])
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 8}), built)
+    with a, b, c, d:
+        await _tick(client, config).execute()
+    override = client.updated[0][1]["inbox_result"]["override"]
+    assert override["tier_achieved"] == "full_text"
+
+
+async def test_tier_achieved_summary_when_no_full_text() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(tasks=[_task(tier="full")])
+    built = _dispatch_building(["profile:a"])
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 8}), built)
+    with a, b, c, d:
+        await _tick(client, config).execute()
+    assert client.completed[0]["outcome"].endswith("tier full achieved: summary")
+
+
+async def test_tier_full_arxiv_url_uses_arxiv_acquisition() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(
+        tasks=[_task(url="https://arxiv.org/pdf/1705.05363v2", tier="full")]
+    )
+    with (
+        patch("influx.inbox.acquire_inbox_bytes") as mock_bytes,
+        patch(
+            "influx.inbox.acquire_inbox_arxiv", return_value=_acquisition()
+        ) as mock_arxiv,
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"a": 8}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile", **_ingests()),
+    ):
+        await _tick(client, config).execute()
+
+    mock_bytes.assert_not_called()
+    mock_arxiv.assert_called_once()
+    assert mock_arxiv.call_args.args[0] == "1705.05363"
+    # The cache lookup keys on the canonical, version-less abs URL so a
+    # scheduled arXiv note for the same paper is found.
+    assert client.lookup_urls == ["https://arxiv.org/abs/1705.05363"]
+
+
+async def test_arxiv_url_without_tier_keeps_the_generic_path() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(
+        tasks=[_task(url="https://arxiv.org/abs/1705.05363", force=True)]
+    )
+    with (
+        patch(
+            "influx.inbox.acquire_inbox_bytes", return_value=_acquisition()
+        ) as mock_bytes,
+        patch("influx.inbox.acquire_inbox_arxiv") as mock_arxiv,
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"a": 8}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile", **_ingests()),
+    ):
+        await _tick(client, config).execute()
+
+    mock_bytes.assert_called_once()
+    mock_arxiv.assert_not_called()
+
+
+async def test_tier_full_non_arxiv_url_keeps_the_generic_path() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(tasks=[_task(tier="full")])
+    with (
+        patch(
+            "influx.inbox.acquire_inbox_bytes", return_value=_acquisition()
+        ) as mock_bytes,
+        patch("influx.inbox.acquire_inbox_arxiv") as mock_arxiv,
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"a": 8}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile", **_ingests()),
+    ):
+        await _tick(client, config).execute()
+
+    mock_bytes.assert_called_once()
+    mock_arxiv.assert_not_called()
+
+
+async def test_invalid_force_completes_terminally() -> None:
+    client = FakeClient(tasks=[_task(force="yes")])
+    with (
+        patch("influx.inbox.dispatch_profile") as mock_dispatch,
+        patch("influx.metrics.inbox_items_processed") as m,
+    ):
+        await _tick(client).execute()
+
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"] == (
+        "error: invalid submission (force must be true or false)"
+    )
+    result = client.updated[0][1]["inbox_result"]
+    assert result["error"] == "invalid_override"
+    assert result["field"] == "force"
+    assert "invalid_submission" in _outcomes(m)
+
+
+async def test_invalid_tier_completes_terminally() -> None:
+    client = FakeClient(tasks=[_task(tier="deep")])
+    with patch("influx.inbox.dispatch_profile") as mock_dispatch:
+        await _tick(client).execute()
+
+    mock_dispatch.assert_not_called()
+    assert client.completed[0]["outcome"] == (
+        'error: invalid submission (tier must be "full")'
+    )
+    assert client.updated[0][1]["inbox_result"]["field"] == "tier"
+
+
+async def test_null_overrides_are_treated_as_absent() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(tasks=[_task(force=None, tier=None)])
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 3}), _ingests())
+    with a, b, c, d as mock_dispatch:
+        await _tick(client, config).execute()
+    mock_dispatch.assert_not_called()
+    assert "override" not in client.updated[0][1]["inbox_result"]
+
+
+async def test_no_overrides_leaves_dispatch_and_result_unchanged() -> None:
+    """Regression guard: feed-style submissions see none of the override
+    plumbing — default gates, not forced, and no ``override`` block."""
+    client = FakeClient(tasks=[_task()])
+    a, b, c, d = _override_patches(_scorer_returning(8), _ingests())
+    with a, b, c, d as mock_dispatch:
+        await _tick(client).execute()
+
+    kwargs = mock_dispatch.call_args.kwargs
+    assert kwargs["forced"] is False
+    assert kwargs["thresholds"] is None
+    assert kwargs["on_built"] is None
+    result = client.updated[0][1]["inbox_result"]
+    assert "override" not in result
+    assert "forced" not in result["per_profile"]["alpha"]
+    assert client.completed[0]["outcome"] == "ingested into 1 profile(s): alpha"
+
+
+def test_parse_overrides_defaults_off() -> None:
+    assert parse_inbox_overrides({}) == InboxOverrides()
+    assert not InboxOverrides().requested
+
+
+def test_parse_overrides_reads_both_fields() -> None:
+    parsed = parse_inbox_overrides({"force": True, "tier": "full"})
+    assert parsed == InboxOverrides(force=True, tier="full")
+    assert parsed.requested
+
+
+def test_parse_overrides_force_false_is_not_a_request() -> None:
+    assert not parse_inbox_overrides({"force": False}).requested
+
+
+@pytest.mark.parametrize(
+    ("metadata", "field"),
+    [
+        ({"force": "true"}, "force"),
+        ({"force": 1}, "force"),
+        ({"tier": "deep"}, "tier"),
+        ({"tier": 2}, "tier"),
+        ({"tier": "Full"}, "tier"),
+    ],
+)
+def test_parse_overrides_rejects_bad_values(
+    metadata: dict[str, Any], field: str
+) -> None:
+    with pytest.raises(InvalidInboxOverride) as exc_info:
+        parse_inbox_overrides(metadata)
+    assert exc_info.value.field == field
+
+
+def test_effective_thresholds_no_override_returns_base() -> None:
+    base = ProfileThresholds()
+    assert effective_thresholds(base, 3, forced=False, tier=None) is base
+
+
+def test_effective_thresholds_forced_opens_tier1_only() -> None:
+    got = effective_thresholds(ProfileThresholds(), 5, forced=True, tier=None)
+    assert (got.relevance, got.full_text, got.deep_extract) == (5, 8, 9)
+
+
+def test_effective_thresholds_tier_full_opens_all_tiers() -> None:
+    got = effective_thresholds(ProfileThresholds(), 7, forced=False, tier="full")
+    assert (got.relevance, got.full_text, got.deep_extract) == (7, 7, 7)
+    assert got.notify_immediate == 8
+
+
+def test_effective_thresholds_never_raises_a_gate() -> None:
+    base = ProfileThresholds(relevance=5, full_text=6, deep_extract=7)
+    got = effective_thresholds(base, 9, forced=True, tier="full")
+    assert (got.relevance, got.full_text, got.deep_extract) == (5, 6, 7)
+
+
+async def test_forced_host_not_written_is_not_reported_as_forced() -> None:
+    """The forced host's Run wrote nothing (e.g. thin-summary drop): the
+    override names the host it tried but does not claim a forced note."""
+    config = _make_config([("a", 7)])
+    client = FakeClient(tasks=[_task(force=True)])
+    nothing = {"return_value": RunOutcome(ingested=0, skip_reason="no note written")}
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 5}), nothing)
+    with a, b, c, d:
+        await _tick(client, config).execute()
+
+    outcome = client.completed[0]["outcome"]
+    assert outcome.startswith("not ingested")
+    assert outcome.endswith("; forced: a (score 5 below threshold 7) not ingested")
+    result = client.updated[0][1]["inbox_result"]
+    assert result["override"]["forced"] is False
+    assert result["override"]["forced_profile"] == "a"
+    assert result["per_profile"]["a"]["forced"] is True
+    assert result["per_profile"]["a"]["ingested"] is False
+
+
+async def test_forced_host_dispatch_failure_is_not_reported_as_forced() -> None:
+    config = _make_config([("a", 7)])
+    client = FakeClient(tasks=[_task(force=True)])
+    boom = {"side_effect": RuntimeError("dispatch boom")}
+    a, b, c, d = _override_patches(_scorer_by_profile({"a": 5}), boom)
+    with a, b, c, d:
+        await _tick(client, config).execute()
+
+    result = client.updated[0][1]["inbox_result"]
+    assert result["override"]["forced"] is False
+    assert result["per_profile"]["a"] == {
+        "score": 5,
+        "ingested": False,
+        "reason": "dispatch_error",
+        "forced": True,
+    }
+
+
+async def test_force_and_tier_apply_to_a_local_pdf(tmp_path: Path) -> None:
+    pdf_root = tmp_path / "pdfs"
+    pdf_root.mkdir()
+    pdf = pdf_root / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 body")
+    config = _make_pdf_config(pdf_root, tmp_path / "archive")
+    task = _task_pdf(local_path=str(pdf))
+    task["metadata"].update({"force": True, "tier": "full"})
+    client = FakeClient(tasks=[task])
+    with (
+        patch("influx.inbox.acquire_inbox_pdf", return_value=_pdf_acquisition()),
+        patch(
+            "influx.inbox.make_default_batch_scorer",
+            return_value=_scorer_by_profile({"alpha": 4}),
+        ),
+        patch("influx.inbox.build_filter_prompt", return_value="prompt"),
+        patch("influx.inbox.dispatch_profile", **_ingests()) as mock_dispatch,
+    ):
+        await _tick(client, config).execute()
+
+    call = mock_dispatch.call_args
+    assert call.args[0] == "alpha"
+    assert call.kwargs["forced"] is True
+    assert _gates(call.kwargs["thresholds"]) == (4, 4, 4)
+    assert client.updated[0][1]["inbox_result"]["override"]["forced"] is True

@@ -17,8 +17,8 @@ arXiv / RSS / inbox adapters: fetch candidates, acquire (download/archive), and 
 | `influx.extraction.pdf` | XS | 1 | 1 |
 | `influx.extraction.pipeline` | XS | 1 | 1 |
 | `influx.sources` | S | 1 | 1 |
-| `influx.sources.arxiv` | XL | 4 | 5 |
-| `influx.sources.inbox` | M | 1 | 3 |
+| `influx.sources.arxiv` | XL | 4 | 6 |
+| `influx.sources.inbox` | M | 1 | 4 |
 | `influx.sources.note_builder` | S | 0 | 3 |
 | `influx.sources.rss` | L | 2 | 3 |
 
@@ -52,6 +52,7 @@ arXiv / RSS / inbox adapters: fetch candidates, acquire (download/archive), and 
 - def `build_query_url` — Build the arXiv API query URL per FR-SRC-1.
 - class `ArxivCooldownError` — Raised by ``_fetch_with_retry`` when cooldown suppresses a fetch.
 - def `fetch_arxiv` — Fetch and filter arXiv items for the given config.
+- def `fetch_arxiv_entry` — Fetch one paper's Atom entry by id, or ``None`` when there is none.
 - def `build_arxiv_note_item` — Build a complete ``ProfileItem`` dict for the scheduler.
 - class `ArxivSource` — arXiv adapter conforming to :class:`influx.source.Source`.
 - def `make_arxiv_item_provider` — Build the production-default ``item_provider`` for arXiv profiles.
@@ -59,6 +60,7 @@ arXiv / RSS / inbox adapters: fetch candidates, acquire (download/archive), and 
 ### `influx.sources.inbox`
 - class `InboxAcquisition` — One inbox URL acquired once: archive state + extracted body.
 - def `acquire_inbox_bytes` — Download + extract one inbox URL into the fixed inbox archive subtree.
+- def `acquire_inbox_arxiv` — Acquire an arXiv paper the way the scheduled arXiv source does.
 - def `acquire_inbox_pdf` — Acquire one local PDF into the fixed ``inbox-pdf`` archive subtree.
 - def `build_inbox_note_item` — Build a complete ``ProfileItem`` for one (item, profile) ingestion.
 
