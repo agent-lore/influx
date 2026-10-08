@@ -41,7 +41,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Feedback | 3 | 579 | 457 | 1 | 4 | 0.80 | 15 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
 | Filter | 1 | 474 | 398 | 3 | 4 | 0.57 | 11 (`influx.filter.make_default_batch_scorer._scorer`) | 1 |
 | HttpApi | 3 | 1141 | 918 | 2 | 8 | 0.80 | 15 (`influx.http_api.post_backfills`) | 3 |
-| LithosBridge | 8 | 4234 | 3376 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
+| LithosBridge | 8 | 4269 | 3399 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1919 | 1408 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
 | Orchestration | 7 | 4767 | 3808 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
@@ -52,7 +52,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **59**, lines: **29244**, SLOC: **22699**
+- Modules: **59**, lines: **29279**, SLOC: **22722**
 - Largest module: `influx.sources.arxiv` (1863 lines)
 - Modules over 800 lines: **11**
   - `influx.config`
@@ -69,7 +69,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **687**, cyclomatic > 10: **46**
+- Functions: **688**, cyclomatic > 10: **46**
 
 Top 10 most complex functions:
 
@@ -133,4 +133,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.56** (75004 test lines / 29244 source lines)
+- Test-to-source line ratio: **2.57** (75132 test lines / 29279 source lines)

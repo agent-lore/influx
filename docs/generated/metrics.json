@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 687
+    "total_functions": 688
   },
   "domain": {
     "associations": 5,
@@ -380,13 +380,13 @@
       },
       "LithosBridge": {
         "classes": 13,
-        "functions": 122,
+        "functions": 123,
         "largest_module": "influx.lithos_client",
-        "largest_module_lines": 1773,
-        "lines": 4234,
+        "largest_module_lines": 1809,
+        "lines": 4269,
         "modules": 8,
-        "public_symbols": 58,
-        "sloc": 3376
+        "public_symbols": 59,
+        "sloc": 3399
       },
       "Notifications": {
         "classes": 5,
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 29244,
+    "total_lines": 29279,
     "total_modules": 59,
-    "total_sloc": 22699
+    "total_sloc": 22722
   },
   "tests": {
-    "ratio": 2.56,
-    "src_lines": 29244,
-    "test_lines": 75004
+    "ratio": 2.57,
+    "src_lines": 29279,
+    "test_lines": 75132
   }
 }

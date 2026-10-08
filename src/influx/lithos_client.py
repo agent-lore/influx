@@ -16,6 +16,7 @@ import dataclasses
 import json
 import logging
 import re
+from collections.abc import Mapping
 from contextlib import AsyncExitStack
 from typing import Any
 from urllib.parse import urlparse
@@ -77,13 +78,35 @@ def _is_unknown_tool_message(message: str | None) -> bool:
     return any(marker in lowered for marker in _UNKNOWN_TOOL_MARKERS)
 
 
-def _first_non_empty_str(body: dict[str, Any], keys: tuple[str, ...]) -> str:
+def _first_non_empty_str(body: Mapping[str, Any], keys: tuple[str, ...]) -> str:
     """Return the first non-empty string value among *keys* in *body*."""
     for key in keys:
         value = body.get(key)
         if isinstance(value, str) and value:
             return value
     return ""
+
+
+# ``lithos_write`` outcomes Lithos reports through its standard error
+# envelope ``{"status": "error", "code", "message"}`` instead of as a
+# top-level ``status`` (lithos ``tools/notes.py``).
+_ERROR_CODE_STATUSES = frozenset({"invalid_input", "content_too_large"})
+
+
+def write_status(body: Mapping[str, Any]) -> str:
+    """Return the outcome of a decoded ``lithos_write`` response.
+
+    Lithos puts ``created`` / ``updated`` / ``duplicate`` /
+    ``slug_collision`` / ``path_collision`` / ``version_conflict`` in
+    ``status``, but reports ``invalid_input`` and ``content_too_large`` as
+    ``{"status": "error", "code": <outcome>}``.  This folds both into one
+    string so callers branch on the outcome, not the envelope.
+    """
+    status = body.get("status")
+    code = body.get("code")
+    if status == "error" and code in _ERROR_CODE_STATUSES:
+        return str(code)
+    return status if isinstance(status, str) else ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,7 +121,7 @@ class WriteResult:
     ``"content_too_large_skipped"`` when content_too_large exhausted
     all trimming retries (logged + counted + skipped).
 
-    *note_id* carries the Lithos note id from the write envelope on
+    *note_id* carries the Lithos note id (the envelope's ``id``) on
     successful ``created`` / ``updated`` outcomes so the LCMA layer can
     wire it as the ``source_note_id`` on subsequent ``edge_upsert``
     calls (PRD 08 graph wiring).
@@ -1229,13 +1252,13 @@ class LithosClient:
         """Parse a ``lithos_write`` response and handle envelopes."""
         text = result.content[0].text  # type: ignore[union-attr]
         body = json.loads(text)
-        status = body.get("status", "")
+        status = write_status(body)
 
         if status == "duplicate":
             return WriteResult(status="duplicate", source_url=source_url)
 
         if status == "invalid_input":
-            reason = body.get("reason", "unknown")
+            reason = _first_non_empty_str(body, ("message", "reason")) or "unknown"
             logger.warning(
                 "lithos_write invalid_input for %s: %s",
                 source_url,
@@ -1269,6 +1292,9 @@ class LithosClient:
             )
 
         if status == "version_conflict":
+            # Lithos's version_conflict carries ``current_version``, not a
+            # note id; the multi-profile merge built on reading one here is
+            # lithos task c1196e30.
             note_id = body.get("note_id", "")
             return WriteResult(
                 status="version_conflict",
@@ -1283,12 +1309,12 @@ class LithosClient:
             )
 
         if status in ("created", "updated"):
-            # Success — ``note_id`` is plumbed through so LCMA can use it
-            # as the ``source_note_id`` on subsequent ``edge_upsert`` calls.
+            # Success — the note's ``id`` is plumbed through so LCMA can use
+            # it as the ``source_note_id`` on subsequent ``edge_upsert`` calls.
             return WriteResult(
                 status=status,
                 source_url=source_url,
-                note_id=body.get("note_id", ""),
+                note_id=_first_non_empty_str(body, ("id",)),
             )
 
         # Undocumented / unexpected envelope (e.g. ``status="error"``).
@@ -1313,7 +1339,6 @@ class LithosClient:
             status=status,
             source_url=source_url,
             detail=detail,
-            note_id=body.get("note_id", ""),
         )
 
     async def list_notes(
@@ -1507,7 +1532,18 @@ class LithosClient:
         evidence: dict[str, Any] | list[Any] | None = None,
         conflict_state: str | None = None,
     ) -> mcp_types.CallToolResult:
-        """Call ``lithos_edge_upsert`` (FR-LCMA-3)."""
+        """Call ``lithos_edge_upsert`` (FR-LCMA-3).
+
+        Raises ``LithosError("missing_edge_endpoint")`` before any RPC
+        when *from_id* or *to_id* is empty: Lithos would store an edge
+        with no source or target (lithos task 9fb58e10).
+        """
+        if not from_id or not to_id:
+            raise LithosError(
+                "missing_edge_endpoint",
+                operation="lithos_edge_upsert",
+                detail=f"from_id={from_id!r} to_id={to_id!r} type={type}",
+            )
         args: dict[str, Any] = {
             "from_id": from_id,
             "to_id": to_id,

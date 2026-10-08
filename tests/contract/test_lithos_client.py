@@ -6,6 +6,7 @@ Exercises lazy-connect + reuse semantics (FR-MCP-2) and validates that
 
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -21,8 +22,13 @@ from influx.feedback import (
     build_negative_examples_block,
     fetch_rejection_titles,
 )
-from influx.lithos_client import LithosClient
-from tests._lithos_bodies import cache_hit_body, cache_hit_json
+from influx.lithos_client import LithosClient, write_status
+from tests._lithos_bodies import (
+    cache_hit_body,
+    cache_hit_json,
+    write_error_json,
+    write_ok_json,
+)
 
 # ── Fake Lithos SSE server ──────────────────────────────────────────
 
@@ -143,7 +149,8 @@ class FakeLithosServer:
             )
             if write_responses:
                 return write_responses.pop(0)
-            return '{"status": "created"}'
+            # Real Lithos always returns the written note's ``id``.
+            return write_ok_json(f"note-auto-{len(calls)}")
 
         @self._mcp.tool(name="lithos_read")
         async def lithos_read(id: str = "") -> str:
@@ -1150,6 +1157,93 @@ class TestWriteEnvelopeDuplicate:
             await client.close()
 
 
+class TestWriteEnvelopeSuccessId:
+    """Lithos names the written note's id ``id`` (lithos task 9fb58e10).
+
+    Influx read ``note_id``, which Lithos never sends, so every
+    ``WriteResult.note_id`` was empty and LCMA wrote edges with
+    ``from_id=""``.
+    """
+
+    @pytest.mark.parametrize("status", ["created", "updated"])
+    async def test_note_id_read_from_id(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        status: str,
+    ) -> None:
+        fake_lithos_server.write_responses.append(
+            write_ok_json("note-abc", status=status)
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Good item",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.00010",
+                tags=["profile:ml-research"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == status
+        assert result.note_id == "note-abc"
+
+
+class TestWriteStatus:
+    """``write_status`` folds Lithos's error-envelope codes into one status."""
+
+    @pytest.mark.parametrize("code", ["invalid_input", "content_too_large"])
+    def test_error_envelope_code_becomes_status(self, code: str) -> None:
+        assert write_status(json.loads(write_error_json(code, "why"))) == code
+
+    def test_other_error_codes_stay_error(self) -> None:
+        body = json.loads(write_error_json("internal_error", "boom"))
+        assert write_status(body) == "error"
+
+    @pytest.mark.parametrize(
+        "status",
+        ["created", "updated", "duplicate", "slug_collision", "version_conflict"],
+    )
+    def test_top_level_status_passes_through(self, status: str) -> None:
+        assert write_status({"status": status}) == status
+
+    def test_missing_status_is_empty(self) -> None:
+        assert write_status({}) == ""
+
+
+class TestEdgeUpsertEndpoints:
+    """An edge needs both ends; an empty id is rejected before any RPC."""
+
+    @pytest.mark.parametrize(
+        ("from_id", "to_id"), [("", "note-b"), ("note-a", ""), ("", "")]
+    )
+    async def test_empty_endpoint_raises_before_rpc(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        from_id: str,
+        to_id: str,
+    ) -> None:
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with pytest.raises(LithosError, match="missing_edge_endpoint"):
+                await client.edge_upsert(
+                    from_id=from_id, to_id=to_id, type="builds_on", weight=1.0
+                )
+        finally:
+            await client.close()
+
+        edge_calls = [
+            c for c in fake_lithos_server.calls if c[0] == "lithos_edge_upsert"
+        ]
+        assert edge_calls == []
+
+
 class TestWriteEnvelopeInvalidInput:
     """``invalid_input`` envelope: logged + skipped (FR-MCP-7)."""
 
@@ -1161,7 +1255,7 @@ class TestWriteEnvelopeInvalidInput:
     ) -> None:
         """invalid_input: no exception, status='invalid_input'."""
         fake_lithos_server.write_responses.append(
-            '{"status": "invalid_input", "reason": "bad payload"}'
+            write_error_json("invalid_input", "bad payload")
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1190,7 +1284,7 @@ class TestWriteEnvelopeInvalidInput:
         import logging
 
         fake_lithos_server.write_responses.append(
-            '{"status": "invalid_input", "reason": "missing field"}'
+            write_error_json("invalid_input", "missing field")
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1216,7 +1310,7 @@ class TestWriteEnvelopeInvalidInput:
     ) -> None:
         """invalid_input does not raise — run continues."""
         fake_lithos_server.write_responses.append(
-            '{"status": "invalid_input", "reason": "bad"}'
+            write_error_json("invalid_input", "bad")
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1588,7 +1682,7 @@ class TestWriteSlugCollisionRecovery:
                 '{"status": "slug_collision", "existing_id": "doc-stale-1",'
                 ' "message": "Slug already in use", "warnings": []}',
                 # Re-issue after reclaim succeeds.
-                '{"status": "created", "note_id": "note-reclaimed"}',
+                write_ok_json("note-reclaimed"),
             ]
         )
         fake_lithos_server.read_responses.append(
@@ -1634,7 +1728,7 @@ class TestWriteSlugCollisionRecovery:
                 '{"status": "slug_collision", "existing_id": "doc-other-1",'
                 ' "message": "Slug already in use", "warnings": []}',
                 # Suffixed retry succeeds.
-                '{"status": "created", "note_id": "note-suffixed"}',
+                write_ok_json("note-suffixed"),
             ]
         )
         # Squatter has its own metadata — different paper, same slug.
@@ -1686,7 +1780,7 @@ class TestWriteSlugCollisionRecovery:
                 '{"status": "slug_collision", "existing_id": "doc-b-residue",'
                 ' "message": "Slug already in use", "warnings": []}',
                 # After reclaiming B, the suffixed write succeeds.
-                '{"status": "created", "note_id": "note-after-reclaim"}',
+                write_ok_json("note-after-reclaim"),
             ]
         )
         fake_lithos_server.read_responses.extend(
@@ -2413,7 +2507,7 @@ class TestWriteEnvelopeContentTooLarge:
         """First content_too_large → drop Tier 2, retry → succeeds."""
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "content_too_large"}',
+                write_error_json("content_too_large"),
                 '{"status": "created"}',
             ]
         )
@@ -2466,7 +2560,7 @@ class TestWriteEnvelopeContentTooLarge:
         )
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "content_too_large"}',
+                write_error_json("content_too_large"),
                 '{"status": "created"}',
             ]
         )
@@ -2503,8 +2597,8 @@ class TestWriteEnvelopeContentTooLarge:
 
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "content_too_large"}',
-                '{"status": "content_too_large"}',
+                write_error_json("content_too_large"),
+                write_error_json("content_too_large"),
             ]
         )
         # No existing note: cache_lookup returns miss (default).
@@ -2556,8 +2650,8 @@ class TestWriteEnvelopeContentTooLarge:
         """
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "content_too_large"}',
-                '{"status": "content_too_large"}',
+                write_error_json("content_too_large"),
+                write_error_json("content_too_large"),
             ]
         )
         fake_lithos_server.cache_lookup_responses.append(
@@ -2592,8 +2686,8 @@ class TestWriteEnvelopeContentTooLarge:
         """Create path: no degraded placeholder note is invented."""
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "content_too_large"}',
-                '{"status": "content_too_large"}',
+                write_error_json("content_too_large"),
+                write_error_json("content_too_large"),
             ]
         )
         client = LithosClient(url=fake_lithos_url)
@@ -2641,8 +2735,8 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         # 3rd write (Tier 1 only, repair) → updated
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "content_too_large"}',
-                '{"status": "content_too_large"}',
+                write_error_json("content_too_large"),
+                write_error_json("content_too_large"),
                 '{"status": "updated"}',
             ]
         )
@@ -2725,9 +2819,9 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         # 3rd write (Tier 1 only, repair) → content_too_large
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "content_too_large"}',
-                '{"status": "content_too_large"}',
-                '{"status": "content_too_large"}',
+                write_error_json("content_too_large"),
+                write_error_json("content_too_large"),
+                write_error_json("content_too_large"),
             ]
         )
         # cache_lookup returns hit → existing note found (repair path).

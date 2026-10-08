@@ -526,11 +526,11 @@ Backfills skip cache hits entirely. Scheduled/manual runs still attempt a write 
 
 ### 10.4 Write Envelope Handling
 
-`lithos_write` results are parsed into `WriteResult` statuses:
+`lithos_write` results are parsed into `WriteResult` statuses. Lithos reports most outcomes in the top-level `status`, but `invalid_input` and `content_too_large` arrive as its standard error envelope `{"status": "error", "code": <outcome>, "message"}`; `lithos_client.write_status` folds both forms, for ingest writes and repair-sweep rewrites alike.
 
-- `created` / `updated`: success; note ID is used for LCMA hooks.
+- `created` / `updated`: success; the note's `id` becomes `WriteResult.note_id`, used for LCMA hooks and the inbox `per_profile` result.
 - `duplicate`: treated as already-ingested.
-- `invalid_input`: logged and skipped.
+- `invalid_input`: logged (with Lithos's `message`) and skipped.
 - `slug_collision`: first, a `source_url` cache lookup (subject to the same-source check in §10.3). If it hits, Lithos already holds the URL and the outcome is `duplicate`. Otherwise recovery uses squatter-shape dispatch.  When Lithos returns the colliding `existing_id`, Influx reads that doc and routes:
   - **duplicate** — squatter carries matching `arxiv-id:<id>` tag or matching `source_url` → treat as `duplicate` outcome (the URL/cache dedup missed; metric `influx_slug_collision_dedup_recovery_total` ticks).
   - **reclaimable** — squatter is empty residue (no tags, no `source_url`, empty body, typically a stale aborted-write artefact) → `lithos_delete(existing_id)` then re-issue the original write (metric `influx_slug_collision_reclaimed_total`).
@@ -545,7 +545,7 @@ Backfills skip cache hits entirely. Scheduled/manual runs still attempt a write 
 After successful writes, Influx:
 
 1. Calls `lithos_retrieve` with a query composed from title plus up to three contribution bullets.
-2. Upserts `related_to` edges for retrieved notes whose score meets `thresholds.lcma_edge_score`.
+2. Upserts `related_to` edges for retrieved notes whose score meets `thresholds.lcma_edge_score`. The edge runs from the written note's id to the result's `id`; its evidence carries the call's `receipt_id`. `LithosClient.edge_upsert` refuses an edge with an empty `from_id` or `to_id` before calling Lithos.
 3. Resolves Tier 3 `builds_on` entries that contain `arXiv:<id>` through `lithos_cache_lookup`.
 4. Upserts `builds_on` edges only when the resolved source URL matches exactly.
 

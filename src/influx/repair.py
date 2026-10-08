@@ -42,6 +42,7 @@ from influx.canonical_note import (
 from influx.cascade import Acquired, Cascade
 from influx.config import ProfileThresholds
 from influx.errors import ExtractionError, LCMAError, LithosError
+from influx.lithos_client import write_status
 from influx.notes import merge_tags
 from influx.repair_counters import (
     CountedStage,
@@ -807,8 +808,7 @@ async def _sweep_call_write(
             detail=str(exc),
         ) from exc
     text = result.content[0].text  # type: ignore[union-attr]
-    body = json.loads(text)
-    return body.get("status", "")
+    return write_status(json.loads(text))
 
 
 async def _sweep_resolve_version_conflict(
