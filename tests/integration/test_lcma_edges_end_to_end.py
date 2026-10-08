@@ -33,7 +33,7 @@ from influx.coordinator import RunKind
 from influx.probes import ProbeLoop
 from influx.scheduler import run_profile
 from tests._bound_helpers import bounds_for
-from tests._lithos_bodies import cache_hit_json
+from tests._lithos_bodies import cache_hit_json, write_ok_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -282,9 +282,7 @@ class TestAfterWriteEdgeWiring:
         # Override lithos_write so the response carries a note_id that
         # the run path must thread through to edge_upsert as
         # source_note_id (per finding 1).
-        fake_lithos.write_responses.append(
-            _json.dumps({"status": "created", "note_id": "note-source-001"})
-        )
+        fake_lithos.write_responses.append(write_ok_json("note-source-001"))
 
         # Queue a retrieve response with one high-scoring result.
         fake_lithos.retrieve_responses.append(
@@ -294,10 +292,10 @@ class TestAfterWriteEdgeWiring:
                         {
                             "title": "Related Paper A",
                             "score": 0.85,
-                            "receipt_id": "rcpt-001",
-                            "note_id": "note-related-001",
+                            "id": "note-related-001",
                         }
-                    ]
+                    ],
+                    "receipt_id": "rcpt-001",
                 }
             )
         )
@@ -373,10 +371,10 @@ class TestAfterWriteEdgeWiring:
                         {
                             "title": "Weakly Related Paper",
                             "score": 0.5,
-                            "receipt_id": "rcpt-002",
-                            "note_id": "note-weak-001",
+                            "id": "note-weak-001",
                         }
-                    ]
+                    ],
+                    "receipt_id": "rcpt-002",
                 }
             )
         )
@@ -434,9 +432,7 @@ class TestBuildsOnResolver:
         # Override lithos_write so the response carries a note_id that
         # the run path must thread through to edge_upsert as
         # source_note_id (per finding 1).
-        fake_lithos.write_responses.append(
-            _json.dumps({"status": "created", "note_id": "note-builds-source"})
-        )
+        fake_lithos.write_responses.append(write_ok_json("note-builds-source"))
 
         # Queue a retrieve response (from after_write).
         fake_lithos.retrieve_responses.append(_json.dumps({"results": []}))

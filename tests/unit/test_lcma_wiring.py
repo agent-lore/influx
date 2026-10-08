@@ -65,14 +65,8 @@ class TestRelatedToEdgeScoreThreshold:
     async def test_above_threshold_upserts_edge(self) -> None:
         client = _make_client(
             retrieve_payload={
-                "results": [
-                    {
-                        "title": "Prior",
-                        "score": 0.9,
-                        "note_id": "note-prior",
-                        "receipt_id": "rcpt-1",
-                    }
-                ]
+                "results": [{"title": "Prior", "score": 0.9, "id": "note-prior"}],
+                "receipt_id": "rcpt-1",
             }
         )
         deps = _make_deps(client, lcma_edge_score=0.75)
@@ -93,13 +87,14 @@ class TestRelatedToEdgeScoreThreshold:
         assert call.kwargs["weight"] == 0.9
         assert call.kwargs["namespace"] == "influx"
         assert call.kwargs["evidence"]["score"] == 0.9
+        assert call.kwargs["evidence"]["receipt_id"] == "rcpt-1"
 
     @pytest.mark.asyncio
     async def test_below_threshold_skips_edge(self) -> None:
         client = _make_client(
             retrieve_payload={
                 "results": [
-                    {"title": "Weak match", "score": 0.5, "note_id": "note-weak"},
+                    {"title": "Weak match", "score": 0.5, "id": "note-weak"},
                 ]
             }
         )
@@ -125,7 +120,7 @@ class TestRelatedToEdgeScoreThreshold:
         client = _make_client(
             retrieve_payload={
                 "results": [
-                    {"title": "Weak match", "score": 0.5, "note_id": "note-weak"},
+                    {"title": "Weak match", "score": 0.5, "id": "note-weak"},
                 ]
             }
         )
@@ -156,7 +151,7 @@ class TestRelatedToEdgeScoreThreshold:
         client = _make_client(
             retrieve_payload={
                 "results": [
-                    {"title": "Edge", "score": 0.75, "note_id": "note-edge"},
+                    {"title": "Edge", "score": 0.75, "id": "note-edge"},
                 ]
             }
         )

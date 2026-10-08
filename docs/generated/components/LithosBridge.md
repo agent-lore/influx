@@ -15,7 +15,7 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 | `influx.dedup` | S | 0 | 6 |
 | `influx.lcma` | M | 0 | 4 |
 | `influx.lcma_wiring` | S | 2 | 1 |
-| `influx.lithos_client` | XL | 3 | 0 |
+| `influx.lithos_client` | XL | 3 | 1 |
 | `influx.notes` | S | 1 | 4 |
 | `influx.renderer` | M | 2 | 6 |
 | `influx.urls` | S | 1 | 6 |
@@ -66,6 +66,7 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 - def `wire` — Run the post-write LCMA wiring for one just-written note.
 
 ### `influx.lithos_client`
+- def `write_status` — Return the outcome of a decoded ``lithos_write`` response.
 - class `WriteResult` — Result of a ``write_note`` call after envelope handling (FR-MCP-7).
 - class `SquatterClassification` — Outcome of inspecting the doc that owns a colliding slug (#31).
 - class `LithosClient` — Lazy-connecting SSE-backed MCP client for Lithos.

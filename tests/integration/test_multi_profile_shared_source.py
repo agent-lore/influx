@@ -39,7 +39,7 @@ from influx.probes import ProbeLoop
 from influx.renderer import ProfileRelevanceEntry, render_note
 from influx.scheduler import InfluxScheduler
 from tests._bound_helpers import bounds_for
-from tests._lithos_bodies import cache_hit_json
+from tests._lithos_bodies import cache_hit_json, write_ok_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -307,7 +307,7 @@ class TestSharedSourceMerge:
         )
         # - lithos_write retry → updated
         fake_lithos.write_responses.append(
-            json.dumps({"status": "updated", "note_id": "note-shared-001"})
+            write_ok_json("note-shared-001", status="updated")
         )
 
         # Run Profile B against the same app (same config, same coordinator)
@@ -493,7 +493,7 @@ class TestPreservationOnSingleProfileRun:
             )
         )
         fake_lithos.write_responses.append(
-            json.dumps({"status": "updated", "note_id": "note-shared-002"})
+            write_ok_json("note-shared-002", status="updated")
         )
 
         app = _make_app(config, profile_items)

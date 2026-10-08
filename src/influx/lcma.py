@@ -175,7 +175,7 @@ async def after_write(
     *source_note_id* is the id of the note that was just written; it is
     passed verbatim as ``from_id`` to each ``edge_upsert`` so a real
     graph edge can be created. Each retrieve result contributes its own
-    ``note_id`` as ``to_id``.
+    ``id`` as ``to_id``; the call's ``receipt_id`` goes in the evidence.
 
     Returns a list of ``{"title": str, "score": float}`` dicts for
     high-scoring results so the webhook digest can populate
@@ -222,15 +222,14 @@ async def after_write(
                 source_url,
                 source_note_id,
                 "lithos_retrieve",
-                r.get("note_id", ""),
+                r.get("id", ""),
                 r.get("title", ""),
                 score,
                 lcma_edge_score,
             )
             continue
 
-        receipt_id = r.get("receipt_id", "")
-        target_note_id = r.get("note_id", "")
+        target_note_id = r.get("id", "")
         await client.edge_upsert(
             from_id=source_note_id,
             to_id=target_note_id,
@@ -242,7 +241,7 @@ async def after_write(
             evidence={
                 "kind": "lithos_retrieve",
                 "score": score,
-                "receipt_id": receipt_id,
+                "receipt_id": body.get("receipt_id", ""),
             },
         )
         logger.info(

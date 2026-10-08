@@ -58,3 +58,33 @@ def cache_miss_body() -> dict[str, Any]:
 def cache_hit_json(source_url: str, **kwargs: Any) -> str:
     """:func:`cache_hit_body` serialised for the fake MCP server queue."""
     return json.dumps(cache_hit_body(source_url, **kwargs))
+
+
+def write_ok_json(
+    note_id: str = "note-1", *, status: str = "created", title: str = "Note"
+) -> str:
+    """A successful ``lithos_write`` in the real envelope.
+
+    Lithos names the note's id ``id`` (``lithos/tools/notes.py``); Influx
+    used to read ``note_id``, which Lithos never sends (lithos task
+    9fb58e10).
+    """
+    return json.dumps(
+        {
+            "status": status,
+            "id": note_id,
+            "title": title,
+            "path": f"notes/{note_id}.md",
+            "version": 1,
+            "warnings": [],
+        }
+    )
+
+
+def write_error_json(code: str, message: str = "") -> str:
+    """A ``lithos_write`` failure in Lithos's standard error envelope.
+
+    ``invalid_input`` and ``content_too_large`` arrive this way, as
+    ``{"status": "error", "code": ...}``, not as a top-level ``status``.
+    """
+    return json.dumps({"status": "error", "code": code, "message": message})

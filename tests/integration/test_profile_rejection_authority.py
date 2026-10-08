@@ -40,7 +40,7 @@ from influx.probes import ProbeLoop
 from influx.renderer import ProfileRelevanceEntry, render_note
 from influx.scheduler import InfluxScheduler
 from tests._bound_helpers import bounds_for
-from tests._lithos_bodies import cache_hit_json
+from tests._lithos_bodies import cache_hit_json, write_ok_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -335,7 +335,7 @@ class TestRejectionAuthorityIngest:
         )
         # write retry → updated
         fake_lithos.write_responses.append(
-            json.dumps({"status": "updated", "note_id": "note-rejected-001"})
+            write_ok_json("note-rejected-001", status="updated")
         )
 
         app = _make_app(config, profile_items)
@@ -403,7 +403,7 @@ class TestRejectionAuthorityIngest:
         )
         # write retry → updated
         fake_lithos.write_responses.append(
-            json.dumps({"status": "updated", "note_id": "note-rejected-001"})
+            write_ok_json("note-rejected-001", status="updated")
         )
 
         with TestClient(app) as tc:

@@ -179,6 +179,16 @@ def test_fanout_produces_one_inbox_ledger_entry_per_clearing_profile(
     assert len(inbox_complete) == 1
     assert "ingested into 3 profile(s)" in inbox_complete[0]["outcome"]
 
+    # Each profile's entry names the note it wrote (Lithos returns ``id``).
+    results = [
+        c["metadata"]["inbox_result"]
+        for c in _calls(fake_lithos, "lithos_task_update")
+        if "inbox_result" in c.get("metadata", {})
+    ]
+    assert len(results) == 1
+    note_ids = [results[0]["per_profile"][p]["note_id"] for p in _PROFILES]
+    assert all(isinstance(n, str) and n.startswith("note-auto-") for n in note_ids)
+
 
 def test_local_pdf_fanout_with_synthetic_source_url(
     fake_lithos: FakeLithosServer,

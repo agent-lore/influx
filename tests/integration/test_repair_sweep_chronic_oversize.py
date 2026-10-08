@@ -33,6 +33,7 @@ from influx.config import (
 )
 from influx.lithos_client import LithosClient
 from influx.repair import SweepHooks, sweep
+from tests._lithos_bodies import write_error_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Fixtures ───────────────────────────────────────────────────────
@@ -198,7 +199,7 @@ def _queue_mixed_sweep(
         fake_lithos.read_responses.append(json.dumps(note))
 
     for _ in range(_CHRONIC_TRIM_ATTEMPTS):
-        fake_lithos.write_responses.append('{"status": "content_too_large"}')
+        fake_lithos.write_responses.append(write_error_json("content_too_large"))
     for _ in normal_notes:
         fake_lithos.write_responses.append('{"status": "updated"}')
 
@@ -376,7 +377,9 @@ class TestChronicOversizeExemption:
             )
             fake_lithos.read_responses.append(json.dumps(chronic))
             for _ in range(_CHRONIC_TRIM_ATTEMPTS):
-                fake_lithos.write_responses.append('{"status": "content_too_large"}')
+                fake_lithos.write_responses.append(
+                    write_error_json("content_too_large")
+                )
 
             visited_r2 = await sweep(
                 "ai-robotics",
@@ -479,7 +482,7 @@ class TestChronicOversizeExemption:
 
         # Two chronic notes × 3 trim attempts each + one normal write.
         for _ in range(2 * _CHRONIC_TRIM_ATTEMPTS):
-            fake_lithos.write_responses.append('{"status": "content_too_large"}')
+            fake_lithos.write_responses.append(write_error_json("content_too_large"))
         fake_lithos.write_responses.append('{"status": "updated"}')
 
         config = _make_config(lithos_url=fake_lithos_url, max_items=10)
@@ -559,7 +562,7 @@ class TestChronicOversizeExemption:
         )
         fake_lithos.read_responses.append(json.dumps(chronic))
         for _ in range(_CHRONIC_TRIM_ATTEMPTS):
-            fake_lithos.write_responses.append('{"status": "content_too_large"}')
+            fake_lithos.write_responses.append(write_error_json("content_too_large"))
 
         config = _make_config(lithos_url=fake_lithos_url, max_items=10)
         client = LithosClient(url=fake_lithos_url)
