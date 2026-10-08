@@ -58,6 +58,7 @@ from influx.source import ScoredCandidate
 from influx.sources import FetchCache, make_item_provider
 from influx.sources.arxiv import ArxivItem
 from influx.sources.rss import RssFeedItem
+from tests._lithos_bodies import cache_hit_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 PROFILE = "ai-robotics"
@@ -238,7 +239,7 @@ class TestPreAcquireDedupArxivBackfill:
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         # Pre-acquire primary lookup → hit.
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2701.00001")
         )
 
         with (
@@ -310,7 +311,7 @@ class TestPreAcquireDedupRssBackfill:
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         # Pre-acquire primary lookup → hit.
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://example.org/already-ingested")
         )
 
         with (
@@ -343,6 +344,78 @@ class TestPreAcquireDedupRssBackfill:
         assert len(cache_calls) == 1
 
 
+class TestPreAcquireDedupSemanticNeighbour:
+    """Lithos e4300784: a semantic-neighbour "hit" must not drop a candidate."""
+
+    def test_backfill_acquires_and_writes_when_hit_is_a_neighbour(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        config = _arxiv_only_config(fake_lithos_url)
+        provider = make_item_provider(
+            config,
+            fetch_cache=FetchCache(),
+            arxiv_scorer=_deterministic_arxiv_scorer(8),
+        )
+
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+        # Lithos's source_url fast path missed and its threshold-0.0
+        # semantic fallback returned the nearest unrelated note.
+        fake_lithos.cache_lookup_responses.append(
+            cache_hit_json(
+                "https://scazlab.yale.edu/to-help-or-not",
+                note_id="8c0a21ae",
+                title="To Help or Not to Help?",
+            )
+        )
+        fake_lithos.write_responses.append(
+            json.dumps({"status": "created", "id": "note-new", "detail": ""})
+        )
+
+        with (
+            patch(
+                "influx.sources.arxiv.fetch_arxiv",
+                return_value=list(_ARXIV_FIXTURE),
+            ),
+            patch(
+                "influx.sources.arxiv.build_arxiv_note_item",
+                return_value={
+                    "title": "Already-Ingested Paper",
+                    "source": "arxiv",
+                    "source_url": "https://arxiv.org/abs/2701.00001",
+                    "content": "content",
+                    "tags": ["source:arxiv", "profile:ai-robotics"],
+                    "filter_tags": [],
+                    "score": 8,
+                    "confidence": 1.0,
+                    "reason": "test-scorer",
+                    "path": "papers/arxiv/2026/04",
+                    "abstract_or_summary": "abs",
+                    "contributions": None,
+                    "builds_on": None,
+                },
+            ) as mock_build,
+        ):
+            result = asyncio.run(
+                run_profile(
+                    PROFILE,
+                    RunKind.BACKFILL,
+                    run_range={"days": 7},
+                    config=config,
+                    item_provider=provider,
+                )
+            )
+
+        assert result is not None
+        # The neighbour is treated as a miss: the candidate is acquired
+        # and written instead of being dropped as a cache hit.
+        assert mock_build.call_count == 1
+        write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1
+        assert write_calls[0][1]["source_url"] == "https://arxiv.org/abs/2701.00001"
+
+
 # ── Normal run: cache hit still goes through acquire (merge path) ──────
 
 
@@ -366,7 +439,7 @@ class TestPreAcquireDedupNormalRun:
         fake_lithos.list_responses.append(json.dumps({"items": []}))  # repair sweep
         # Pre-acquire primary lookup → hit (normal run, so merge path).
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2701.00001")
         )
         # Lithos write succeeds (multi-profile merge).
         fake_lithos.write_responses.append(

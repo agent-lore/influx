@@ -566,8 +566,11 @@ async def _run_ingest_stage(
         )
         # #125: the Acquire stage now performs the primary
         # ``lithos_cache_lookup`` *before* ``Source.acquire`` and stamps
-        # the verdict on the ProfileItem.  The legacy primary-lookup
-        # branch below is reached only when ``cache_hit`` is absent —
+        # the verdict on the ProfileItem.  A hit is a verified same-source
+        # match; ``LithosClient.cache_lookup_body`` turns Lithos's
+        # semantic-neighbour fallback into a miss (Lithos e4300784).  The
+        # legacy primary-lookup branch below is reached only when
+        # ``cache_hit`` is absent —
         # i.e. tests that hand-build ProfileItems and call
         # ``_run_ingest_stage`` directly without going through the
         # Acquire stage.  Production runs always carry the metadata.
@@ -588,14 +591,11 @@ async def _run_ingest_stage(
                 # sync with the metric.
                 record_cache_hit()
         else:
+            # The Acquire stage already ticked metrics.cache_hits and the
+            # ledger's cache_hits for this verdict (including the hits a
+            # backfill skipped, which never reach this loop).
             cache_hit = bool(cache_hit_meta)
             cache_hit_reason = item.get("cache_hit_reason") if cache_hit else None
-            # #152: the Acquire-stage primary lookup short-circuits the
-            # legacy in-loop branch above, so its hits are counted here
-            # to keep the ledger total in lockstep with metrics.cache_hits
-            # which Acquire already ticked.
-            if cache_hit:
-                record_cache_hit()
 
         # #128: defensive source_url-only fallback when the primary
         # title+abstract dedup misses.  Catches notes whose source_url

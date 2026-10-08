@@ -40,6 +40,7 @@ from influx.probes import ProbeLoop
 from influx.renderer import ProfileRelevanceEntry, render_note
 from influx.scheduler import InfluxScheduler
 from tests._bound_helpers import bounds_for
+from tests._lithos_bodies import cache_hit_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -316,9 +317,7 @@ class TestRejectionAuthorityIngest:
             )
         )
         # cache_lookup → HIT (item already in Lithos from prior run)
-        fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
-        )
+        fake_lithos.cache_lookup_responses.append(cache_hit_json(SHARED_URL))
         # write (cache-hit path) → version_conflict
         fake_lithos.write_responses.append(
             json.dumps({"status": "version_conflict", "note_id": "note-rejected-001"})
@@ -386,9 +385,7 @@ class TestRejectionAuthorityIngest:
         # lithos_list (feedback: influx:rejected:web-tech) → empty
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         # cache_lookup → HIT
-        fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
-        )
+        fake_lithos.cache_lookup_responses.append(cache_hit_json(SHARED_URL))
         # write (cache-hit path) → version_conflict
         fake_lithos.write_responses.append(
             json.dumps({"status": "version_conflict", "note_id": "note-rejected-001"})

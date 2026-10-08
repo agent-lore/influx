@@ -22,6 +22,7 @@ from influx.feedback import (
     fetch_rejection_titles,
 )
 from influx.lithos_client import LithosClient
+from tests._lithos_bodies import cache_hit_body, cache_hit_json
 
 # ── Fake Lithos SSE server ──────────────────────────────────────────
 
@@ -681,6 +682,65 @@ class TestCacheLookupChokepoint:
         finally:
             await client.close()
 
+    async def test_semantic_neighbour_hit_becomes_miss(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Lithos e4300784: a hit for a *different* source_url is a miss.
+
+        Lithos falls back to a threshold-0.0 semantic search when its
+        source_url fast path misses and reports the nearest note as a hit.
+        """
+        import logging
+
+        fake_lithos_server.cache_lookup_responses.append(
+            cache_hit_json(
+                "https://scazlab.yale.edu/to-help-or-not",
+                note_id="8c0a21ae",
+                title="To Help or Not to Help?",
+            )
+        )
+        incoming = "https://www.frontiersin.org/articles/10.3389/frobt.2026.1938840"
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            with caplog.at_level(logging.INFO, logger="influx.lithos_client"):
+                body = await client.cache_lookup_for_item_body(
+                    title="Robots that help", source_url=incoming
+                )
+        finally:
+            await client.close()
+
+        assert body["hit"] is False
+        assert body["document"] is None
+        assert body["ignored_neighbour"]["id"] == "8c0a21ae"
+        assert "semantic neighbour ignored" in caplog.text
+        assert "reason=semantic_neighbour_ignored" in caplog.text
+        assert "8c0a21ae" in caplog.text
+
+    async def test_same_source_hit_kept(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """A hit whose document carries the requested URL stays a hit."""
+        url = "https://arxiv.org/abs/2610.00710"
+        fake_lithos_server.cache_lookup_responses.append(
+            cache_hit_json(url, note_id="n-1")
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            body = await client.cache_lookup_for_item_body(
+                title="ReLiveGym", source_url=url
+            )
+        finally:
+            await client.close()
+
+        assert body == cache_hit_body(url, note_id="n-1")
+
 
 # ── Source-URL cache lookup chokepoint (#128) ─────────────────────
 
@@ -716,11 +776,9 @@ class TestCacheLookupByUrlBody:
         client = LithosClient(url=fake_lithos_url)
         try:
             url = "https://arxiv.org/abs/1706.03762"
-            fake_lithos_server.cache_lookup_responses.append(
-                '{"hit": true, "stale_exists": false}'
-            )
+            fake_lithos_server.cache_lookup_responses.append(cache_hit_json(url))
             body = await client.cache_lookup_by_url_body(source_url=url)
-            assert body == {"hit": True, "stale_exists": False}
+            assert body == cache_hit_body(url)
             lookup_calls = [
                 c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
             ]
@@ -728,6 +786,27 @@ class TestCacheLookupByUrlBody:
             assert lookup_calls[0][1] == {"query": url, "source_url": url}
         finally:
             await client.close()
+
+    async def test_semantic_neighbour_hit_becomes_miss(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """``query=source_url`` still hits Lithos's semantic fallback (e4300784)."""
+        fake_lithos_server.cache_lookup_responses.append(
+            cache_hit_json("https://example.com/mars-curiosity-rover", note_id="m-1")
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            body = await client.cache_lookup_by_url_body(
+                source_url="https://towardsdatascience.com/robot-curiosity"
+            )
+        finally:
+            await client.close()
+
+        assert body["hit"] is False
+        assert body["ignored_neighbour"]["id"] == "m-1"
 
     async def test_decodes_miss_body_unchanged(
         self,
@@ -1715,7 +1794,9 @@ class TestSlugCollisionUrlIdentityRecovery:
             ' "message": "Slug already in use", "warnings": []}'
         )
         fake_lithos_server.cache_lookup_responses.append(
-            '{"hit": true, "id": "note-existing-99", "stale_exists": false}'
+            cache_hit_json(
+                "https://arxiv.org/abs/2604.28197", note_id="note-existing-99"
+            )
         )
         client = LithosClient(url=fake_lithos_url)
         try:
@@ -1795,6 +1876,50 @@ class TestSlugCollisionUrlIdentityRecovery:
         read_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_read"]
         assert len(read_calls) == 1
 
+    async def test_url_neighbour_falls_through_to_squatter_inspection(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Lithos e4300784: a semantic-neighbour "hit" on the URL pre-check
+        must not turn a distinct-paper collision into ``duplicate``.
+        """
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "slug_collision", "existing_id": "doc-other",'
+                ' "message": "Slug already in use", "warnings": []}',
+                '{"status": "created", "id": "note-new"}',
+            ]
+        )
+        fake_lithos_server.cache_lookup_responses.append(
+            cache_hit_json("https://arxiv.org/abs/2501.11111", note_id="doc-other")
+        )
+        fake_lithos_server.read_responses.append(
+            '{"id": "doc-other", "title": "Some Paper",'
+            ' "content": "real content",'
+            ' "source_url": "https://arxiv.org/abs/2501.11111",'
+            ' "tags": ["arxiv-id:2501.11111", "source:arxiv"]}'
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Some Paper",
+                content="# Summary\nContent.",
+                path="papers/arxiv/2026/04",
+                source_url="https://arxiv.org/abs/2604.28197",
+                tags=["profile:staging-robotics"],
+                confidence=0.8,
+            )
+        finally:
+            await client.close()
+
+        # Distinct squatter → suffix retry → created, not a false duplicate.
+        assert result.status == "created"
+        write_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 2
+        assert write_calls[1][1]["title"] == "Some Paper [arXiv 2604.28197]"
+
     async def test_url_precheck_failure_falls_through(
         self,
         fake_lithos_url: str,
@@ -1866,8 +1991,12 @@ class TestSlugCollisionUrlIdentityRecovery:
         )
         fake_lithos_server.cache_lookup_responses.extend(
             [
-                '{"hit": true, "id": "note-already", "stale_exists": false}',
-                '{"hit": true, "id": "note-already", "stale_exists": false}',
+                cache_hit_json(
+                    "https://arxiv.org/abs/2604.99999", note_id="note-already"
+                ),
+                cache_hit_json(
+                    "https://arxiv.org/abs/2604.99999", note_id="note-already"
+                ),
             ]
         )
         client = LithosClient(url=fake_lithos_url)
@@ -2407,6 +2536,44 @@ class TestWriteEnvelopeContentTooLarge:
         finally:
             await client.close()
 
+    async def test_create_path_when_lookup_returns_neighbour(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Lithos e4300784: a semantic neighbour is not an existing note.
+
+        The second content_too_large must take the create-path skip, not
+        the repair path (which would write a Tier-1-only note).
+        """
+        fake_lithos_server.write_responses.extend(
+            [
+                '{"status": "content_too_large"}',
+                '{"status": "content_too_large"}',
+            ]
+        )
+        fake_lithos_server.cache_lookup_responses.append(
+            cache_hit_json("https://arxiv.org/abs/2401.00001", note_id="other")
+        )
+        client = LithosClient(url=fake_lithos_url)
+        try:
+            result = await client.write_note(
+                title="Huge Paper",
+                content=_CONTENT_WITH_TIERS,
+                path="papers/arxiv/2026/03",
+                source_url="https://arxiv.org/abs/2601.50003",
+                tags=["profile:ml-research"],
+                confidence=0.9,
+            )
+        finally:
+            await client.close()
+
+        assert result.status == "content_too_large_skipped"
+        assert result.detail == "create_path"
+        write_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 2
+
     async def test_create_path_no_note_persisted(
         self,
         fake_lithos_url: str,
@@ -2459,7 +2626,6 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         repair-path Tier-1-only retry.  Asserts repair-needed
         tag present and existing tags preserved (AC-05-F).
         """
-        import json as _json
 
         # 1st write → content_too_large
         # 2nd write (Tier 2 dropped) → content_too_large
@@ -2475,16 +2641,14 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         # Existing rejection guards a *different* profile so the canonical
         # merge contract (FR-NOTE-6) preserves profile:ml-research.
         fake_lithos_server.cache_lookup_responses.append(
-            _json.dumps(
-                {
-                    "hit": True,
-                    "id": "note-repair-001",
-                    "tags": [
-                        "profile:ml-research",
-                        "user-custom-tag",
-                        "influx:rejected:robotics",
-                    ],
-                }
+            cache_hit_json(
+                "https://arxiv.org/abs/2601.60001",
+                note_id="note-repair-001",
+                tags=[
+                    "profile:ml-research",
+                    "user-custom-tag",
+                    "influx:rejected:robotics",
+                ],
             )
         )
         client = LithosClient(url=fake_lithos_url)
@@ -2545,7 +2709,6 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         Existing note untouched, counter incremented, no abort,
         updated_at unchanged (AC-05-F repair path).
         """
-        import json as _json
         import logging
 
         # 1st write → content_too_large
@@ -2560,12 +2723,10 @@ class TestWriteEnvelopeContentTooLargeRepairPath:
         )
         # cache_lookup returns hit → existing note found (repair path).
         fake_lithos_server.cache_lookup_responses.append(
-            _json.dumps(
-                {
-                    "hit": True,
-                    "id": "note-repair-002",
-                    "tags": ["profile:ml-research"],
-                }
+            cache_hit_json(
+                "https://arxiv.org/abs/2601.60002",
+                note_id="note-repair-002",
+                tags=["profile:ml-research"],
             )
         )
         client = LithosClient(url=fake_lithos_url)

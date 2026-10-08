@@ -41,6 +41,7 @@ from urllib.parse import urlparse
 from influx import metrics
 from influx.config import AppConfig, InboxConfig
 from influx.coordinator import Coordinator, ProfileBusyError, RunKind
+from influx.dedup import cache_hit_document
 from influx.errors import LCMAError, LithosError
 from influx.feedback import build_filter_prompt
 from influx.filter import make_default_batch_scorer
@@ -165,14 +166,12 @@ def _backoff_minutes(attempt: int, *, base: int, cap: int) -> int:
 
 
 def _extract_note_id(body: dict[str, Any]) -> str | None:
-    """Pull a note id out of a ``lithos_cache_lookup`` body (mirrors #148)."""
-    if not body.get("hit"):
+    """Pull the hit's note id out of a ``lithos_cache_lookup`` body."""
+    doc = cache_hit_document(body)
+    if doc is None:
         return None
-    for key in ("id", "note_id", "existing_id"):
-        value = body.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
+    note_id = doc.get("id")
+    return note_id if isinstance(note_id, str) and note_id else None
 
 
 # ── Seam: single-item provider + per-Profile dispatch ───────────────

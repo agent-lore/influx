@@ -5,6 +5,11 @@ ahead of :meth:`Source.acquire` so duplicate items skip download / archive /
 extraction cost in backfill profiles and merge-bound items still flow through
 the write path with the cache-hit fact recorded.
 
+A ``hit`` here is a *verified* same-source hit:
+:meth:`~influx.lithos_client.LithosClient.cache_lookup_body` turns
+Lithos's semantic-neighbour fallback into a miss (Lithos task e4300784),
+so a backfill only skips candidates whose URL is already stored.
+
 Partition rules (one ``cache_lookup`` per scored candidate):
 
 ============================  =====================  ===========================
@@ -15,9 +20,11 @@ Partition rules (one ``cache_lookup`` per scored candidate):
 ``True`` (hit)                ``False``              ``to_acquire`` (cache_hit=True)
 ============================  =====================  ===========================
 
-The helper emits :func:`metrics.cache_hits` and the ``"article cache hit"``
+The helper emits :func:`metrics.cache_hits`, the run ledger's
+:func:`~influx.telemetry.record_cache_hit` and the ``"article cache hit"``
 log line for each hit it decides — those signals move out of the Ingest
-stage with the lookup itself.  The defensive source-URL fallback (#128)
+stage with the lookup itself, so a backfill's skipped hits are counted
+too.  The defensive source-URL fallback (#128)
 stays in Ingest and only fires when ``cache_hit=False`` reaches the write
 path.
 
@@ -47,7 +54,7 @@ from influx import metrics
 from influx.errors import LithosError
 from influx.lithos_client import LithosClient
 from influx.source import BoundScoredCandidate
-from influx.telemetry import record_dedup_lookup_error
+from influx.telemetry import record_cache_hit, record_dedup_lookup_error
 
 __all__ = [
     "DedupDecision",
@@ -167,6 +174,7 @@ async def dedup_scored_candidates(
             metrics.cache_hits().add(
                 1, {"profile": profile, "source": _metric_source(bound.source_label)}
             )
+            record_cache_hit()
             action = "skip" if skip_cache_hits else "merge-profile"
             logger.info(
                 "article cache hit profile=%s source_url=%s title=%r "

@@ -12,13 +12,13 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
 | `influx.canonical_note` | L | 4 | 18 |
-| `influx.dedup` | XS | 0 | 2 |
+| `influx.dedup` | S | 0 | 6 |
 | `influx.lcma` | M | 0 | 4 |
 | `influx.lcma_wiring` | S | 2 | 1 |
 | `influx.lithos_client` | XL | 3 | 0 |
 | `influx.notes` | S | 1 | 4 |
 | `influx.renderer` | M | 2 | 6 |
-| `influx.urls` | S | 1 | 4 |
+| `influx.urls` | S | 1 | 5 |
 
 ## Public API
 
@@ -49,6 +49,10 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 ### `influx.dedup`
 - def `first_sentence` — Extract the first sentence from *text*.
 - def `compose_dedup_query` — Compose the ``query`` argument for ``lithos_cache_lookup``.
+- def `arxiv_id_from_url` — Return the arxiv id from a URL like ``https://arxiv.org/abs/2604.28197``.
+- def `same_source_reason` — Say why an existing doc is the same source as *incoming_source_url*.
+- def `verify_cache_hit` — Keep a ``lithos_cache_lookup`` hit only if it is the same source.
+- def `cache_hit_document` — Return the hit's ``document`` (``id``, ``source_url``, ``tags``, ...).
 
 ### `influx.lcma`
 - def `compose_retrieve_query` — Compose a deterministic ``lithos_retrieve`` query string (FR-LCMA-2).
@@ -85,6 +89,7 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 
 ### `influx.urls`
 - def `normalise_url` — Return a canonical form of *raw*.
+- def `safe_normalise_url` — Return :func:`normalise_url` output, falling back to *url* on error.
 - def `url_hash` — Return a 10-char hex SHA-256 digest of the normalised *source_url*.
 - def `arxiv_canonical_url` — Return the canonical arXiv URL for a given arXiv ID (FR-MCP-5).
 - class `UrlValidation` — Result of :func:`classify_article_url`.

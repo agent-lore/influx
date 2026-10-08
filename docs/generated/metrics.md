@@ -21,7 +21,7 @@ lower a budget after improving the code to lock in the gain.
 
 ## Import graph
 
-- Cross-component edges: **62** (187 module-level)
+- Cross-component edges: **62** (188 module-level)
 - Component cycles: Common ↔ Config; Enrich ↔ Repair ↔ Sources ↔ Storage; HttpApi ↔ Orchestration
 - Module cycles: influx.http_api ↔ influx.inbox ↔ influx.run ↔ influx.run_dispatch ↔ influx.run_service ↔ influx.scheduler ↔ influx.service; influx.repair ↔ influx.repair_hooks; influx.sources ↔ influx.sources.arxiv ↔ influx.sources.rss
 - Tier-skipping edges (Entrypoints → Foundation): 9 (Entrypoint -> Common, Entrypoint -> Config, Entrypoint -> Observability, HttpApi -> Common, HttpApi -> Config, HttpApi -> Observability, Orchestration -> Common, Orchestration -> Config, Orchestration -> Observability)
@@ -38,13 +38,13 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Config | 4 | 1608 | 1160 | 11 | 1 | 0.08 | 14 (`influx.config.NotificationWebhookConfig._validate_type_specific_fields`) | 1 |
 | Enrich | 2 | 998 | 804 | 2 | 5 | 0.71 | 22 (`influx.cascade.Cascade.enrich`) | 2 |
 | Entrypoint | 2 | 573 | 454 | 0 | 5 | 1.00 | 14 (`influx.main._cmd_backfill`) | 2 |
-| Feedback | 3 | 571 | 450 | 1 | 4 | 0.80 | 15 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
+| Feedback | 3 | 579 | 457 | 1 | 4 | 0.80 | 15 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
 | Filter | 1 | 474 | 398 | 3 | 4 | 0.57 | 11 (`influx.filter.make_default_batch_scorer._scorer`) | 1 |
 | HttpApi | 3 | 1141 | 918 | 2 | 8 | 0.80 | 15 (`influx.http_api.post_backfills`) | 3 |
-| LithosBridge | 8 | 4129 | 3283 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 4 |
+| LithosBridge | 8 | 4219 | 3367 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1919 | 1408 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
-| Orchestration | 6 | 4377 | 3476 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
+| Orchestration | 6 | 4376 | 3473 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
 | Repair | 5 | 3984 | 3041 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 331 | 247 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
 | Sources | 10 | 4343 | 3323 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
@@ -52,7 +52,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **58**, lines: **28594**, SLOC: **22140**
+- Modules: **58**, lines: **28691**, SLOC: **22228**
 - Largest module: `influx.sources.arxiv` (1830 lines)
 - Modules over 800 lines: **11**
   - `influx.config`
@@ -69,7 +69,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **666**, cyclomatic > 10: **47**
+- Functions: **670**, cyclomatic > 10: **46**
 
 Top 10 most complex functions:
 
@@ -81,7 +81,7 @@ Top 10 most complex functions:
 | 28 | `influx.sources.arxiv.build_arxiv_note_item` |
 | 28 | `influx.sources.rss.build_rss_note_item` |
 | 26 | `influx.repair._process_sweep_note` |
-| 24 | `influx.run._run_ingest_stage` |
+| 23 | `influx.run._run_ingest_stage` |
 | 23 | `influx.run_ledger.build_degradation_summary` |
 | 22 | `influx.cascade.Cascade.enrich` |
 | 20 | `influx.promotion_gate.evaluate_promotion_gate` |
@@ -133,4 +133,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.57** (73454 test lines / 28594 source lines)
+- Test-to-source line ratio: **2.58** (73913 test lines / 28691 source lines)

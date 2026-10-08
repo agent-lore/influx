@@ -10,6 +10,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from influx.dedup import cache_hit_document
 from influx.telemetry import current_run_id, get_tracer
 
 if TYPE_CHECKING:
@@ -319,7 +320,8 @@ async def resolve_builds_on(
             query=prior_title,
             source_url=source_url,
         )
-        if not body.get("hit"):
+        doc = cache_hit_document(body)
+        if doc is None:
             logger.info(
                 "LCMA builds_on lookup miss profile=%s run_id=%s "
                 "source_url=%s note_id=%s tool=%s target_source_url=%s "
@@ -336,7 +338,9 @@ async def resolve_builds_on(
             continue
 
         # Exact source_url match required — no fuzzy matching (AC-M2-8).
-        if body.get("source_url") != source_url:
+        target_source_url = doc.get("source_url")
+        target_note_id = doc.get("id") or ""
+        if target_source_url != source_url:
             logger.info(
                 "LCMA builds_on lookup source_url mismatch profile=%s run_id=%s "
                 "source_url=%s note_id=%s tool=%s expected_source_url=%s "
@@ -347,7 +351,7 @@ async def resolve_builds_on(
                 source_note_id,
                 "lithos_cache_lookup",
                 source_url,
-                body.get("source_url", ""),
+                target_source_url or "",
                 prior_title,
                 arxiv_id,
             )
@@ -355,7 +359,7 @@ async def resolve_builds_on(
 
         await client.edge_upsert(
             from_id=source_note_id,
-            to_id=body.get("note_id", ""),
+            to_id=target_note_id,
             type="builds_on",
             weight=1.0,
             namespace="influx",
@@ -371,5 +375,5 @@ async def resolve_builds_on(
             written_source_url,
             source_note_id,
             "lithos_edge_upsert",
-            body.get("note_id", ""),
+            target_note_id,
         )

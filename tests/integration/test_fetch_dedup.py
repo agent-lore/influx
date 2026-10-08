@@ -46,6 +46,7 @@ from influx.scheduler import run_profile
 from influx.source import ScoredCandidate
 from influx.sources import FetchCache, make_item_provider
 from influx.sources.arxiv import ArxivItem
+from tests._lithos_bodies import cache_hit_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -247,7 +248,7 @@ class TestArxivFetchDedup:
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         # Cache hit → write → version_conflict → merge
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://arxiv.org/abs/2601.00001")
         )
 
         with patch(
@@ -497,7 +498,7 @@ class TestRssFetchDedup:
             fake_lithos.list_responses.append(json.dumps({"items": []}))
         # Profile B cache hit on the Lithos note (already ingested by A).
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://shared-blog.example/post-1")
         )
 
         # Patch both guarded_fetch callsites: the one in rss.py (for
@@ -772,7 +773,7 @@ class TestFetchCacheConcurrencyAndScope:
             json.dumps({"hit": False, "stale_exists": False})
         )
         fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
+            cache_hit_json("https://shared-feed.example/post-1")
         )
 
         async def sequential_within_one_tick() -> None:

@@ -39,6 +39,7 @@ from influx.inbox import InboxTick, _extract_note_id
 from influx.run import RunOutcome
 from influx.source import Candidate, ScoredCandidate
 from influx.sources.inbox import InboxAcquisition
+from tests._lithos_bodies import cache_hit_body, cache_miss_body
 
 
 def _make_config(
@@ -136,11 +137,11 @@ class FakeClient:
         if source_url not in self._gated:
             self._gated.add(source_url)
             if self._existing_note_id:
-                return {"hit": True, "id": self._existing_note_id}
-            return {"hit": False}
+                return cache_hit_body(source_url, note_id=self._existing_note_id)
+            return cache_miss_body()
         if self._note_id:
-            return {"hit": True, "id": self._note_id}
-        return {"hit": False}
+            return cache_hit_body(source_url, note_id=self._note_id)
+        return cache_miss_body()
 
     async def read_note(self, *, note_id: str) -> dict[str, Any]:
         return self._existing_note
@@ -466,14 +467,13 @@ async def test_per_profile_dispatch_failure_isolated() -> None:
     assert per_profile["b"]["ingested"] is False
 
 
-def test_extract_note_id_key_fallback() -> None:
-    """The cache-hit gate's id extraction tolerates id / note_id / existing_id;
-    a miss → None."""
-    assert _extract_note_id({"hit": True, "id": "n1"}) == "n1"
-    assert _extract_note_id({"hit": True, "note_id": "n2"}) == "n2"
-    assert _extract_note_id({"hit": True, "existing_id": "n3"}) == "n3"
-    assert _extract_note_id({"hit": False, "id": "n1"}) is None
-    assert _extract_note_id({"hit": True}) is None
+def test_extract_note_id_reads_document() -> None:
+    """The cache-hit gate reads the note id from ``document.id``, where
+    Lithos puts it; a miss, or an id only at the top level, → None."""
+    url = "https://example.com/article"
+    assert _extract_note_id(cache_hit_body(url, note_id="n1")) == "n1"
+    assert _extract_note_id(cache_miss_body()) is None
+    assert _extract_note_id({"hit": True, "id": "n1"}) is None
 
 
 # ── Slice 2: multi-profile fan-out ──────────────────────────────────

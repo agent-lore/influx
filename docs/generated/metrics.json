@@ -37,7 +37,7 @@
         "max_function": "influx.http_api.post_backfills"
       },
       "LithosBridge": {
-        "functions_over_10": 4,
+        "functions_over_10": 3,
         "max_complexity": 17,
         "max_function": "influx.notes.merge_tags"
       },
@@ -77,7 +77,7 @@
         "max_function": "influx.storage.download_archive"
       }
     },
-    "functions_over_10": 47,
+    "functions_over_10": 46,
     "top_functions": [
       {
         "complexity": 52,
@@ -104,7 +104,7 @@
         "qualname": "influx.repair._process_sweep_note"
       },
       {
-        "complexity": 24,
+        "complexity": 23,
         "qualname": "influx.run._run_ingest_stage"
       },
       {
@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 666
+    "total_functions": 670
   },
   "domain": {
     "associations": 5,
@@ -222,7 +222,7 @@
       }
     },
     "cross_component_edges": 62,
-    "cross_component_module_edges": 187,
+    "cross_component_module_edges": 188,
     "longest_component_chain": 4,
     "module_cycle_count": 3,
     "module_cycles": [
@@ -352,11 +352,11 @@
         "classes": 2,
         "functions": 10,
         "largest_module": "influx.run_dedup",
-        "largest_module_lines": 251,
-        "lines": 571,
+        "largest_module_lines": 259,
+        "lines": 579,
         "modules": 3,
         "public_symbols": 10,
-        "sloc": 450
+        "sloc": 457
       },
       "Filter": {
         "classes": 2,
@@ -380,13 +380,13 @@
       },
       "LithosBridge": {
         "classes": 13,
-        "functions": 117,
+        "functions": 121,
         "largest_module": "influx.lithos_client",
-        "largest_module_lines": 1821,
-        "lines": 4129,
+        "largest_module_lines": 1771,
+        "lines": 4219,
         "modules": 8,
-        "public_symbols": 52,
-        "sloc": 3283
+        "public_symbols": 57,
+        "sloc": 3367
       },
       "Notifications": {
         "classes": 5,
@@ -412,11 +412,11 @@
         "classes": 24,
         "functions": 77,
         "largest_module": "influx.inbox",
-        "largest_module_lines": 1456,
-        "lines": 4377,
+        "largest_module_lines": 1455,
+        "lines": 4376,
         "modules": 6,
         "public_symbols": 32,
-        "sloc": 3476
+        "sloc": 3473
       },
       "Repair": {
         "classes": 17,
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 28594,
+    "total_lines": 28691,
     "total_modules": 58,
-    "total_sloc": 22140
+    "total_sloc": 22228
   },
   "tests": {
-    "ratio": 2.57,
-    "src_lines": 28594,
-    "test_lines": 73454
+    "ratio": 2.58,
+    "src_lines": 28691,
+    "test_lines": 73913
   }
 }

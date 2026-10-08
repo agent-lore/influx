@@ -39,6 +39,7 @@ from influx.probes import ProbeLoop
 from influx.renderer import ProfileRelevanceEntry, render_note
 from influx.scheduler import InfluxScheduler
 from tests._bound_helpers import bounds_for
+from tests._lithos_bodies import cache_hit_json
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -288,9 +289,7 @@ class TestSharedSourceMerge:
         # - lithos_list (feedback) → empty
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         # - cache_lookup → HIT (item already ingested by Profile A)
-        fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
-        )
+        fake_lithos.cache_lookup_responses.append(cache_hit_json(SHARED_URL))
         # - lithos_write (from cache-hit path) → version_conflict
         fake_lithos.write_responses.append(
             json.dumps({"status": "version_conflict", "note_id": "note-shared-001"})
@@ -479,9 +478,7 @@ class TestPreservationOnSingleProfileRun:
         fake_lithos.list_responses.append(json.dumps({"items": []}))
 
         # Cache hit → write → version_conflict → read → retry
-        fake_lithos.cache_lookup_responses.append(
-            json.dumps({"hit": True, "stale_exists": False})
-        )
+        fake_lithos.cache_lookup_responses.append(cache_hit_json(SHARED_URL))
         fake_lithos.write_responses.append(
             json.dumps({"status": "version_conflict", "note_id": "note-shared-002"})
         )

@@ -33,7 +33,13 @@ from influx.canonical_note import (
     graft_user_notes,
     replace_profile_relevance_section,
 )
-from influx.dedup import compose_dedup_query
+from influx.dedup import (
+    arxiv_id_from_url,
+    cache_hit_document,
+    compose_dedup_query,
+    same_source_reason,
+    verify_cache_hit,
+)
 from influx.errors import ConfigError, LCMAError, LithosError
 from influx.notes import (
     NoteParseError,
@@ -46,7 +52,7 @@ from influx.notes import (
 from influx.renderer import (
     merge_profile_relevance_union,
 )
-from influx.urls import normalise_url
+from influx.urls import safe_normalise_url
 
 __all__ = ["LithosClient", "WriteResult"]
 
@@ -106,7 +112,6 @@ class WriteResult:
 
 # ── Pure helpers ────────────────────────────────────────────────────
 
-_ARXIV_ID_RE = re.compile(r"arxiv\.org/abs/([^\s?#]+)")
 # Matcher for parsing ``existing_id=<id>`` out of the slug_collision
 # diagnostic.  Lithos returns UUIDs in production (``[0-9a-f-]+``) but
 # tests use friendlier ids like ``doc-dup-1``; accept anything up to a
@@ -121,19 +126,24 @@ def _extract_slug_suffix(source_url: str) -> str:
     (``inbox-pdf:sha256:…``, which have no host) get `` [inbox-pdf]``;
     all others get `` [<host>]`` (FR-MCP-7, AC-05-D; inbox §13.3).
     """
-    m = _ARXIV_ID_RE.search(source_url)
-    if m:
-        return f" [arXiv {m.group(1)}]"
+    arxiv_id = arxiv_id_from_url(source_url)
+    if arxiv_id:
+        return f" [arXiv {arxiv_id}]"
     if source_url.startswith("inbox-pdf:"):
         return " [inbox-pdf]"
     host = urlparse(source_url).hostname or urlparse(source_url).netloc
     return f" [{host}]"
 
 
-def _arxiv_id_from_url(source_url: str) -> str | None:
-    """Return the arxiv id from a URL like ``https://arxiv.org/abs/2604.28197``."""
-    m = _ARXIV_ID_RE.search(source_url)
-    return m.group(1) if m else None
+def _item_dedup_query(title: str, abstract_or_summary: str | None) -> str:
+    """Compose the FR-MCP-3 item query, rejecting an empty *title* before any RPC."""
+    if not title:
+        raise LithosError(
+            "missing_lookup_arg",
+            operation="cache_lookup",
+            detail="title is required",
+        )
+    return compose_dedup_query(title, abstract_or_summary)
 
 
 def _existing_id_from_detail(detail: str) -> str | None:
@@ -292,20 +302,6 @@ class SquatterClassification:
     reason: str  # human-readable explanation, surfaced in detail / logs
 
 
-def _safe_normalise_url(url: str) -> str:
-    """Return :func:`normalise_url` output, falling back to *url* on error.
-
-    The classifier is on the conflict-recovery hot path; a malformed URL
-    must not crash the write loop.  Empty input returns ``""``.
-    """
-    if not url:
-        return ""
-    try:
-        return normalise_url(url)
-    except Exception:  # noqa: BLE001 — defensive: never crash recovery on bad URLs
-        return url
-
-
 def _classify_squatter(
     doc: dict[str, Any],
     *,
@@ -329,18 +325,9 @@ def _classify_squatter(
       the suffix-retry path; if THAT also collides, the entry goes
       to the unresolved-collisions backlog.
 
-    Stable-identity matches (#148) now include:
-
-    * arxiv-id tag equality (existing);
-    * exact ``source_url`` equality (existing);
-    * canonical-URL equality via :func:`influx.urls.normalise_url`
-      (handles scheme case, default ports, tracking params, trailing
-      slashes) — catches the staging cases where two writes for the
-      same paper differ only in URL normalisation;
-    * arxiv id extracted from the squatter's ``source_url`` when no
-      explicit ``arxiv-id:`` tag is present — catches squatters whose
-      tagset was truncated by an earlier merge but whose ``source_url``
-      still names the same paper.
+    Stable-identity matches (#148) are decided by
+    :func:`influx.dedup.same_source_reason` (arxiv-id tag, arxiv id in
+    the squatter's ``source_url``, exact or canonical URL equality).
 
     This function is pure: I/O lives in :meth:`LithosClient._retry_slug_collision`.
     """
@@ -348,63 +335,17 @@ def _classify_squatter(
     sq_source_url = _doc_source_url(doc)
     body = str(doc.get("content") or "").strip()
 
-    incoming_arxiv_id = _arxiv_id_from_url(incoming_source_url)
-
-    # Match #1: explicit arxiv-id tag equality.
-    if incoming_arxiv_id:
-        for tag in tags:
-            if tag == f"arxiv-id:{incoming_arxiv_id}":
-                return SquatterClassification(
-                    kind="duplicate",
-                    squatter_id=squatter_id,
-                    reason=(
-                        f"squatter carries arxiv-id:{incoming_arxiv_id} — "
-                        "treat as duplicate of the same paper"
-                    ),
-                )
-
-    # Match #1b: arxiv-id extracted from the squatter's source_url matches the
-    # incoming arxiv-id.  Squatters whose tagset was truncated by an earlier
-    # merge can still be identified by URL alone.
-    if incoming_arxiv_id and sq_source_url:
-        sq_arxiv_id = _arxiv_id_from_url(sq_source_url)
-        if sq_arxiv_id == incoming_arxiv_id:
-            return SquatterClassification(
-                kind="duplicate",
-                squatter_id=squatter_id,
-                reason=(
-                    f"squatter source_url names arxiv-id:{incoming_arxiv_id} — "
-                    "treat as duplicate of the same paper"
-                ),
-            )
-
-    # Match #2: source_url equality (exact or canonical).
-    if sq_source_url:
-        if sq_source_url == incoming_source_url:
-            return SquatterClassification(
-                kind="duplicate",
-                squatter_id=squatter_id,
-                reason=(
-                    f"squatter source_url matches incoming ({sq_source_url}) — "
-                    "treat as duplicate of the same paper"
-                ),
-            )
-        # Canonical-URL equality: handles scheme case, default ports,
-        # tracking params, trailing slashes.  Same paper, different URL
-        # shape — Lithos's URL dedup missed it because the stored URL
-        # was a slightly different rendering of the same logical link.
-        sq_canonical = _safe_normalise_url(sq_source_url)
-        incoming_canonical = _safe_normalise_url(incoming_source_url)
-        if sq_canonical and incoming_canonical and sq_canonical == incoming_canonical:
-            return SquatterClassification(
-                kind="duplicate",
-                squatter_id=squatter_id,
-                reason=(
-                    f"squatter source_url is canonical match for incoming "
-                    f"({sq_source_url} ≡ {incoming_source_url}) — "
-                    "treat as duplicate of the same paper"
-                ),
-            )
+    match_reason = same_source_reason(
+        doc_tags=tags,
+        doc_source_url=sq_source_url,
+        incoming_source_url=incoming_source_url,
+    )
+    if match_reason is not None:
+        return SquatterClassification(
+            kind="duplicate",
+            squatter_id=squatter_id,
+            reason=f"squatter {match_reason} — treat as duplicate of the same paper",
+        )
 
     # Reclaim path: empty residue.  Conservative: ALL of the following
     # must hold so we never delete a real note that just shares a slug.
@@ -669,11 +610,34 @@ class LithosClient:
     async def cache_lookup_body(
         self, *, query: str | None, source_url: str | None
     ) -> dict[str, Any]:
-        """Run ``cache_lookup`` and decode the JSON body."""
-        return self._result_json_dict(
+        """Run ``cache_lookup``, decode the JSON body, and verify the hit.
+
+        Every decoded lookup goes through here.  ``hit`` in the returned
+        body means Lithos holds a note for the *same source* as
+        *source_url* (:func:`influx.dedup.verify_cache_hit`).  When
+        Lithos's ``source_url`` fast path misses it falls back to a
+        threshold-0.0 semantic search and reports the nearest unrelated
+        note as a hit; that comes back here as a miss carrying
+        ``ignored_neighbour`` (Lithos task e4300784).
+        """
+        body = self._result_json_dict(
             await self.cache_lookup(query=query, source_url=source_url),
             operation="cache_lookup",
         )
+        # ``cache_lookup`` has already rejected an empty source_url.
+        verified = verify_cache_hit(body, source_url=source_url or "")
+        if body.get("hit") and not verified.get("hit"):
+            neighbour = verified["ignored_neighbour"]
+            logger.info(
+                "cache_lookup semantic neighbour ignored requested_source_url=%s "
+                "neighbour_id=%s neighbour_source_url=%s neighbour_title=%r "
+                "reason=semantic_neighbour_ignored",
+                source_url,
+                neighbour["id"],
+                neighbour["source_url"],
+                neighbour["title"],
+            )
+        return verified
 
     async def cache_lookup_for_item(
         self,
@@ -690,14 +654,10 @@ class LithosClient:
         and RSS callers.  Raises ``LithosError("missing_lookup_arg")``
         before any RPC when *title* or *source_url* is missing.
         """
-        if not title:
-            raise LithosError(
-                "missing_lookup_arg",
-                operation="cache_lookup",
-                detail="title is required",
-            )
-        query = compose_dedup_query(title, abstract_or_summary)
-        return await self.cache_lookup(query=query, source_url=source_url)
+        return await self.cache_lookup(
+            query=_item_dedup_query(title, abstract_or_summary),
+            source_url=source_url,
+        )
 
     async def cache_lookup_by_url_body(
         self,
@@ -730,14 +690,10 @@ class LithosClient:
         source_url: str | None,
         abstract_or_summary: str | None = None,
     ) -> dict[str, Any]:
-        """Run ``cache_lookup_for_item`` and decode the JSON body."""
-        return self._result_json_dict(
-            await self.cache_lookup_for_item(
-                title=title,
-                source_url=source_url,
-                abstract_or_summary=abstract_or_summary,
-            ),
-            operation="cache_lookup",
+        """Item-identity lookup through the verified :meth:`cache_lookup_body`."""
+        return await self.cache_lookup_body(
+            query=_item_dedup_query(title, abstract_or_summary),
+            source_url=source_url,
         )
 
     async def read_note(self, *, note_id: str) -> dict[str, Any]:
@@ -818,11 +774,11 @@ class LithosClient:
                 detail="embedded_frontmatter",
             )
         # FR-MCP-4: canonicalise source_url at the API boundary.  See
-        # ``_safe_normalise_url`` — never crash the write loop on a
+        # ``safe_normalise_url`` — never crash the write loop on a
         # malformed URL, fall through with the raw value so the write
         # at least attempts (Lithos will reject it as invalid_input
         # if it really is unusable).
-        canonical_source_url = _safe_normalise_url(source_url)
+        canonical_source_url = safe_normalise_url(source_url)
         args: dict[str, Any] = {
             "title": title,
             "content": content,
@@ -1006,16 +962,12 @@ class LithosClient:
             )
             return None
 
-        if not body.get("hit"):
+        doc = cache_hit_document(body)
+        if doc is None:
             return None
 
-        existing_id = ""
-        if isinstance(body, dict):
-            for key in ("id", "note_id", "existing_id"):
-                value = body.get(key)
-                if isinstance(value, str) and value:
-                    existing_id = value
-                    break
+        raw_id = doc.get("id")
+        existing_id = raw_id if isinstance(raw_id, str) else ""
 
         metrics_module.slug_collision_url_recovery().add(1)
         logger.info(
@@ -1170,14 +1122,12 @@ class LithosClient:
         """Check whether an Influx-authored note exists for *source_url*.
 
         Thin wrapper over :meth:`cache_lookup_by_url_body`: returns the
-        decoded body when ``hit`` is true, ``None`` otherwise.  The
-        detection mechanism is a cache lookup by ``source_url`` —
-        implementation-defined per AC of US-010.
+        hit's ``document`` (so the repair path merges its real ``tags``),
+        ``None`` on a miss.  The detection mechanism is a cache lookup by
+        ``source_url`` — implementation-defined per AC of US-010.
         """
         body = await self.cache_lookup_by_url_body(source_url=source_url)
-        if body.get("hit"):
-            return body
-        return None
+        return cache_hit_document(body)
 
     async def _retry_content_too_large(
         self,
