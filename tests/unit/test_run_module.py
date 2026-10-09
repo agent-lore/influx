@@ -512,6 +512,93 @@ async def test_run_execute_walks_provider_and_writes_per_item() -> None:
     wire.assert_awaited_once()
 
 
+@pytest.mark.parametrize(
+    ("status", "note_id", "ingested", "warned"),
+    [
+        ("updated", "note-shared", 1, False),
+        ("duplicate", "note-shared", 0, False),
+        ("version_conflict", "note-shared", 0, True),
+    ],
+    ids=["merged", "nothing-to-merge", "merge-failed"],
+)
+async def test_cache_hit_write_outcomes(
+    status: str,
+    note_id: str,
+    ingested: int,
+    warned: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """c1196e30: a cache hit for another Profile's note goes to the write,
+    which merges.  ``updated`` is an ingest for this Profile; ``duplicate``
+    is a quiet no-op; any other status is a merge that failed and is logged.
+    """
+    from mcp import types as mcp_types
+
+    from tests._lithos_bodies import cache_hit_body
+
+    item = {
+        "title": "Shared Paper",
+        "source_url": "https://arxiv.org/abs/2401.00002",
+        "content": "# Summary\n\nbody",
+        "tags": ["profile:alpha", "source:arxiv"],
+        "confidence": 0.9,
+        "score": 9,
+        "path": "papers/arxiv/2024/01",
+        "abstract_or_summary": "abs",
+    }
+
+    async def provider(
+        profile: str, kind: RunKind, run_range: Any, filter_prompt: str
+    ) -> list[BoundScoredCandidate]:
+        return [_bound_for(item)]
+
+    deps = RunDeps(config=_make_config(), item_provider=provider, probe_loop=None)
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.list_archive_terminal_arxiv_ids = AsyncMock(return_value=frozenset())
+    mock_client.task_create_body = AsyncMock(return_value={"task_id": "task-1"})
+    mock_client.task_complete = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[
+                mcp_types.TextContent(
+                    type="text", text=json.dumps({"status": "completed"})
+                )
+            ]
+        )
+    )
+    mock_client.cache_lookup_for_item_body = AsyncMock(
+        return_value=cache_hit_body(
+            item["source_url"], note_id="note-shared", tags=["profile:beta"]
+        )
+    )
+    write_result = MagicMock()
+    write_result.status = status
+    write_result.note_id = note_id
+    write_result.detail = ""
+    mock_client.write_note = AsyncMock(return_value=write_result)
+
+    with (
+        patch("influx.run.LithosClient", return_value=mock_client),
+        patch("influx.run.repair_sweep", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "influx.feedback.build_negative_examples_block",
+            side_effect=_empty_neg_block,
+        ),
+        patch("influx.run.lcma_wire", new_callable=AsyncMock, return_value=[]),
+        patch("influx.service.post_run_webhook_hook"),
+        caplog.at_level("WARNING", logger="influx.run"),
+    ):
+        outcome = await Run(_scheduled_plan(), deps).execute()
+
+    mock_client.write_note.assert_awaited_once()
+    assert outcome.ingested == ingested
+    assert outcome.written_note_ids == (("note-shared",) if ingested else ())
+    skipped = [r for r in caplog.records if "article write skipped" in r.getMessage()]
+    assert bool(skipped) is warned
+    if warned:
+        assert "cache_hit=true" in skipped[0].getMessage()
+
+
 async def test_run_execute_uses_injected_client_factory() -> None:
     """finding 6: ``RunDeps.client_factory`` supplies the LithosClient.
 

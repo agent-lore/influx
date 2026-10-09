@@ -22,10 +22,12 @@ from influx.feedback import (
     build_negative_examples_block,
     fetch_rejection_titles,
 )
-from influx.lithos_client import LithosClient, write_status
+from influx.lithos_client import LithosClient, WriteResult, write_status
 from tests._lithos_bodies import (
     cache_hit_body,
     cache_hit_json,
+    duplicate_json,
+    read_note_json,
     write_error_json,
     write_ok_json,
 )
@@ -1080,7 +1082,11 @@ class TestWriteNote:
 
 
 class TestWriteEnvelopeDuplicate:
-    """``duplicate`` envelope is treated as hit (AC-05-C)."""
+    """``duplicate`` naming no note is treated as hit (AC-05-C).
+
+    With ``duplicate_of`` it is a multi-profile merge instead — see
+    :class:`TestWriteEnvelopeDuplicateMerge`.
+    """
 
     async def test_duplicate_treated_as_hit(
         self,
@@ -1918,8 +1924,11 @@ class TestSlugCollisionUrlIdentityRecovery:
         write_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_write"]
         assert len(write_calls) == 1
         # The squatter must NOT have been read; the pre-check obviates it.
+        # The only read is of the note that owns the URL, for the
+        # multi-profile merge (c1196e30) — here an empty, non-Influx doc,
+        # so nothing is written.
         read_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_read"]
-        assert len(read_calls) == 0
+        assert [c[1]["id"] for c in read_calls] == ["note-existing-99"]
         # And the cache_lookup was keyed on the source URL only (issue #128 shape).
         cache_calls = [
             c for c in fake_lithos_server.calls if c[0] == "lithos_cache_lookup"
@@ -2123,363 +2132,521 @@ class TestSlugCollisionUrlIdentityRecovery:
         )
 
 
-# ── Write envelopes — version_conflict (FR-MCP-7, AC-05-E) ────────
+# ── Write envelopes — duplicate → multi-profile merge (FR-NOTE-6) ──
 
 
-class TestWriteEnvelopeVersionConflict:
-    """``version_conflict``: re-read + tag-merge + user-notes, retry once."""
+_MERGE_URL = "https://arxiv.org/abs/2601.11111"
+_MERGE_TITLE = "Shared Paper"
+_MERGE_BASE_TAGS = ["source:arxiv", "ingested-by:influx", "schema:1"]
 
-    async def test_version_conflict_reread_merge_retry(
+
+def _merge_note(
+    profile: str,
+    score: int,
+    *,
+    full_text: str | None = None,
+    user_notes: str | None = None,
+) -> str:
+    from influx.renderer import ProfileRelevanceEntry, render_note
+
+    return render_note(
+        title=_MERGE_TITLE,
+        tags=[f"profile:{profile}", "ingested-by:influx"],
+        confidence=score / 10,
+        archive_path="arxiv/2026/01/2601.11111.pdf",
+        summary=f"Summary written for {profile}.",
+        keywords=[],
+        profile_entries=[
+            ProfileRelevanceEntry(
+                profile_name=profile, score=score, reason=f"Relevant to {profile}."
+            )
+        ],
+        full_text=full_text,
+        user_notes=user_notes,
+    )
+
+
+def _writes(server: FakeLithosServer) -> list[dict[str, Any]]:
+    return [args for name, args in server.calls if name == "lithos_write"]
+
+
+def _reads(server: FakeLithosServer) -> list[dict[str, Any]]:
+    return [args for name, args in server.calls if name == "lithos_read"]
+
+
+async def _write_incoming(
+    url: str,
+    *,
+    profile: str = "knowledge-systems",
+    score: int = 7,
+    full_text: str | None = None,
+    extra_tags: tuple[str, ...] = (),
+) -> WriteResult:
+    client = LithosClient(url=url)
+    try:
+        return await client.write_note(
+            title=_MERGE_TITLE,
+            content=_merge_note(profile, score, full_text=full_text),
+            path="papers/arxiv/2026/01",
+            source_url=_MERGE_URL,
+            tags=[*_MERGE_BASE_TAGS, f"profile:{profile}", *extra_tags],
+            confidence=score / 10,
+        )
+    finally:
+        await client.close()
+
+
+class TestWriteEnvelopeDuplicateMerge:
+    """``duplicate`` naming the existing note → read, merge, update (c1196e30).
+
+    Lithos answers a create-path write for a ``source_url`` it already
+    holds with ``duplicate`` + ``duplicate_of.id``; a ``version_conflict``
+    only comes back from an update whose ``expected_version`` is stale.
+    """
+
+    async def test_second_profile_merges_into_existing_note(
         self,
         fake_lithos_url: str,
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
     ) -> None:
-        """First conflict: re-read, merge tags + user notes, retry succeeds."""
-        import json as _json
-
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "version_conflict", "note_id": "note-042"}',
-                '{"status": "updated"}',
+                duplicate_json("note-042", title=_MERGE_TITLE, source_url=_MERGE_URL),
+                write_ok_json("note-042", status="updated"),
             ]
         )
         fake_lithos_server.read_responses.append(
-            _json.dumps(
-                {
-                    "id": "note-042",
-                    "content": (
-                        "# Summary\nOld content.\n\n"
-                        "## User Notes\nMy custom annotations."
-                    ),
-                    "tags": [
-                        "profile:ml-research",
-                        "user-custom-tag",
-                        "influx:rejected:other-profile",
-                    ],
-                    "version": 3,
-                }
-            )
-        )
-        client = LithosClient(url=fake_lithos_url)
-        try:
-            result = await client.write_note(
-                title="Updated Paper",
-                content="# Summary\nNew content.",
-                path="papers/arxiv/2026/03",
-                source_url="https://arxiv.org/abs/2601.11111",
-                tags=["profile:ml-research", "source:arxiv"],
-                confidence=0.9,
-            )
-            assert result.status == "updated"
-
-            # Verify lithos_read was called with note_id.
-            read_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_read"]
-            assert len(read_calls) == 1
-            assert read_calls[0][1]["id"] == "note-042"
-
-            # Verify the retry write has merged tags.
-            write_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
-            ]
-            assert len(write_calls) == 2
-            retry_payload = write_calls[1][1]
-            retry_tags = retry_payload["tags"]
-            # Existing tags preserved + new tags present.
-            assert "profile:ml-research" in retry_tags
-            assert "source:arxiv" in retry_tags
-            assert "user-custom-tag" in retry_tags
-            assert "influx:rejected:other-profile" in retry_tags
-
-            # Verify user notes preserved in content.
-            assert "## User Notes" in retry_payload["content"]
-            assert "My custom annotations" in retry_payload["content"]
-            # New content is also present.
-            assert "New content" in retry_payload["content"]
-
-            # Verify version info forwarded.
-            assert retry_payload["expected_version"] == 3
-            assert retry_payload["id"] == "note-042"
-        finally:
-            await client.close()
-
-    async def test_version_conflict_preserves_repair_section(
-        self,
-        fake_lithos_url: str,
-        fake_lithos_server: FakeLithosServer,
-        clear_fake_calls: None,
-    ) -> None:
-        """3a.4: a multi-profile re-ingest preserves the existing note's
-        ``## Repair`` counters so a tier-terminal note keeps its caps.
-
-        The freshly-ingested create-path content carries no ``## Repair``
-        section (only the sweep writes one), so without the carry-forward
-        the merge would drop the accumulated counters and let the next
-        sweep re-attempt a capped tier from zero.
-        """
-        import json as _json
-
-        repair_section = (
-            "## Repair\n"
-            "- tier2_attempts: 3\n"
-            '- tier2_last_stage: "parse"\n'
-            '- tier2_last_error: "unparseable full text"\n'
-            "- tier3_attempts: 0\n"
-            '- tier3_last_stage: ""\n'
-            '- tier3_last_error: ""\n'
-            "- archive_attempts: 0\n"
-            '- archive_last_kind: ""\n'
-            '- archive_last_error: ""\n'
-        )
-        fake_lithos_server.write_responses.extend(
-            [
-                '{"status": "version_conflict", "note_id": "note-050"}',
-                '{"status": "updated"}',
-            ]
-        )
-        fake_lithos_server.read_responses.append(
-            _json.dumps(
-                {
-                    "id": "note-050",
-                    "content": (
-                        f"## Summary\nOld summary.\n\n{repair_section}\n"
-                        "## User Notes\nHand notes."
-                    ),
-                    "tags": [
-                        "profile:ml-research",
-                        "influx:tier2-terminal",
-                    ],
-                    "version": 5,
-                }
-            )
-        )
-        client = LithosClient(url=fake_lithos_url)
-        try:
-            result = await client.write_note(
-                title="Re-ingested Paper",
-                # Fresh create-path content: no ## Repair section.
-                content="## Summary\nFresh summary.",
-                path="papers/arxiv/2026/03",
-                source_url="https://arxiv.org/abs/2601.22222",
-                tags=["profile:cv-research", "source:arxiv"],
-                confidence=0.9,
-            )
-            assert result.status == "updated"
-
-            write_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
-            ]
-            retry_content = write_calls[1][1]["content"]
-            # The accumulated ## Repair counters survive the merge — this is
-            # the cap's source of truth.  (The ``influx:tier2-terminal``
-            # *tag* is Influx-owned and intentionally replaced by the fresh
-            # write per the merge_tags contract; the next sweep re-derives
-            # it from these preserved counters — attempts=3 ≥ cap.)
-            assert "## Repair" in retry_content
-            assert "tier2_attempts: 3" in retry_content
-            assert 'tier2_last_error: "unparseable full text"' in retry_content
-            # The fresh content + preserved user notes are still there.
-            assert "Fresh summary" in retry_content
-            assert "Hand notes" in retry_content
-        finally:
-            await client.close()
-
-    async def test_version_conflict_preserves_user_notes_block(
-        self,
-        fake_lithos_url: str,
-        fake_lithos_server: FakeLithosServer,
-        clear_fake_calls: None,
-    ) -> None:
-        """User Notes block from existing note replaces any in new content."""
-        import json as _json
-
-        fake_lithos_server.write_responses.extend(
-            [
-                '{"status": "version_conflict", "note_id": "note-043"}',
-                '{"status": "updated"}',
-            ]
-        )
-        existing_user_notes = (
-            "## User Notes\n"
-            "Important: this paper is referenced in our Q3 review.\n"
-            "Follow up with team lead."
-        )
-        fake_lithos_server.read_responses.append(
-            _json.dumps(
-                {
-                    "id": "note-043",
-                    "content": f"# Summary\nOld.\n\n{existing_user_notes}",
-                    "tags": ["profile:ml-research"],
-                    "version": 5,
-                }
-            )
-        )
-        client = LithosClient(url=fake_lithos_url)
-        try:
-            # New content has its own ## User Notes that should be replaced.
-            await client.write_note(
-                title="Paper X",
-                content="# Summary\nRefreshed.\n\n## User Notes\n",
-                path="papers/arxiv/2026/03",
-                source_url="https://arxiv.org/abs/2601.22222",
-                tags=["profile:ml-research"],
+            read_note_json(
+                "note-042",
+                title=_MERGE_TITLE,
+                content=_merge_note("ai-agents", 8),
+                tags=[
+                    *_MERGE_BASE_TAGS,
+                    "profile:ai-agents",
+                    "reading-list",
+                    "influx:rejected:robotics",
+                ],
+                version=3,
                 confidence=0.8,
             )
-            write_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
-            ]
-            retry_content = write_calls[1][1]["content"]
-            assert "Refreshed" in retry_content
-            assert "Important: this paper is referenced" in retry_content
-            assert "Follow up with team lead" in retry_content
-        finally:
-            await client.close()
+        )
 
-    async def test_version_conflict_locator_ignores_midline_user_notes(
+        result = await _write_incoming(fake_lithos_url)
+
+        assert result.status == "updated"
+        assert result.note_id == "note-042"
+        assert [r["id"] for r in _reads(fake_lithos_server)] == ["note-042"]
+        create, update = _writes(fake_lithos_server)
+        assert create["id"] is None
+        assert update["id"] == "note-042"
+        assert update["expected_version"] == 3
+        assert update["title"] == _MERGE_TITLE
+        # Path, source_url and note_type are left for Lithos to preserve.
+        assert update["path"] == ""
+        assert update["source_url"] == ""
+        assert update["note_type"] == ""
+        assert {
+            "profile:ai-agents",
+            "profile:knowledge-systems",
+            "reading-list",
+            "influx:rejected:robotics",
+        } <= set(update["tags"])
+        assert "### ai-agents\nScore: 8/10" in update["content"]
+        assert "### knowledge-systems\nScore: 7/10" in update["content"]
+        assert update["confidence"] == 0.8
+
+    async def test_profile_already_on_note_writes_nothing(
         self,
         fake_lithos_url: str,
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
     ) -> None:
-        """Conflict merge is protected against an impostor ``## User Notes``.
-
-        PR 3 grafts User Notes via ``canonical_note.graft_user_notes``, whose
-        line-anchored matcher (vs the legacy unanchored ``str.find``) means a
-        mid-line ``## User Notes`` literal in the incoming body no longer
-        truncates the note, and the existing region is grafted byte-exactly
-        including trailing whitespace.
-        """
-        import json as _json
-
-        fake_lithos_server.write_responses.extend(
-            [
-                '{"status": "version_conflict", "note_id": "note-046"}',
-                '{"status": "updated"}',
-            ]
-        )
-        # Existing note's User Notes carry trailing spaces + blank lines.
-        existing_region = "## User Notes\nKeep verbatim.  \n\n\n"
+        fake_lithos_server.write_responses.append(duplicate_json("note-043"))
         fake_lithos_server.read_responses.append(
-            _json.dumps(
-                {
-                    "id": "note-046",
-                    "content": f"# Summary\nOld.\n\n{existing_region}",
-                    "tags": ["profile:ml-research"],
-                    "version": 7,
-                }
+            read_note_json(
+                "note-043",
+                title=_MERGE_TITLE,
+                content=_merge_note("knowledge-systems", 8),
+                tags=[*_MERGE_BASE_TAGS, "profile:knowledge-systems"],
             )
         )
-        client = LithosClient(url=fake_lithos_url)
-        try:
-            # Incoming body mentions "## User Notes" mid-sentence, before the
-            # real heading — the legacy str.find would truncate here.
-            await client.write_note(
-                title="Paper Y",
-                content=(
-                    "# Summary\nSee the ## User Notes section below.\n\n## User Notes\n"
+
+        result = await _write_incoming(fake_lithos_url)
+
+        assert result.status == "duplicate"
+        assert result.note_id == "note-043"
+        assert len(_writes(fake_lithos_server)) == 1
+
+    async def test_note_not_written_by_influx_is_left_alone(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        fake_lithos_server.write_responses.append(duplicate_json("note-044"))
+        fake_lithos_server.read_responses.append(
+            read_note_json(
+                "note-044",
+                title="Someone's research note",
+                content="# Someone's research note\n\nNotes on the paper.",
+                tags=["research", "profile:ai-agents"],
+            )
+        )
+
+        result = await _write_incoming(fake_lithos_url)
+
+        assert result.status == "duplicate"
+        assert result.note_id == "note-044"
+        assert len(_writes(fake_lithos_server)) == 1
+
+    async def test_duplicate_without_duplicate_of_is_plain_duplicate(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        fake_lithos_server.write_responses.append(
+            json.dumps({"status": "duplicate", "duplicate_of": None, "warnings": []})
+        )
+
+        result = await _write_incoming(fake_lithos_url)
+
+        assert result.status == "duplicate"
+        assert result.note_id == ""
+        assert _reads(fake_lithos_server) == []
+
+    async def test_unreadable_existing_note_falls_back_to_duplicate(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        fake_lithos_server.write_responses.append(duplicate_json("note-045"))
+        fake_lithos_server.read_responses.append("not json")
+
+        result = await _write_incoming(fake_lithos_url)
+
+        assert result.status == "duplicate"
+        assert result.note_id == "note-045"
+        assert len(_writes(fake_lithos_server)) == 1
+
+    async def test_stale_version_rereads_and_retries_once(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        fake_lithos_server.write_responses.extend(
+            [
+                duplicate_json("note-046"),
+                json.dumps(
+                    {
+                        "status": "version_conflict",
+                        "message": "Version conflict: expected 3, got 4",
+                        "current_version": 4,
+                        "warnings": [],
+                    }
                 ),
-                path="papers/arxiv/2026/03",
-                source_url="https://arxiv.org/abs/2601.33333",
-                tags=["profile:ml-research"],
-                confidence=0.8,
-            )
-            write_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
-            ]
-            retry_content = write_calls[1][1]["content"]
-            # Mid-line literal survived (not truncated at the impostor).
-            assert "See the ## User Notes section below." in retry_content
-            # Existing region grafted byte-exactly, trailing whitespace intact.
-            assert retry_content.endswith(existing_region)
-        finally:
-            await client.close()
-
-    async def test_second_version_conflict_skips(
-        self,
-        fake_lithos_url: str,
-        fake_lithos_server: FakeLithosServer,
-        clear_fake_calls: None,
-    ) -> None:
-        """Second version_conflict: skip item, no further retry."""
-        import json as _json
-
-        fake_lithos_server.write_responses.extend(
-            [
-                '{"status": "version_conflict", "note_id": "note-044"}',
-                '{"status": "version_conflict", "note_id": "note-044"}',
+                write_ok_json("note-046", status="updated"),
             ]
         )
-        fake_lithos_server.read_responses.append(
-            _json.dumps(
-                {
-                    "id": "note-044",
-                    "content": "# Summary\nContent.",
-                    "tags": ["profile:ml-research"],
-                    "version": 7,
-                }
+        for version, profile in ((3, "ai-agents"), (4, "robotics")):
+            fake_lithos_server.read_responses.append(
+                read_note_json(
+                    "note-046",
+                    title=_MERGE_TITLE,
+                    content=_merge_note(profile, 8),
+                    tags=[*_MERGE_BASE_TAGS, f"profile:{profile}"],
+                    version=version,
+                )
             )
-        )
-        client = LithosClient(url=fake_lithos_url)
-        try:
-            result = await client.write_note(
-                title="Conflict Item",
-                content="# Summary\nNew.",
-                path="papers/arxiv/2026/03",
-                source_url="https://arxiv.org/abs/2601.33333",
-                tags=["profile:ml-research"],
-                confidence=0.8,
-            )
-            assert result.status == "version_conflict"
 
-            write_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
-            ]
-            assert len(write_calls) == 2  # No third attempt
-        finally:
-            await client.close()
+        result = await _write_incoming(fake_lithos_url)
 
-    async def test_second_version_conflict_logs(
+        assert result.status == "updated"
+        assert len(_reads(fake_lithos_server)) == 2
+        _create, first, retry = _writes(fake_lithos_server)
+        assert first["expected_version"] == 3
+        assert retry["expected_version"] == 4
+        # The retry merges into what the concurrent writer left behind.
+        assert "profile:robotics" in retry["tags"]
+        assert "### robotics" in retry["content"]
+
+    async def test_second_version_conflict_gives_up_and_logs(
         self,
         fake_lithos_url: str,
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Second version_conflict: warning logged with source_url."""
-        import json as _json
         import logging
 
+        conflict = json.dumps(
+            {"status": "version_conflict", "message": "stale", "current_version": 9}
+        )
+        fake_lithos_server.write_responses.extend(
+            [duplicate_json("note-047"), conflict, conflict]
+        )
+        for _ in range(2):
+            fake_lithos_server.read_responses.append(
+                read_note_json(
+                    "note-047",
+                    title=_MERGE_TITLE,
+                    content=_merge_note("ai-agents", 8),
+                    tags=[*_MERGE_BASE_TAGS, "profile:ai-agents"],
+                )
+            )
+
+        with caplog.at_level(logging.WARNING):
+            result = await _write_incoming(fake_lithos_url)
+
+        assert result.status == "version_conflict"
+        assert result.note_id == "note-047"
+        assert len(_writes(fake_lithos_server)) == 3  # no third update
+        assert "version_conflict" in caplog.text
+        assert "2601.11111" in caplog.text
+
+    async def test_richer_incoming_body_keeps_user_notes_and_repair(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        repair = "## Repair\n- tier2_attempts: 3\n- tier3_attempts: 0\n"
+        existing = _merge_note("ai-agents", 7).replace(
+            "## Profile Relevance", f"{repair}\n## Profile Relevance"
+        )
+        # Byte-exact User Notes region, trailing whitespace included.
+        existing_region = "## User Notes\nKeep verbatim.  \n\n\n"
+        existing = existing[: existing.index("## User Notes")] + existing_region
+        fake_lithos_server.write_responses.extend(
+            [duplicate_json("note-048"), write_ok_json("note-048", status="updated")]
+        )
+        fake_lithos_server.read_responses.append(
+            read_note_json(
+                "note-048",
+                title=_MERGE_TITLE,
+                content=existing,
+                tags=[*_MERGE_BASE_TAGS, "profile:ai-agents", "influx:tier2-terminal"],
+            )
+        )
+
+        await _write_incoming(
+            fake_lithos_url,
+            score=9,
+            # A mid-line "## User Notes" literal must not truncate the body.
+            full_text="See the ## User Notes section below.",
+            extra_tags=("full-text", "text:pdf"),
+        )
+
+        update = _writes(fake_lithos_server)[1]
+        assert "## Full Text\nSee the ## User Notes section below." in update["content"]
+        assert update["content"].endswith(existing_region)
+        assert "tier2_attempts: 3" in update["content"]
+        assert "full-text" in update["tags"]
+        assert "influx:tier2-terminal" not in update["tags"]
+
+    async def test_poorer_incoming_body_keeps_existing_full_text(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        fake_lithos_server.write_responses.extend(
+            [duplicate_json("note-049"), write_ok_json("note-049", status="updated")]
+        )
+        fake_lithos_server.read_responses.append(
+            read_note_json(
+                "note-049",
+                title=_MERGE_TITLE,
+                content=_merge_note("ai-agents", 9, full_text="The whole paper."),
+                tags=[*_MERGE_BASE_TAGS, "profile:ai-agents", "full-text", "text:html"],
+            )
+        )
+
+        await _write_incoming(fake_lithos_url, extra_tags=("text:abstract-only",))
+
+        update = _writes(fake_lithos_server)[1]
+        assert "## Full Text\nThe whole paper." in update["content"]
+        assert "Summary written for knowledge-systems." not in update["content"]
+        assert {"full-text", "text:html", "profile:knowledge-systems"} <= set(
+            update["tags"]
+        )
+        assert "text:abstract-only" not in update["tags"]
+
+    async def test_too_large_richer_body_falls_back_to_existing_body(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "version_conflict", "note_id": "note-045"}',
-                '{"status": "version_conflict", "note_id": "note-045"}',
+                duplicate_json("note-050"),
+                write_error_json("content_too_large", "too big"),
+                write_ok_json("note-050", status="updated"),
             ]
         )
         fake_lithos_server.read_responses.append(
-            _json.dumps(
+            read_note_json(
+                "note-050",
+                title=_MERGE_TITLE,
+                content=_merge_note("ai-agents", 7),
+                tags=[*_MERGE_BASE_TAGS, "profile:ai-agents"],
+                version=2,
+            )
+        )
+
+        result = await _write_incoming(
+            fake_lithos_url, score=9, full_text="Huge.", extra_tags=("full-text",)
+        )
+
+        assert result.status == "updated"
+        _create, too_large, fallback = _writes(fake_lithos_server)
+        assert "Huge." in too_large["content"]
+        assert "Huge." not in fallback["content"]
+        assert fallback["expected_version"] == 2
+        assert "profile:knowledge-systems" in fallback["tags"]
+        assert "full-text" not in fallback["tags"]
+
+    async def test_missing_version_skips_the_merge(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Without a version the update would be an unguarded overwrite."""
+        import logging
+
+        fake_lithos_server.write_responses.append(duplicate_json("note-052"))
+        fake_lithos_server.read_responses.append(
+            json.dumps(
                 {
-                    "id": "note-045",
-                    "content": "# Summary\nContent.",
-                    "tags": [],
-                    "version": 1,
+                    "id": "note-052",
+                    "title": _MERGE_TITLE,
+                    "content": _merge_note("ai-agents", 8),
+                    "metadata": {"tags": [*_MERGE_BASE_TAGS, "profile:ai-agents"]},
                 }
             )
         )
-        client = LithosClient(url=fake_lithos_url)
-        try:
-            with caplog.at_level(logging.WARNING):
-                await client.write_note(
-                    title="Conflict Log",
-                    content="# Summary\nNew.",
-                    path="papers/arxiv/2026/03",
-                    source_url="https://arxiv.org/abs/2601.44444",
-                    tags=["profile:ml-research"],
-                    confidence=0.8,
-                )
-            assert "version_conflict" in caplog.text
-            assert "2601.44444" in caplog.text
-        finally:
-            await client.close()
+
+        with caplog.at_level(logging.WARNING):
+            result = await _write_incoming(fake_lithos_url)
+
+        assert result.status == "duplicate"
+        assert len(_writes(fake_lithos_server)) == 1
+        assert "no version" in caplog.text
+
+    async def test_fallback_body_also_too_large_is_skipped(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        too_large = write_error_json("content_too_large", "too big")
+        fake_lithos_server.write_responses.extend(
+            [duplicate_json("note-053"), too_large, too_large]
+        )
+        fake_lithos_server.read_responses.append(
+            read_note_json(
+                "note-053",
+                title=_MERGE_TITLE,
+                content=_merge_note("ai-agents", 7),
+                tags=[*_MERGE_BASE_TAGS, "profile:ai-agents"],
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await _write_incoming(
+                fake_lithos_url, score=9, full_text="Huge.", extra_tags=("full-text",)
+            )
+
+        assert result.status == "content_too_large_skipped"
+        assert result.note_id == "note-053"
+        assert len(_writes(fake_lithos_server)) == 3
+        assert "content_too_large" in caplog.text
+
+    async def test_slug_collision_recovered_as_duplicate_merges(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """The slug-collision URL pre-check names the note; merge into it."""
+        fake_lithos_server.write_responses.extend(
+            [
+                json.dumps(
+                    {
+                        "status": "slug_collision",
+                        "existing_id": "note-054",
+                        "message": "slug taken",
+                        "warnings": [],
+                    }
+                ),
+                write_ok_json("note-054", status="updated"),
+            ]
+        )
+        fake_lithos_server.cache_lookup_responses.append(
+            cache_hit_json(_MERGE_URL, note_id="note-054")
+        )
+        fake_lithos_server.read_responses.append(
+            read_note_json(
+                "note-054",
+                title=_MERGE_TITLE,
+                content=_merge_note("ai-agents", 8),
+                tags=[*_MERGE_BASE_TAGS, "profile:ai-agents"],
+                version=6,
+            )
+        )
+
+        result = await _write_incoming(fake_lithos_url)
+
+        assert result.status == "updated"
+        update = _writes(fake_lithos_server)[1]
+        assert update["id"] == "note-054"
+        assert update["expected_version"] == 6
+        assert "profile:knowledge-systems" in update["tags"]
+
+    async def test_trimmed_create_retry_that_hits_duplicate_still_merges(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """Lithos checks size before the source_url index, so an oversized
+        create for a known URL is ``content_too_large`` first and only the
+        trimmed retry comes back ``duplicate``."""
+        fake_lithos_server.write_responses.extend(
+            [
+                write_error_json("content_too_large", "too big"),
+                duplicate_json("note-051"),
+                write_ok_json("note-051", status="updated"),
+            ]
+        )
+        fake_lithos_server.read_responses.append(
+            read_note_json(
+                "note-051",
+                title=_MERGE_TITLE,
+                content=_merge_note("ai-agents", 8),
+                tags=[*_MERGE_BASE_TAGS, "profile:ai-agents"],
+            )
+        )
+
+        result = await _write_incoming(
+            fake_lithos_url, full_text="Huge.", extra_tags=("full-text",)
+        )
+
+        assert result.status == "updated"
+        assert result.note_id == "note-051"
+        update = _writes(fake_lithos_server)[2]
+        assert update["id"] == "note-051"
+        assert "Huge." not in update["content"]
+        assert "profile:knowledge-systems" in update["tags"]
 
 
 # ── Write envelopes — content_too_large (§9.7, AC-05-F) ───────────
@@ -3061,136 +3228,92 @@ class TestFeedbackTagIntegrity:
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
     ) -> None:
-        """version_conflict re-write preserves existing rejected tags."""
-        import json as _json
-
-        # First write returns version_conflict.
-        fake_lithos_server.write_responses.append(
-            _json.dumps(
-                {
-                    "status": "version_conflict",
-                    "note_id": "note-rejected-001",
-                }
-            )
-        )
-        # Read returns a note with an existing rejected tag.
-        fake_lithos_server.read_responses.append(
-            _json.dumps(
-                {
-                    "id": "note-rejected-001",
-                    "title": "Existing Paper",
-                    "content": "# Summary\nOld content.",
-                    "tags": [
-                        "profile:ml-research",
-                        "influx:rejected:robotics",
-                        "source:arxiv",
-                    ],
-                    "version": 2,
-                }
-            )
-        )
-        # Retry write succeeds.
-        fake_lithos_server.write_responses.append('{"status": "updated"}')
-
-        client = LithosClient(url=fake_lithos_url)
-        try:
-            result = await client.write_note(
-                title="Existing Paper",
-                content="# Summary\nNew content.",
-                path="papers/arxiv/2026/04",
-                source_url="https://arxiv.org/abs/2601.88888",
-                tags=[
-                    "profile:ml-research",
-                    "arxiv-id:2601.88888",
-                    "source:arxiv",
-                ],
-                confidence=0.9,
-            )
-            assert result.status == "updated"
-            # The retry write should contain the merged tags.
-            write_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
+        """A multi-profile merge preserves the note's existing rejected tags."""
+        fake_lithos_server.write_responses.extend(
+            [
+                duplicate_json("note-rejected-001"),
+                write_ok_json("note-rejected-001", status="updated"),
             ]
-            # 2 writes: original + retry after version_conflict.
-            assert len(write_calls) == 2
-            retry_tags = write_calls[1][1]["tags"]
-            # Existing influx:rejected:robotics is preserved via merge.
-            assert "influx:rejected:robotics" in retry_tags
-        finally:
-            await client.close()
+        )
+        fake_lithos_server.read_responses.append(
+            read_note_json(
+                "note-rejected-001",
+                title=_MERGE_TITLE,
+                content=_merge_note("ml-research", 8),
+                tags=[
+                    *_MERGE_BASE_TAGS,
+                    "profile:ml-research",
+                    "influx:rejected:robotics",
+                ],
+                version=2,
+            )
+        )
 
-    async def test_version_conflict_replaces_stale_influx_owned_tags(
+        result = await _write_incoming(fake_lithos_url, profile="nlp")
+
+        assert result.status == "updated"
+        write_calls = _writes(fake_lithos_server)
+        # 2 writes: the create that came back duplicate + the merge update.
+        assert len(write_calls) == 2
+        retry_tags = write_calls[1]["tags"]
+        assert "influx:rejected:robotics" in retry_tags
+        assert not any(
+            t.startswith("influx:rejected:") and t != "influx:rejected:robotics"
+            for t in retry_tags
+        )
+
+    async def test_richer_merge_replaces_stale_influx_owned_tags(
         self,
         fake_lithos_url: str,
         fake_lithos_server: FakeLithosServer,
         clear_fake_calls: None,
     ) -> None:
-        """Stale Influx-owned tags (e.g. source:rss) are fully replaced.
+        """Stale Influx-owned tags are replaced when the incoming body wins.
 
-        FR-NOTE-5: Influx-owned prefix tags from the existing note must
-        not survive when the new write supplies a fresh value.  The
-        canonical :func:`influx.notes.merge_tags` contract is enforced
-        at the version_conflict retry chokepoint.
+        FR-NOTE-5: Influx-owned prefix tags describe the body; when the
+        merge takes the richer incoming body, the canonical
+        :func:`influx.notes.merge_tags` contract replaces them.
         """
-        import json as _json
-
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "version_conflict", "note_id": "note-stale-001"}',
-                '{"status": "updated"}',
+                duplicate_json("note-stale-001"),
+                write_ok_json("note-stale-001", status="updated"),
             ]
         )
         fake_lithos_server.read_responses.append(
-            _json.dumps(
-                {
-                    "id": "note-stale-001",
-                    "content": "# Summary\nOld content.",
-                    "tags": [
-                        "source:rss",
-                        "arxiv-id:old.0001",
-                        "profile:ml-research",
-                        "user-custom-tag",
-                    ],
-                    "version": 4,
-                }
+            read_note_json(
+                "note-stale-001",
+                title=_MERGE_TITLE,
+                content=_merge_note("ml-research", 7),
+                tags=[
+                    "ingested-by:influx",
+                    "source:rss",
+                    "arxiv-id:old.0001",
+                    "profile:ml-research",
+                    "user-custom-tag",
+                ],
+                version=4,
             )
         )
 
-        client = LithosClient(url=fake_lithos_url)
-        try:
-            result = await client.write_note(
-                title="Updated Paper",
-                content="# Summary\nNew content.",
-                path="papers/arxiv/2026/04",
-                source_url="https://arxiv.org/abs/2601.77777",
-                tags=[
-                    "profile:ml-research",
-                    "source:arxiv",
-                    "arxiv-id:2601.77777",
-                ],
-                confidence=0.9,
-            )
-            assert result.status == "updated"
+        result = await _write_incoming(
+            fake_lithos_url,
+            profile="ml-research",
+            score=9,
+            full_text="Body.",
+            extra_tags=("arxiv-id:2601.11111", "full-text"),
+        )
 
-            write_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
-            ]
-            assert len(write_calls) == 2
-            retry_tags = write_calls[1][1]["tags"]
+        assert result.status == "updated"
+        retry_tags = _writes(fake_lithos_server)[1]["tags"]
+        assert "source:arxiv" in retry_tags
+        assert "arxiv-id:2601.11111" in retry_tags
+        assert "source:rss" not in retry_tags
+        assert "arxiv-id:old.0001" not in retry_tags
+        assert "user-custom-tag" in retry_tags
+        assert "profile:ml-research" in retry_tags
 
-            # New Influx-owned tags present.
-            assert "source:arxiv" in retry_tags
-            assert "arxiv-id:2601.77777" in retry_tags
-            # Stale Influx-owned tags fully replaced.
-            assert "source:rss" not in retry_tags
-            assert "arxiv-id:old.0001" not in retry_tags
-            # External + profile + rejection tags preserved.
-            assert "user-custom-tag" in retry_tags
-            assert "profile:ml-research" in retry_tags
-        finally:
-            await client.close()
-
-    async def test_version_conflict_rejection_guard_blocks_profile(
+    async def test_rejection_guard_blocks_profile_on_merge(
         self,
         fake_lithos_url: str,
         fake_lithos_server: FakeLithosServer,
@@ -3198,52 +3321,66 @@ class TestFeedbackTagIntegrity:
     ) -> None:
         """Rejection guard: ``influx:rejected:<p>`` blocks ``profile:<p>``.
 
-        FR-NOTE-6: a rejected profile tag on the existing note prevents
-        the matching ``profile:<p>`` tag from being re-added on rewrite.
+        FR-NOTE-6: a rejected profile on the existing note is never re-added
+        by a merge — not even when the merge rewrites the body.
         """
-        import json as _json
-
         fake_lithos_server.write_responses.extend(
             [
-                '{"status": "version_conflict", "note_id": "note-reject-002"}',
-                '{"status": "updated"}',
+                duplicate_json("note-reject-002"),
+                write_ok_json("note-reject-002", status="updated"),
             ]
         )
         fake_lithos_server.read_responses.append(
-            _json.dumps(
-                {
-                    "id": "note-reject-002",
-                    "content": "# Summary\nOld.",
-                    "tags": [
-                        "profile:robotics",
-                        "influx:rejected:robotics",
-                    ],
-                    "version": 1,
-                }
+            read_note_json(
+                "note-reject-002",
+                title=_MERGE_TITLE,
+                content=_merge_note("robotics", 6),
+                tags=[
+                    *_MERGE_BASE_TAGS,
+                    "profile:robotics",
+                    "influx:rejected:robotics",
+                ],
             )
         )
 
-        client = LithosClient(url=fake_lithos_url)
-        try:
-            await client.write_note(
-                title="Rejected Paper",
-                content="# Summary\nNew.",
-                path="papers/arxiv/2026/04",
-                source_url="https://arxiv.org/abs/2601.66666",
-                tags=["profile:robotics", "source:arxiv"],
-                confidence=0.7,
+        await _write_incoming(
+            fake_lithos_url,
+            profile="robotics",
+            score=9,
+            full_text="Body.",
+            extra_tags=("full-text",),
+        )
+
+        retry_tags = _writes(fake_lithos_server)[1]["tags"]
+        assert "profile:robotics" not in retry_tags
+        assert "influx:rejected:robotics" in retry_tags
+        assert "source:arxiv" in retry_tags
+
+    async def test_rejected_profile_alone_writes_nothing(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """A rejected profile re-seeing the note has nothing to merge."""
+        fake_lithos_server.write_responses.append(duplicate_json("note-reject-003"))
+        fake_lithos_server.read_responses.append(
+            read_note_json(
+                "note-reject-003",
+                title=_MERGE_TITLE,
+                content=_merge_note("ml-research", 8),
+                tags=[
+                    *_MERGE_BASE_TAGS,
+                    "profile:ml-research",
+                    "influx:rejected:robotics",
+                ],
             )
-            write_calls = [
-                c for c in fake_lithos_server.calls if c[0] == "lithos_write"
-            ]
-            assert len(write_calls) == 2
-            retry_tags = write_calls[1][1]["tags"]
-            # Rejection guard blocks profile:robotics.
-            assert "profile:robotics" not in retry_tags
-            assert "influx:rejected:robotics" in retry_tags
-            assert "source:arxiv" in retry_tags
-        finally:
-            await client.close()
+        )
+
+        result = await _write_incoming(fake_lithos_url, profile="robotics")
+
+        assert result.status == "duplicate"
+        assert len(_writes(fake_lithos_server)) == 1
 
 
 # ── Inspector pre-check: list_archive_terminal_arxiv_ids (issue #14) ─

@@ -12,13 +12,20 @@ backfill only skips candidates whose URL is already stored.
 
 Partition rules (one ``cache_lookup`` per scored candidate):
 
-============================  =====================  ===========================
-``hit``                       ``skip_cache_hits``    Goes to
-============================  =====================  ===========================
-``False`` (miss)              ``True``  / ``False``  ``to_acquire`` (cache_hit=False)
-``True`` (hit)                ``True``               ``hits_to_skip`` (drop)
-``True`` (hit)                ``False``              ``to_acquire`` (cache_hit=True)
-============================  =====================  ===========================
+==========================  =====================  =================================
+``hit``                     ``skip_cache_hits``    Goes to
+==========================  =====================  =================================
+``False`` (miss)            ``True``  / ``False``  ``to_acquire`` (cache_hit=False)
+``True`` (hit)              ``True``               ``hits_to_skip`` (drop)
+``True``, note settled      ``False``              ``hits_to_skip`` (``skip-present``)
+``True``, note not settled  ``False``              ``to_acquire`` (cache_hit=True)
+==========================  =====================  =================================
+
+A hit's note is *settled* for the Profile when it already carries
+``profile:<profile>`` or ``influx:rejected:<profile>``: the multi-profile
+merge would add nothing (lithos task c1196e30), so the candidate skips the
+download / extraction / enrichment it would otherwise pay for only to be
+written back as ``duplicate``.  Any other hit goes on to the merge.
 
 The helper emits :func:`metrics.cache_hits`, the run ledger's
 :func:`~influx.telemetry.record_cache_hit` and the ``"article cache hit"``
@@ -51,6 +58,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from influx import metrics
+from influx.dedup import cache_hit_document
 from influx.errors import LithosError
 from influx.lithos_client import LithosClient
 from influx.source import BoundScoredCandidate
@@ -118,6 +126,15 @@ class DedupOutcome:
     lookup_errors: int = 0
 
 
+def _note_settled_for_profile(body: dict[str, Any], profile: str) -> bool:
+    """True when the hit's note already carries *profile* or its rejection."""
+    doc = cache_hit_document(body)
+    tags = doc.get("tags") if doc is not None else None
+    if not isinstance(tags, list):
+        return False
+    return f"profile:{profile}" in tags or f"influx:rejected:{profile}" in tags
+
+
 async def dedup_scored_candidates(
     bounds: Sequence[BoundScoredCandidate],
     *,
@@ -175,7 +192,13 @@ async def dedup_scored_candidates(
                 1, {"profile": profile, "source": _metric_source(bound.source_label)}
             )
             record_cache_hit()
-            action = "skip" if skip_cache_hits else "merge-profile"
+            settled = _note_settled_for_profile(body, profile)
+            if skip_cache_hits:
+                action = "skip"
+            elif settled:
+                action = "skip-present"
+            else:
+                action = "merge-profile"
             logger.info(
                 "article cache hit profile=%s source_url=%s title=%r "
                 "action=%s reason=primary source=%s",
@@ -191,7 +214,7 @@ async def dedup_scored_candidates(
                 cache_hit_reason="primary",
                 cache_body=body,
             )
-            if skip_cache_hits:
+            if skip_cache_hits or settled:
                 hits_to_skip.append(decision)
             else:
                 to_acquire.append(decision)

@@ -193,6 +193,71 @@ async def test_cache_hit_without_skip_lands_in_to_acquire_for_merge() -> None:
     assert decision.cache_hit_reason == "primary"
 
 
+@pytest.mark.parametrize(
+    "tag", ["profile:p1", "influx:rejected:p1"], ids=["present", "rejected"]
+)
+@pytest.mark.asyncio
+async def test_cache_hit_already_settled_for_profile_is_skipped(
+    tag: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A note that already carries this profile (or its rejection) has
+    nothing to merge, so the hit skips acquire like a backfill hit
+    (lithos task c1196e30: 94% of prod cache hits were this case)."""
+    bound = _make_bound()
+    client = _client_with_responses(cache_hit_body(_URL, tags=[tag, "profile:p2"]))
+
+    with caplog.at_level("INFO", logger="influx.run_dedup"):
+        outcome = await dedup_scored_candidates(
+            [bound],
+            client=client,
+            profile="p1",
+            skip_cache_hits=False,
+        )
+
+    assert outcome.to_acquire == ()
+    assert [d.bound for d in outcome.hits_to_skip] == [bound]
+    assert outcome.hits_to_skip[0].cache_hit is True
+    assert "action=skip-present" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_for_another_profile_goes_to_acquire_for_merge(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bound = _make_bound()
+    client = _client_with_responses(
+        cache_hit_body(_URL, tags=["profile:p2", "profile:p10"])
+    )
+
+    with caplog.at_level("INFO", logger="influx.run_dedup"):
+        outcome = await dedup_scored_candidates(
+            [bound],
+            client=client,
+            profile="p1",
+            skip_cache_hits=False,
+        )
+
+    assert [d.bound for d in outcome.to_acquire] == [bound]
+    assert outcome.to_acquire[0].cache_hit is True
+    assert "action=merge-profile" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_settled_hit_still_counts_as_a_cache_hit() -> None:
+    bound = _make_bound()
+    client = _client_with_responses(cache_hit_body(_URL, tags=["profile:p1"]))
+    counter = [0]
+    token = current_cache_hits.set(counter)
+    try:
+        await dedup_scored_candidates(
+            [bound], client=client, profile="p1", skip_cache_hits=False
+        )
+    finally:
+        current_cache_hits.reset(token)
+
+    assert counter == [1]
+
+
 @pytest.mark.asyncio
 async def test_mixed_batch_partitions_correctly() -> None:
     """Three-way mix: miss → acquire, hit+skip → drop, hit+merge → acquire.

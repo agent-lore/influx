@@ -27,12 +27,8 @@ from mcp.client.sse import sse_client
 from mcp.shared.exceptions import McpError
 
 from influx.canonical_note import (
-    REPAIR,
-    carry_forward_section,
     drop_tier2,
     drop_tier2_and_tier3,
-    graft_user_notes,
-    replace_profile_relevance_section,
 )
 from influx.dedup import (
     arxiv_id_from_url,
@@ -42,16 +38,9 @@ from influx.dedup import (
     verify_cache_hit,
 )
 from influx.errors import ConfigError, LCMAError, LithosError
-from influx.notes import (
-    NoteParseError,
-    parse_note,
-    parse_profile_relevance,
-)
+from influx.note_merge import MergedNote, merge_into_existing
 from influx.notes import (
     merge_tags as _canonical_merge_tags,
-)
-from influx.renderer import (
-    merge_profile_relevance_union,
 )
 from influx.urls import safe_normalise_url
 
@@ -113,18 +102,22 @@ def write_status(body: Mapping[str, Any]) -> str:
 class WriteResult:
     """Result of a ``write_note`` call after envelope handling (FR-MCP-7).
 
-    *status*: ``"created"`` / ``"updated"`` for success, ``"duplicate"``
-    for an already-ingested item (caller increments ``dedup_skipped``),
+    *status*: ``"created"`` / ``"updated"`` for success (``updated`` is
+    also a multi-profile merge into an existing note), ``"duplicate"``
+    for an already-ingested item with nothing to merge (caller
+    increments ``dedup_skipped``),
     ``"invalid_input"`` for a malformed payload (logged + skipped),
     ``"slug_collision"`` when both retries exhausted (logged + skipped),
-    ``"version_conflict"`` when both retries exhausted (logged + skipped),
+    ``"version_conflict"`` when the merge update lost the race twice
+    (logged + skipped),
     ``"content_too_large_skipped"`` when content_too_large exhausted
     all trimming retries (logged + counted + skipped).
 
     *note_id* carries the Lithos note id (the envelope's ``id``) on
     successful ``created`` / ``updated`` outcomes so the LCMA layer can
     wire it as the ``source_note_id`` on subsequent ``edge_upsert``
-    calls (PRD 08 graph wiring).
+    calls (PRD 08 graph wiring).  On ``duplicate`` / ``version_conflict``
+    it names the existing note Lithos matched, when known.
     """
 
     status: str
@@ -225,6 +218,25 @@ def _format_unresolved_detail(
     if tail:
         parts.append(tail)
     return "; ".join(parts)
+
+
+# Every Influx-authored note carries this tag (FR-RES-6); the multi-profile
+# merge only ever rewrites notes that do.
+_INFLUX_AUTHOR_TAG = "ingested-by:influx"
+
+
+def _doc_confidence(doc: Mapping[str, Any]) -> float:
+    """A read doc's ``confidence`` (hoisted by ``read_note``), else 0.0."""
+    value = doc.get("confidence")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return 0.0
+
+
+def _merge_skipped(duplicate: WriteResult, reason: str) -> WriteResult:
+    """*duplicate* with why no merge was written appended to its detail."""
+    detail = f"{duplicate.detail}; {reason}" if duplicate.detail else reason
+    return dataclasses.replace(duplicate, detail=detail)
 
 
 def _doc_tags(doc: dict[str, Any]) -> list[str]:
@@ -401,43 +413,6 @@ def _merge_tags(existing_tags: list[str], new_tags: list[str]) -> list[str]:
     the rejection guard, and external tags are preserved verbatim.
     """
     return _canonical_merge_tags(existing_tags=existing_tags, new_tags=new_tags)
-
-
-def _merge_profile_relevance_in_content(
-    existing_content: str,
-    new_content: str,
-    merged_tags: list[str],
-) -> str:
-    """Merge ``## Profile Relevance`` sections from two note contents.
-
-    Parses Profile Relevance entries from both *existing_content* and
-    *new_content*, union-merges them (preserving old entries for profiles
-    not in the new set), and replaces the ``## Profile Relevance``
-    section in *new_content* with the merged result.
-
-    Falls back to *new_content* unchanged when either note cannot be
-    parsed (e.g. non-canonical format).
-    """
-    try:
-        existing_parsed = parse_note(existing_content)
-        new_parsed = parse_note(new_content)
-    except NoteParseError:
-        return new_content
-
-    old_entries = parse_profile_relevance(existing_parsed)
-    new_entries = parse_profile_relevance(new_parsed)
-
-    if not old_entries:
-        return new_content  # Nothing to merge from existing
-
-    merged_entries = merge_profile_relevance_union(
-        old_entries=old_entries,
-        new_entries=new_entries,
-        tags=merged_tags,
-    )
-
-    # Replace the ## Profile Relevance section in new_content
-    return replace_profile_relevance_section(new_content, merged_entries)
 
 
 logger = logging.getLogger(__name__)
@@ -759,11 +734,11 @@ class LithosClient:
     ) -> WriteResult:
         """Write a note to Lithos with envelope handling (FR-MCP-6/7).
 
-        Handles ``duplicate`` (treated as hit, no retry),
+        Handles ``duplicate`` (merge into the existing note Lithos names,
+        FR-NOTE-6 — see :meth:`_merge_on_duplicate`),
         ``invalid_input`` (logged + skipped, no exception),
         ``slug_collision`` (retry once with disambiguating title suffix,
-        AC-05-D), and ``version_conflict`` (re-read + tag-merge +
-        user-notes preservation + retry once, AC-05-E).
+        AC-05-D), and ``content_too_large`` (trim + retry, §9.7).
         Returns a :class:`WriteResult` so callers can inspect the
         outcome and increment counters (e.g. ``dedup_skipped``).
 
@@ -821,17 +796,14 @@ class LithosClient:
         parsed = self._parse_write_response(result, source_url=canonical_source_url)
 
         if parsed.status == "slug_collision":
-            return await self._retry_slug_collision(
+            recovered = await self._retry_slug_collision(
                 args, source_url=canonical_source_url, initial_collision=parsed
             )
-
-        if parsed.status == "version_conflict":
-            return await self._retry_version_conflict(
-                args,
-                note_id=parsed.detail,
-                source_url=canonical_source_url,
-                original_tags=tags,
-            )
+            if recovered.status == "duplicate":
+                # Recovery that names the note stored under this source_url
+                # merges like a plain duplicate; one without an id stays put.
+                return await self._merge_on_duplicate(args, duplicate=recovered)
+            return recovered
 
         if parsed.status == "content_too_large":
             return await self._retry_content_too_large(
@@ -839,6 +811,9 @@ class LithosClient:
                 source_url=canonical_source_url,
                 original_tags=tags,
             )
+
+        if parsed.status == "duplicate":
+            return await self._merge_on_duplicate(args, duplicate=parsed)
 
         return parsed
 
@@ -1094,50 +1069,141 @@ class LithosClient:
         result = await self.call_tool("lithos_write", retry_args)
         return self._parse_write_response(result, source_url=source_url)
 
-    # ── Version-conflict retry (AC-05-E) ────────────────────────────
+    # ── Multi-profile merge on duplicate (FR-NOTE-6) ────────────────
 
-    async def _retry_version_conflict(
+    async def _merge_on_duplicate(
+        self, args: dict[str, Any], *, duplicate: WriteResult
+    ) -> WriteResult:
+        """Merge this create-path write into the note Lithos already holds.
+
+        Lithos answers a create for a ``source_url`` it already indexes with
+        ``duplicate`` + ``duplicate_of.id`` (lithos task c1196e30).  Read
+        that note, merge with :func:`influx.note_merge.merge_into_existing`,
+        and update it by ``id`` + ``expected_version``.  A ``version_conflict``
+        means another writer got there first: re-read and merge once more,
+        then give up (logged).
+
+        Returns *duplicate* unchanged when there is no note to merge into,
+        it can't be read, it isn't Influx-authored, or the merge adds
+        nothing (the Profile is already on the note).
+        """
+        existing_id = duplicate.note_id
+        if not existing_id:
+            return duplicate
+        outcome = duplicate
+        for _attempt in range(2):
+            try:
+                existing = await self.read_note(note_id=existing_id)
+            except (LithosError, McpError):
+                logger.warning(
+                    "multi-profile merge skipped for %s: could not read "
+                    "existing note %s",
+                    duplicate.source_url,
+                    existing_id,
+                    exc_info=True,
+                )
+                return duplicate
+            outcome = await self._write_merge(
+                args, existing=existing, duplicate=duplicate
+            )
+            if outcome.status != "version_conflict":
+                return outcome
+        logger.warning(
+            "lithos_write version_conflict retry failed for %s (merging into note %s)",
+            duplicate.source_url,
+            existing_id,
+        )
+        return dataclasses.replace(outcome, note_id=existing_id)
+
+    async def _write_merge(
         self,
         args: dict[str, Any],
         *,
-        note_id: str,
-        source_url: str,
-        original_tags: list[str],
+        existing: dict[str, Any],
+        duplicate: WriteResult,
     ) -> WriteResult:
-        """Re-read, merge tags + notes + Profile Relevance (AC-05-E)."""
-        existing = await self.read_note(note_id=note_id)
-        existing_tags: list[str] = existing.get("tags", [])
-        merged_tags = _merge_tags(existing_tags, original_tags)
-        existing_content: str = existing.get("content", "")
-        merged_content = graft_user_notes(existing_content, args["content"])
-        # Multi-profile merge: union-merge Profile Relevance entries (FR-NOTE-6)
-        merged_content = _merge_profile_relevance_in_content(
-            existing_content, merged_content, merged_tags
-        )
-        # 3a.4: preserve the existing note's ``## Repair`` counters.  Only
-        # the repair sweep writes that section; the freshly-ingested
-        # create-path content has none, so a naive merge would drop the
-        # accumulated counters and reset a tier-terminal note's caps on
-        # re-ingest.  Carry the section forward (as text) so re-ingesting a
-        # capped note keeps respecting its caps.
-        merged_content = carry_forward_section(existing_content, merged_content, REPAIR)
-        retry_args = {
-            **args,
-            "tags": merged_tags,
-            "content": merged_content,
-        }
+        """Merge *args* into *existing* and send one update (plus fallback)."""
+        existing_tags = _doc_tags(existing)
+        if _INFLUX_AUTHOR_TAG not in existing_tags:
+            logger.info(
+                "multi-profile merge skipped for %s: note %s is not Influx-authored",
+                duplicate.source_url,
+                duplicate.note_id,
+            )
+            return _merge_skipped(duplicate, "existing note not Influx-authored")
         version = existing.get("version")
-        if version is not None:
-            retry_args["expected_version"] = version
-        if note_id:
-            retry_args["id"] = note_id
-
-        result = await self.call_tool("lithos_write", retry_args)
-        parsed = self._parse_write_response(result, source_url=source_url)
-        if parsed.status == "version_conflict":
+        if not isinstance(version, int) or isinstance(version, bool):
+            # Without expected_version the update would be a blind overwrite
+            # of whatever a concurrent writer (or a user) just saved.
             logger.warning(
-                "lithos_write version_conflict retry failed for %s",
-                source_url,
+                "multi-profile merge skipped for %s: note %s read with no version",
+                duplicate.source_url,
+                duplicate.note_id,
+            )
+            return _merge_skipped(duplicate, "existing note has no version")
+        title = _first_non_empty_str(existing, ("title",)) or str(args["title"])
+
+        def update_base(merged: MergedNote) -> dict[str, Any]:
+            # ``path`` / ``source_url`` / ``note_type`` / ``namespace`` are
+            # left out so Lithos keeps the note's own; the existing title
+            # keeps the slug (and file) where it is.
+            return {
+                "id": duplicate.note_id,
+                "agent": args["agent"],
+                "title": title,
+                "content": merged.content,
+                "tags": merged.tags,
+                "confidence": merged.confidence,
+                "expected_version": version,
+            }
+
+        def merge(*, keep_existing_body: bool) -> MergedNote | None:
+            return merge_into_existing(
+                title=title,
+                existing_content=str(existing.get("content") or ""),
+                existing_tags=existing_tags,
+                existing_confidence=_doc_confidence(existing),
+                incoming_content=str(args["content"]),
+                incoming_tags=list(args["tags"]),
+                incoming_confidence=float(args["confidence"]),
+                keep_existing_body=keep_existing_body,
+            )
+
+        merged = merge(keep_existing_body=False)
+        if merged is None:
+            return _merge_skipped(duplicate, "nothing to merge")
+        parsed = await self._send_merge(update_base(merged), merged, duplicate)
+        if parsed.status == "content_too_large" and not merged.kept_existing_body:
+            # The richer incoming body doesn't fit; the existing one did.
+            merged = merge(keep_existing_body=True)
+            if merged is None:
+                return _merge_skipped(duplicate, "nothing to merge")
+            parsed = await self._send_merge(update_base(merged), merged, duplicate)
+        if parsed.status == "content_too_large":
+            logger.warning(
+                "lithos_write content_too_large merging into note %s for %s "
+                "— leaving the note untouched",
+                duplicate.note_id,
+                duplicate.source_url,
+            )
+            return dataclasses.replace(
+                duplicate, status="content_too_large_skipped", detail="merge"
+            )
+        return parsed
+
+    async def _send_merge(
+        self, update: dict[str, Any], merged: MergedNote, duplicate: WriteResult
+    ) -> WriteResult:
+        """Send the merge *update* to Lithos and log a successful merge."""
+        result = await self.call_tool("lithos_write", update)
+        parsed = self._parse_write_response(result, source_url=duplicate.source_url)
+        if parsed.status in ("created", "updated"):
+            logger.info(
+                "multi-profile merge into note %s for %s: added_profiles=%s body=%s",
+                duplicate.note_id,
+                duplicate.source_url,
+                ",".join(merged.added_profiles) or "none",
+                "existing" if merged.kept_existing_body else "incoming",
             )
         return parsed
 
@@ -1175,6 +1241,10 @@ class LithosClient:
         retry_args = {**args, "content": trimmed}
         result = await self.call_tool("lithos_write", retry_args)
         parsed = self._parse_write_response(result, source_url=source_url)
+        if parsed.status == "duplicate":
+            # Lithos checks size before its source_url index, so a known
+            # URL only reports ``duplicate`` once the content fits.
+            return await self._merge_on_duplicate(retry_args, duplicate=parsed)
         if parsed.status != "content_too_large":
             return parsed
 
@@ -1226,6 +1296,8 @@ class LithosClient:
         }
         result = await self.call_tool("lithos_write", repair_args)
         parsed = self._parse_write_response(result, source_url=source_url)
+        if parsed.status == "duplicate":
+            return await self._merge_on_duplicate(repair_args, duplicate=parsed)
         if parsed.status == "content_too_large":
             # Tier 1 alone too large — leave existing note untouched.
             logger.warning(
@@ -1255,7 +1327,15 @@ class LithosClient:
         status = write_status(body)
 
         if status == "duplicate":
-            return WriteResult(status="duplicate", source_url=source_url)
+            # ``duplicate_of`` names the note already stored under this
+            # source_url; the multi-profile merge updates it (c1196e30).
+            dup = body.get("duplicate_of")
+            existing_id = (
+                _first_non_empty_str(dup, ("id",)) if isinstance(dup, Mapping) else ""
+            )
+            return WriteResult(
+                status="duplicate", source_url=source_url, note_id=existing_id
+            )
 
         if status == "invalid_input":
             reason = _first_non_empty_str(body, ("message", "reason")) or "unknown"
@@ -1292,14 +1372,12 @@ class LithosClient:
             )
 
         if status == "version_conflict":
-            # Lithos's version_conflict carries ``current_version``, not a
-            # note id; the multi-profile merge built on reading one here is
-            # lithos task c1196e30.
-            note_id = body.get("note_id", "")
+            # Only an update with a stale ``expected_version`` gets this (the
+            # multi-profile merge); Lithos sends ``current_version``, no id.
             return WriteResult(
                 status="version_conflict",
                 source_url=source_url,
-                detail=note_id,
+                detail=_first_non_empty_str(body, ("message",)),
             )
 
         if status == "content_too_large":

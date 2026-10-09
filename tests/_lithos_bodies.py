@@ -88,3 +88,62 @@ def write_error_json(code: str, message: str = "") -> str:
     ``{"status": "error", "code": ...}``, not as a top-level ``status``.
     """
     return json.dumps({"status": "error", "code": code, "message": message})
+
+
+def duplicate_json(
+    note_id: str = "note-1",
+    *,
+    title: str = "Existing note",
+    source_url: str = "https://arxiv.org/abs/2601.00001",
+) -> str:
+    """A create-path ``lithos_write`` for a ``source_url`` Lithos already holds.
+
+    Lithos names the existing note in ``duplicate_of`` (``lithos/tools/
+    notes.py``).  Influx's multi-profile merge used to wait for a
+    ``version_conflict`` carrying ``note_id`` instead, which Lithos never
+    sends (lithos task c1196e30).
+    """
+    return json.dumps(
+        {
+            "status": "duplicate",
+            "duplicate_of": {"id": note_id, "title": title, "source_url": source_url},
+            "message": f"URL already exists in document '{title}'",
+            "warnings": [],
+        }
+    )
+
+
+def read_note_json(
+    note_id: str = "note-1",
+    *,
+    title: str = "Existing note",
+    content: str = "",
+    tags: Sequence[str] = (),
+    version: int = 1,
+    confidence: float = 0.8,
+    source_url: str = "https://arxiv.org/abs/2601.00001",
+) -> str:
+    """A ``lithos_read`` response in the real envelope.
+
+    Lithos nests the structured fields under ``metadata``;
+    ``LithosClient.read_note`` hoists them (#187).
+    """
+    return json.dumps(
+        {
+            "id": note_id,
+            "title": title,
+            "path": f"notes/{note_id}.md",
+            "content": content,
+            "metadata": {
+                "tags": list(tags),
+                "version": version,
+                "confidence": confidence,
+                "source_url": source_url,
+                "author": "influx",
+                "note_type": "summary",
+                "namespace": "influx",
+            },
+            "links": [],
+            "truncated": False,
+        }
+    )

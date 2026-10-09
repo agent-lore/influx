@@ -39,7 +39,12 @@ from influx.probes import ProbeLoop
 from influx.renderer import ProfileRelevanceEntry, render_note
 from influx.scheduler import InfluxScheduler
 from tests._bound_helpers import bounds_for
-from tests._lithos_bodies import cache_hit_json, write_ok_json
+from tests._lithos_bodies import (
+    cache_hit_json,
+    duplicate_json,
+    read_note_json,
+    write_ok_json,
+)
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -228,8 +233,9 @@ class TestSharedSourceMerge:
     """Two profiles matching the same item produce ONE note with both tags.
 
     Profile A runs first (cache miss → write succeeds).
-    Profile B runs second (cache hit → write triggers version_conflict →
-    merge merges profile tags and Profile Relevance).
+    Profile B runs second: the cache hit's note lacks ``profile:B``, so the
+    item is acquired and written; Lithos answers ``duplicate`` naming A's
+    note, and Influx reads it, merges, and updates it (lithos task c1196e30).
     """
 
     def test_two_profiles_same_item_produces_merged_note(
@@ -246,7 +252,7 @@ class TestSharedSourceMerge:
         }
 
         # Profile A: cache miss → write succeeds
-        # Profile B: cache hit → write → version_conflict → merge
+        # Profile B: cache hit → write → duplicate → read → merge update
 
         # Queue: Profile A's cache_lookup miss + write success
         # (default behaviour: cache miss, write created)
@@ -288,24 +294,26 @@ class TestSharedSourceMerge:
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         # - lithos_list (feedback) → empty
         fake_lithos.list_responses.append(json.dumps({"items": []}))
-        # - cache_lookup → HIT (item already ingested by Profile A)
-        fake_lithos.cache_lookup_responses.append(cache_hit_json(SHARED_URL))
-        # - lithos_write (from cache-hit path) → version_conflict
-        fake_lithos.write_responses.append(
-            json.dumps({"status": "version_conflict", "note_id": "note-shared-001"})
+        # - cache_lookup → HIT on Profile A's note
+        fake_lithos.cache_lookup_responses.append(
+            cache_hit_json(SHARED_URL, note_id="note-shared-001", tags=profile_a_tags)
         )
-        # - lithos_read (version_conflict retry reads existing note)
+        # - lithos_write (create path) → duplicate naming A's note
+        fake_lithos.write_responses.append(
+            duplicate_json("note-shared-001", title=SHARED_TITLE, source_url=SHARED_URL)
+        )
+        # - lithos_read of the existing note (real, metadata-nested envelope)
         fake_lithos.read_responses.append(
-            json.dumps(
-                {
-                    "id": "note-shared-001",
-                    "content": profile_a_content,
-                    "tags": profile_a_tags,
-                    "version": 1,
-                }
+            read_note_json(
+                "note-shared-001",
+                title=SHARED_TITLE,
+                content=profile_a_content,
+                tags=profile_a_tags,
+                version=1,
+                source_url=SHARED_URL,
             )
         )
-        # - lithos_write retry → updated
+        # - lithos_write merge update → updated
         fake_lithos.write_responses.append(
             write_ok_json("note-shared-001", status="updated")
         )
@@ -315,13 +323,14 @@ class TestSharedSourceMerge:
             tc.post("/runs", json={"profile": PROFILE_B})
             _wait_for_idle(app.state.coordinator, PROFILE_B)
 
-        # Find the final lithos_write call (the version_conflict retry)
         write_calls_b = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
         n = len(write_calls_b)
-        assert n >= 2, f"Expected ≥2 write calls, got {n}"
+        assert n == 2, f"Expected create + merge update, got {n} writes"
 
-        # The retry (second write) should have merged tags
+        # The merge update targets A's note by id and version
         retry_write = write_calls_b[-1][1]
+        assert retry_write["id"] == "note-shared-001"
+        assert retry_write["expected_version"] == 1
         assert f"profile:{PROFILE_A}" in retry_write["tags"], (
             "Profile A tag must be preserved in merged write"
         )
@@ -470,30 +479,60 @@ class TestPreservationOnSingleProfileRun:
             ],
         )
 
-        # Profile B runs alone, gets cache hit → writes → version_conflict → merge
         profile_items = {PROFILE_B: _make_items_for_profile(PROFILE_B)}
 
         # Queue repair + feedback
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         fake_lithos.list_responses.append(json.dumps({"items": []}))
+        # The hit's note already carries profile:web-tech → skip-present.
+        fake_lithos.cache_lookup_responses.append(
+            cache_hit_json(SHARED_URL, note_id="note-shared-002", tags=both_tags)
+        )
 
-        # Cache hit → write → version_conflict → read → retry
-        fake_lithos.cache_lookup_responses.append(cache_hit_json(SHARED_URL))
-        fake_lithos.write_responses.append(
-            json.dumps({"status": "version_conflict", "note_id": "note-shared-002"})
+        app = _make_app(config, profile_items)
+
+        with TestClient(app) as tc:
+            tc.post("/runs", json={"profile": PROFILE_B})
+            _wait_for_idle(app.state.coordinator, PROFILE_B)
+
+        # Nothing to merge: no acquire, no write, the note is untouched.
+        assert [c for c in fake_lithos.calls if c[0] == "lithos_write"] == []
+        assert [c for c in fake_lithos.calls if c[0] == "lithos_read"] == []
+        assert parse_profile_relevance(parse_note(existing_content))
+
+    def test_merge_with_nothing_new_leaves_note_untouched(
+        self,
+        fake_lithos: FakeLithosServer,
+        fake_lithos_url: str,
+    ) -> None:
+        """A hit without document tags still reaches the write; the merge
+        reads the note, finds web-tech already on it, and writes nothing."""
+        config = _make_config(lithos_url=fake_lithos_url)
+        both_tags = [
+            f"profile:{PROFILE_A}",
+            f"profile:{PROFILE_B}",
+            "source:arxiv",
+            "ingested-by:influx",
+            "schema:1",
+        ]
+        existing_content = _render_item_content(
+            profile_name=PROFILE_A, score=8, reason="AI robotics.", tags=both_tags
         )
+        profile_items = {PROFILE_B: _make_items_for_profile(PROFILE_B)}
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+        fake_lithos.list_responses.append(json.dumps({"items": []}))
+        fake_lithos.cache_lookup_responses.append(
+            cache_hit_json(SHARED_URL, note_id="note-shared-003")
+        )
+        fake_lithos.write_responses.append(duplicate_json("note-shared-003"))
         fake_lithos.read_responses.append(
-            json.dumps(
-                {
-                    "id": "note-shared-002",
-                    "content": existing_content,
-                    "tags": both_tags,
-                    "version": 2,
-                }
+            read_note_json(
+                "note-shared-003",
+                title=SHARED_TITLE,
+                content=existing_content,
+                tags=both_tags,
+                version=5,
             )
-        )
-        fake_lithos.write_responses.append(
-            write_ok_json("note-shared-002", status="updated")
         )
 
         app = _make_app(config, profile_items)
@@ -503,16 +542,5 @@ class TestPreservationOnSingleProfileRun:
             _wait_for_idle(app.state.coordinator, PROFILE_B)
 
         write_calls = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-        assert len(write_calls) >= 2
-
-        # The retry write should preserve profile:ai-robotics
-        retry_write = write_calls[-1][1]
-        assert f"profile:{PROFILE_A}" in retry_write["tags"]
-        assert f"profile:{PROFILE_B}" in retry_write["tags"]
-
-        # Profile Relevance should have both entries
-        parsed = parse_note(retry_write["content"])
-        entries = parse_profile_relevance(parsed)
-        by_name = {e.profile_name: e for e in entries}
-        assert PROFILE_A in by_name, "profile:ai-robotics entry must be preserved"
-        assert PROFILE_B in by_name
+        assert len(write_calls) == 1  # the create; no merge update
+        assert write_calls[0][1]["id"] is None
