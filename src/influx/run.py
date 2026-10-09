@@ -455,8 +455,10 @@ async def _run_acquire_stage(
 
     - cache miss → invoke the bound's ``acquire`` closure;
     - cache hit + ``skip_cache_hits=True`` (backfill) → drop, no acquire;
-    - cache hit + normal run → invoke ``acquire`` so the multi-profile
-      merge path inside :meth:`LithosClient.write_note` still runs.
+    - cache hit on a note already carrying this profile (or its
+      rejection) → drop, no acquire: there is nothing to merge;
+    - any other cache hit → invoke ``acquire`` so the multi-profile
+      merge in :meth:`LithosClient.write_note` (on ``duplicate``) runs.
 
     Each acquired ProfileItem is stamped with ``cache_hit`` (and
     ``cache_hit_reason`` on hits) so the Ingest stage can skip its own
@@ -727,15 +729,19 @@ async def _run_ingest_stage(
             # re-resolve it via cache_lookup_by_url_body (finding 6).
             if write_result.note_id:
                 written_note_ids.append(write_result.note_id)
-        elif not cache_hit:
+        elif not cache_hit or write_result.status != "duplicate":
+            # On a cache hit, ``duplicate`` means the merge had nothing to
+            # add; anything else is a merge that failed (c1196e30).
             logger.warning(
                 "article write skipped profile=%s source_url=%s title=%r "
-                "status=%s detail=%r cache_hit=false cache_hit_reason=none",
+                "status=%s detail=%r cache_hit=%s cache_hit_reason=%s",
                 profile,
                 source_url,
                 title,
                 write_result.status,
                 write_result.detail,
+                str(cache_hit).lower(),
+                cache_hit_reason or "none",
                 extra={
                     "profile": profile,
                     "source_url": source_url,
@@ -744,8 +750,8 @@ async def _run_ingest_stage(
                     "detail": write_result.detail,
                     "run_id": current_run_id.get() or "",
                     "tags": list(item.get("tags", [])),
-                    "cache_hit": False,
-                    "cache_hit_reason": "none",
+                    "cache_hit": cache_hit,
+                    "cache_hit_reason": cache_hit_reason or "none",
                 },
             )
             if write_result.status == "slug_collision":

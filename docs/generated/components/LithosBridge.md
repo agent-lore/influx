@@ -16,6 +16,7 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 | `influx.lcma` | M | 0 | 4 |
 | `influx.lcma_wiring` | S | 2 | 1 |
 | `influx.lithos_client` | XL | 3 | 1 |
+| `influx.note_merge` | S | 1 | 1 |
 | `influx.notes` | S | 1 | 4 |
 | `influx.renderer` | M | 2 | 6 |
 | `influx.urls` | S | 1 | 6 |
@@ -71,6 +72,10 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 - class `SquatterClassification` — Outcome of inspecting the doc that owns a colliding slug (#31).
 - class `LithosClient` — Lazy-connecting SSE-backed MCP client for Lithos.
 
+### `influx.note_merge`
+- class `MergedNote` — The note to write back over the existing one.
+- def `merge_into_existing` — Merge *incoming* into *existing*, or return ``None`` if nothing changes.
+
 ### `influx.notes`
 - class `ArchiveParseError` — Raised when the ``## Archive`` section body is malformed.
 - def `merge_tags` — Compute the final tag set for a note rewrite (FR-NOTE-5/6/7/8).
@@ -101,5 +106,9 @@ Renders CanonicalNotes and is the write-mostly MCP/SSE client to Lithos (WriteRe
 
 - Depends on: [Common](Common.md), [Observability](Observability.md), [Schemas](Schemas.md)
 - Used by: [Entrypoint](Entrypoint.md), [Feedback](Feedback.md), [HttpApi](HttpApi.md), [Orchestration](Orchestration.md), [Repair](Repair.md), [Sources](Sources.md)
+
+## ADRs
+
+- [A second Profile merges into the existing note on `duplicate`; the richer body wins](../../adr/0003-multi-profile-merge-on-duplicate.md)
 
 [← all generated docs](../README.md)

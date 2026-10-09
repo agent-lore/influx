@@ -40,7 +40,12 @@ from influx.probes import ProbeLoop
 from influx.renderer import ProfileRelevanceEntry, render_note
 from influx.scheduler import InfluxScheduler
 from tests._bound_helpers import bounds_for
-from tests._lithos_bodies import cache_hit_json, write_ok_json
+from tests._lithos_bodies import (
+    cache_hit_json,
+    duplicate_json,
+    read_note_json,
+    write_ok_json,
+)
 from tests.contract.test_lithos_client import FakeLithosServer
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -316,26 +321,10 @@ class TestRejectionAuthorityIngest:
                 }
             )
         )
-        # cache_lookup → HIT (item already in Lithos from prior run)
-        fake_lithos.cache_lookup_responses.append(cache_hit_json(SHARED_URL))
-        # write (cache-hit path) → version_conflict
-        fake_lithos.write_responses.append(
-            json.dumps({"status": "version_conflict", "note_id": "note-rejected-001"})
-        )
-        # read (version_conflict retry) → existing note with rejection tag
-        fake_lithos.read_responses.append(
-            json.dumps(
-                {
-                    "id": "note-rejected-001",
-                    "content": existing_content,
-                    "tags": existing_tags,
-                    "version": 1,
-                }
-            )
-        )
-        # write retry → updated
-        fake_lithos.write_responses.append(
-            write_ok_json("note-rejected-001", status="updated")
+        # cache_lookup → HIT on the note that carries the rejection: nothing
+        # for ai-robotics to merge, so the run skips it before acquire.
+        fake_lithos.cache_lookup_responses.append(
+            cache_hit_json(SHARED_URL, note_id="note-rejected-001", tags=existing_tags)
         )
 
         app = _make_app(config, profile_items)
@@ -344,34 +333,11 @@ class TestRejectionAuthorityIngest:
             tc.post("/runs", json={"profile": PROFILE_A})
             _wait_for_idle(app.state.coordinator, PROFILE_A)
 
-        # Verify Profile A's retry write: profile:ai-robotics must be absent
-        write_calls_a = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-        assert len(write_calls_a) >= 2, "Expected initial write + retry write"
+        # AC-M3-6: the rejected profile neither re-adds its tag nor refreshes
+        # its Profile Relevance entry — the note is not written at all.
+        assert [c for c in fake_lithos.calls if c[0] == "lithos_write"] == []
 
-        retry_write_a = write_calls_a[-1][1]
-        assert "influx:rejected:ai-robotics" in retry_write_a["tags"], (
-            "Rejection tag must be preserved"
-        )
-        assert f"profile:{PROFILE_A}" not in retry_write_a["tags"], (
-            "Rejected profile:ai-robotics must NOT be re-added (AC-M3-6)"
-        )
-
-        # Capture Profile A's merged content + tags for Profile B's read
-        merged_content_a = retry_write_a["content"]
-        merged_tags_a = retry_write_a["tags"]
-
-        # Profile Relevance: ai-robotics entry should be OLD (score=6, not 8)
         from influx.notes import parse_note, parse_profile_relevance
-
-        parsed_a = parse_note(merged_content_a)
-        entries_a = parse_profile_relevance(parsed_a)
-        by_name_a = {e.profile_name: e for e in entries_a}
-        assert PROFILE_A in by_name_a, (
-            "Old Profile Relevance entry for rejected profile must be preserved"
-        )
-        assert by_name_a[PROFILE_A].score == 6, (
-            "Rejected profile's score must NOT be refreshed (old=6, new would be 8)"
-        )
 
         # ── Profile B run ──
         fake_lithos.calls.clear()
@@ -384,24 +350,23 @@ class TestRejectionAuthorityIngest:
         fake_lithos.list_responses.append(json.dumps({"items": []}))
         # lithos_list (feedback: influx:rejected:web-tech) → empty
         fake_lithos.list_responses.append(json.dumps({"items": []}))
-        # cache_lookup → HIT
-        fake_lithos.cache_lookup_responses.append(cache_hit_json(SHARED_URL))
-        # write (cache-hit path) → version_conflict
-        fake_lithos.write_responses.append(
-            json.dumps({"status": "version_conflict", "note_id": "note-rejected-001"})
+        # cache_lookup → HIT; web-tech is not on the note yet
+        fake_lithos.cache_lookup_responses.append(
+            cache_hit_json(SHARED_URL, note_id="note-rejected-001", tags=existing_tags)
         )
-        # read (version_conflict retry) → note as left by Profile A's run
+        # write (create path) → duplicate naming the note
+        fake_lithos.write_responses.append(duplicate_json("note-rejected-001"))
+        # read → the note as Profile A's run left it (untouched)
         fake_lithos.read_responses.append(
-            json.dumps(
-                {
-                    "id": "note-rejected-001",
-                    "content": merged_content_a,
-                    "tags": merged_tags_a,
-                    "version": 2,
-                }
+            read_note_json(
+                "note-rejected-001",
+                title=SHARED_TITLE,
+                content=existing_content,
+                tags=existing_tags,
+                version=2,
             )
         )
-        # write retry → updated
+        # merge update → updated
         fake_lithos.write_responses.append(
             write_ok_json("note-rejected-001", status="updated")
         )
@@ -410,9 +375,10 @@ class TestRejectionAuthorityIngest:
             tc.post("/runs", json={"profile": PROFILE_B})
             _wait_for_idle(app.state.coordinator, PROFILE_B)
 
-        # Verify Profile B's retry write
+        # Verify Profile B's merge update
         write_calls_b = [c for c in fake_lithos.calls if c[0] == "lithos_write"]
-        assert len(write_calls_b) >= 2
+        assert len(write_calls_b) == 2
+        assert write_calls_b[-1][1]["id"] == "note-rejected-001"
 
         retry_write_b = write_calls_b[-1][1]
         final_tags = retry_write_b["tags"]

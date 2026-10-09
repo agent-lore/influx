@@ -14,14 +14,14 @@ lower a budget after improving the code to lock in the gain.
 | `component_cycles` | 3 | 3 | 0 |
 | `cross_component_edges` | 62 | 62 | 0 |
 | `cross_module_private_refs` | 5 | 5 | 0 |
-| `max_module_lines` | 1863 | 2000 | 137 |
+| `max_module_lines` | 1890 | 2000 | 110 |
 | `module_cycles` | 3 | 3 | 0 |
 | `modules_over_800_lines` | 11 | 11 | 0 |
-| `tests_private_imports` | 80 | 80 | 0 |
+| `tests_private_imports` | 79 | 79 | 0 |
 
 ## Import graph
 
-- Cross-component edges: **62** (190 module-level)
+- Cross-component edges: **62** (191 module-level)
 - Component cycles: Common ↔ Config; Enrich ↔ Repair ↔ Sources ↔ Storage; HttpApi ↔ Orchestration
 - Module cycles: influx.http_api ↔ influx.inbox ↔ influx.run ↔ influx.run_dispatch ↔ influx.run_service ↔ influx.scheduler ↔ influx.service; influx.repair ↔ influx.repair_hooks; influx.sources ↔ influx.sources.arxiv ↔ influx.sources.rss
 - Tier-skipping edges (Entrypoints → Foundation): 9 (Entrypoint -> Common, Entrypoint -> Config, Entrypoint -> Observability, HttpApi -> Common, HttpApi -> Config, HttpApi -> Observability, Orchestration -> Common, Orchestration -> Config, Orchestration -> Observability)
@@ -38,13 +38,13 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Config | 4 | 1608 | 1160 | 11 | 1 | 0.08 | 14 (`influx.config.NotificationWebhookConfig._validate_type_specific_fields`) | 1 |
 | Enrich | 2 | 998 | 804 | 2 | 5 | 0.71 | 22 (`influx.cascade.Cascade.enrich`) | 2 |
 | Entrypoint | 2 | 573 | 454 | 0 | 5 | 1.00 | 14 (`influx.main._cmd_backfill`) | 2 |
-| Feedback | 3 | 579 | 457 | 1 | 4 | 0.80 | 15 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
+| Feedback | 3 | 602 | 477 | 1 | 4 | 0.80 | 17 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
 | Filter | 1 | 474 | 398 | 3 | 4 | 0.57 | 11 (`influx.filter.make_default_batch_scorer._scorer`) | 1 |
 | HttpApi | 3 | 1141 | 918 | 2 | 8 | 0.80 | 15 (`influx.http_api.post_backfills`) | 3 |
-| LithosBridge | 8 | 4269 | 3399 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
+| LithosBridge | 9 | 4546 | 3627 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1919 | 1408 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
-| Orchestration | 7 | 4767 | 3808 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
+| Orchestration | 7 | 4773 | 3812 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
 | Repair | 5 | 3984 | 3041 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 331 | 247 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
 | Sources | 10 | 4490 | 3450 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
@@ -52,8 +52,8 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **59**, lines: **29279**, SLOC: **22722**
-- Largest module: `influx.sources.arxiv` (1863 lines)
+- Modules: **60**, lines: **29585**, SLOC: **22974**
+- Largest module: `influx.lithos_client` (1890 lines)
 - Modules over 800 lines: **11**
   - `influx.config`
   - `influx.inbox`
@@ -69,7 +69,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **688**, cyclomatic > 10: **46**
+- Functions: **702**, cyclomatic > 10: **46**
 
 Top 10 most complex functions:
 
@@ -81,7 +81,7 @@ Top 10 most complex functions:
 | 28 | `influx.sources.arxiv.build_arxiv_note_item` |
 | 28 | `influx.sources.rss.build_rss_note_item` |
 | 26 | `influx.repair._process_sweep_note` |
-| 23 | `influx.run._run_ingest_stage` |
+| 26 | `influx.run._run_ingest_stage` |
 | 23 | `influx.run_ledger.build_degradation_summary` |
 | 22 | `influx.cascade.Cascade.enrich` |
 | 20 | `influx.promotion_gate.evaluate_promotion_gate` |
@@ -97,7 +97,7 @@ Private-name reaches across module seams. Both counts can be pinned as
   - `influx.logging_config -> influx.telemetry._build_logger_provider`
   - `influx.repair_hooks -> influx.extraction.html._clean_html_fragments`
   - `influx.repair_hooks -> influx.extraction.html._strip_tags`
-- Tests importing src privates: **80**
+- Tests importing src privates: **79**
   - `tests/unit/test_lithos_client.py -> influx.lithos_client._classify_squatter (x10)`
   - `tests/integration/test_serve.py -> influx.main._cmd_serve (x5)`
   - `tests/unit/test_lithos_client.py -> influx.lithos_client._existing_id_from_detail (x4)`
@@ -133,4 +133,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.57** (75132 test lines / 29279 source lines)
+- Test-to-source line ratio: **2.56** (75788 test lines / 29585 source lines)

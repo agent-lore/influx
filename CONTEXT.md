@@ -108,6 +108,9 @@ Influx's MCP/SSE wrapper. Parses `lithos_write` envelopes into a **WriteResult**
 **WriteResult**:
 The typed outcome of `lithos_write`: `created`, `updated`, `duplicate`, `invalid_input`, `slug_collision`, `version_conflict`, `content_too_large`, or another envelope captured into `WriteResult.detail`.
 
+**Multi-profile merge**:
+What happens when a Profile writes an item Lithos already holds: `lithos_write` returns `duplicate` naming the existing note, and Influx reads it, unions the `profile:*` tags and `## Profile Relevance` entries, keeps the **richer body** (the one with full text / Tier 3; a tie keeps the existing body), and updates the note by `id` + `expected_version`. Nothing is written when the Profile is already on the note. See ADR 0003.
+
 **Squatter-shape dispatch**:
 The recovery strategy when `lithos_write` returns `slug_collision`. Influx reads the colliding note and routes by shape: **duplicate squatter** (carries matching `arxiv-id` or `source_url`) → treat as `duplicate`; **reclaimable squatter** (empty residue from an aborted write) → delete and retry; **distinct squatter** (genuinely different paper) → suffix-retry with `[arXiv <id>]` or `[<host>]`. Anything still colliding is appended to `unresolved-slug-collisions.jsonl`.
 
@@ -127,7 +130,7 @@ _Avoid_: probes (one input to Health), readiness (one output of Health).
 
 - A **Profile** has many **Runs** over time; at most one Run per Profile is active at once (enforced by the **Coordinator**).
 - A **Run** consumes a **RunPlan** and produces a **RunOutcome**; its history lives in the **RunLedger**.
-- A **Run**'s Acquire stage walks: **Source**.fetch_candidates → **Filter** → pre-acquire `lithos_cache_lookup` → **Source**.acquire → **Acquired**. The pre-acquire `cache_lookup` is the primary `compose_dedup_query` lookup (title + first sentence of summary, #125). Backfill cache hits short-circuit before `Source.acquire`, so duplicate items skip the download / archive / extract cost; normal-run hits still acquire so the multi-profile merge path inside `LithosClient.write_note` runs.
+- A **Run**'s Acquire stage walks: **Source**.fetch_candidates → **Filter** → pre-acquire `lithos_cache_lookup` → **Source**.acquire → **Acquired**. The pre-acquire `cache_lookup` is the primary `compose_dedup_query` lookup (title + first sentence of summary, #125). Backfill cache hits short-circuit before `Source.acquire`, so duplicate items skip the download / archive / extract cost. A normal-run hit whose note already carries the Profile (or its rejection) short-circuits too; any other hit is acquired so the **Multi-profile merge** inside `LithosClient.write_note` runs.
 - A **Run**'s Ingest stage walks: **Cascade**.enrich → **Renderer** → **LithosClient**.write_note → **LcmaWiring**.wire. On items the Acquire stage flagged as cache misses, Ingest also runs a defensive exact-`source_url` fallback (#128) before write — catching notes whose `source_url` is already in Lithos but whose title/first-sentence abstract drifted between runs, so they never silently fall through to a write-time `duplicate` rejection.
 - A **Cascade** consults **RepairCounters** before each tier and after counted failures.
 - A **LithosClient** owns **WriteResult** parsing and **Squatter-shape dispatch** internally.

@@ -402,13 +402,14 @@ _LITHOS_TOOLS: dict[str, dict[str, str]] = {
         "error": "TestCacheLookupChokepoint::test_empty_query_raises_before_rpc",
     },
     "lithos_read": {
-        "happy": "TestWriteEnvelopeVersionConflict::test_version_conflict_reread",
+        "happy": "TestWriteEnvelopeDuplicateMerge::"
+        "test_second_profile_merges_into_existing_note",
         "error": "TestFeedbackFetch::test_fetch_titles_fallback_to_read",
     },
     "lithos_write": {
         "happy": "TestWriteNote::test_happy_path_arxiv_item",
         "error": "TestWriteEnvelopeDuplicate + InvalidInput + SlugCollision + "
-        "VersionConflict + ContentTooLarge",
+        "DuplicateMerge + ContentTooLarge",
     },
     "lithos_list": {
         "happy": "TestListNotes::test_happy_path_with_tags",
@@ -473,7 +474,7 @@ class TestACX6LithosContractTests:
             "TestWriteEnvelopeDuplicate",
             "TestWriteEnvelopeInvalidInput",
             "TestWriteEnvelopeSlugCollision",
-            "TestWriteEnvelopeVersionConflict",
+            "TestWriteEnvelopeDuplicateMerge",
             "TestWriteEnvelopeContentTooLarge",
         ]:
             assert cls in code, f"Missing error-envelope test class {cls}"

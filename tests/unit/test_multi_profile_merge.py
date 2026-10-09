@@ -2,16 +2,15 @@
 
 Verifies that ``merge_tags()`` union-merges ``profile:*`` tags,
 ``merge_profile_relevance_union()`` preserves entries from non-current
-profiles, rejection authority is honoured, and the content-level merge
-helper correctly replaces the ``## Profile Relevance`` section.
+profiles, rejection authority is honoured, and
+``replace_profile_relevance_section()`` rewrites the section.  The
+note-level merge is covered in ``tests/unit/test_note_merge.py``.
 """
 
 from __future__ import annotations
 
 from influx.canonical_note import replace_profile_relevance_section
-from influx.lithos_client import (
-    _merge_profile_relevance_in_content,
-)
+from influx.note_merge import merge_into_existing
 from influx.notes import (
     merge_tags,
     parse_note,
@@ -283,141 +282,6 @@ class TestProfileRelevanceUnionMerge:
         assert result[0].profile_name == PROFILE_A
 
 
-# ── Content-level Profile Relevance merge ───────���────────────────────
-
-
-class TestContentLevelProfileRelevanceMerge:
-    """_merge_profile_relevance_in_content() correctly merges sections."""
-
-    def test_merge_adds_old_profile_entry_to_new_content(self) -> None:
-        """Profile A's entry from existing note is added to Profile B's new note."""
-        existing_tags = [
-            f"profile:{PROFILE_A}",
-            "source:arxiv",
-            "ingested-by:influx",
-            "schema:1",
-        ]
-        existing_content = _make_note_content(
-            tags=existing_tags,
-            profile_entries=[
-                ProfileRelevanceEntry(
-                    profile_name=PROFILE_A,
-                    score=8,
-                    reason="Relevant to AI robotics.",
-                ),
-            ],
-        )
-
-        new_tags = [
-            f"profile:{PROFILE_B}",
-            "source:arxiv",
-            "ingested-by:influx",
-            "schema:1",
-        ]
-        new_content = _make_note_content(
-            tags=new_tags,
-            profile_entries=[
-                ProfileRelevanceEntry(
-                    profile_name=PROFILE_B,
-                    score=7,
-                    reason="Relevant to web tech.",
-                ),
-            ],
-        )
-
-        merged_tags = [
-            f"profile:{PROFILE_A}",
-            f"profile:{PROFILE_B}",
-            "source:arxiv",
-            "ingested-by:influx",
-            "schema:1",
-        ]
-        merged_content = _merge_profile_relevance_in_content(
-            existing_content, new_content, merged_tags
-        )
-
-        # Parse and verify both entries are present
-        parsed = parse_note(merged_content)
-        entries = parse_profile_relevance(parsed)
-        by_name = {e.profile_name: e for e in entries}
-
-        assert PROFILE_A in by_name
-        assert by_name[PROFILE_A].score == 8
-        assert PROFILE_B in by_name
-        assert by_name[PROFILE_B].score == 7
-
-    def test_merge_preserves_user_notes_section(self) -> None:
-        """Content-level merge does not damage ## User Notes."""
-        tags = [
-            f"profile:{PROFILE_A}",
-            "source:arxiv",
-            "ingested-by:influx",
-            "schema:1",
-        ]
-        existing_content = _make_note_content(
-            tags=tags,
-            profile_entries=[
-                ProfileRelevanceEntry(
-                    profile_name=PROFILE_A,
-                    score=8,
-                    reason="AI.",
-                ),
-            ],
-        )
-
-        new_tags = [
-            f"profile:{PROFILE_B}",
-            "source:arxiv",
-            "ingested-by:influx",
-            "schema:1",
-        ]
-        new_content = _make_note_content(
-            tags=new_tags,
-            profile_entries=[
-                ProfileRelevanceEntry(
-                    profile_name=PROFILE_B,
-                    score=7,
-                    reason="Web.",
-                ),
-            ],
-        )
-
-        merged_content = _merge_profile_relevance_in_content(
-            existing_content, new_content, tags + [f"profile:{PROFILE_B}"]
-        )
-
-        assert "## User Notes" in merged_content
-
-    def test_merge_with_no_old_entries_returns_new(self) -> None:
-        """When existing note has no Profile Relevance entries, return new content."""
-        new_tags = [
-            f"profile:{PROFILE_A}",
-            "source:arxiv",
-            "ingested-by:influx",
-            "schema:1",
-        ]
-        new_content = _make_note_content(
-            tags=new_tags,
-            profile_entries=[
-                ProfileRelevanceEntry(
-                    profile_name=PROFILE_A,
-                    score=8,
-                    reason="AI.",
-                ),
-            ],
-        )
-        # Existing content with empty profile relevance
-        existing_content = _make_note_content(
-            tags=new_tags,
-            profile_entries=[],
-        )
-
-        merged = _merge_profile_relevance_in_content(
-            existing_content, new_content, new_tags
-        )
-        assert merged == new_content
-
-
 # ── replace_profile_relevance_section (canonical_note) ───────────────
 
 
@@ -510,8 +374,14 @@ class TestSingleProfileRunPreservesOthers:
             "ingested-by:influx",
             "schema:1",
         ]
-        new_content = _make_note_content(
+        # ... with a richer (full-text) body, so the merge rewrites the note.
+        new_content = render_note(
+            title="Shared Paper",
             tags=new_tags,
+            confidence=0.8,
+            archive_path=None,
+            summary="A shared paper abstract.",
+            keywords=[],
             profile_entries=[
                 ProfileRelevanceEntry(
                     profile_name=PROFILE_B,
@@ -519,19 +389,27 @@ class TestSingleProfileRunPreservesOthers:
                     reason="Web tech.",
                 ),
             ],
+            full_text="The whole paper.",
         )
 
+        merged = merge_into_existing(
+            title="Shared Paper",
+            existing_content=existing_content,
+            existing_tags=existing_tags,
+            existing_confidence=0.8,
+            incoming_content=new_content,
+            incoming_tags=[*new_tags, "full-text"],
+            incoming_confidence=0.7,
+        )
+
+        assert merged is not None
+        assert merged.kept_existing_body is False
         # Tags are union-merged
-        merged_tags = merge_tags(existing_tags=existing_tags, new_tags=new_tags)
-        assert f"profile:{PROFILE_A}" in merged_tags
-        assert f"profile:{PROFILE_B}" in merged_tags
+        assert f"profile:{PROFILE_A}" in merged.tags
+        assert f"profile:{PROFILE_B}" in merged.tags
 
         # Profile Relevance is union-merged
-        merged_content = _merge_profile_relevance_in_content(
-            existing_content, new_content, merged_tags
-        )
-
-        parsed = parse_note(merged_content)
+        parsed = parse_note(merged.content)
         entries = parse_profile_relevance(parsed)
         by_name = {e.profile_name: e for e in entries}
         assert PROFILE_A in by_name, "profile:ai-robotics entry must be preserved"
