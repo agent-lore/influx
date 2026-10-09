@@ -17,6 +17,10 @@ what the merged note looks like:
   (``full-text``, ``text:*``, the terminal markers), so a later,
   lower-scoring Profile's summary-only write never replaces an earlier
   Profile's full text.
+- ``influx:repair-needed`` stays if either side has it.  The repair sweep
+  only visits flagged notes, re-derives what the merged note is missing
+  (the added Profile's score may now require Tier 2 / Tier 3), and clears
+  the flag once nothing is; dropping it would strand that enrichment.
 - Confidence is the higher of the two (FR-NOTE-8).
 
 It returns ``None`` when the merge would add nothing: no new Profile and no
@@ -47,6 +51,7 @@ from influx.renderer import merge_profile_relevance_union
 __all__ = ["MergedNote", "merge_into_existing"]
 
 _PROFILE_PREFIX = "profile:"
+_REPAIR_NEEDED = "influx:repair-needed"
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,7 @@ def merge_into_existing(
         )
         content = existing_content
 
+    tags = _keep_repair_flag(tags, existing_tags, incoming_tags)
     added = tuple(sorted(_profiles(tags) - _profiles(existing_tags)))
     if not take_incoming and not added:
         return None
@@ -113,6 +119,15 @@ def merge_into_existing(
         kept_existing_body=not take_incoming,
         added_profiles=added,
     )
+
+
+def _keep_repair_flag(
+    tags: list[str], existing_tags: Sequence[str], incoming_tags: Sequence[str]
+) -> list[str]:
+    """*tags* plus ``influx:repair-needed`` when either side carries it."""
+    if _REPAIR_NEEDED in tags or _REPAIR_NEEDED not in (*existing_tags, *incoming_tags):
+        return tags
+    return [*tags, _REPAIR_NEEDED]
 
 
 def _parse_canonical(content: str, title: str) -> CanonicalNote | None:

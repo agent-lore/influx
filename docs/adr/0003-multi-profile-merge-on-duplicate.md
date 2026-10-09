@@ -29,7 +29,9 @@ text extraction, Tier 1–3 LLM calls) before Lithos replied `duplicate`.
   A note read without a `version` is not merged, since the update would be an
   unguarded overwrite. The hook covers every create-path write, including the
   `content_too_large` trim retry (Lithos checks size before its `source_url`
-  index) and a slug-collision recovery that names the note owning the URL.
+  index) and a slug-collision recovery that identifies the item's note,
+  either by the `source_url` pre-check or by squatter inspection (matching
+  `arxiv-id` or canonical URL, e.g. a note stored under an older http URL).
 - **The richer body wins.** A body ranks by whether it has `## Full Text` and
   whether it has Tier 3 content. The incoming body replaces the existing one
   only when it ranks strictly higher and does not drop the existing note's
@@ -53,6 +55,14 @@ text extraction, Tier 1–3 LLM calls) before Lithos replied `duplicate`.
 - **Only Influx's notes.** A note without `ingested-by:influx` is another
   agent's; the merge leaves it alone. A body with none of the canonical
   sections is never ranked or replaced, though tags still merge.
+- **The repair flag survives.** `influx:repair-needed` stays on the merged
+  note if either side had it. The repair sweep only visits flagged notes; it
+  re-derives what is missing from the merged note (the added Profile's score
+  may now require Tier 2 or Tier 3) and clears the flag once nothing is.
+  Dropping it would strand that enrichment for good, because later runs skip
+  the Profile as `skip-present` (found in the PR #304 review: Profile B scores
+  9, its Tier 3 call fails, its full-text body ties with Profile A's, and A's
+  body is kept).
 - **Confidence** is the higher of the two (FR-NOTE-8).
 
 ## Consequences

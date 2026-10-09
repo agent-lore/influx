@@ -267,6 +267,53 @@ class TestRicherBodyWins:
         assert "tier2_attempts: 3" in merged.content
 
 
+class TestRepairFlag:
+    """``influx:repair-needed`` is what puts a note in front of the repair
+    sweep, which re-derives what is missing and clears the flag once
+    nothing is.  Dropping it on a merge strands the note (PR #304 review)."""
+
+    def test_incoming_flag_survives_when_existing_body_is_kept(self) -> None:
+        """Profile B scores 9 but its Tier 3 call failed: its full-text body
+        ties with A's, so A's body stays — and B's repair flag must too, or
+        the Tier 3 B's score requires is never retried."""
+        merged = _merge(
+            existing_content=_note("ai-agents", 8, full_text="Existing text."),
+            existing_tags=_tags("ai-agents", "full-text", "text:html"),
+            incoming_content=_note("knowledge-systems", 9, full_text="Incoming."),
+            incoming_tags=_tags(
+                "knowledge-systems", "full-text", "text:html", "influx:repair-needed"
+            ),
+        )
+
+        assert merged is not None
+        assert merged.kept_existing_body is True
+        assert "influx:repair-needed" in merged.tags
+        assert "profile:knowledge-systems" in merged.tags
+
+    def test_existing_flag_survives_when_incoming_body_wins(self) -> None:
+        merged = _merge(
+            existing_content=_note("ai-agents", 7),
+            existing_tags=_tags("ai-agents", "influx:repair-needed"),
+            incoming_content=_note("knowledge-systems", 9, full_text="Body."),
+            incoming_tags=_tags("knowledge-systems", "full-text"),
+        )
+
+        assert merged is not None
+        assert merged.kept_existing_body is False
+        assert merged.tags.count("influx:repair-needed") == 1
+
+    def test_no_flag_when_neither_side_has_one(self) -> None:
+        merged = _merge(
+            existing_content=_note("ai-agents", 8),
+            existing_tags=_tags("ai-agents"),
+            incoming_content=_note("knowledge-systems", 7),
+            incoming_tags=_tags("knowledge-systems"),
+        )
+
+        assert merged is not None
+        assert "influx:repair-needed" not in merged.tags
+
+
 class TestNothingToMerge:
     def test_same_profile_and_no_richer_body_is_a_no_op(self) -> None:
         assert (

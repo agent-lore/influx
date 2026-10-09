@@ -1034,10 +1034,13 @@ class LithosClient:
                 source_url,
                 classification.reason,
             )
+            # The squatter is this item's note; name it so the
+            # multi-profile merge can update it.
             return WriteResult(
                 status="duplicate",
                 source_url=source_url,
                 detail=f"recovered: {classification.reason}",
+                note_id=squatter_id,
             )
 
         if classification.kind == "reclaimable":

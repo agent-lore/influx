@@ -1980,9 +1980,13 @@ class TestSlugCollisionUrlIdentityRecovery:
         # Still recovered as duplicate, just via the squatter-shape path.
         assert result.status == "duplicate"
         assert "arxiv-id:2604.28197" in result.detail
-        # And the squatter WAS read this time.
+        # And the squatter WAS read this time — once for inspection and once
+        # by the multi-profile merge, which leaves it alone because it is
+        # not Influx-authored (one write: the original create).
         read_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_read"]
-        assert len(read_calls) == 1
+        assert [c[1]["id"] for c in read_calls] == ["doc-dup-1", "doc-dup-1"]
+        write_calls = [c for c in fake_lithos_server.calls if c[0] == "lithos_write"]
+        assert len(write_calls) == 1
 
     async def test_url_neighbour_falls_through_to_squatter_inspection(
         self,
@@ -2611,6 +2615,50 @@ class TestWriteEnvelopeDuplicateMerge:
         assert update["id"] == "note-054"
         assert update["expected_version"] == 6
         assert "profile:knowledge-systems" in update["tags"]
+
+    async def test_slug_collision_squatter_duplicate_merges(
+        self,
+        fake_lithos_url: str,
+        fake_lithos_server: FakeLithosServer,
+        clear_fake_calls: None,
+    ) -> None:
+        """The URL pre-check misses (the stored note has an older http URL)
+        but squatter inspection matches it by arxiv-id: merge into it by
+        the id inspection already read (PR #304 review)."""
+        squatter = read_note_json(
+            "note-055",
+            title=_MERGE_TITLE,
+            content=_merge_note("ai-agents", 8),
+            tags=[*_MERGE_BASE_TAGS, "arxiv-id:2601.11111", "profile:ai-agents"],
+            version=3,
+            source_url="http://arxiv.org/abs/2601.11111",
+        )
+        fake_lithos_server.write_responses.extend(
+            [
+                json.dumps(
+                    {
+                        "status": "slug_collision",
+                        "existing_id": "note-055",
+                        "message": "slug taken",
+                        "warnings": [],
+                    }
+                ),
+                write_ok_json("note-055", status="updated"),
+            ]
+        )
+        # One read for squatter inspection, one for the merge.
+        fake_lithos_server.read_responses.extend([squatter, squatter])
+
+        result = await _write_incoming(fake_lithos_url)
+
+        assert result.status == "updated"
+        assert result.note_id == "note-055"
+        update = _writes(fake_lithos_server)[1]
+        assert update["id"] == "note-055"
+        assert update["expected_version"] == 3
+        assert "profile:knowledge-systems" in update["tags"]
+        # The merge leaves the stored (older) source_url alone.
+        assert update["source_url"] == ""
 
     async def test_trimmed_create_retry_that_hits_duplicate_still_merges(
         self,
