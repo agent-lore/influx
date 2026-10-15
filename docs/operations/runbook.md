@@ -69,7 +69,8 @@ Three quick signals, all read-only:
   duration, and source-acquisition errors. Active runs (if any) appear
   above the list.
 - **`failures`** filters to `failed`, `abandoned`, and `degraded` runs
-  in one go. A `degraded` run completed but is flagged for at least
+  in one go, and lists `skipped` runs (circuit-breaker short-circuit,
+  `lithos_unhealthy` / `lcma_tools_unavailable`, #40) separately. A `degraded` run completed but is flagged for at least
   one structured reason in `degraded_reasons`:
   - `source_acquisition` (issue #20) — at least one source-fetch
     failure was swallowed; the body of the run still landed.
