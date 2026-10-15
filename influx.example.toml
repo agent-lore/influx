@@ -9,6 +9,20 @@
 [influx]
 note_schema_version = 1         # stamped on every Influx-authored note
 
+# Lithos MCP connection.  ``url`` is the SSE endpoint of the Lithos server
+# (e.g. "http://lithos:8765/sse"); ``transport`` must be "sse" — it is the
+# only transport the client implements.  Both can be overridden from the
+# environment (LITHOS_URL, LITHOS_MCP_TRANSPORT); the env values are applied
+# before validation and win over the file.  Note the Docker stack does NOT
+# forward LITHOS_URL into the container, so set ``url`` here when running
+# under docker/docker-compose.yml.
+# With ``url = ""`` (the default) ``validate-config`` skips its Lithos
+# dry-connect, ``serve`` still starts, and the readiness probe reports
+# Lithos as degraded ("Lithos URL not configured") until a URL is set.
+[lithos]
+url = ""
+transport = "sse"
+
 [schedule]
 cron = "0 6 * * *"              # daily at 06:00
 timezone = "UTC"
@@ -30,7 +44,7 @@ max_download_bytes = 52_428_800 # 50 MB per file
 download_timeout_seconds = 30
 
 # Issue #149: domain-aware archive acquisition policy.  Maps a host
-# suffix to one of three modes:
+# suffix to one of four modes:
 #   blocked       — try the download but expect HTTP 403 / WAF; the
 #                    note is tagged ``influx:archive-blocked`` and
 #                    ``influx:archive-terminal`` so the repair sweep
@@ -39,7 +53,16 @@ download_timeout_seconds = 30
 #                    tagged ``influx:archive-rate-limited`` and stays
 #                    in the normal repair-needed loop.
 #   skip          — do not attempt the download at all; the note is
-#                    tagged ``influx:archive-skipped-by-policy``.
+#                    tagged ``influx:archive-skipped-by-policy`` and
+#                    ``influx:archive-missing`` (still counts toward the
+#                    run-level ``archive_acquisition`` degraded reason).
+#   unsupported   — (issue #161) do not attempt the download and treat
+#                    the domain as having no archive surface at all; the
+#                    note is tagged ``influx:archive-unsupported`` and
+#                    ``influx:archive-terminal`` but NOT
+#                    ``influx:archive-missing``, so the run is not
+#                    degraded.  Use for domains where 403 is the
+#                    permanent contract (e.g. ``openai.com``).
 # A built-in defaults set already covers the staging hot offenders
 # (``science.org``, ``alignmentforum.org``, ``therobotreport.com``,
 # ``tnmoc.org``, ``lesswrong.com``); set ``include_defaults = false``
@@ -56,6 +79,9 @@ download_timeout_seconds = 30
 #
 # [storage.archive_policy.skip]
 # "never.example" = "auth-walled; archive disabled permanently"
+#
+# [storage.archive_policy.unsupported]
+# "openai.com" = "403 is the permanent contract; no archive surface"
 
 [notifications]
 timeout_seconds = 5
@@ -318,6 +344,12 @@ negative_example_max_title_chars = 200
 [extraction]
 min_html_chars = 1000
 min_web_chars = 500
+# Issue #166: thin-summary suppression.  When an item's archive fetch
+# fails AND its (post-fallback) summary is shorter than this, the source
+# adapter drops the item instead of writing a summary-only note.  ``0``
+# disables the length rule only — title-equality and boilerplate-pattern
+# suppression still fire.
+min_summary_chars = 80
 strip_tags = ["script", "iframe", "object", "embed"]
 
 # ---------------------------------------------------------------------------
@@ -373,6 +405,19 @@ max_items_per_run = 100
 # ---------------------------------------------------------------------------
 # Telemetry
 # ---------------------------------------------------------------------------
+# NOT WIRED: this section is validated by the config model but never
+# consulted when the OTEL exporters are set up.  ``src/influx/telemetry.py``
+# reads the environment only:
+#   INFLUX_OTEL_ENABLED=true            turn traces + metrics on
+#   INFLUX_OTEL_CONSOLE_FALLBACK=true   stdout exporters when no endpoint
+#   OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT
+#   OTEL_EXPORTER_OTLP_PROTOCOL         (http/protobuf)
+#   OTEL_SERVICE_NAME                   resource service.name (default "influx")
+#   INFLUX_ENVIRONMENT                  resource deployment.environment
+#   OTEL_BSP_SCHEDULE_DELAY             span batch export delay (ms)
+# docker/docker-compose.yml forwards these from the per-environment
+# .env.<env> file.  The values below are kept so existing files still
+# validate; changing them has no effect.
 
 [telemetry]
 enabled = false

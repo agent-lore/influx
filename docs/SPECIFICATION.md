@@ -1,8 +1,8 @@
 # Influx - Specification
 
 Version: 0.1.0
-Date: 2026-04-29
-Status: Aligned with Implementation
+Date: 2026-10-11
+Status: Aligned with Implementation (maintained as a living document; the date is the last reconciliation against the code)
 
 ---
 
@@ -120,7 +120,7 @@ Environment overrides are applied for selected runtime values. The complete anno
 - `[influx]`: `note_schema_version`, stamped as `schema:<version>` on Influx-authored notes.
 - `[lithos]`: Lithos MCP endpoint and transport. Only `transport = "sse"` is supported.
 - `[schedule]`: cron expression, timezone, misfire grace, shutdown grace, optional initial-tick jitter (`initial_jitter_seconds`), and optional inter-profile gap (`inter_profile_gap_seconds`).
-- `[storage]`: archive directory, local state directory, retention setting, max download size, and download timeout.
+- `[storage]`: archive directory, local state directory, retention setting, max download size, and download timeout. `[storage.archive_policy]` adds per-domain acquisition modes (`blocked`, `rate_limited`, `skip`, `unsupported`) merged over a built-in default set (`include_defaults`).
 - `[notifications]`: outbound timeout plus typed `[[notifications.webhooks]]` sinks. `notifications.webhook_url` remains as a legacy single-sink generic-digest fallback.
 - `[security]`: outbound/private-IP and remote-admin bind policy.
 - `[[profiles]]`: profile name, description, thresholds, and source configuration.
@@ -128,11 +128,12 @@ Environment overrides are applied for selected runtime values. The complete anno
 - `[models.*]`: model slots for `filter`, `enrich`, and `extract`.
 - `[prompts.*]`: inline prompt text or prompt file paths for `filter`, `tier1_enrich`, and `tier3_extract`.
 - `[filter]`: batch size and negative-example tuning.
-- `[extraction]`: minimum extracted text lengths and stripped HTML tags.
+- `[extraction]`: minimum extracted text lengths, thin-summary suppression threshold (`min_summary_chars`, default 80), and stripped HTML tags.
 - `[resilience]`: retry, backoff, arXiv pacing, and Lithos write-conflict settings.
 - `[feedback]`: negative feedback example limits.
 - `[repair]`: repair sweep batch limit.
-- `[telemetry]`: optional OpenTelemetry setup.
+- `[telemetry]`: accepted and validated but not consulted; OpenTelemetry is controlled by environment variables only (§13.2).
+- `[inbox]`: opt-in manual-submission intake (§17).
 
 ### 3.3 Validation Rules
 
@@ -245,7 +246,7 @@ The arXiv provider:
 
 Archive failures do not abort note creation. The note is tagged `influx:archive-missing` and `influx:repair-needed`, and the Archive section is left empty.
 
-Issue #149: archive acquisition consults a per-domain policy registry built from `[storage.archive_policy]`. Domains classified as `blocked` (HTTP 403 / WAF challenge), `rate_limited` (HTTP 429 under normal cadence), or `skip` (no attempt made at all) produce distinct note tags — `influx:archive-blocked`, `influx:archive-rate-limited`, or `influx:archive-skipped-by-policy` — alongside the generic `influx:archive-missing`. `blocked` and `skip` notes additionally carry `influx:archive-terminal` **at acquisition time** so the repair sweep stops re-attempting the doomed path. The defaults set covers staging hot offenders (`science.org`, `alignmentforum.org`, `therobotreport.com`, …).
+Issue #149: archive acquisition consults a per-domain policy registry built from `[storage.archive_policy]`. Domains classified as `blocked` (HTTP 403 / WAF challenge), `rate_limited` (HTTP 429 under normal cadence), or `skip` (no attempt made at all) produce distinct note tags — `influx:archive-blocked`, `influx:archive-rate-limited`, or `influx:archive-skipped-by-policy` — alongside the generic `influx:archive-missing`. `blocked` and `skip` notes additionally carry `influx:archive-terminal` **at acquisition time** so the repair sweep stops re-attempting the doomed path. A fourth mode, `unsupported` (issue #161), also makes no attempt but tags `influx:archive-unsupported` + `influx:archive-terminal` **without** `influx:archive-missing`, so domains that systematically refuse archive acquisition (e.g. `openai.com`) do not degrade the run. The defaults set covers staging hot offenders (`science.org`, `alignmentforum.org`, `therobotreport.com`, …).
 
 ### 6.2 RSS and Atom Feeds
 
@@ -373,8 +374,8 @@ Ledger entries include:
 
 - `run_id`
 - `profile`
-- `kind`: `scheduled`, `manual`, or `backfill`
-- `status`: `running`, `completed`, `failed`, or `abandoned`
+- `kind`: `scheduled`, `manual`, `backfill`, or `inbox`
+- `status`: `running`, `completed`, `failed`, `skipped`, or `abandoned`
 - `run_range`
 - `started_at`
 - `completed_at`
@@ -390,6 +391,7 @@ Ledger entries include:
 - Scheduled runs generate a UUID.
 - Completed runs record `sources_checked` and `ingested` when available.
 - Failed runs record the exception type and message.
+- Skipped runs (`RunLedger.skip`) never started any source-fetch, LLM, or write work because a circuit breaker opened first; `error` records the reason (`lithos_unhealthy` or `lcma_tools_unavailable`, see §13.1) and `sources_checked` / `ingested` are null. Distinct from `failed`, which means the run started and crashed.
 - Active runs left behind by a previous process are marked `abandoned` on startup.
 
 ---
@@ -754,7 +756,7 @@ Multiple reasons can apply to a single run, but the three stall reasons (`ingest
 
 ### 13.2 Telemetry
 
-When telemetry is enabled (`INFLUX_OTEL_ENABLED=true`), Influx exports OTEL traces and metrics. Both signals share the same toggle, the same OTLP endpoint configuration (`OTEL_EXPORTER_OTLP_ENDPOINT`), and the same resource attributes (`service.name=influx`, `deployment.environment=<INFLUX_ENVIRONMENT>`).
+When telemetry is enabled (`INFLUX_OTEL_ENABLED=true`), Influx exports OTEL traces and metrics. Both signals share the same toggle, the same OTLP endpoint configuration (`OTEL_EXPORTER_OTLP_ENDPOINT`), and the same resource attributes (`service.name=<OTEL_SERVICE_NAME, default influx>`, `deployment.environment=<INFLUX_ENVIRONMENT>`). These environment variables are the only control: the `[telemetry]` TOML section is validated by the config model but `telemetry.py` never reads it when wiring exporters.
 
 Spans are emitted for run, source fetch, archive download, enrichment, Lithos write, and Lithos retrieve operations.
 
