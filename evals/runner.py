@@ -330,11 +330,12 @@ def _finish(
     except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         return replace(base, error="parse", error_detail=f"envelope: {exc}")
     usage = _usage_from(resp)
+    raw = content if isinstance(content, str) else ""
     try:
         parsed = parse_json_content(content)
     except JsonContentError as exc:
         return replace(
-            base, usage=usage, raw_content=content, error="parse", error_detail=str(exc)
+            base, usage=usage, raw_content=raw, error="parse", error_detail=str(exc)
         )
     salvaged = not _is_clean_object(content)
     if salvaged:

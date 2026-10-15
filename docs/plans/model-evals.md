@@ -182,10 +182,11 @@ Anything short of that is a prompt-tuning or `reasoning_effort` iteration
 
 Dataset: 23 filter batches (230 candidates: live arXiv + RSS for the 8 prod
 profiles), 32 Tier-1 cases sampled from those candidates, 40 Tier-3 cases
-mined from prod notes with full text. Prompts, profiles and thresholds are
-the live prod `influx.toml`. Judge: `anthropic/claude-sonnet-4.6` via
-OpenRouter, both position orders, disagreement counted as a tie. Total
-spend for every run and the judge: under $6.
+mined from prod notes with full text (4k–114k chars). Prompts, profiles and
+thresholds are the live prod `influx.toml`. Judge: `anthropic/claude-sonnet-4.6`
+via OpenRouter, both position orders, disagreement counted as a tie, the
+*whole* source text supplied (a source over the judge's cap is excluded,
+never clipped). Total spend for every run and the judge: about $12.
 
 ### 7.1 Validity, latency, cost
 
@@ -209,7 +210,9 @@ writes ~55% more output; the extract slot's timeout goes to 120s.
    prose ("We need JSON only. Assess scores…") and once never got to the
    JSON. Strict structured outputs (`json_schema_strict = true`) removed it
    completely (23/23). The filter scorer now sends the `FilterResponse`
-   schema when the slot opts in.
+   schema when the slot opts in — a review of PR #309 caught that the
+   first cut only did so in the harness, and a test now pins the
+   production and eval request bodies to each other.
 2. **Object, stray tokens, object again.** On long Tier-3 outputs Luna
    sometimes emits a complete object, then junk such as `ciao` or a leaked
    `assistant to=final` marker, then the object again. Strict mode does not
@@ -244,7 +247,7 @@ so `none` stays.
 | slot | Luna wins | baseline wins | ties | mean judge score baseline → Luna |
 |---|---:|---:|---:|---|
 | tier1 | 23 | 6 | 3 | 2.4 → 3.5 |
-| tier3 | 39 | 0 | 1 | 2.7 → 4.7 |
+| tier3 | 40 | 0 | 0 | 2.7 → 4.7 |
 
 Luna is more faithful and more specific (concrete numbers from the source,
 no invented facts); where 4.1-mini won on Tier 1 it was for listing more

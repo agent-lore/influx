@@ -44,6 +44,11 @@ def parse_json_content(content: str, *, context: str = "") -> dict[str, Any]:
     WARNING records how much was discarded so the rate stays visible.
     Raises :class:`JsonContentError` when no object can be decoded.
     """
+    if not isinstance(content, str):
+        # ``message.content`` is null on a refusal / empty completion.
+        raise JsonContentError(
+            f"model content is {type(content).__name__}, not a string"
+        )
     try:
         value = json.loads(content)
     except json.JSONDecodeError:

@@ -13,6 +13,7 @@ from evals.runner import ModelSpec, Runner
 from influx.config import AppConfig
 from influx.enrich import render_tier1_prompt
 from influx.errors import NetworkError
+from influx.http_client import FetchResult
 from tests.evals.conftest import chat_response, error_response
 
 
@@ -181,3 +182,31 @@ def test_unknown_provider_is_a_clear_error(eval_config: AppConfig) -> None:
 
     with pytest.raises(ValueError, match="provider 'nope'"):
         runner.run_tier1([Tier1Case("t1", "ai-robotics", "T", "A")])
+
+
+def test_null_content_is_recorded_as_parse_error_and_cached_replay_agrees(
+    eval_config: AppConfig, tmp_path: Path
+) -> None:
+    envelope = {
+        "choices": [{"message": {"content": None}}],
+        "usage": {"prompt_tokens": 5},
+    }
+    null_response = FetchResult(
+        body=json.dumps(envelope).encode(),
+        status_code=200,
+        content_type="application/json",
+        final_url="https://example.test",
+    )
+    poster = _Poster([null_response])
+    case = Tier1Case("t1", "ai-robotics", "T", "A")
+
+    (first,) = Runner(eval_config, _SPEC, poster=poster, cache_dir=tmp_path).run_tier1(
+        [case]
+    )  # type: ignore[arg-type]
+    (replay,) = Runner(eval_config, _SPEC, poster=poster, cache_dir=tmp_path).run_tier1(
+        [case]
+    )  # type: ignore[arg-type]
+
+    assert first.error == "parse" and "NoneType" in first.error_detail
+    assert first.raw_content == "" and first.usage.prompt_tokens == 5
+    assert replay.error == "parse" and replay.meta["from_cache"] is True

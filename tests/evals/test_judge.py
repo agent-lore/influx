@@ -109,3 +109,21 @@ def test_summary_counts_and_errors() -> None:
         1,
     )
     assert s.baseline_mean == 3.0 and s.candidate_mean == 11 / 3
+
+
+def test_source_over_cap_is_excluded_not_truncated(eval_config: AppConfig) -> None:
+    poster = _Poster([])
+    judge = Judge(
+        eval_config,
+        model="judge",
+        provider="test-provider",
+        poster=poster,  # type: ignore[arg-type]
+        concurrency=1,
+        source_char_cap=100,
+    )
+
+    (verdict,) = judge.judge_outputs("tier3", [("c1", "t", "x" * 101, {}, {})])
+
+    assert verdict.error.startswith("source is 101 chars")
+    assert poster.prompts == []  # never sent a clipped source
+    assert summarize_verdicts([verdict]).judged == 0

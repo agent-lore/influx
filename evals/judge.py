@@ -26,7 +26,16 @@ from influx.llm_request import build_chat_request, provider_endpoint
 _log = logging.getLogger(__name__)
 
 _JUDGE_MAX_TOKENS = 1024
-_SOURCE_CHAR_CAP = 40_000
+# Sources longer than this are not judged (recorded as an error and left out
+# of the aggregate) rather than silently cut: a truncated source would make
+# supported claims from the tail look like hallucinations.  Default covers
+# the dataset builder's ``tier3_max_chars`` (120k chars ≈ 30k tokens).
+DEFAULT_SOURCE_CHAR_CAP = 130_000
+
+
+class SourceTooLong(ValueError):
+    """The source exceeds the judge's ``source_char_cap``."""
+
 
 _PAIRWISE_PROMPT = (
     "You are judging two structured extractions of the same source for an "
@@ -116,6 +125,7 @@ class Judge:
         reasoning_effort: str | None = None,
         poster: Poster | None = None,
         concurrency: int = 4,
+        source_char_cap: int = DEFAULT_SOURCE_CHAR_CAP,
     ) -> None:
         if provider not in config.providers:
             raise ValueError(f"judge provider {provider!r} is not configured")
@@ -134,6 +144,7 @@ class Judge:
         # Resolved at call time so tests can monkeypatch the module global.
         self._poster = poster or guarded_post_json_fetch
         self._concurrency = max(1, concurrency)
+        self._source_char_cap = source_char_cap
 
     def _ask(self, prompt: str) -> dict[str, Any]:
         url, headers = provider_endpoint(self._provider)
@@ -170,7 +181,10 @@ class Judge:
 
         Returns ``(winner as A/B/tie, a_score, b_score, rationale)``.
         """
-        source = source[:_SOURCE_CHAR_CAP]
+        if len(source) > self._source_char_cap:
+            raise SourceTooLong(
+                f"source is {len(source)} chars, judge cap is {self._source_char_cap}"
+            )
         first = self._ask(_PAIRWISE_PROMPT.format(task=task, source=source, a=a, b=b))
         second = self._ask(_PAIRWISE_PROMPT.format(task=task, source=source, a=b, b=a))
         w1 = str(first.get("winner", "tie")).upper()

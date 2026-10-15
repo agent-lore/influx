@@ -215,9 +215,17 @@ def cmd_compare(args: argparse.Namespace) -> int:
             provider=args.judge_provider,
             reasoning_effort=args.judge_reasoning_effort,
             concurrency=args.concurrency,
+            **(
+                {"source_char_cap": args.judge_source_cap}
+                if args.judge_source_cap is not None
+                else {}
+            ),
         )
         run_dir = args.root / "runs" / args.dataset / args.candidate
+        judge_slots = set(args.judge_slots.split(","))
         for slot, cases in (("tier1", tier1_cases), ("tier3", tier3_cases)):
+            if slot not in judge_slots:
+                continue
             rows = _judge_rows(
                 slot, cases, base[slot], cand[slot], profiles, args.judge_limit
             )
@@ -226,7 +234,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
             verdicts = judge.judge_outputs(slot, rows)
             write_jsonl(run_dir / f"judge-{slot}-vs-{args.baseline}.jsonl", verdicts)
             out += [f"**{slot}** — " + render_judge(summarize_verdicts(verdicts)), ""]
-        if base["filter"] and cand["filter"]:
+        if "filter" in judge_slots and base["filter"] and cand["filter"]:
             cmp = compare_filter(filter_cases, base["filter"], cand["filter"])
             rows = _filter_flip_rows(
                 filter_cases,
@@ -392,6 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--judge-provider", default="openrouter")
     p.add_argument("--judge-reasoning-effort", default=None)
     p.add_argument("--judge-limit", type=int, default=60)
+    p.add_argument(
+        "--judge-slots",
+        default="filter,tier1,tier3",
+        help="comma-separated subset of slots to (re-)judge",
+    )
+    p.add_argument("--judge-source-cap", type=int, default=None)
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--out", type=Path, default=None)
     p.set_defaults(func=cmd_compare)

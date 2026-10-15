@@ -54,7 +54,7 @@ from influx.llm_request import (
     parse_json_content,
     provider_endpoint,
 )
-from influx.schemas import FilterResponse
+from influx.schemas import FilterResponse, openai_strict_response_format
 from influx.source import Candidate, ScoredCandidate
 from influx.telemetry import record_filter_error
 
@@ -324,7 +324,11 @@ def make_default_batch_scorer(config: AppConfig) -> BatchScorer | None:
 
         user_message = render_filter_user_message(filter_prompt, candidates)
         url, headers = provider_endpoint(provider)
-        body = build_chat_request(slot, user_message)
+        body = build_chat_request(
+            slot,
+            user_message,
+            strict_response_format=openai_strict_response_format(FilterResponse),
+        )
 
         by_id: dict[str, Candidate] = {c.item_id: c for c in candidates}
         response = await _acall_filter_model_with_retry(

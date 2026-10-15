@@ -139,3 +139,7 @@ class TestParseJsonContent:
     def test_no_object_raises(self) -> None:
         with pytest.raises(JsonContentError):
             parse_json_content("nothing to see here")
+
+    def test_null_content_is_a_content_error_not_a_crash(self) -> None:
+        with pytest.raises(JsonContentError, match="NoneType"):
+            parse_json_content(None)  # type: ignore[arg-type]

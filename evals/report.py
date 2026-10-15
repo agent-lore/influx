@@ -15,7 +15,7 @@ def _money(value: float | None) -> str:
 def render_run_table(summaries: Sequence[RunSummary]) -> str:
     lines = [
         "| slot | model | cases | valid | salvaged | errors | retried | p50 s | p95 s "
-        "| prompt tok | completion tok | reasoning tok | cost | cost/case |",
+        + "| prompt tok | completion tok | reasoning tok | cost | cost/case |",
         "|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for s in summaries:
@@ -45,7 +45,7 @@ def render_filter_comparison(cmp: FilterComparison) -> str:
         f"{cmp.candidate_mean:.2f}",
         "",
         "| threshold | both pass | baseline only | candidate only | neither "
-        "| agreement | kappa |",
+        + "| agreement | kappa |",
         "|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for t in cmp.thresholds:
@@ -60,7 +60,7 @@ def render_shape(baseline: ShapeSummary, candidate: ShapeSummary) -> str:
     keys = sorted(set(baseline.list_means) | set(candidate.list_means))
     lines = [
         "| field | baseline mean len | candidate mean len | baseline empty "
-        "| candidate empty |",
+        + "| candidate empty |",
         "|---|---:|---:|---:|---:|",
     ]
     for k in keys:
