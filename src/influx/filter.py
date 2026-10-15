@@ -220,7 +220,9 @@ def _call_filter_model_with_retry(
         try:
             resp_json = json.loads(result.body.decode("utf-8"))
             content_str: str = resp_json["choices"][0]["message"]["content"]
-            parsed = parse_json_content(content_str)
+            parsed = parse_json_content(
+                content_str, context=f"slot=filter model={body.get('model')}"
+            )
             return FilterResponse.model_validate(parsed)
         except (
             UnicodeDecodeError,

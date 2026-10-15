@@ -167,7 +167,9 @@ def _call_json_model(
             ) from exc
 
         try:
-            return parse_json_content(content_str)
+            return parse_json_content(
+                content_str, context=f"slot={slot_name} model={slot.model}"
+            )
         except JsonContentError as exc:
             last_error = exc
             continue

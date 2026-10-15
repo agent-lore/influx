@@ -30,8 +30,11 @@ class JsonContentError(ValueError):
     """The model's message content held no JSON object."""
 
 
-def parse_json_content(content: str) -> dict[str, Any]:
+def parse_json_content(content: str, *, context: str = "") -> dict[str, Any]:
     """Return the JSON object in a model's message content.
+
+    *context* (e.g. ``"slot=extract model=openai/gpt-6-luna"``) is echoed in
+    the salvage WARNING so the rate can be read per slot from the logs.
 
     The fast path is the whole content being one object.  Reasoning models
     at ``reasoning_effort: "none"`` sometimes think aloud in the content
@@ -65,9 +68,10 @@ def parse_json_content(content: str) -> dict[str, Any]:
         if isinstance(value, dict):
             _log.warning(
                 "salvaged JSON object from model content: prefix=%d chars "
-                "trailing=%d chars",
+                "trailing=%d chars %s",
                 start,
                 len(content) - end,
+                context,
             )
             return value
         tried += 1

@@ -116,10 +116,11 @@ class TestParseJsonContent:
         content = 'We need JSON only. Scores: x 7, y 8.\n{"results": [{"id": "x"}]}'
 
         with caplog.at_level("WARNING", logger="influx.llm_request"):
-            parsed = parse_json_content(content)
+            parsed = parse_json_content(content, context="slot=filter model=m")
 
         assert parsed == {"results": [{"id": "x"}]}
         assert "salvaged JSON object" in caplog.text
+        assert "prefix=37 chars trailing=0 chars slot=filter model=m" in caplog.text
 
     def test_trailing_junk_and_duplicate_object_are_dropped(self) -> None:
         content = '{"claims": ["a"]} ciao\n\n{"claims": ["a"]'
