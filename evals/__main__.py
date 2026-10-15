@@ -10,6 +10,14 @@
     uv run python -m evals compare --dataset oct15 --config prod.toml \\
         --baseline gpt41mini --candidate luna-none \\
         --judge-model anthropic/claude-sonnet-4.6 --judge-provider openrouter
+    uv run python -m evals label --dataset oct15 --config prod.toml
+    uv run python -m evals grade --dataset oct15 --config prod.toml \\
+        --runs gpt41mini,luna-none
+
+``label`` collects your own relevance calls on the filter candidates
+(``datasets/<name>/labels.jsonl``); ``grade`` scores runs against them and
+``compare`` adds the same grades whenever labels exist.  See
+``docs/operations/model-evals.md``.
 
 API keys are read from the environment (``--env-file`` loads a dotenv file
 first).  Datasets, runs and the response cache live under ``--root``
@@ -19,6 +27,7 @@ first).  Datasets, runs and the response cache live under ``--root``
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import logging
 import sys
@@ -30,19 +39,32 @@ from dotenv import load_dotenv
 from evals.cases import load_dataset, read_results, write_jsonl
 from evals.dataset import DatasetSpec, build_dataset
 from evals.judge import Judge, summarize_verdicts
+from evals.labels import (
+    LABELS_FILE,
+    label_items,
+    label_tiers,
+    read_labels,
+    run_labelling,
+)
 from evals.metrics import (
     compare_filter,
+    grade_filter,
+    judge_label_agreement,
     summarize_run,
     summarize_shape,
 )
 from evals.report import (
     render_filter_comparison,
     render_judge,
+    render_judge_vs_labels,
+    render_label_grades,
+    render_label_misses,
+    render_label_mix,
     render_run_table,
     render_shape,
 )
 from evals.runner import ModelSpec, Runner
-from influx.config import load_config
+from influx.config import AppConfig, load_config
 
 _ROOT = Path(__file__).resolve().parent
 _SLOTS = ("filter", "tier1", "tier3")
@@ -78,6 +100,36 @@ def _setup(args: argparse.Namespace):
     if args.env_file:
         load_dotenv(args.env_file)
     return load_config(args.config, check_api_keys=False)
+
+
+def _gate_thresholds(config: AppConfig) -> dict[str, tuple[int, int, int]]:
+    """``profile → (relevance, full_text, deep_extract)``: the label tiers' gates."""
+    return {
+        p.name: (
+            p.thresholds.relevance,
+            p.thresholds.full_text,
+            p.thresholds.deep_extract,
+        )
+        for p in config.profiles
+    }
+
+
+def _default_labeller() -> str:
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError):  # no login name (e.g. a bare container)
+        return ""
+
+
+def _label_tiers(dataset_dir: Path) -> dict[tuple[str, str], int]:
+    try:
+        return label_tiers(read_labels(dataset_dir / LABELS_FILE))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _split(value: str) -> tuple[str, ...]:
+    return tuple(v.strip() for v in value.split(",") if v.strip())
 
 
 def cmd_build_dataset(args: argparse.Namespace) -> int:
@@ -158,6 +210,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     base = _load_run(args.root, args.dataset, args.baseline)
     cand = _load_run(args.root, args.dataset, args.candidate)
     profiles = {p.name: p for p in config.profiles}
+    relevance = {name: p.thresholds.relevance for name, p in profiles.items()}
 
     out: list[str] = [
         f"# Eval: {args.candidate} vs {args.baseline} on `{args.dataset}`",
@@ -183,12 +236,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
             }
         )
         cmp = compare_filter(
-            filter_cases, base["filter"], cand["filter"], thresholds=thresholds
+            filter_cases,
+            base["filter"],
+            cand["filter"],
+            thresholds=thresholds,
+            relevance=relevance,
         )
         out += ["", "## Filter: score agreement", "", render_filter_comparison(cmp)]
         out += [
             "",
-            f"Relevance-decision flips at threshold {thresholds[0]}: "
+            "Ingest-decision flips (at each profile's own relevance threshold): "
             f"{len(cmp.disagreements)}",
         ]
         if cmp.disagreements:
@@ -200,6 +257,19 @@ def cmd_compare(args: argparse.Namespace) -> int:
             out += [
                 f"| {c} | {i} | {b} | {d} |" for c, i, b, d in cmp.disagreements[:40]
             ]
+    labels = _label_tiers(dataset_dir)
+    gates = _gate_thresholds(config)
+    if labels and base["filter"] and cand["filter"]:
+        grades = [
+            (label, grade_filter(filter_cases, run["filter"], labels, gates))
+            for label, run in ((args.baseline, base), (args.candidate, cand))
+        ]
+        out += [
+            "",
+            "## Filter: graded against your labels",
+            "",
+            render_label_grades(grades),
+        ]
     for slot in ("tier1", "tier3"):
         if base[slot] and cand[slot]:
             out += ["", f"## {slot}: output shape", ""]
@@ -235,7 +305,9 @@ def cmd_compare(args: argparse.Namespace) -> int:
             write_jsonl(run_dir / f"judge-{slot}-vs-{args.baseline}.jsonl", verdicts)
             out += [f"**{slot}** — " + render_judge(summarize_verdicts(verdicts)), ""]
         if "filter" in judge_slots and base["filter"] and cand["filter"]:
-            cmp = compare_filter(filter_cases, base["filter"], cand["filter"])
+            cmp = compare_filter(
+                filter_cases, base["filter"], cand["filter"], relevance=relevance
+            )
             rows = _filter_flip_rows(
                 filter_cases,
                 base["filter"],
@@ -252,6 +324,19 @@ def cmd_compare(args: argparse.Namespace) -> int:
                     "**filter flips** — " + render_judge(summarize_verdicts(verdicts)),
                     "",
                 ]
+                if labels:
+                    check = judge_label_agreement(
+                        [
+                            (v.case_id, v.item_id, v.winner)
+                            for v in verdicts
+                            if not v.error
+                        ],
+                        cmp.disagreements,
+                        {c.case_id: c.profile for c in filter_cases},
+                        labels,
+                        gates,
+                    )
+                    out += [render_judge_vs_labels(check), ""]
 
     text = "\n".join(out) + "\n"
     target = args.out or (
@@ -260,6 +345,68 @@ def cmd_compare(args: argparse.Namespace) -> int:
         / args.dataset
         / f"compare-{args.candidate}-vs-{args.baseline}.md"
     )
+    target.write_text(text, encoding="utf-8")
+    print(text)
+    print(f"written: {target}", file=sys.stderr)
+    return 0
+
+
+def cmd_label(args: argparse.Namespace) -> int:
+    config = _setup(args)
+    dataset_dir = args.root / "datasets" / args.dataset
+    filter_cases, _tier1, _tier3 = load_dataset(dataset_dir)
+    if not filter_cases:
+        raise SystemExit(f"no filter cases in {dataset_dir}; build the dataset first")
+    items = label_items(filter_cases, profiles=_split(args.profiles))
+    if not items:
+        raise SystemExit(f"no candidates for profiles {args.profiles!r}")
+    _label_tiers(dataset_dir)  # a bad labels file fails here, not mid-session
+    run_labelling(
+        items,
+        labels_path=dataset_dir / LABELS_FILE,
+        descriptions={p.name: p.description for p in config.profiles},
+        labeller=args.labeller,
+        relabel=args.relabel,
+    )
+    return 0
+
+
+def cmd_grade(args: argparse.Namespace) -> int:
+    config = _setup(args)
+    dataset_dir = args.root / "datasets" / args.dataset
+    filter_cases, _tier1, _tier3 = load_dataset(dataset_dir)
+    labels = _label_tiers(dataset_dir)
+    if not labels:
+        raise SystemExit(
+            f"no labels in {dataset_dir / LABELS_FILE}; run `evals label` first"
+        )
+    gates = _gate_thresholds(config)
+    grades = []
+    for run in _split(args.runs):
+        results = _load_run(args.root, args.dataset, run)["filter"]
+        if not results:
+            raise SystemExit(f"run {run!r} has no filter results to grade")
+        grades.append((run, grade_filter(filter_cases, results, labels, gates)))
+    in_dataset = [labels[i.key] for i in label_items(filter_cases) if i.key in labels]
+    out = [
+        f"# Filter grades on `{args.dataset}`",
+        "",
+        "## Filter: graded against your labels",
+        "",
+        render_label_mix(in_dataset),
+        "",
+        render_label_grades(grades),
+    ]
+    for run, grade in grades:
+        out += [
+            "",
+            f"### {run}: ingest misses",
+            "",
+            render_label_misses(grade, limit=args.misses),
+        ]
+    text = "\n".join(out) + "\n"
+    target = args.out or args.root / "runs" / args.dataset / "grade.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8")
     print(text)
     print(f"written: {target}", file=sys.stderr)
@@ -409,6 +556,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--out", type=Path, default=None)
     p.set_defaults(func=cmd_compare)
+
+    p = sub.add_parser(
+        "label", help="label filter candidates yourself (resumable, blind)"
+    )
+    _common(p)
+    p.add_argument("--dataset", required=True)
+    p.add_argument(
+        "--profiles", default="", help="comma-separated subset of profile names"
+    )
+    p.add_argument(
+        "--relabel",
+        action="store_true",
+        help="revisit candidates that already have a label",
+    )
+    p.add_argument(
+        "--labeller",
+        default=_default_labeller(),
+        help="name recorded on each label (default: your login)",
+    )
+    p.set_defaults(func=cmd_label)
+
+    p = sub.add_parser("grade", help="grade filter runs against your labels")
+    _common(p)
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--runs", required=True, help="comma-separated run labels")
+    p.add_argument("--misses", type=int, default=40, help="misses to list per run")
+    p.add_argument("--out", type=Path, default=None)
+    p.set_defaults(func=cmd_grade)
     return parser
 
 
