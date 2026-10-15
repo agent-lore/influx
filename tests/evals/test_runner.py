@@ -115,14 +115,18 @@ def test_validation_failure_is_recorded_not_raised(eval_config: AppConfig) -> No
     assert result.usage.prompt_tokens == 100
 
 
-def test_non_json_content_is_a_parse_error(eval_config: AppConfig) -> None:
-    poster = _Poster([chat_response("not json at all")])
+def test_non_json_content_is_a_parse_error_after_production_retries(
+    eval_config: AppConfig,
+) -> None:
+    attempts = eval_config.models["extract"].max_retries + 1
+    poster = _Poster([chat_response("not json at all")] * attempts)
     runner = Runner(eval_config, _SPEC, poster=poster)  # type: ignore[arg-type]
 
     (result,) = runner.run_tier3([Tier3Case("t3", "T", "body")])
 
-    assert result.error == "parse"
+    assert result.error == "parse" and result.attempts == attempts
     assert result.raw_content == "not json at all"
+    assert len(poster.bodies) == attempts
 
 
 def test_http_errors_retry_up_to_slot_max_retries(eval_config: AppConfig) -> None:
@@ -197,7 +201,8 @@ def test_null_content_is_recorded_as_parse_error_and_cached_replay_agrees(
         content_type="application/json",
         final_url="https://example.test",
     )
-    poster = _Poster([null_response])
+    attempts = eval_config.models["enrich"].max_retries + 1
+    poster = _Poster([null_response] * attempts)
     case = Tier1Case("t1", "ai-robotics", "T", "A")
 
     (first,) = Runner(eval_config, _SPEC, poster=poster, cache_dir=tmp_path).run_tier1(
@@ -208,5 +213,102 @@ def test_null_content_is_recorded_as_parse_error_and_cached_replay_agrees(
     )  # type: ignore[arg-type]
 
     assert first.error == "parse" and "NoneType" in first.error_detail
-    assert first.raw_content == "" and first.usage.prompt_tokens == 5
+    assert first.attempts == attempts
+    assert first.raw_content == "" and first.usage.prompt_tokens == 5 * attempts
     assert replay.error == "parse" and replay.meta["from_cache"] is True
+    assert len(poster.bodies) == attempts  # replay made no network call
+
+
+# ── production retry policy ──────────────────────────────────────────
+
+
+def test_malformed_200_reply_is_retried_and_all_attempts_are_charged(
+    eval_config: AppConfig, tmp_path: Path
+) -> None:
+    usage = {"prompt_tokens": 100, "completion_tokens": 10, "cost": 0.001}
+    poster = _Poster(
+        [
+            chat_response("We need JSON only. hmm", usage=usage),
+            chat_response(_TIER1, usage=usage),
+        ]
+    )
+    runner = Runner(eval_config, _SPEC, poster=poster, cache_dir=tmp_path)  # type: ignore[arg-type]
+
+    (result,) = runner.run_tier1([Tier1Case("t1", "ai-robotics", "T", "A")])
+
+    assert result.ok and result.attempts == 2
+    assert len(poster.bodies) == 2
+    assert result.usage.prompt_tokens == 200
+    assert result.usage.cost_usd == pytest.approx(0.002)
+    assert result.meta["attempt_errors"] == ["parse"]
+    # Replay from cache: the final outcome, no further network calls.
+    (replay,) = Runner(eval_config, _SPEC, poster=poster, cache_dir=tmp_path).run_tier1(  # type: ignore[arg-type]
+        [Tier1Case("t1", "ai-robotics", "T", "A")]
+    )
+    assert replay.ok and replay.attempts == 2 and replay.meta["from_cache"] is True
+    assert len(poster.bodies) == 2
+
+
+def test_filter_retries_validation_failure_like_production(
+    eval_config: AppConfig,
+) -> None:
+    bad = {"results": [{"id": "x", "score": 42, "tags": [], "reason": "r"}]}
+    good = {"results": [{"id": "x", "score": 8, "tags": [], "reason": "r"}]}
+    poster = _Poster([chat_response(bad), chat_response(good)])
+    runner = Runner(eval_config, _SPEC, poster=poster)  # type: ignore[arg-type]
+    case = FilterCase("f", "ai-robotics", (CandidateRecord("x", "T", "A"),))
+
+    (result,) = runner.run_filter([case])
+
+    assert result.ok and result.attempts == 2 and result.output == good
+
+
+def test_tier1_does_not_retry_validation_failure_like_production(
+    eval_config: AppConfig,
+) -> None:
+    bad = {"contributions": [], "method": "m", "result": "r", "relevance": ""}
+    poster = _Poster([chat_response(bad), chat_response(_TIER1)])
+    runner = Runner(eval_config, _SPEC, poster=poster)  # type: ignore[arg-type]
+
+    (result,) = runner.run_tier1([Tier1Case("t1", "ai-robotics", "T", "A")])
+
+    assert result.error == "validate" and result.attempts == 1
+    assert len(poster.bodies) == 1
+
+
+def test_filter_4xx_is_fatal_but_tier1_4xx_is_retried(eval_config: AppConfig) -> None:
+    poster = _Poster([error_response(400), chat_response({"results": []})])
+    (filtered,) = Runner(eval_config, _SPEC, poster=poster).run_filter(  # type: ignore[arg-type]
+        [FilterCase("f", "ai-robotics", (CandidateRecord("x", "T", "A"),))]
+    )
+    assert filtered.error == "http" and filtered.attempts == 1
+
+    poster = _Poster([error_response(400), chat_response(_TIER1)])
+    (enriched,) = Runner(eval_config, _SPEC, poster=poster).run_tier1(  # type: ignore[arg-type]
+        [Tier1Case("t1", "ai-robotics", "T", "A")]
+    )
+    assert enriched.ok and enriched.attempts == 2
+
+
+def test_old_cache_entry_with_retryable_failure_is_continued_live(
+    eval_config: AppConfig, tmp_path: Path
+) -> None:
+    # First run with the pre-retry runner shape: a single failed attempt
+    # stored flat.  Simulate by running once with retries exhausted at 1.
+    one_shot = eval_config.model_copy(deep=True)
+    one_shot.models["enrich"] = one_shot.models["enrich"].model_copy(
+        update={"max_retries": 0}
+    )
+    poster = _Poster([chat_response("not json")])
+    Runner(one_shot, _SPEC, poster=poster, cache_dir=tmp_path).run_tier1(  # type: ignore[arg-type]
+        [Tier1Case("t1", "ai-robotics", "T", "A")]
+    )
+    # Now the slot allows retries: the cached parse failure is retried live.
+    poster = _Poster([chat_response(_TIER1)])
+    (result,) = Runner(eval_config, _SPEC, poster=poster, cache_dir=tmp_path).run_tier1(  # type: ignore[arg-type]
+        [Tier1Case("t1", "ai-robotics", "T", "A")]
+    )
+
+    assert result.ok and result.attempts == 2
+    assert result.meta["from_cache"] is False
+    assert len(poster.bodies) == 1

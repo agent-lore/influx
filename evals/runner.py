@@ -18,7 +18,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +220,17 @@ class Runner:
         return result, time.perf_counter() - started, ""
 
     def run_one(self, eval_slot: str, case_id: str, prompt: str) -> CaseResult:
+        """Send one case, retrying exactly as the production caller would.
+
+        The filter scorer retries network errors, 429 / 5xx, malformed JSON
+        *and* schema-validation failures (other 4xx are fatal); the Tier-1 /
+        Tier-3 caller retries network errors, any HTTP error and malformed
+        JSON but not validation failures.  Latency, tokens and cost are
+        summed over every attempt so a model that needs a retry is charged
+        for it, and only the final outcome is cached — a cached run that
+        ended in a retryable failure before its attempts were used up is
+        continued live rather than replayed.
+        """
         slot, provider = self._slot_and_provider(eval_slot)
         _slot_name, schema = _SLOT_BINDINGS[eval_slot]
         url, headers = provider_endpoint(provider)
@@ -230,39 +241,56 @@ class Runner:
             # OpenRouter returns the exact upstream cost when asked.
             body = {**body, "usage": {"include": True}}
         key = _request_key(body, url)
+        policy = _RETRY_POLICIES[eval_slot]
+        max_attempts = slot.max_retries + 1
 
-        cached = self._cached(key)
-        if cached is not None:
-            return _finish(
-                case_id, eval_slot, slot.model, schema, cached, from_cache=True
-            )
-
-        attempts = slot.max_retries + 1
-        last: dict[str, Any] = {}
-        for attempt in range(1, attempts + 1):
+        attempts: list[dict[str, Any]] = list(self._cached_attempts(key))
+        from_cache = bool(attempts)
+        while True:
+            outcome = _evaluate(attempts, schema) if attempts else None
+            if outcome is not None and (
+                outcome.error is None
+                or not policy.retries(outcome.error, outcome.status)
+                or len(attempts) >= max_attempts
+            ):
+                break
+            from_cache = False
             result, latency, net_error = self._post(
                 url, headers, body, slot.request_timeout
             )
-            last = {
-                "attempts": attempt,
-                "latency_seconds": latency,
-                "status": result.status_code if result else None,
-                "body": result.body.decode("utf-8", errors="replace") if result else "",
-                "network_error": net_error,
-            }
-            if result is not None and result.status_code < 400:
-                self._store(key, last)
-                break
-            _log.warning(
-                "%s/%s attempt %d/%d failed: status=%s %s",
-                eval_slot,
-                case_id,
-                attempt,
-                attempts,
-                last["status"],
-                (net_error or last["body"])[:200],
+            attempts.append(
+                {
+                    "latency_seconds": latency,
+                    "status": result.status_code if result else None,
+                    "body": (
+                        result.body.decode("utf-8", errors="replace") if result else ""
+                    ),
+                    "network_error": net_error,
+                }
             )
-        return _finish(case_id, eval_slot, slot.model, schema, last, from_cache=False)
+            if attempts[-1]["status"] is None or attempts[-1]["status"] >= 400:
+                _log.warning(
+                    "%s/%s attempt %d/%d failed: status=%s %s",
+                    eval_slot,
+                    case_id,
+                    len(attempts),
+                    max_attempts,
+                    attempts[-1]["status"],
+                    (net_error or attempts[-1]["body"])[:200],
+                )
+        self._store(key, {"attempts": attempts})
+        assert outcome is not None
+        return _finish(case_id, eval_slot, slot.model, outcome, from_cache=from_cache)
+
+    def _cached_attempts(self, key: str) -> list[dict[str, Any]]:
+        cached = self._cached(key)
+        if cached is None:
+            return []
+        if isinstance(cached.get("attempts"), list):
+            return list(cached["attempts"])
+        # Pre-retry cache shape: one attempt stored flat (its ``attempts``
+        # key, when present, is the attempt *number*).
+        return [cached]
 
     def run_filter(self, cases: Sequence[FilterCase]) -> list[CaseResult]:
         return self._run_many(
@@ -290,66 +318,170 @@ class Runner:
             )
 
 
-def _is_clean_object(content: str) -> bool:
+def _is_clean_object(content: Any) -> bool:
+    if not isinstance(content, str):
+        return False
     try:
         return isinstance(json.loads(content), dict)
     except json.JSONDecodeError:
         return False
 
 
-def _finish(
-    case_id: str,
-    eval_slot: str,
-    model: str,
-    schema: type[BaseModel],
-    last: dict[str, Any],
-    *,
-    from_cache: bool,
-) -> CaseResult:
-    base = CaseResult(
-        case_id=case_id,
-        slot=eval_slot,
-        model=model,
-        latency_seconds=float(last.get("latency_seconds") or 0.0),
-        usage=Usage(),
-        attempts=int(last.get("attempts") or 1),
-        meta={"from_cache": from_cache},
-    )
-    status = last.get("status")
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """Which failure kinds a slot's production caller retries."""
+
+    network: bool = True
+    parse: bool = True
+    validate: bool = False
+    http_4xx: bool = False  # 429 and 5xx are always retried
+
+    def retries(self, error: str, status: int | None) -> bool:
+        if error == "network":
+            return self.network
+        if error == "parse":
+            return self.parse
+        if error == "validate":
+            return self.validate
+        if error == "http":
+            if status is None:
+                return self.network
+            if status == 429 or status >= 500:
+                return True
+            return self.http_4xx
+        return False
+
+
+# Mirrors ``influx.filter._call_filter_model_with_retry`` and
+# ``influx.enrich._call_json_model`` respectively.
+_RETRY_POLICIES: dict[str, RetryPolicy] = {
+    "filter": RetryPolicy(parse=True, validate=True, http_4xx=False),
+    "tier1": RetryPolicy(parse=True, validate=False, http_4xx=True),
+    "tier3": RetryPolicy(parse=True, validate=False, http_4xx=True),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _Outcome:
+    """The last attempt's classification plus totals over all attempts."""
+
+    error: str | None
+    error_detail: str
+    status: int | None
+    usage: Usage
+    latency_seconds: float
+    attempts: int
+    raw_content: str = ""
+    output: dict[str, Any] | None = None
+    salvaged: bool = False
+    attempt_errors: tuple[str, ...] = ()
+
+
+def _classify(
+    attempt: dict[str, Any], schema: type[BaseModel]
+) -> tuple[str | None, str, Usage, str, dict[str, Any] | None, bool]:
+    """Classify one attempt: (error, detail, usage, raw_content, output, salvaged)."""
+    status = attempt.get("status")
     if status is None:
-        return replace(
-            base, error="network", error_detail=last.get("network_error", "")
-        )
+        return "network", attempt.get("network_error", ""), Usage(), "", None, False
     if status >= 400:
-        return replace(
-            base, error="http", error_detail=f"HTTP {status}: {last['body'][:300]}"
+        return (
+            "http",
+            f"HTTP {status}: {attempt['body'][:300]}",
+            Usage(),
+            "",
+            None,
+            False,
         )
     try:
-        resp = json.loads(last["body"])
+        resp = json.loads(attempt["body"])
         content = resp["choices"][0]["message"]["content"]
     except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
-        return replace(base, error="parse", error_detail=f"envelope: {exc}")
+        return "parse", f"envelope: {exc}", Usage(), "", None, False
     usage = _usage_from(resp)
     raw = content if isinstance(content, str) else ""
     try:
         parsed = parse_json_content(content)
     except JsonContentError as exc:
-        return replace(
-            base, usage=usage, raw_content=raw, error="parse", error_detail=str(exc)
-        )
-    salvaged = not _is_clean_object(content)
-    if salvaged:
-        base = replace(base, meta={**base.meta, "salvaged": True})
+        return "parse", str(exc), usage, raw, None, False
     try:
         validated = schema.model_validate(parsed)
     except ValidationError as exc:
-        return replace(
-            base,
-            usage=usage,
-            raw_content=content,
-            error="validate",
-            error_detail=str(exc)[:500],
+        return "validate", str(exc)[:500], usage, raw, None, False
+    return None, "", usage, raw, validated.model_dump(), not _is_clean_object(content)
+
+
+def _evaluate(attempts: Sequence[dict[str, Any]], schema: type[BaseModel]) -> _Outcome:
+    totals = Usage()
+    errors: list[str] = []
+    last: tuple[str | None, str, Usage, str, dict[str, Any] | None, bool] = (
+        "network",
+        "",
+        Usage(),
+        "",
+        None,
+        False,
+    )
+    for attempt in attempts:
+        last = _classify(attempt, schema)
+        error, _detail, usage, _raw, _out, _salv = last
+        totals = Usage(
+            prompt_tokens=totals.prompt_tokens + usage.prompt_tokens,
+            completion_tokens=totals.completion_tokens + usage.completion_tokens,
+            reasoning_tokens=totals.reasoning_tokens + usage.reasoning_tokens,
+            cost_usd=_add_cost(
+                totals.cost_usd, usage.cost_usd, first=attempt is attempts[0]
+            ),
         )
-    return replace(
-        base, usage=usage, raw_content=content, output=validated.model_dump()
+        if error:
+            errors.append(error)
+    error, detail, _usage, raw, output, salvaged = last
+    return _Outcome(
+        error=error,
+        error_detail=detail,
+        status=attempts[-1].get("status"),
+        usage=totals,
+        latency_seconds=sum(float(a.get("latency_seconds") or 0.0) for a in attempts),
+        attempts=len(attempts),
+        raw_content=raw,
+        output=output,
+        salvaged=salvaged,
+        attempt_errors=tuple(errors),
+    )
+
+
+def _add_cost(total: float | None, cost: float | None, *, first: bool) -> float | None:
+    """Sum costs; a failed attempt reports no cost and is treated as free."""
+    if first:
+        return cost
+    if total is None:
+        return cost
+    return total + (cost or 0.0)
+
+
+def _finish(
+    case_id: str,
+    eval_slot: str,
+    model: str,
+    outcome: _Outcome,
+    *,
+    from_cache: bool,
+) -> CaseResult:
+    meta: dict[str, Any] = {"from_cache": from_cache}
+    if outcome.salvaged:
+        meta["salvaged"] = True
+    if outcome.attempt_errors:
+        meta["attempt_errors"] = list(outcome.attempt_errors)
+    return CaseResult(
+        case_id=case_id,
+        slot=eval_slot,
+        model=model,
+        latency_seconds=outcome.latency_seconds,
+        usage=outcome.usage,
+        output=outcome.output,
+        error=outcome.error,
+        error_detail=outcome.error_detail,
+        raw_content=outcome.raw_content,
+        attempts=outcome.attempts,
+        meta=meta,
     )
