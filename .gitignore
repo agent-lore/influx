@@ -216,3 +216,8 @@ __marimo__/
 .codex/*
 
 .idea
+
+# Model-eval harness artefacts (datasets snapshot prod data; runs hold raw model output)
+evals/datasets/
+evals/runs/
+evals/.cache/

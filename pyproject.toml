@@ -59,7 +59,7 @@ dev = [
 
 [tool.ruff]
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src", "tests", "evals"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -86,6 +86,7 @@ source_modules = [
     "influx.probes",
     "influx.slugs",
     "influx.prompts",
+    "influx.llm_request",
     "influx.telemetry",
     "influx.metrics",
     "influx.logging_config",

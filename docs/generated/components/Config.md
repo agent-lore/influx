@@ -12,6 +12,7 @@ Pydantic config schema / loading, health probes, slug generation, and prompt tem
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
 | `influx.config` | L | 25 | 2 |
+| `influx.llm_request` | S | 1 | 3 |
 | `influx.probes` | M | 3 | 0 |
 | `influx.prompts` | XS | 0 | 3 |
 | `influx.slugs` | XS | 0 | 2 |
@@ -46,6 +47,12 @@ Pydantic config schema / loading, health probes, slug generation, and prompt tem
 - class `AppConfig` — Root configuration model for the full v0.7 TOML schema.
 - def `find_config_path` — Return the first existing ``influx.toml`` in the discovery order.
 - def `load_config` — Load, validate, and return the v0.7 ``AppConfig``.
+
+### `influx.llm_request`
+- class `JsonContentError` — The model's message content held no JSON object.
+- def `parse_json_content` — Return the JSON object in a model's message content.
+- def `provider_endpoint` — Return the ``/chat/completions`` URL and request headers for *provider*.
+- def `build_chat_request` — Build the chat-completions body for *slot* carrying *prompt*.
 
 ### `influx.probes`
 - class `ProbeResult` — Outcome of a single probe check.

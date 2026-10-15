@@ -11,12 +11,14 @@ Score-gated entry: scores candidates 1–10 against the Profile and drops sub-th
 
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
-| `influx.filter` | M | 2 | 1 |
+| `influx.filter` | M | 2 | 3 |
 
 ## Public API
 
 ### `influx.filter`
 - class `FilterScorerError` — Hard failure of the production-default LLM filter scorer.
+- def `retry_delay_seconds` — Seconds the filter scorer waits before retrying *attempt* (0-based).
+- def `render_filter_user_message` — Append the ``## CANDIDATES`` JSON block to the rendered filter prompt.
 - def `make_default_batch_scorer` — Build the production-default source-agnostic batched scorer.
 - class `Filter` — Score-gated entry to ingestion (CONTEXT.md ``Filter``).
 
