@@ -327,19 +327,33 @@ def _rate_limited(retry_after: str) -> FetchResult:
     )
 
 
-def test_filter_waits_retry_after_before_retrying_429(eval_config: AppConfig) -> None:
+def test_filter_waits_retry_after_before_retrying_429(
+    eval_config: AppConfig, tmp_path: Path
+) -> None:
     good = {"results": [{"id": "x", "score": 8, "tags": [], "reason": "r"}]}
-    poster = _Poster([_rate_limited("0.05"), chat_response(good)])
+    poster = _Poster([_rate_limited("5"), chat_response(good)])
     slept: list[float] = []
-    runner = Runner(eval_config, _SPEC, poster=poster, sleeper=slept.append)  # type: ignore[arg-type]
+    case = FilterCase("f", "ai-robotics", (CandidateRecord("x", "T", "A"),))
+    runner = Runner(
+        eval_config, _SPEC, poster=poster, sleeper=slept.append, cache_dir=tmp_path
+    )  # type: ignore[arg-type]
 
-    (result,) = runner.run_filter(
-        [FilterCase("f", "ai-robotics", (CandidateRecord("x", "T", "A"),))]
-    )
+    (result,) = runner.run_filter([case])
 
     assert result.ok and result.attempts == 2
-    assert slept == [pytest.approx(0.05)]
-    assert result.meta["backoff_seconds"] == pytest.approx(0.05)
+    assert slept == [5.0]
+    assert result.meta["backoff_seconds"] == 5.0
+    # Elapsed case time includes the wait, not just the two requests.
+    assert result.latency_seconds >= 5.0
+
+    # A cached replay reports the same wait and elapsed time, with no sleep.
+    slept.clear()
+    (replay,) = Runner(
+        eval_config, _SPEC, poster=poster, sleeper=slept.append, cache_dir=tmp_path
+    ).run_filter([case])  # type: ignore[arg-type]
+    assert replay.meta["from_cache"] is True and slept == []
+    assert replay.meta["backoff_seconds"] == 5.0
+    assert replay.latency_seconds == result.latency_seconds
 
 
 def test_filter_backs_off_exponentially_on_5xx_and_network(

@@ -249,7 +249,6 @@ class Runner:
 
         attempts: list[dict[str, Any]] = list(self._cached_attempts(key))
         from_cache = bool(attempts)
-        backoff_total = 0.0
         while True:
             outcome = _evaluate(attempts, schema) if attempts else None
             if outcome is not None and (
@@ -259,6 +258,7 @@ class Runner:
             ):
                 break
             from_cache = False
+            backoff = 0.0
             if outcome is not None and policy.backoff:
                 # Wait exactly as the production filter scorer would before
                 # retrying a 429 (Retry-After), 5xx or network failure.
@@ -270,13 +270,16 @@ class Runner:
                 )
                 if delay > 0 and outcome.error in ("http", "network"):
                     self._sleeper(delay)
-                    backoff_total += delay
+                    backoff = delay
             result, latency, net_error = self._post(
                 url, headers, body, slot.request_timeout
             )
             attempts.append(
                 {
                     "latency_seconds": latency,
+                    # Wait that preceded this attempt; persisted so a cached
+                    # replay reports the same elapsed time as the live run.
+                    "backoff_before_seconds": backoff,
                     "status": result.status_code if result else None,
                     "headers": dict(result.headers) if result else {},
                     "body": (
@@ -297,14 +300,7 @@ class Runner:
                 )
         self._store(key, {"attempts": attempts})
         assert outcome is not None
-        return _finish(
-            case_id,
-            eval_slot,
-            slot.model,
-            outcome,
-            from_cache=from_cache,
-            backoff_seconds=backoff_total,
-        )
+        return _finish(case_id, eval_slot, slot.model, outcome, from_cache=from_cache)
 
     def _cached_attempts(self, key: str) -> list[dict[str, Any]]:
         cached = self._cached(key)
@@ -403,6 +399,7 @@ class _Outcome:
     output: dict[str, Any] | None = None
     salvaged: bool = False
     attempt_errors: tuple[str, ...] = ()
+    backoff_seconds: float = 0.0
 
 
 def _classify(
@@ -464,17 +461,22 @@ def _evaluate(attempts: Sequence[dict[str, Any]], schema: type[BaseModel]) -> _O
         if error:
             errors.append(error)
     error, detail, _usage, raw, output, salvaged = last
+    backoff = sum(float(a.get("backoff_before_seconds") or 0.0) for a in attempts)
+    requests = sum(float(a.get("latency_seconds") or 0.0) for a in attempts)
     return _Outcome(
         error=error,
         error_detail=detail,
         status=attempts[-1].get("status"),
         usage=totals,
-        latency_seconds=sum(float(a.get("latency_seconds") or 0.0) for a in attempts),
+        # Elapsed time for the case as production would experience it:
+        # every request plus every wait between them.
+        latency_seconds=requests + backoff,
         attempts=len(attempts),
         raw_content=raw,
         output=output,
         salvaged=salvaged,
         attempt_errors=tuple(errors),
+        backoff_seconds=backoff,
     )
 
 
@@ -494,11 +496,10 @@ def _finish(
     outcome: _Outcome,
     *,
     from_cache: bool,
-    backoff_seconds: float = 0.0,
 ) -> CaseResult:
     meta: dict[str, Any] = {"from_cache": from_cache}
-    if backoff_seconds:
-        meta["backoff_seconds"] = backoff_seconds
+    if outcome.backoff_seconds:
+        meta["backoff_seconds"] = outcome.backoff_seconds
     if outcome.salvaged:
         meta["salvaged"] = True
     if outcome.attempt_errors:
