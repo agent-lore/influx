@@ -28,6 +28,7 @@ against both environments — just pass the right `--env`. Run
 | A run failed / degraded / didn't run | [§2 Decide if there is a problem](#2-decide-if-there-is-a-problem), [§3 Drill into one run](#3-drill-into-one-run) |
 | Unexpected exception / new ERROR in logs | [§4 Common log shapes](#4-common-log-shapes) |
 | A feed produces nothing / a feed went silent | [§8g Feed yield](#8g-feed-yield--per-feed-note-production-issue-233) |
+| Switching a model slot (new OpenAI tier, on-prem model) | [§8h Changing a model slot](#8h-changing-a-model-slot-eval-first) |
 | arXiv 429 / timeout storms | [§9 Scheduling stagger](#9-scheduling-stagger-issue-87) |
 | Slug-collision squatters / zombie notes | [§8 Cleaning up slug-collision squatters](#8-cleaning-up-slug-collision-squatters) |
 | Notes with empty/invalid source metadata | [§8b Invalid-source notes](#8b-cleaning-up-invalid-source-metadata-notes-issue-162) |
@@ -912,6 +913,31 @@ rather than raising the relevance threshold — see the retro-computing
 profile's `DURABLE-KNOWLEDGE BAR` block for the pattern. Re-run
 `feed-yield` over the following cycles to confirm the tuning reduced the
 low-value volume while keeping the substantive notes.
+
+## 8h. Changing a model slot (eval first)
+
+Every `[models.*]` change — a new OpenAI model, a cheaper tier, an on-prem
+server — goes through the eval harness before it reaches `influx.toml`:
+`docs/plans/model-evals.md` has the full recipe (`uv run python -m evals
+build-dataset | run | compare`) and the decision rule. The short version:
+
+1. Build a dataset from the live prod config and knowledge dir (~1 min).
+2. Run the current prod model (baseline) and the candidate on it.
+3. `compare` with a judge; read validity, cost/case, the filter decision
+   flips and the judge verdicts.
+4. Reasoning models (GPT-6 Luna / Sol, GPT-5.x) need
+   `reasoning_effort = "none"` on the slot or they bill hidden reasoning
+   tokens against `max_tokens`; `temperature` is dropped automatically
+   whenever effort is anything else. Prefer `json_schema_strict = true` on
+   every slot for such models — plain `json_object` mode lets them think
+   aloud before the JSON.
+5. A `salvaged JSON object from model content` WARNING in the logs means
+   `parse_json_content` cut the object out of surrounding text; a rising
+   rate is the signal to re-run the eval, not an error in itself.
+
+The model change itself is config-only (`docker restart <container>` after
+editing the TOML) unless the slot needs a field the running image does not
+know, in which case rebuild with `./docker/run.sh <env> up`.
 
 ## 9. Scheduling stagger (issue #87)
 

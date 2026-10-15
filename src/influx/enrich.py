@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -22,6 +21,12 @@ from pydantic import BaseModel, ValidationError
 from influx.config import AppConfig
 from influx.errors import LCMAError, NetworkError
 from influx.http_client import guarded_post_json_fetch
+from influx.llm_request import (
+    JsonContentError,
+    build_chat_request,
+    parse_json_content,
+    provider_endpoint,
+)
 from influx.prompts import load_prompt
 from influx.schemas import (
     TIER3_LIST_MAX,
@@ -52,6 +57,8 @@ _TIER3_CAP_REMINDER = (
 )
 
 __all__ = [
+    "render_tier1_prompt",
+    "render_tier3_prompt",
     "tier1_enrich",
     "tier3_extract",
 ]
@@ -110,27 +117,13 @@ def _call_json_model(
             stage="resolve",
         )
 
-    api_key = ""
-    if provider.api_key_env:
-        api_key = os.environ.get(provider.api_key_env, "")
-
-    url = f"{provider.base_url.rstrip('/')}/chat/completions"
-
-    headers: dict[str, str] = {**provider.extra_headers}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    body: dict[str, Any] = {
-        "model": slot.model,
-        "temperature": slot.temperature,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if slot.max_tokens is not None:
-        body["max_tokens"] = slot.max_tokens
-    if slot.json_schema_strict and schema_class is not None:
-        body["response_format"] = openai_strict_response_format(schema_class)
-    elif slot.json_mode:
-        body["response_format"] = {"type": "json_object"}
+    url, headers = provider_endpoint(provider)
+    strict_format = (
+        openai_strict_response_format(schema_class)
+        if schema_class is not None
+        else None
+    )
+    body = build_chat_request(slot, prompt, strict_response_format=strict_format)
 
     attempts = slot.max_retries + 1
     last_error: Exception | None = None
@@ -174,12 +167,10 @@ def _call_json_model(
             ) from exc
 
         try:
-            parsed: dict[str, Any] = json.loads(content_str)
-        except json.JSONDecodeError as exc:
+            return parse_json_content(content_str)
+        except JsonContentError as exc:
             last_error = exc
             continue
-
-        return parsed
 
     raise LCMAError(
         f"Model slot {slot_name!r} failed after {attempts} attempts",
@@ -187,6 +178,30 @@ def _call_json_model(
         stage="http",
         detail=str(last_error)[:500] if last_error is not None else "",
     ) from last_error
+
+
+# ── Prompt rendering ─────────────────────────────────────────────────
+
+
+def render_tier1_prompt(
+    config: AppConfig, *, title: str, abstract: str, profile_summary: str
+) -> str:
+    """Render ``prompts.tier1_enrich`` exactly as :func:`tier1_enrich` sends it."""
+    prompt_cfg = config.prompts.tier1_enrich
+    prompt_text = load_prompt(text=prompt_cfg.text, path=prompt_cfg.path)
+    return prompt_text.format(
+        title=title,
+        abstract=abstract,
+        profile_summary=profile_summary,
+    )
+
+
+def render_tier3_prompt(config: AppConfig, *, title: str, full_text: str) -> str:
+    """Render ``prompts.tier3_extract`` plus the schema-cap reminder, exactly
+    as :func:`tier3_extract` sends it."""
+    prompt_cfg = config.prompts.tier3_extract
+    prompt_text = load_prompt(text=prompt_cfg.text, path=prompt_cfg.path)
+    return prompt_text.format(title=title, full_text=full_text) + _TIER3_CAP_REMINDER
 
 
 # ── Tier 1 enrichment caller ─────────────────────────────────────────
@@ -230,12 +245,8 @@ def tier1_enrich(
         schema validation failure — the caller can handle this per
         FR-ENR-6 (no placeholder text on failure).
     """
-    prompt_cfg = config.prompts.tier1_enrich
-    prompt_text = load_prompt(text=prompt_cfg.text, path=prompt_cfg.path)
-    rendered = prompt_text.format(
-        title=title,
-        abstract=abstract,
-        profile_summary=profile_summary,
+    rendered = render_tier1_prompt(
+        config, title=title, abstract=abstract, profile_summary=profile_summary
     )
 
     raw = _call_json_model(config, "enrich", rendered, schema_class=Tier1Enrichment)
@@ -290,15 +301,7 @@ def tier3_extract(
         schema validation failure — the caller can handle this per
         FR-ENR-6 (no placeholder text on failure).
     """
-    prompt_cfg = config.prompts.tier3_extract
-    prompt_text = load_prompt(text=prompt_cfg.text, path=prompt_cfg.path)
-    rendered = (
-        prompt_text.format(
-            title=title,
-            full_text=full_text,
-        )
-        + _TIER3_CAP_REMINDER
-    )
+    rendered = render_tier3_prompt(config, title=title, full_text=full_text)
 
     raw = _call_json_model(config, "extract", rendered, schema_class=Tier3Extraction)
 

@@ -12,7 +12,7 @@ The score-gated tiered enrichment cascade (Tier 1 summary / Tier 2 full text / T
 | Module | Size | Classes | Functions |
 |---|---|---:|---:|
 | `influx.cascade` | M | 4 | 0 |
-| `influx.enrich` | M | 0 | 2 |
+| `influx.enrich` | M | 0 | 4 |
 
 ## Public API
 
@@ -23,6 +23,8 @@ The score-gated tiered enrichment cascade (Tier 1 summary / Tier 2 full text / T
 - class `Cascade` — Score-gated enrichment cascade for one profile run.
 
 ### `influx.enrich`
+- def `render_tier1_prompt` — Render ``prompts.tier1_enrich`` exactly as :func:`tier1_enrich` sends it.
+- def `render_tier3_prompt` — Render ``prompts.tier3_extract`` plus the schema-cap reminder, exactly as :func:`tier3_extract` sends it.
 - def `tier1_enrich` — Invoke Tier-1 enrichment against the ``models.enrich`` slot (FR-ENR-4).
 - def `tier3_extract` — Invoke Tier-3 deep extraction against the ``models.extract`` slot (FR-ENR-5).
 

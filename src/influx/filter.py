@@ -37,7 +37,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC
@@ -50,6 +49,11 @@ from influx import metrics
 from influx.config import AppConfig, ProfileConfig
 from influx.errors import NetworkError
 from influx.http_client import guarded_post_json_fetch
+from influx.llm_request import (
+    build_chat_request,
+    parse_json_content,
+    provider_endpoint,
+)
 from influx.schemas import FilterResponse
 from influx.source import Candidate, ScoredCandidate
 from influx.telemetry import record_filter_error
@@ -59,6 +63,7 @@ __all__ = [
     "Filter",
     "FilterScorerError",
     "make_default_batch_scorer",
+    "render_filter_user_message",
 ]
 
 
@@ -215,7 +220,7 @@ def _call_filter_model_with_retry(
         try:
             resp_json = json.loads(result.body.decode("utf-8"))
             content_str: str = resp_json["choices"][0]["message"]["content"]
-            parsed = json.loads(content_str)
+            parsed = parse_json_content(content_str)
             return FilterResponse.model_validate(parsed)
         except (
             UnicodeDecodeError,
@@ -270,6 +275,23 @@ async def _acall_filter_model_with_retry(
 # ── Source-agnostic Filter (issue #57) ───────────────────────────────
 
 
+def render_filter_user_message(filter_prompt: str, candidates: list[Candidate]) -> str:
+    """Append the ``## CANDIDATES`` JSON block to the rendered filter prompt.
+
+    This is the exact user message the production scorer posts; the
+    model-eval harness renders through it so eval and production requests
+    cannot drift apart.
+    """
+    candidate_payload = [
+        {"id": c.item_id, "title": c.title, "abstract": c.abstract} for c in candidates
+    ]
+    return (
+        f"{filter_prompt}\n\n"
+        "## CANDIDATES\n"
+        f"{json.dumps(candidate_payload, ensure_ascii=False)}"
+    )
+
+
 def make_default_batch_scorer(config: AppConfig) -> BatchScorer | None:
     """Build the production-default source-agnostic batched scorer.
 
@@ -298,34 +320,9 @@ def make_default_batch_scorer(config: AppConfig) -> BatchScorer | None:
                 f"filter provider {slot.provider!r} not configured",
             )
 
-        candidate_payload = [
-            {"id": c.item_id, "title": c.title, "abstract": c.abstract}
-            for c in candidates
-        ]
-        user_message = (
-            f"{filter_prompt}\n\n"
-            "## CANDIDATES\n"
-            f"{json.dumps(candidate_payload, ensure_ascii=False)}"
-        )
-
-        api_key = ""
-        if provider.api_key_env:
-            api_key = os.environ.get(provider.api_key_env, "")
-
-        url = f"{provider.base_url.rstrip('/')}/chat/completions"
-        headers: dict[str, str] = {**provider.extra_headers}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        body: dict[str, Any] = {
-            "model": slot.model,
-            "temperature": slot.temperature,
-            "messages": [{"role": "user", "content": user_message}],
-        }
-        if slot.max_tokens is not None:
-            body["max_tokens"] = slot.max_tokens
-        if slot.json_mode:
-            body["response_format"] = {"type": "json_object"}
+        user_message = render_filter_user_message(filter_prompt, candidates)
+        url, headers = provider_endpoint(provider)
+        body = build_chat_request(slot, user_message)
 
         by_id: dict[str, Candidate] = {c.item_id: c for c in candidates}
         response = await _acall_filter_model_with_retry(

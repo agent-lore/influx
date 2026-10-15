@@ -534,6 +534,9 @@ class ProviderConfig(BaseModel):
     extra_headers: dict[str, str] = Field(default_factory=dict)
 
 
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+
 class ModelSlotConfig(BaseModel):
     """``[models.*]`` LLM model slot configuration (FR-CFG-6)."""
 
@@ -553,6 +556,13 @@ class ModelSlotConfig(BaseModel):
     # that supports structured outputs; falls back to ``json_object``
     # mode automatically when the slot has no associated schema class.
     json_schema_strict: bool = False
+    # Reasoning-model effort selector, sent as ``reasoning_effort`` on the
+    # chat-completions request when set.  GPT-6 Luna defaults to
+    # ``medium`` reasoning, which bills hidden reasoning tokens against
+    # ``max_tokens`` and rejects ``temperature``; OpenAI's GPT-4.x
+    # migration guide says to start at ``"none"``.  Leave unset for
+    # models without a reasoning mode (GPT-4.1, most local models).
+    reasoning_effort: ReasoningEffort | None = None
 
 
 # ── Prompts ──────────────────────────────────────────────────────────

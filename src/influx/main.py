@@ -121,10 +121,10 @@ def _validate_json_mode_slots(config: AppConfig) -> None:
     (AC-X-1 — no hardcoded constants).  (FR-CLI-5, §16.4)
     """
     import json
-    import os
 
     from influx.errors import NetworkError
     from influx.http_client import guarded_post_json_fetch
+    from influx.llm_request import build_chat_request, provider_endpoint
 
     for slot_name, slot in config.models.items():
         if not slot.json_mode:
@@ -139,22 +139,10 @@ def _validate_json_mode_slots(config: AppConfig) -> None:
             )
             sys.exit(EXIT_FAILURE)
 
-        api_key = ""
-        if provider.api_key_env:
-            api_key = os.environ.get(provider.api_key_env, "")
-
-        headers: dict[str, str] = {**provider.extra_headers}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        body = {
-            "model": slot.model,
-            "messages": [{"role": "user", "content": "1"}],
-            "max_tokens": 1,
-            "response_format": {"type": "json_object"},
-        }
-
-        url = f"{provider.base_url.rstrip('/')}/chat/completions"
+        url, headers = provider_endpoint(provider)
+        # Same wire shape as a real call (so ``reasoning_effort`` and the
+        # sampling parameters are probed too), capped to a one-token reply.
+        body = build_chat_request(slot.model_copy(update={"max_tokens": 1}), "1")
 
         try:
             resp = guarded_post_json_fetch(

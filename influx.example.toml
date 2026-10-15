@@ -251,6 +251,15 @@ json_mode = true
 # `json_schema` response_format.  Switch to true if you point this slot
 # at a native OpenAI model that supports structured outputs (e.g.
 # `provider = "openai"`, `model = "gpt-4.1"`).
+#
+# Reasoning models (GPT-6 Luna / Sol, GPT-5.x) take an optional effort
+# selector, sent as `reasoning_effort`.  Unset = provider default, which
+# for GPT-6 Luna is `medium`: hidden reasoning tokens are billed as
+# output and count against `max_tokens`, and `temperature` is rejected
+# (Influx omits it automatically whenever effort is anything but "none").
+# OpenAI's GPT-4.x -> GPT-6 migration guide says to start with "none";
+# leave it unset for GPT-4.1 and for local models without a reasoning mode.
+# reasoning_effort = "none"   # none | minimal | low | medium | high | xhigh | max
 
 # ---------------------------------------------------------------------------
 # Prompts (filter / tier1_enrich / tier3_extract)
