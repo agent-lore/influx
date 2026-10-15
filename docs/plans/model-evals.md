@@ -79,8 +79,9 @@ would have run every call at `medium` reasoning (slower, pricier, and a
 | `runner.py` | send cases through production rendering + `build_chat_request` with the slot overridden by a `ModelSpec`; records validated output, latency, tokens, OpenRouter `usage.cost`; disk cache keyed by request body |
 | `metrics.py` | pure: validity/latency/cost summary; filter score agreement vs a baseline run (exact, ±1, MAE, pass/fail confusion + Cohen's kappa at 7/8/9); output-shape stats |
 | `judge.py` | pairwise LLM judge, both position orders, disagreement → tie |
+| `labels.py` | human relevance labels for filter candidates (0 skip … 3 deep extract) and the blind, resumable terminal tool that collects them |
 | `report.py` | markdown tables |
-| `__main__.py` | `build-dataset`, `run`, `compare` |
+| `__main__.py` | `build-dataset`, `run`, `compare`, `label`, `grade` |
 
 Datasets, runs and the cache live under `evals/{datasets,runs,.cache}` and
 are git-ignored (they contain snapshotted paper text and raw model output).
@@ -102,6 +103,11 @@ are git-ignored (they contain snapshotted paper text and raw model output).
   fails validation 5% of the time costs repair sweeps and terminal notes.
 
 ## 4. How to run it
+
+The operator guide, [`docs/operations/model-evals.md`](../operations/model-evals.md),
+is the maintained how-to: comparing a new model against production,
+labelling the filter set and grading runs against it. The commands below
+are the ones used for the migration.
 
 ```bash
 # API keys (OPENROUTER_API_KEY) are read from the env or --env-file.
@@ -242,6 +248,15 @@ the filter doing its job, not a regression. `low` reasoning on the filter
 did not change the picture (kappa 0.41, +1.9k reasoning tokens, 2x latency)
 so `none` stays.
 
+> **Correction (2026-10-15, after the fact).** The judge took its flips at
+> score 7 for every profile, and the report's "flips at threshold 6: 49"
+> line used yet another cut; neither honoured `retro-computing`'s own
+> `relevance = 6`. At each profile's own gate there are 55 flips, not 54:
+> one judged pair was not an ingest flip and two real ones were never
+> judged, all three `retro-computing` RSS items. The split above stands to
+> within those three. `compare` now takes flips at each profile's gate for
+> both the report and the judge.
+
 ### 7.4 Tier 1 / Tier 3: judge prefers Luna
 
 | slot | Luna wins | baseline wins | ties | mean judge score baseline → Luna |
@@ -270,5 +285,10 @@ bar for the *next* migration is agreement with Luna.
 - Record `usage` (tokens, cost) per production call in telemetry so the
   weekly spend per slot is visible without the harness.
 - Tune `reasoning_effort` per slot if Tier 3 benefits from `low`.
-- Grow the dataset: add a human-labelled filter set (operator-scored
-  candidates) so the filter has a key, not just a baseline.
+- ~~Grow the dataset: add a human-labelled filter set (operator-scored
+  candidates) so the filter has a key, not just a baseline.~~ Shipped:
+  `evals label` collects blind labels on the pipeline's own tiers (0 skip,
+  1 ingest, 2 full text, 3 deep extract) into `datasets/<name>/labels.jsonl`;
+  `evals grade` (and `compare`, whenever labels exist) reports per-gate
+  precision/recall/kappa against them and checks the judge's filter-flip
+  verdicts against the labels. Next: label `oct15`.

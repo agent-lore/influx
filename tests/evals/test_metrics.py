@@ -6,9 +6,13 @@ import pytest
 from evals.cases import CandidateRecord, CaseResult, FilterCase, Usage
 from evals.metrics import (
     DROPPED,
+    GateConfusion,
     ThresholdAgreement,
     compare_filter,
     filter_scores,
+    grade_filter,
+    judge_label_agreement,
+    predicted_tier,
     summarize_run,
     summarize_shape,
 )
@@ -122,6 +126,31 @@ class TestCompareFilter:
         assert cmp.comparable_cases == 0
         assert cmp.candidates == 0
 
+    def test_flips_use_each_profiles_own_relevance_gate(self) -> None:
+        cases = [
+            FilterCase("c1", "strict", (CandidateRecord("x", "t", "a"),)),
+            FilterCase("c2", "lenient", (CandidateRecord("y", "t", "a"),)),
+        ]
+        # x: 7 vs 6 flips at strict's 7; y: 6 vs 3 flips at lenient's 6.
+        baseline = [
+            _result("c1", _filter_output({"x": 7})),
+            _result("c2", _filter_output({"y": 6})),
+        ]
+        candidate = [
+            _result("c1", _filter_output({"x": 6})),
+            _result("c2", _filter_output({"y": 3})),
+        ]
+
+        cmp = compare_filter(
+            cases,
+            baseline,
+            candidate,
+            thresholds=(6, 7),
+            relevance={"strict": 7, "lenient": 6},
+        )
+
+        assert sorted(cmp.disagreements) == [("c1", "x", 7, 6), ("c2", "y", 6, 3)]
+
     def test_filter_scores_of_failed_result_is_empty(self) -> None:
         assert filter_scores(_result("c1", None, error="http")) == {}
 
@@ -168,3 +197,186 @@ class TestSummarizeShape:
 
         assert s.text_mean_chars == {"method": 4.0, "result": 2.0, "relevance": 0.0}
         assert s.arxiv_ref_rate is None
+
+
+class TestPredictedTier:
+    @pytest.mark.parametrize(
+        ("score", "tier"), [(DROPPED, 0), (6, 0), (7, 1), (8, 2), (9, 3), (10, 3)]
+    )
+    def test_score_maps_to_highest_gate_passed(self, score: int, tier: int) -> None:
+        assert predicted_tier(score, (7, 8, 9)) == tier
+
+    def test_gates_are_cumulative_like_the_cascade(self) -> None:
+        # Below relevance nothing is ingested, whatever full_text says.
+        assert predicted_tier(7, (8, 7, 9)) == 0
+        assert predicted_tier(8, (8, 7, 9)) == 2
+
+
+class TestGateConfusion:
+    def test_rates(self) -> None:
+        g = GateConfusion("ingest", tp=6, fp=2, fn=3, tn=9)
+
+        assert g.total == 20
+        assert g.precision == pytest.approx(0.75)
+        assert g.recall == pytest.approx(6 / 9)
+        assert g.f1 == pytest.approx(2 * 0.75 * (6 / 9) / (0.75 + 6 / 9))
+        assert g.accuracy == pytest.approx(0.75)
+        # Same formula the baseline-vs-candidate agreement uses.
+        assert g.kappa == pytest.approx(ThresholdAgreement(7, 6, 3, 2, 9).kappa)
+
+    def test_undefined_rates_are_none(self) -> None:
+        g = GateConfusion("deep extract", tp=0, fp=0, fn=0, tn=5)
+
+        assert (g.precision, g.recall, g.f1, g.kappa) == (None, None, None, None)
+        assert g.accuracy == 1.0
+
+    def test_nothing_graded_is_all_none(self) -> None:
+        g = GateConfusion("ingest", tp=0, fp=0, fn=0, tn=0)
+
+        assert (g.accuracy, g.kappa) == (None, None)
+
+    def test_constant_labels_but_varying_model_has_a_kappa(self) -> None:
+        assert GateConfusion("ingest", tp=0, fp=2, fn=0, tn=3).kappa == 0.0
+
+
+class TestGradeFilter:
+    _cases = (
+        FilterCase(
+            case_id="c1",
+            profile="a",
+            candidates=tuple(CandidateRecord(i, f"T{i}", "") for i in "wxyz"),
+        ),
+        FilterCase(
+            case_id="c2",
+            profile="b",
+            candidates=(CandidateRecord("v", "Tv", ""), CandidateRecord("x", "Tx", "")),
+        ),
+    )
+    _gates = {"a": (7, 8, 9), "b": (5, 6, 7)}
+
+    def test_per_gate_confusion_with_per_profile_thresholds(self) -> None:
+        labels = {
+            ("a", "w"): 3,
+            ("a", "x"): 1,
+            ("a", "y"): 0,
+            ("a", "z"): 2,
+            ("b", "v"): 1,
+        }
+        results = [
+            _result("c1", _filter_output({"w": 9, "x": 8, "y": 7})),  # z dropped
+            _result("c2", _filter_output({"v": 5})),  # 5 passes b's ingest gate
+        ]
+
+        g = grade_filter(self._cases, results, labels, self._gates)
+
+        assert (g.labelled, g.graded) == (5, 5)
+        ingest, full_text, deep = g.gates
+        assert ingest == GateConfusion("ingest", tp=3, fp=1, fn=1, tn=0)
+        assert full_text == GateConfusion("full text", tp=1, fp=1, fn=1, tn=2)
+        assert deep == GateConfusion("deep extract", tp=1, fp=0, fn=0, tn=4)
+        assert g.tier_exact == 2  # w (3/3) and v (1/1)
+        assert sorted(m[:2] for m in g.misses) == [("a", "y"), ("a", "z")]
+        assert ("a", "z", "Tz", 2, DROPPED) in g.misses
+
+    def test_unlabelled_items_and_failed_batches_are_not_graded(self) -> None:
+        labels = {("a", "w"): 3, ("b", "v"): 0}
+        results = [
+            _result("c1", _filter_output({"w": 9})),
+            _result("c2", None, error="validate"),
+        ]
+
+        g = grade_filter(self._cases, results, labels, self._gates)
+
+        assert (g.labelled, g.graded) == (2, 1)
+        assert g.gates[0] == GateConfusion("ingest", tp=1, fp=0, fn=0, tn=0)
+
+    def test_unknown_profile_falls_back_to_default_gates(self) -> None:
+        case = FilterCase("c9", "gone", (CandidateRecord("x", "T", ""),))
+
+        g = grade_filter(
+            [case], [_result("c9", _filter_output({"x": 7}))], {("gone", "x"): 1}, {}
+        )
+
+        assert g.tier_exact == 1
+
+    def test_item_repeated_across_batches_is_graded_once(self) -> None:
+        cases = [
+            FilterCase("c1", "a", (CandidateRecord("x", "T", ""),)),
+            FilterCase("c2", "a", (CandidateRecord("x", "T", ""),)),
+        ]
+        results = [
+            _result("c1", _filter_output({"x": 9})),
+            _result("c2", _filter_output({"x": 2})),
+        ]
+
+        g = grade_filter(cases, results, {("a", "x"): 3}, self._gates)
+
+        assert (g.labelled, g.graded, g.tier_exact) == (1, 1, 1)
+
+    def test_repeated_item_graded_on_the_first_batch_the_run_scored(self) -> None:
+        cases = [
+            FilterCase("c1", "a", (CandidateRecord("x", "T", ""),)),
+            FilterCase("c2", "a", (CandidateRecord("x", "T", ""),)),
+        ]
+        results = [
+            _result("c1", None, error="http"),
+            _result("c2", _filter_output({"x": 9})),
+        ]
+
+        g = grade_filter(cases, results, {("a", "x"): 3}, self._gates)
+
+        assert (g.labelled, g.graded, g.tier_exact) == (1, 1, 1)
+
+
+class TestJudgeLabelAgreement:
+    _profiles = {"c1": "a", "c2": "b"}
+    _gates = {"a": (7, 8, 9), "b": (8, 9, 10)}
+
+    def test_judge_checked_against_the_model_the_label_sides_with(self) -> None:
+        flips = [
+            ("c1", "x", 8, 3),  # label 1: baseline right
+            ("c1", "y", 3, 8),  # label 1: candidate right
+            ("c1", "z", 9, 0),  # label 0: candidate right
+            ("c1", "w", 7, 6),  # unlabelled
+        ]
+        judged = [
+            ("c1", "x", "baseline"),
+            ("c1", "y", "baseline"),
+            ("c1", "z", "tie"),
+            ("c1", "w", "candidate"),
+        ]
+        labels = {("a", "x"): 1, ("a", "y"): 1, ("a", "z"): 0}
+
+        check = judge_label_agreement(
+            judged, flips, self._profiles, labels, self._gates
+        )
+
+        assert (check.checked, check.agree, check.disagree, check.ties) == (
+            3,
+            1,
+            1,
+            1,
+        )
+
+    def test_flip_that_is_not_a_flip_at_the_profile_gate_is_skipped(self) -> None:
+        # Both scores sit below profile b's ingest gate of 8.
+        check = judge_label_agreement(
+            [("c2", "x", "baseline")],
+            [("c2", "x", 7, 3)],
+            self._profiles,
+            {("b", "x"): 0},
+            self._gates,
+        )
+
+        assert check.checked == 0
+
+    def test_item_judged_in_two_batches_counts_once(self) -> None:
+        check = judge_label_agreement(
+            [("c1", "x", "baseline"), ("c3", "x", "baseline")],
+            [("c1", "x", 8, 3), ("c3", "x", 8, 3)],
+            {"c1": "a", "c3": "a"},
+            {("a", "x"): 1},
+            self._gates,
+        )
+
+        assert (check.checked, check.agree) == (1, 1)

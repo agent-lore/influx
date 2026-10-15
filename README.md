@@ -142,6 +142,21 @@ make diagrams   # = pytest tests/guardrail/ -q; commit the result
 `docs/generated/`. CI's `diagrams` job fails if the committed views drift from the
 code.
 
+## Model evals
+
+`evals/` measures a model, slot-setting or prompt change on the exact
+requests production sends (filter, Tier 1, Tier 3) before it ships, and
+keeps a human-labelled answer key for the filter:
+
+```bash
+uv run python -m evals --help   # build-dataset, run, compare, label, grade
+```
+
+The operator guide, [docs/operations/model-evals.md](docs/operations/model-evals.md),
+covers comparing a new model against production, labelling the filter set
+and grading runs against it. [docs/plans/model-evals.md](docs/plans/model-evals.md)
+has the background and the GPT-4.1-mini → GPT-6 Luna results.
+
 ## Docker
 
 Build and run with the project Docker helpers:
