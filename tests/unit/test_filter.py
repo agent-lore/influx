@@ -321,3 +321,37 @@ async def test_score_propagates_filter_tags_and_reason() -> None:
     assert result[0].filter_tags == ("ai-safety",)
     assert result[0].reason == "ok"
     assert result[0].confidence == 1.0
+
+
+class TestRetryDelaySeconds:
+    """``retry_delay_seconds`` is the single home of the scorer's backoff."""
+
+    def test_429_honours_retry_after(self, influx_config_env: object) -> None:
+        from influx.config import load_config
+        from influx.filter import retry_delay_seconds
+
+        config = load_config(check_api_keys=False)
+
+        delay = retry_delay_seconds(
+            status=429, headers={"retry-after": "7"}, config=config, attempt=0
+        )
+
+        assert delay == 7.0
+
+    def test_5xx_and_network_back_off_exponentially(
+        self, influx_config_env: object
+    ) -> None:
+        from influx.config import load_config
+        from influx.filter import retry_delay_seconds
+
+        config = load_config(check_api_keys=False)
+        base = config.resilience.backoff_base_seconds
+
+        assert (
+            retry_delay_seconds(status=503, headers={}, config=config, attempt=0)
+            == base
+        )
+        assert (
+            retry_delay_seconds(status=None, headers={}, config=config, attempt=2)
+            == base * 4
+        )

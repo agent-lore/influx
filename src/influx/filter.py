@@ -64,6 +64,7 @@ __all__ = [
     "FilterScorerError",
     "make_default_batch_scorer",
     "render_filter_user_message",
+    "retry_delay_seconds",
 ]
 
 
@@ -143,6 +144,25 @@ def _filter_429_delay(
     return float(config.resilience.backoff_base_seconds * (2**attempt))
 
 
+def retry_delay_seconds(
+    *,
+    status: int | None,
+    headers: dict[str, str],
+    config: AppConfig,
+    attempt: int,
+) -> float:
+    """Seconds the filter scorer waits before retrying *attempt* (0-based).
+
+    A 429 honours ``Retry-After`` (seconds or HTTP-date, capped) and falls
+    back to exponential backoff; 5xx and network failures (``status`` is
+    ``None``) back off exponentially from ``resilience.backoff_base_seconds``.
+    Public so the eval harness waits exactly as production does.
+    """
+    if status == 429:
+        return _filter_429_delay(headers, config, attempt)
+    return float(config.resilience.backoff_base_seconds * (2**attempt))
+
+
 def _call_filter_model_with_retry(
     *,
     config: AppConfig,
@@ -168,7 +188,9 @@ def _call_filter_model_with_retry(
             last_error = exc
             if attempt + 1 >= attempts:
                 break
-            delay = float(config.resilience.backoff_base_seconds * (2**attempt))
+            delay = retry_delay_seconds(
+                status=None, headers={}, config=config, attempt=attempt
+            )
             _log.warning(
                 "filter HTTP error for profile %r on attempt %d/%d: %s; "
                 "retrying in %.1fs",
@@ -185,7 +207,9 @@ def _call_filter_model_with_retry(
             last_error = FilterScorerError("filter slot HTTP 429")
             if attempt + 1 >= attempts:
                 break
-            delay = _filter_429_delay(result.headers, config, attempt)
+            delay = retry_delay_seconds(
+                status=429, headers=result.headers, config=config, attempt=attempt
+            )
             _log.warning(
                 "filter slot HTTP 429 for profile %r on attempt %d/%d; "
                 "backing off %.1fs",
@@ -201,7 +225,12 @@ def _call_filter_model_with_retry(
             last_error = FilterScorerError(f"filter slot HTTP {result.status_code}")
             if attempt + 1 >= attempts:
                 break
-            delay = float(config.resilience.backoff_base_seconds * (2**attempt))
+            delay = retry_delay_seconds(
+                status=result.status_code,
+                headers=result.headers,
+                config=config,
+                attempt=attempt,
+            )
             _log.warning(
                 "filter slot HTTP %d for profile %r on attempt %d/%d; "
                 "retrying in %.1fs",

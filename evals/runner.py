@@ -35,7 +35,7 @@ from influx.config import AppConfig, ModelSlotConfig, ProviderConfig
 from influx.enrich import render_tier1_prompt, render_tier3_prompt
 from influx.errors import NetworkError
 from influx.feedback import format_negative_examples
-from influx.filter import render_filter_user_message
+from influx.filter import render_filter_user_message, retry_delay_seconds
 from influx.http_client import FetchResult, guarded_post_json_fetch
 from influx.llm_request import (
     JsonContentError,
@@ -61,6 +61,7 @@ _SLOT_BINDINGS: dict[str, tuple[str, type[BaseModel]]] = {
 }
 
 Poster = Callable[..., FetchResult]
+Sleeper = Callable[[float], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,10 +131,12 @@ class Runner:
         cache_dir: Path | None = None,
         poster: Poster | None = None,
         concurrency: int = 4,
+        sleeper: Sleeper = time.sleep,
     ) -> None:
         self._config = config
         self._spec = spec
         self._cache_dir = cache_dir
+        self._sleeper = sleeper
         # Resolved at call time so tests can monkeypatch the module global.
         self._poster = poster or guarded_post_json_fetch
         self._concurrency = max(1, concurrency)
@@ -246,6 +249,7 @@ class Runner:
 
         attempts: list[dict[str, Any]] = list(self._cached_attempts(key))
         from_cache = bool(attempts)
+        backoff_total = 0.0
         while True:
             outcome = _evaluate(attempts, schema) if attempts else None
             if outcome is not None and (
@@ -255,6 +259,18 @@ class Runner:
             ):
                 break
             from_cache = False
+            if outcome is not None and policy.backoff:
+                # Wait exactly as the production filter scorer would before
+                # retrying a 429 (Retry-After), 5xx or network failure.
+                delay = retry_delay_seconds(
+                    status=outcome.status,
+                    headers=attempts[-1].get("headers") or {},
+                    config=self._config,
+                    attempt=len(attempts) - 1,
+                )
+                if delay > 0 and outcome.error in ("http", "network"):
+                    self._sleeper(delay)
+                    backoff_total += delay
             result, latency, net_error = self._post(
                 url, headers, body, slot.request_timeout
             )
@@ -262,6 +278,7 @@ class Runner:
                 {
                     "latency_seconds": latency,
                     "status": result.status_code if result else None,
+                    "headers": dict(result.headers) if result else {},
                     "body": (
                         result.body.decode("utf-8", errors="replace") if result else ""
                     ),
@@ -280,7 +297,14 @@ class Runner:
                 )
         self._store(key, {"attempts": attempts})
         assert outcome is not None
-        return _finish(case_id, eval_slot, slot.model, outcome, from_cache=from_cache)
+        return _finish(
+            case_id,
+            eval_slot,
+            slot.model,
+            outcome,
+            from_cache=from_cache,
+            backoff_seconds=backoff_total,
+        )
 
     def _cached_attempts(self, key: str) -> list[dict[str, Any]]:
         cached = self._cached(key)
@@ -335,6 +359,10 @@ class RetryPolicy:
     parse: bool = True
     validate: bool = False
     http_4xx: bool = False  # 429 and 5xx are always retried
+    backoff: bool = False
+    """Wait (Retry-After / exponential) before retrying 429, 5xx and network
+    failures, as the production filter scorer does.  The Tier-1 / Tier-3
+    caller retries immediately, so its slots leave this off."""
 
     def retries(self, error: str, status: int | None) -> bool:
         if error == "network":
@@ -355,7 +383,7 @@ class RetryPolicy:
 # Mirrors ``influx.filter._call_filter_model_with_retry`` and
 # ``influx.enrich._call_json_model`` respectively.
 _RETRY_POLICIES: dict[str, RetryPolicy] = {
-    "filter": RetryPolicy(parse=True, validate=True, http_4xx=False),
+    "filter": RetryPolicy(parse=True, validate=True, http_4xx=False, backoff=True),
     "tier1": RetryPolicy(parse=True, validate=False, http_4xx=True),
     "tier3": RetryPolicy(parse=True, validate=False, http_4xx=True),
 }
@@ -466,8 +494,11 @@ def _finish(
     outcome: _Outcome,
     *,
     from_cache: bool,
+    backoff_seconds: float = 0.0,
 ) -> CaseResult:
     meta: dict[str, Any] = {"from_cache": from_cache}
+    if backoff_seconds:
+        meta["backoff_seconds"] = backoff_seconds
     if outcome.salvaged:
         meta["salvaged"] = True
     if outcome.attempt_errors:

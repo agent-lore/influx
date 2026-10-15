@@ -312,3 +312,80 @@ def test_old_cache_entry_with_retryable_failure_is_continued_live(
     assert result.ok and result.attempts == 2
     assert result.meta["from_cache"] is False
     assert len(poster.bodies) == 1
+
+
+# ── production backoff before retries ─────────────────────────────────
+
+
+def _rate_limited(retry_after: str) -> FetchResult:
+    return FetchResult(
+        body=b'{"error": {"message": "slow down"}}',
+        status_code=429,
+        content_type="application/json",
+        final_url="https://example.test",
+        headers={"Retry-After": retry_after},
+    )
+
+
+def test_filter_waits_retry_after_before_retrying_429(eval_config: AppConfig) -> None:
+    good = {"results": [{"id": "x", "score": 8, "tags": [], "reason": "r"}]}
+    poster = _Poster([_rate_limited("0.05"), chat_response(good)])
+    slept: list[float] = []
+    runner = Runner(eval_config, _SPEC, poster=poster, sleeper=slept.append)  # type: ignore[arg-type]
+
+    (result,) = runner.run_filter(
+        [FilterCase("f", "ai-robotics", (CandidateRecord("x", "T", "A"),))]
+    )
+
+    assert result.ok and result.attempts == 2
+    assert slept == [pytest.approx(0.05)]
+    assert result.meta["backoff_seconds"] == pytest.approx(0.05)
+
+
+def test_filter_backs_off_exponentially_on_5xx_and_network(
+    eval_config: AppConfig,
+) -> None:
+    base = eval_config.resilience.backoff_base_seconds
+    good = {"results": []}
+    poster = _Poster(
+        [
+            error_response(503),
+            NetworkError("boom", url="https://x", kind="timeout"),
+            chat_response(good),
+        ]
+    )
+    slept: list[float] = []
+    runner = Runner(eval_config, _SPEC, poster=poster, sleeper=slept.append)  # type: ignore[arg-type]
+
+    (result,) = runner.run_filter(
+        [FilterCase("f", "ai-robotics", (CandidateRecord("x", "T", "A"),))]
+    )
+
+    assert result.ok and result.attempts == 3
+    assert slept == [float(base), float(base * 2)]
+
+
+def test_filter_does_not_sleep_before_retrying_a_parse_failure(
+    eval_config: AppConfig,
+) -> None:
+    poster = _Poster([chat_response("prose only"), chat_response({"results": []})])
+    slept: list[float] = []
+    runner = Runner(eval_config, _SPEC, poster=poster, sleeper=slept.append)  # type: ignore[arg-type]
+
+    (result,) = runner.run_filter(
+        [FilterCase("f", "ai-robotics", (CandidateRecord("x", "T", "A"),))]
+    )
+
+    assert result.ok and result.attempts == 2
+    assert slept == []
+
+
+def test_tier1_retries_immediately_like_production(eval_config: AppConfig) -> None:
+    poster = _Poster([_rate_limited("5"), chat_response(_TIER1)])
+    slept: list[float] = []
+    runner = Runner(eval_config, _SPEC, poster=poster, sleeper=slept.append)  # type: ignore[arg-type]
+
+    (result,) = runner.run_tier1([Tier1Case("t1", "ai-robotics", "T", "A")])
+
+    assert result.ok and result.attempts == 2
+    assert slept == []

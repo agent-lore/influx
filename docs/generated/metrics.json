@@ -120,7 +120,7 @@
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
       }
     ],
-    "total_functions": 708
+    "total_functions": 709
   },
   "domain": {
     "associations": 5,
@@ -360,13 +360,13 @@
       },
       "Filter": {
         "classes": 2,
-        "functions": 12,
+        "functions": 13,
         "largest_module": "influx.filter",
-        "largest_module_lines": 477,
-        "lines": 477,
+        "largest_module_lines": 506,
+        "lines": 506,
         "modules": 1,
-        "public_symbols": 4,
-        "sloc": 401
+        "public_symbols": 5,
+        "sloc": 427
       },
       "HttpApi": {
         "classes": 4,
@@ -474,13 +474,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 29725,
+    "total_lines": 29754,
     "total_modules": 61,
-    "total_sloc": 23078
+    "total_sloc": 23104
   },
   "tests": {
     "ratio": 2.59,
-    "src_lines": 29725,
-    "test_lines": 76996
+    "src_lines": 29754,
+    "test_lines": 77107
   }
 }
