@@ -3,7 +3,7 @@
 # Single source of truth for:
 #   - the generated component diagram + per-component pages
 #   - which modules are scanned for the domain class diagram
-#   - the architecture metrics snapshot and its hard budgets
+#   - the architecture metrics snapshot and its accepted budgets
 #
 # The directional layering contract lives in pyproject.toml
 # ([tool.importlinter]); the tiers below document that intent (dependencies must
@@ -65,17 +65,15 @@ Entrypoints = ["Entrypoint", "HttpApi", "Orchestration"]
 Core        = ["Sources", "Filter", "Enrich", "Repair", "Storage", "LithosBridge", "Feedback", "Notifications"]
 Foundation  = ["Config", "Observability", "Schemas", "Common"]
 
-# Hard architecture budgets, checked by tests/guardrail/test_metrics_budgets.py
+# Accepted architecture budgets, classified by [policies] and checked by tests/guardrail/test_metrics_budgets.py
 # against the metrics snapshot (docs/generated/metrics.md explains each one).
-# CI fails if a measured value exceeds its budget. Raising a budget is allowed
-# but must be an explicit, reviewed edit to this file; lower a budget after
-# improving the code to lock in the gain.
+# Invariant breaches fail CI; review thresholds produce findings. Budget changes
+# require an explicit, reviewed edit to this file; lower a threshold after
+# improving the code where that protects a useful gain.
 #
-# Most budgets below are tight ratchets pinned at today's value (any regression
-# fails CI). max_module_lines is the exception: it is a STOP-LOSS ceiling set a
-# little above today's largest module so a big module can't quietly balloon — it
-# is deliberately NOT pinned to the exact current high-water mark. Ratchet the
-# *count* of oversized modules down via modules_over_800_lines instead.
+# Size and count ceilings retain their accepted values as review thresholds.
+# They guide design judgment; they do not require mechanical splitting.
+# See [review], [policies], and docs/quality-guide.md.
 [budgets]
 cross_component_edges  = 62   # measured 2026-07 (64->62 after #267 broke Sources<->Filter); direction: down
 component_cycles       = 3    # Common<->Config, a Core SCC, HttpApi<->Orchestration; goal: fewer
@@ -125,3 +123,24 @@ exclude_modules = [
     "influx.storage",
     "influx.urls",
 ]
+
+# Kit 1.6: merge this baseline before enabling changed-code review gates.
+[review]
+function_complexity = 10
+function_length = 75
+module_lines = 800
+enforce_new = false
+enforce_worsened = false
+
+# Dependency/cycle contracts remain invariants; size/count thresholds prompt review.
+[policies]
+cross_component_edges = "review"
+component_cycles = "invariant"
+module_cycles = "invariant"
+modules_over_800_lines = "review"
+max_module_lines = "review"
+cross_module_private_refs = "invariant"
+tests_private_imports = "invariant"
+function_complexity = "review"
+function_length = "review"
+module_lines = "review"

@@ -35,7 +35,7 @@ metrics-history:
 metrics-diff:
 	@set -e; tmp=$$(mktemp); trap 'rm -f $$tmp' EXIT; \
 	git show $(or $(BASE),origin/main):docs/generated/metrics.json > $$tmp 2>/dev/null || echo '{}' > $$tmp; \
-	uv run python scripts/metrics_diff.py $$tmp docs/generated/metrics.json
+	uv run python scripts/metrics_diff.py $$tmp docs/generated/metrics.json --check
 
 docker-build:
 	docker build -t influx:dev -f docker/Dockerfile .

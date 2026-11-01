@@ -44,12 +44,27 @@ def test_extract_missing_key_is_none() -> None:
     assert mh.extract(metrics, "absent.path") is None
 
 
+def test_extract_greedy_dotted_module_keys() -> None:
+    metrics = {"modules": {"pkg.core": {"sloc": 120, "max_complexity": 7}}}
+    assert mh.extract(metrics, "modules.pkg.core.sloc") == 120
+    assert mh.extract(metrics, "modules.pkg.core.max_complexity") == 7
+    assert mh.extract(metrics, "modules.pkg.gone.sloc") is None
+
+
+def test_extract_greedy_prefers_longest_joined_key() -> None:
+    # the package module "pkg" is a sibling key of "pkg.core" in the modules
+    # map — the longest joined run must win or the package entry shadows it
+    metrics = {"modules": {"pkg": {"sloc": 10}, "pkg.core": {"sloc": 120}}}
+    assert mh.extract(metrics, "modules.pkg.core.sloc") == 120
+    assert mh.extract(metrics, "modules.pkg.sloc") == 10
+
+
 def test_emit_csv_shape() -> None:
     csv = mh.emit_csv(
         [_SNAP_A, _SNAP_B], ["graph.cross_component_edges", "items.count"]
     )
     lines = csv.strip().splitlines()
-    assert lines[0] == "sha,date,graph.cross_component_edges,items.count"
+    assert lines[0] == "sha,timestamp,graph.cross_component_edges,items.count"
     assert lines[1] == "aaaaaaa,2026-01-01,63,2"
     assert lines[2] == "bbbbbbb,2026-02-01,60,3"
 
@@ -67,13 +82,14 @@ def test_emit_mermaid_has_chart_per_key() -> None:
     assert "line [63, 60]" in out
 
 
-def test_emit_mermaid_missing_value_is_zero() -> None:
+def test_emit_mermaid_missing_value_is_not_fabricated_zero() -> None:
     out = mh.emit_mermaid([_SNAP_A], ["graph.nope"])
-    assert "line [0]" in out
+    assert "Chart omitted" in out
+    assert "line [0]" not in out
 
 
 def test_emit_handles_empty_history() -> None:
-    assert mh.emit_csv([], ["k"]) == "sha,date,k\n"
+    assert mh.emit_csv([], ["k"]) == "sha,timestamp,k\n"
     assert mh.emit_mermaid([], ["k"]).startswith("## k")
 
 
@@ -113,7 +129,7 @@ def test_iter_snapshots_parses_first_parent_history(
     assert snaps[0][2]["graph"]["cross_component_edges"] == 63
 
 
-def test_iter_snapshots_skips_commit_missing_snapshot(
+def test_iter_snapshots_preserves_commit_missing_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     log_out = "aaaaaaa 2026-01-01\nbbbbbbb 2026-02-01\n"
@@ -122,10 +138,11 @@ def test_iter_snapshots_skips_commit_missing_snapshot(
         "bbbbbbb": json.dumps({"graph": {"cross_component_edges": 60}}),
     }
     monkeypatch.setattr(mh, "_git", _fake_git(log_out, shows))
-    assert [sha for sha, _, _ in mh.iter_snapshots()] == ["bbbbbbb"]
+    assert [sha for sha, _, _ in mh.iter_snapshots()] == ["aaaaaaa", "bbbbbbb"]
+    assert mh.iter_snapshots()[0][2] == {}
 
 
-def test_iter_snapshots_skips_malformed_snapshot(
+def test_iter_snapshots_preserves_malformed_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     log_out = "aaaaaaa 2026-01-01\nbbbbbbb 2026-02-01\n"
@@ -134,7 +151,8 @@ def test_iter_snapshots_skips_malformed_snapshot(
         "bbbbbbb": json.dumps({"graph": {"cross_component_edges": 60}}),
     }
     monkeypatch.setattr(mh, "_git", _fake_git(log_out, shows))
-    assert [sha for sha, _, _ in mh.iter_snapshots()] == ["bbbbbbb"]
+    assert [sha for sha, _, _ in mh.iter_snapshots()] == ["aaaaaaa", "bbbbbbb"]
+    assert mh.iter_snapshots()[0][2] == {}
 
 
 def test_iter_snapshots_empty_history(monkeypatch: pytest.MonkeyPatch) -> None:

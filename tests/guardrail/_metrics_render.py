@@ -2,7 +2,10 @@
 
 Both renderers consume the single dict produced by
 :func:`tests.guardrail._metrics_toolkit.compute_metrics`, so the two committed
-artifacts can never disagree with each other.
+artifacts can never disagree with each other. The per-module ``modules`` map
+stays JSON-only: a table with one row per module would swamp metrics.md, and
+the offenders are already named by ``modules_over_800`` and the component
+table — the map exists for trend mining, not for reading.
 """
 
 from __future__ import annotations
@@ -10,9 +13,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from scripts.quality import policy_mode, render_report, report
+
 from tests.guardrail._common import LANGUAGE, load_architecture, with_header
 from tests.guardrail._metrics_toolkit import (
     COMPLEXITY_THRESHOLD,
+    FUNCTION_LENGTH_THRESHOLD,
     GOD_MODULE_LINES,
     budget_actual,
 )
@@ -27,17 +33,26 @@ def _budget_table(metrics: dict[str, Any], budgets: dict[str, int]) -> list[str]
     lines = [
         "## Budgets",
         "",
-        "Hard limits from `docs/architecture.toml [budgets]`, enforced in CI by",
-        "`tests/guardrail/test_metrics_budgets.py`. Headroom = budget - actual;",
-        "lower a budget after improving the code to lock in the gain.",
+        "Only invariant budgets block generation; review/context thresholds are "
+        + "reported.",
+        "Accepted budgets from `docs/architecture.toml [budgets]`, enforced in CI by",
+        "`tests/guardrail/test_metrics_budgets.py`. Headroom = budget - actual.",
         "",
-        "| Metric | Actual | Budget | Headroom |",
-        "|---|---:|---:|---:|",
+        "Architectural invariants (dependency restrictions and prohibited cycles)",
+        "require an explicit architecture decision to change. Size and complexity",
+        "thresholds prompt design review: do not split cohesive code solely to",
+        "satisfy a number. If there is no clean seam and keeping the code together",
+        "is clearer, adjust the relevant threshold and explain the design tradeoff",
+        "in the same PR. Lower thresholds when that protects useful improvements.",
+        "",
+        "| Metric | Actual | Budget | Headroom | Policy |",
+        "|---|---:|---:|---:|---|",
     ]
     for key in sorted(budgets):
         actual = budget_actual(metrics, key)
         lines.append(
-            f"| `{key}` | {actual} | {budgets[key]} | {budgets[key] - actual} |"
+            f"| `{key}` | {actual} | {budgets[key]} | {budgets[key] - actual} | "
+            + f"{policy_mode(metrics.get('review', {}), key)} |"
         )
     return lines
 
@@ -50,7 +65,7 @@ def _component_table(metrics: dict[str, Any]) -> list[str]:
         "1 = unstable (depends on many, nothing depends on it).",
         "",
         "| Component | Modules | Lines | SLOC | Fan-in | Fan-out | Instability |"
-        " Max complexity | Functions > "
+        + " Max complexity | Functions > "
         f"{COMPLEXITY_THRESHOLD} |",
         "|---|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
@@ -65,9 +80,9 @@ def _component_table(metrics: dict[str, Any]) -> list[str]:
             else "-"
         )
         lines.append(
-            f"| {comp} | {s['modules']} | {s['lines']} | {s['sloc']} |"
-            + f" {g['fan_in']} | {g['fan_out']} | {g['instability']:.2f} |"
-            + f" {max_cx} | {c['functions_over_10']} |"
+            f"| {comp} | {s['modules']} | {s['lines']} | {s['sloc']} | {g['fan_in']} |"
+            + f" {g['fan_out']} | {g['instability']:.2f} | {max_cx} | "
+            + f"{c['functions_over_10']} |"
         )
     return lines
 
@@ -96,11 +111,11 @@ def _graph_section(metrics: dict[str, Any]) -> list[str]:
         "## Import graph",
         "",
         f"- Cross-component edges: **{g['cross_component_edges']}**"
-        f" ({g['cross_component_module_edges']} module-level)",
+        + f" ({g['cross_component_module_edges']} module-level)",
         f"- Component cycles: {cycles}",
         f"- Module cycles: {module_cycles}",
-        f"- Tier-skipping edges ({tiers[0]} → {tiers[-1]}):"
-        + f" {g['tier_skipping_edges']} ({skips})",
+        f"- Tier-skipping edges ({tiers[0]} → {tiers[-1]}): "
+        + f"{g['tier_skipping_edges']} ({skips})",
         f"- Longest component dependency chain: {g['longest_component_chain']}",
     ]
 
@@ -111,7 +126,7 @@ def _size_section(metrics: dict[str, Any]) -> list[str]:
         "## Size",
         "",
         f"- Modules: **{s['total_modules']}**, lines: **{s['total_lines']}**,"
-        f" SLOC: **{s['total_sloc']}**",
+        + f" SLOC: **{s['total_sloc']}**",
         f"- Largest module: `{s['max_module']}` ({s['max_module_lines']} lines)",
         f"- Modules over {GOD_MODULE_LINES} lines: **{len(s['modules_over_800'])}**",
     ]
@@ -121,19 +136,27 @@ def _size_section(metrics: dict[str, Any]) -> list[str]:
 
 def _complexity_section(metrics: dict[str, Any]) -> list[str]:
     c = metrics["complexity"]
+    fl = c["function_lengths"]
+    longest = f" (`{fl['max_function']}`)" if fl["max_function"] else ""
     lines = [
         "## Complexity",
         "",
         f"- Functions: **{c['total_functions']}**, cyclomatic > {COMPLEXITY_THRESHOLD}:"
-        f" **{c['functions_over_10']}**",
+        + f" **{c['functions_over_10']}**",
+        f"- Cyclomatic distribution: median **{c['median']}**, p90 **{c['p90']}**,"
+        + f" max **{c['max']}**",
+        f"- Function length (lines): median {fl['median']}, p90 {fl['p90']},"
+        + f" max {fl['max']}{longest}; over {FUNCTION_LENGTH_THRESHOLD}: "
+        + f"**{fl['over_75']}**",
         "",
         "Top 10 most complex functions:",
         "",
-        "| Complexity | Function |",
-        "|---:|---|",
+        "| Complexity | Length | Function |",
+        "|---:|---:|---|",
     ]
     lines.extend(
-        f"| {t['complexity']} | `{t['qualname']}` |" for t in c["top_functions"]
+        f"| {t['complexity']} | {t['length']} | `{t['qualname']}` |"
+        for t in c["top_functions"]
     )
     return lines
 
@@ -155,11 +178,11 @@ def _seams_section(metrics: dict[str, Any]) -> list[str]:
     ]
     if LANGUAGE != "python":
         lines.append(
-            "Not scanned: underscore privacy is a " + "Python convention (n/a here)."
+            "Not scanned: underscore privacy is a Python convention (n/a here)."
         )
         return lines
     lines.append(
-        "- Cross-module private refs (src): " + f"**{s['cross_module_private_refs']}**"
+        f"- Cross-module private refs (src): **{s['cross_module_private_refs']}**"
     )
     _seam_details(lines, s["cross_module_private_detail"])
     lines.append(f"- Tests importing src privates: **{s['tests_private_imports']}**")
@@ -184,16 +207,16 @@ def _summary_section(metrics: dict[str, Any]) -> list[str]:
     if has_domain:
         lines.append(
             f"- Domain models: **{d['models']}** ({d['associations']} associations,"
-            f" {d['models_without_docstrings']} without docstrings)"
+            + f" {d['models_without_docstrings']} without docstrings)"
         )
     if has_tools:
         lines.append(
-            f"- MCP tools: **{m['tools']}**"
-            + f" ({m['tools_without_docstrings']} without docstrings)"
+            f"- MCP tools: **{m['tools']}** ({m['tools_without_docstrings']} "
+            + "without docstrings)"
         )
     lines.append(
         f"- Test-to-source line ratio: **{t['ratio']:.2f}**"
-        f" ({t['test_lines']} test lines / {t['src_lines']} source lines)"
+        + f" ({t['test_lines']} test lines / {t['src_lines']} source lines)"
     )
     return lines
 
@@ -201,7 +224,28 @@ def _summary_section(metrics: dict[str, Any]) -> list[str]:
 def render_metrics_md(metrics: dict[str, Any], budgets: dict[str, int]) -> str:
     sections = [
         ["# Architecture metrics"],
+        [
+            "## Measurement scope",
+            "",
+            "```json",
+            json.dumps(metrics.get("measurement", {}), indent=2, sort_keys=True),
+            "```",
+            "",
+            "Test/source ratio is a volume statistic, not test effectiveness; kit "
+            + "tooling is excluded.",
+        ],
         _budget_table(metrics, budgets),
+        [render_report(report(metrics, metrics))],
+        [
+            "## Quality evidence",
+            "",
+            "Optional measurements are source-bound; missing or stale evidence is "
+            + "not a score.",
+            "",
+            "```json",
+            json.dumps(metrics.get("quality", {}), indent=2, sort_keys=True),
+            "```",
+        ],
         _graph_section(metrics),
         _component_table(metrics),
         _size_section(metrics),

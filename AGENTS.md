@@ -13,7 +13,7 @@ model, architecture metrics, and per-component drill-down pages (indexed by
 - The CI job `diagrams` fails when the committed files disagree with what the
   code generates. Fix: `make diagrams`, commit.
 - `docs/architecture.toml` is the source of truth for components, tiers,
-  domain-model scanning, and the hard metric budgets. Adding a new module,
+  domain-model scanning, and the accepted metric budgets. Adding a new module,
   component, or model? The guardrail orphan/completeness checks fail until you map
   it there.
 - Directional import rules (Entrypoints → Core → Foundation) are enforced by
@@ -38,3 +38,19 @@ Use the default Matt Pocock skills triage label vocabulary. See `docs/agents/tri
 ### Domain docs
 
 This is a single-context repo. Read root `CONTEXT.md` and `docs/adr/` if present, plus `docs/SPECIFICATION.md` as the current source of truth. See `docs/agents/domain.md`.
+
+## Guardrail policy
+
+Guardrails support maintainability; passing a metric alone is not evidence of
+good design. Dependency restrictions, cycle limits, and private-access contracts
+are architectural invariants. Size, complexity, and dependency counts are review
+thresholds: do not split cohesive code or add forwarding layers just to meet a
+number. Refactor when a clean seam improves clarity, cohesion, or testability.
+
+`[policies]` classifies the accepted budgets; `[review]` holds per-entity thresholds
+and optional new/worsened-code gates. If keeping code together is clearer, record
+a proportionate, bounded `[[exceptions]]` entry with a reason and review reference,
+or explain a threshold adjustment in the same PR. Never automatically raise
+budgets or bypass an invariant. Lower thresholds when that protects useful gains.
+Changed-code gates remain disabled until the first 1.6 baseline is merged.
+See `docs/quality-guide.md` for the migration and evidence contracts.
