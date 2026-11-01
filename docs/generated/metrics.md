@@ -3,21 +3,254 @@
 
 # Architecture metrics
 
+## Measurement scope
+
+```json
+{
+  "analyzer_version": "1.6.0",
+  "capabilities": {
+    "complexity": "measured",
+    "domain": "measured",
+    "mcp": "unsupported",
+    "seams": "measured",
+    "structure": "measured"
+  },
+  "config_hash": "2bdc90b54448a10dd1106e315cd29939892c6262dfb2cc7523cc0c15e4fef8b2",
+  "definitions": {
+    "complexity": 1,
+    "structure": 1,
+    "test_volume": 2
+  },
+  "language": "python",
+  "scope": {
+    "domain": {
+      "exclude_modules": [
+        "influx.config",
+        "influx.errors",
+        "influx.archive_policy",
+        "influx.audit_invalid_source",
+        "influx.canonical_note",
+        "influx.cascade",
+        "influx.extraction",
+        "influx.http_api",
+        "influx.http_client",
+        "influx.inbox",
+        "influx.inbox_overrides",
+        "influx.lithos_client",
+        "influx.note_merge",
+        "influx.notes",
+        "influx.notifications",
+        "influx.probes",
+        "influx.promotion_gate",
+        "influx.renderer",
+        "influx.repair",
+        "influx.repair_counters",
+        "influx.repair_hooks",
+        "influx.run_dedup",
+        "influx.run_dispatch",
+        "influx.run_ledger",
+        "influx.run_service",
+        "influx.source",
+        "influx.sources",
+        "influx.storage",
+        "influx.urls"
+      ],
+      "include_modules": [
+        "influx.schemas",
+        "influx.run",
+        "influx.lcma_wiring"
+      ]
+    },
+    "excluded": [
+      "third-party code",
+      "files outside the source root",
+      "templates and browser code",
+      "kit tooling"
+    ],
+    "source_root": "src/influx",
+    "source_suffixes": [
+      ".py"
+    ],
+    "test_exclusions": [
+      "tests/guardrail",
+      "tests/test_metrics_diff.py",
+      "tests/test_metrics_history.py",
+      "tests/test_quality.py"
+    ]
+  },
+  "source_hash": "a7920f3c15092d351444a9bafb721f36d64c9a0e748fcb7602f013b471df1df7",
+  "tools": {
+    "grimp": "3.14",
+    "networkx": "3.6.1"
+  }
+}
+```
+
+Test/source ratio is a volume statistic, not test effectiveness; kit tooling is excluded.
+
 ## Budgets
 
-Hard limits from `docs/architecture.toml [budgets]`, enforced in CI by
-`tests/guardrail/test_metrics_budgets.py`. Headroom = budget - actual;
-lower a budget after improving the code to lock in the gain.
+Only invariant budgets block generation; review/context thresholds are reported.
+Accepted budgets from `docs/architecture.toml [budgets]`, enforced in CI by
+`tests/guardrail/test_metrics_budgets.py`. Headroom = budget - actual.
 
-| Metric | Actual | Budget | Headroom |
-|---|---:|---:|---:|
-| `component_cycles` | 3 | 3 | 0 |
-| `cross_component_edges` | 62 | 62 | 0 |
-| `cross_module_private_refs` | 5 | 5 | 0 |
-| `max_module_lines` | 1890 | 2000 | 110 |
-| `module_cycles` | 3 | 3 | 0 |
-| `modules_over_800_lines` | 11 | 11 | 0 |
-| `tests_private_imports` | 79 | 79 | 0 |
+Architectural invariants (dependency restrictions and prohibited cycles)
+require an explicit architecture decision to change. Size and complexity
+thresholds prompt design review: do not split cohesive code solely to
+satisfy a number. If there is no clean seam and keeping the code together
+is clearer, adjust the relevant threshold and explain the design tradeoff
+in the same PR. Lower thresholds when that protects useful improvements.
+
+| Metric | Actual | Budget | Headroom | Policy |
+|---|---:|---:|---:|---|
+| `component_cycles` | 3 | 3 | 0 | invariant |
+| `cross_component_edges` | 62 | 62 | 0 | review |
+| `cross_module_private_refs` | 5 | 5 | 0 | invariant |
+| `max_module_lines` | 1890 | 2000 | 110 | review |
+| `module_cycles` | 3 | 3 | 0 | invariant |
+| `modules_over_800_lines` | 11 | 11 | 0 | review |
+| `tests_private_imports` | 79 | 79 | 0 | invariant |
+
+### Quality review
+
+
+| Status | Metric | Target | Before | After | Policy | Exception |
+|---|---|---|---:|---:|---|---|
+| unchanged | function_complexity | influx.archive_policy.classify_failure_kind | 13 | 13 | review | — |
+| unchanged | function_complexity | influx.backfill.validate_backfill_range | 12 | 12 | review | — |
+| unchanged | function_complexity | influx.cascade.Cascade.enrich | 22 | 22 | review | — |
+| unchanged | function_complexity | influx.config.NotificationWebhookConfig._validate_type_specific_fields | 14 | 14 | review | — |
+| unchanged | function_complexity | influx.enrich._call_json_model | 11 | 11 | review | — |
+| unchanged | function_complexity | influx.extraction.html.extract_html | 11 | 11 | review | — |
+| unchanged | function_complexity | influx.http_api.BackfillRequest._validate_scope_and_range | 14 | 14 | review | — |
+| unchanged | function_complexity | influx.http_api.post_backfills | 15 | 15 | review | — |
+| unchanged | function_complexity | influx.http_client.guarded_fetch | 14 | 14 | review | — |
+| unchanged | function_complexity | influx.inbox.InboxTick._build_outcome_string | 16 | 16 | review | — |
+| unchanged | function_complexity | influx.inbox.InboxTick._build_per_profile | 16 | 16 | review | — |
+| unchanged | function_complexity | influx.inbox.InboxTick._complement_profiles | 11 | 11 | review | — |
+| unchanged | function_complexity | influx.inbox.InboxTick._ingest_item | 32 | 32 | review | — |
+| unchanged | function_complexity | influx.inbox.InboxTick._process_pdf_task | 11 | 11 | review | — |
+| unchanged | function_complexity | influx.inbox.InboxTick._process_task | 15 | 15 | review | — |
+| unchanged | function_complexity | influx.inbox.InboxTick.execute | 17 | 17 | review | — |
+| unchanged | function_complexity | influx.lcma.resolve_builds_on | 12 | 12 | review | — |
+| unchanged | function_complexity | influx.lithos_client.LithosClient._parse_write_response | 15 | 15 | review | — |
+| unchanged | function_complexity | influx.main._cmd_backfill | 14 | 14 | review | — |
+| unchanged | function_complexity | influx.main.main | 12 | 12 | review | — |
+| unchanged | function_complexity | influx.notes.merge_tags | 17 | 17 | review | — |
+| unchanged | function_complexity | influx.notifications._build_message_text | 11 | 11 | review | — |
+| unchanged | function_complexity | influx.notifications.dispatch_notifications | 13 | 13 | review | — |
+| unchanged | function_complexity | influx.promotion_gate.evaluate_promotion_gate | 20 | 20 | review | — |
+| unchanged | function_complexity | influx.promotion_gate.format_gate_summary | 14 | 14 | review | — |
+| unchanged | function_complexity | influx.repair._process_sweep_note | 26 | 26 | review | — |
+| unchanged | function_complexity | influx.repair.compute_clearing | 16 | 16 | review | — |
+| unchanged | function_complexity | influx.repair.select_stages | 12 | 12 | review | — |
+| unchanged | function_complexity | influx.run._run_ingest_stage | 26 | 26 | review | — |
+| unchanged | function_complexity | influx.run_dedup.dedup_scored_candidates | 17 | 17 | review | — |
+| unchanged | function_complexity | influx.run_ledger.RunLedger._finish | 11 | 11 | review | — |
+| unchanged | function_complexity | influx.run_ledger.RunLedger.complete | 47 | 47 | review | — |
+| unchanged | function_complexity | influx.run_ledger.build_degradation_summary | 23 | 23 | review | — |
+| unchanged | function_complexity | influx.run_service._format_top_drivers_tail | 15 | 15 | review | — |
+| unchanged | function_complexity | influx.run_service.ledger_lifecycle | 52 | 52 | review | — |
+| unchanged | function_complexity | influx.scheduler.InfluxScheduler._fire_tick | 12 | 12 | review | — |
+| unchanged | function_complexity | influx.schemas._harden_for_openai_strict | 14 | 14 | review | — |
+| unchanged | function_complexity | influx.sources.arxiv.ArxivSource.fetch_candidates | 11 | 11 | review | — |
+| unchanged | function_complexity | influx.sources.arxiv._fetch_with_retry | 18 | 18 | review | — |
+| unchanged | function_complexity | influx.sources.arxiv._parse_atom | 12 | 12 | review | — |
+| unchanged | function_complexity | influx.sources.arxiv.build_arxiv_note_item | 28 | 28 | review | — |
+| unchanged | function_complexity | influx.sources.inbox.build_inbox_note_item | 20 | 20 | review | — |
+| unchanged | function_complexity | influx.sources.rss.build_rss_note_item | 28 | 28 | review | — |
+| unchanged | function_complexity | influx.storage.download_archive | 14 | 14 | review | — |
+| unchanged | function_complexity | influx.storage.download_archive_autodetect | 14 | 14 | review | — |
+| unchanged | function_length | influx.cascade.Cascade._log_tier3_failure | 78 | 78 | review | — |
+| unchanged | function_length | influx.cascade.Cascade.enrich | 165 | 165 | review | — |
+| unchanged | function_length | influx.enrich._call_json_model | 111 | 111 | review | — |
+| unchanged | function_length | influx.extraction.html.extract_html | 94 | 94 | review | — |
+| unchanged | function_length | influx.filter.Filter.score | 77 | 77 | review | — |
+| unchanged | function_length | influx.filter._call_filter_model_with_retry | 110 | 110 | review | — |
+| unchanged | function_length | influx.http_api.post_backfills | 158 | 158 | review | — |
+| unchanged | function_length | influx.http_api.post_runs | 112 | 112 | review | — |
+| unchanged | function_length | influx.http_client.guarded_fetch | 125 | 125 | review | — |
+| unchanged | function_length | influx.http_client.guarded_post_json_fetch | 80 | 80 | review | — |
+| unchanged | function_length | influx.inbox.InboxTick._ingest_item | 256 | 256 | review | — |
+| unchanged | function_length | influx.inbox.InboxTick._process_pdf_task | 129 | 129 | review | — |
+| unchanged | function_length | influx.inbox.InboxTick._process_task | 98 | 98 | review | — |
+| unchanged | function_length | influx.inbox.InboxTick.execute | 81 | 81 | review | — |
+| unchanged | function_length | influx.lcma.after_write | 113 | 113 | review | — |
+| unchanged | function_length | influx.lcma.resolve_builds_on | 102 | 102 | review | — |
+| unchanged | function_length | influx.lcma_wiring.wire | 77 | 77 | review | — |
+| unchanged | function_length | influx.lithos_client.LithosClient._parse_write_response | 103 | 103 | review | — |
+| unchanged | function_length | influx.lithos_client.LithosClient._retry_slug_collision | 100 | 100 | review | — |
+| unchanged | function_length | influx.lithos_client.LithosClient._try_recover_collision | 76 | 76 | review | — |
+| unchanged | function_length | influx.lithos_client.LithosClient.write_note | 98 | 98 | review | — |
+| unchanged | function_length | influx.main._cmd_backfill | 113 | 113 | review | — |
+| unchanged | function_length | influx.main._cmd_serve | 98 | 98 | review | — |
+| unchanged | function_length | influx.promotion_gate.evaluate_promotion_gate | 108 | 108 | review | — |
+| unchanged | function_length | influx.renderer.render_note | 119 | 119 | review | — |
+| unchanged | function_length | influx.repair._process_sweep_note | 148 | 148 | review | — |
+| unchanged | function_length | influx.repair._rewrite_sweep_note | 92 | 92 | review | — |
+| unchanged | function_length | influx.repair._run_tier3_via_cascade | 78 | 78 | review | — |
+| unchanged | function_length | influx.repair.apply_abstract_only_reextraction | 78 | 78 | review | — |
+| unchanged | function_length | influx.repair.compute_clearing | 129 | 129 | review | — |
+| unchanged | function_length | influx.repair.select_stages | 83 | 83 | review | — |
+| unchanged | function_length | influx.repair.sweep | 144 | 144 | review | — |
+| unchanged | function_length | influx.repair_hooks._make_archive_download_hook | 100 | 100 | review | — |
+| unchanged | function_length | influx.repair_hooks._make_text_extraction_hook | 81 | 81 | review | — |
+| unchanged | function_length | influx.run.Run.execute | 101 | 101 | review | — |
+| unchanged | function_length | influx.run._run_ingest_stage | 249 | 249 | review | — |
+| unchanged | function_length | influx.run_dedup.dedup_scored_candidates | 145 | 145 | review | — |
+| unchanged | function_length | influx.run_dispatch.RunDispatcher._run_many_and_release | 79 | 79 | review | — |
+| unchanged | function_length | influx.run_ledger.RunLedger._finish | 107 | 107 | review | — |
+| unchanged | function_length | influx.run_ledger.RunLedger.complete | 344 | 344 | review | — |
+| unchanged | function_length | influx.run_ledger.RunLedger.start | 79 | 79 | review | — |
+| unchanged | function_length | influx.run_ledger.build_degradation_summary | 225 | 225 | review | — |
+| unchanged | function_length | influx.run_service.ledger_lifecycle | 649 | 649 | review | — |
+| unchanged | function_length | influx.service.create_app | 136 | 136 | review | — |
+| unchanged | function_length | influx.sources.arxiv.ArxivSource.fetch_candidates | 133 | 133 | review | — |
+| unchanged | function_length | influx.sources.arxiv._fetch_arxiv_items | 96 | 96 | review | — |
+| unchanged | function_length | influx.sources.arxiv._fetch_with_retry | 217 | 217 | review | — |
+| unchanged | function_length | influx.sources.arxiv.build_arxiv_note_item | 327 | 327 | review | — |
+| unchanged | function_length | influx.sources.arxiv.fetch_arxiv | 80 | 80 | review | — |
+| unchanged | function_length | influx.sources.arxiv.make_arxiv_item_provider | 129 | 129 | review | — |
+| unchanged | function_length | influx.sources.arxiv.make_arxiv_item_provider.provider | 84 | 84 | review | — |
+| unchanged | function_length | influx.sources.inbox.acquire_inbox_bytes | 89 | 89 | review | — |
+| unchanged | function_length | influx.sources.inbox.build_inbox_note_item | 141 | 141 | review | — |
+| unchanged | function_length | influx.sources.rss._fetch_rss_feed | 138 | 138 | review | — |
+| unchanged | function_length | influx.sources.rss.build_rss_note_item | 377 | 377 | review | — |
+| unchanged | function_length | influx.sources.rss.make_rss_item_provider | 109 | 109 | review | — |
+| unchanged | function_length | influx.sources.rss.parse_feed | 106 | 106 | review | — |
+| unchanged | function_length | influx.storage.download_archive | 204 | 204 | review | — |
+| unchanged | function_length | influx.storage.download_archive_autodetect | 167 | 167 | review | — |
+| unchanged | module_lines | influx.config | 983 | 983 | review | — |
+| unchanged | module_lines | influx.inbox | 1742 | 1742 | review | — |
+| unchanged | module_lines | influx.lithos_client | 1890 | 1890 | review | — |
+| unchanged | module_lines | influx.repair | 1736 | 1736 | review | — |
+| unchanged | module_lines | influx.repair_hooks | 941 | 941 | review | — |
+| unchanged | module_lines | influx.run | 1012 | 1012 | review | — |
+| unchanged | module_lines | influx.run_ledger | 1457 | 1457 | review | — |
+| unchanged | module_lines | influx.run_service | 890 | 890 | review | — |
+| unchanged | module_lines | influx.sources.arxiv | 1863 | 1863 | review | — |
+| unchanged | module_lines | influx.sources.rss | 1226 | 1226 | review | — |
+| unchanged | module_lines | influx.telemetry | 1035 | 1035 | review | — |
+- branch_coverage: missing; value —; scope not recorded; evidence not recorded
+- mutation: missing; value —; scope not recorded; evidence not recorded
+- Review lowering budget max_module_lines: actual 1890, accepted ceiling 2000.
+
+
+## Quality evidence
+
+Optional measurements are source-bound; missing or stale evidence is not a score.
+
+```json
+{
+  "branch_coverage": {
+    "status": "missing"
+  },
+  "mutation": {
+    "status": "missing"
+  },
+  "outcomes": []
+}
+```
 
 ## Import graph
 
@@ -70,21 +303,23 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 ## Complexity
 
 - Functions: **709**, cyclomatic > 10: **45**
+- Cyclomatic distribution: median **3**, p90 **9**, max **52**
+- Function length (lines): median 18, p90 67, max 649 (`influx.run_service.ledger_lifecycle`); over 75: **59**
 
 Top 10 most complex functions:
 
-| Complexity | Function |
-|---:|---|
-| 52 | `influx.run_service.ledger_lifecycle` |
-| 47 | `influx.run_ledger.RunLedger.complete` |
-| 32 | `influx.inbox.InboxTick._ingest_item` |
-| 28 | `influx.sources.arxiv.build_arxiv_note_item` |
-| 28 | `influx.sources.rss.build_rss_note_item` |
-| 26 | `influx.repair._process_sweep_note` |
-| 26 | `influx.run._run_ingest_stage` |
-| 23 | `influx.run_ledger.build_degradation_summary` |
-| 22 | `influx.cascade.Cascade.enrich` |
-| 20 | `influx.promotion_gate.evaluate_promotion_gate` |
+| Complexity | Length | Function |
+|---:|---:|---|
+| 52 | 649 | `influx.run_service.ledger_lifecycle` |
+| 47 | 344 | `influx.run_ledger.RunLedger.complete` |
+| 32 | 256 | `influx.inbox.InboxTick._ingest_item` |
+| 28 | 327 | `influx.sources.arxiv.build_arxiv_note_item` |
+| 28 | 377 | `influx.sources.rss.build_rss_note_item` |
+| 26 | 148 | `influx.repair._process_sweep_note` |
+| 26 | 249 | `influx.run._run_ingest_stage` |
+| 23 | 225 | `influx.run_ledger.build_degradation_summary` |
+| 22 | 165 | `influx.cascade.Cascade.enrich` |
+| 20 | 108 | `influx.promotion_gate.evaluate_promotion_gate` |
 
 ## Seams
 
@@ -133,4 +368,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.61** (77716 test lines / 29754 source lines)
+- Test-to-source line ratio: **2.49** (73996 test lines / 29754 source lines)
