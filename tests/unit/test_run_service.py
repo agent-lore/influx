@@ -37,6 +37,7 @@ from influx.config import (
 from influx.coordinator import RunKind
 from influx.errors import LithosError
 from influx.run import RunOutcome, RunPlan
+from influx.run_assessment import RunEvidence
 from influx.run_ledger import RunLedger
 from influx.run_service import RunService
 from influx.scheduler import run_profile
@@ -445,9 +446,7 @@ def _seed_zero_ingestion_stall_history(ledger: RunLedger, profile: str) -> None:
         run_range=None,
     )
     ledger.complete(
-        run_id="prior-ingestion",
-        sources_checked=5,
-        ingested=0,
+        run_id="prior-ingestion", evidence=RunEvidence(sources_checked=5, ingested=0)
     )
 
 
@@ -465,9 +464,7 @@ def _seed_fetch_stall_history(ledger: RunLedger, profile: str) -> None:
     )
     ledger.complete(
         run_id="prior-history",
-        sources_checked=5,
-        ingested=2,
-        fetched_total=5,
+        evidence=RunEvidence(sources_checked=5, ingested=2, fetched_total=5),
     )
     ledger.start(
         run_id="prior-zero-fetch",
@@ -477,9 +474,7 @@ def _seed_fetch_stall_history(ledger: RunLedger, profile: str) -> None:
     )
     ledger.complete(
         run_id="prior-zero-fetch",
-        sources_checked=0,
-        ingested=0,
-        fetched_total=0,
+        evidence=RunEvidence(sources_checked=0, ingested=0, fetched_total=0),
     )
 
 
@@ -499,9 +494,7 @@ def _seed_filter_stall_history(ledger: RunLedger, profile: str) -> None:
     )
     ledger.complete(
         run_id="prior-history",
-        sources_checked=5,
-        ingested=2,
-        fetched_total=5,
+        evidence=RunEvidence(sources_checked=5, ingested=2, fetched_total=5),
     )
     ledger.start(
         run_id="prior-filter-rejected",
@@ -511,9 +504,7 @@ def _seed_filter_stall_history(ledger: RunLedger, profile: str) -> None:
     )
     ledger.complete(
         run_id="prior-filter-rejected",
-        sources_checked=0,
-        ingested=0,
-        fetched_total=10,
+        evidence=RunEvidence(sources_checked=0, ingested=0, fetched_total=10),
     )
 
 

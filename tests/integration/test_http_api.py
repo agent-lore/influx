@@ -29,6 +29,7 @@ from influx.coordinator import Coordinator
 from influx.http_api import install_exception_handlers, router
 from influx.inbox import InboxStatus
 from influx.probes import ProbeLoop
+from influx.run_assessment import RunEvidence
 from influx.run_ledger import RunLedger
 from influx.scheduler import InfluxScheduler
 
@@ -241,7 +242,9 @@ class TestStatus:
             kind="manual",
             run_range=None,
         )
-        ledger.complete(run_id="run-1", sources_checked=12, ingested=4)
+        ledger.complete(
+            run_id="run-1", evidence=RunEvidence(sources_checked=12, ingested=4)
+        )
 
         body = client.get("/status").json()
 
@@ -417,7 +420,9 @@ class TestRecentRuns:
             kind="scheduled",
             run_range=None,
         )
-        ledger.complete(run_id="done-1", sources_checked=3, ingested=2)
+        ledger.complete(
+            run_id="done-1", evidence=RunEvidence(sources_checked=3, ingested=2)
+        )
 
         body = client.get("/runs/recent").json()
 
@@ -435,14 +440,18 @@ class TestRecentRuns:
             kind="manual",
             run_range=None,
         )
-        ledger.complete(run_id="run-ai", sources_checked=1, ingested=1)
+        ledger.complete(
+            run_id="run-ai", evidence=RunEvidence(sources_checked=1, ingested=1)
+        )
         ledger.start(
             run_id="run-web",
             profile="web-tech",
             kind="manual",
             run_range=None,
         )
-        ledger.complete(run_id="run-web", sources_checked=1, ingested=0)
+        ledger.complete(
+            run_id="run-web", evidence=RunEvidence(sources_checked=1, ingested=0)
+        )
 
         body = client.get("/runs/recent?profile=web-tech").json()
 
@@ -469,9 +478,11 @@ class TestRecentRuns:
         )
         ledger.complete(
             run_id="run-noisy",
-            sources_checked=10,
-            ingested=10,
-            tier3_fallbacks={"harmless": 7, "degraded": 2},
+            evidence=RunEvidence(
+                sources_checked=10,
+                ingested=10,
+                tier3_fallbacks={"harmless": 7, "degraded": 2},
+            ),
         )
         ledger.start(
             run_id="run-clean",
@@ -480,9 +491,7 @@ class TestRecentRuns:
             run_range=None,
         )
         ledger.complete(
-            run_id="run-clean",
-            sources_checked=4,
-            ingested=4,
+            run_id="run-clean", evidence=RunEvidence(sources_checked=4, ingested=4)
         )
 
         body = client.get("/runs/recent").json()
@@ -516,27 +525,29 @@ class TestRecentRuns:
         )
         ledger.complete(
             run_id="run-degraded",
-            sources_checked=4,
-            ingested=2,
-            archive_failures_total=2,
-            archive_failures=[
-                {
-                    "url": "https://ieee.org/a",
-                    "tags": ["influx:archive-missing", "influx:archive-blocked"],
-                },
-                {
-                    "url": "https://ieee.org/b",
-                    "tags": ["influx:archive-missing", "influx:archive-blocked"],
-                },
-            ],
-            source_acquisition_errors=[
-                {
-                    "source": "arxiv",
-                    "kind": "rate_limit_upstream_capacity",
-                    "detail": "429",
-                }
-            ],
-            cache_hits_total=12,
+            evidence=RunEvidence(
+                sources_checked=4,
+                ingested=2,
+                archive_failures_total=2,
+                archive_failures=[
+                    {
+                        "url": "https://ieee.org/a",
+                        "tags": ["influx:archive-missing", "influx:archive-blocked"],
+                    },
+                    {
+                        "url": "https://ieee.org/b",
+                        "tags": ["influx:archive-missing", "influx:archive-blocked"],
+                    },
+                ],
+                source_acquisition_errors=[
+                    {
+                        "source": "arxiv",
+                        "kind": "rate_limit_upstream_capacity",
+                        "detail": "429",
+                    }
+                ],
+                cache_hits_total=12,
+            ),
         )
 
         body = client.get("/runs/recent").json()
@@ -571,7 +582,9 @@ class TestRecentRuns:
             kind="scheduled",
             run_range=None,
         )
-        ledger.complete(run_id="run-clean", sources_checked=3, ingested=2)
+        ledger.complete(
+            run_id="run-clean", evidence=RunEvidence(sources_checked=3, ingested=2)
+        )
 
         body = client.get("/runs/recent").json()
         entry = body["runs"][0]

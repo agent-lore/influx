@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from influx.run_assessment import RunEvidence
 from influx.run_ledger import RunLedger
 
 
@@ -25,11 +26,15 @@ def _run(
     ingested: int = 0,
 ) -> list[str]:
     ledger.start(run_id=run_id, profile=profile, kind=kind, run_range=None)
-    return ledger.complete(
-        run_id=run_id,
-        sources_checked=sources_checked,
-        ingested=ingested,
-        fetched_total=sources_checked,
+    return list(
+        ledger.complete(
+            run_id=run_id,
+            evidence=RunEvidence(
+                sources_checked=sources_checked,
+                ingested=ingested,
+                fetched_total=sources_checked,
+            ),
+        ).reasons
     )
 
 

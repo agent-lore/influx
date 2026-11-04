@@ -117,10 +117,16 @@ The recovery strategy when `lithos_write` returns `slug_collision`. Influx reads
 ### Operational state
 
 **RunLedger**:
-The local persistent record of Run history. Lives under `storage.state_dir` as `active-runs.json` (in-flight) plus `runs.jsonl` (terminal). Owns the `ingestion_stall` heuristic (consecutive zero-ingestion scheduled runs for the same Profile; non-scheduled kinds — backfill, inbox — excluded). Not stored in Lithos — operational state, not knowledge.
+The local persistent record of Run history. Lives under `storage.state_dir` as `active-runs.json` (in-flight) plus `runs.jsonl` (terminal). Owns the history-dependent stall heuristics (`ingestion_stall` / `fetch_stall` / `filter_stall` — consecutive scheduled runs for the same Profile; non-scheduled kinds — manual, backfill, inbox — excluded) and builds the **RunCompletionAssessment** for every terminal transition. Not stored in Lithos — operational state, not knowledge.
+
+**RunEvidence**:
+What one Run observed, handed to the **RunLedger** at completion: the counts (`sources_checked`, `ingested`, `fetched_total`, filter errors, URL rejections, archive-policy tallies, thin-summary drops, cache hits, write outcomes) and the swallowed error records (source acquisition, cooldown skips, `cache_lookup` failures). Lives in `src/influx/run_assessment.py`.
+
+**RunCompletionAssessment**:
+The RunLedger's verdict on one finished Run — status, **Degraded reasons**, severity (`success` / `expected_lossy` / `unexpected_failure`, or `not_applicable` for skipped and failed runs), the metric `outcome` label, the degradation summary and per-reason operator guidance. It is persisted as the ledger entry and is the single input to the `run_completions` metric and the `run flagged` / `run completed` log lines, so the three cannot disagree. Adding a degraded reason means editing `run_assessment.py` (rule, severity set, stall-metric membership, guidance) — the ledger only contributes the history-dependent stall family.
 
 **Degraded reasons**:
-The structured list on a Run's ledger entry explaining why it was marked `degraded`. Current values: `source_acquisition` (a source-fetch error was swallowed), `ingestion_stall` (this and the prior scheduled run both ingested zero with `sources_checked > 0`).
+The structured list on a Run's ledger entry explaining why it was marked `degraded`. History-free reasons (`source_acquisition`, `source_cooldown_skip`, `dedup_cache_lookup`, `filter_error`, `archive_acquisition`, `invalid_note_state`, `invalid_url_stall`, `invalid_url_rejections`) come from the **RunEvidence** alone; the scheduled-only stall family (`ingestion_stall`, `fetch_stall`, `filter_stall`) needs the prior-run window and is detected by the **RunLedger**. The full catalogue with triggers is in `docs/operations/runbook.md`.
 
 **Health**:
 The aggregate readiness state — cached probe results plus three sticky latches (`repair_write_failure`, `lcma_unknown_tool_failure`, `lithos_circuit_open`). Drives `/ready` and gates whether new Runs proceed.

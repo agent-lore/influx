@@ -157,8 +157,12 @@ def inbox_task_call_failures() -> Any:
 def run_completions() -> Any:
     """Counter incremented once when a run reaches a terminal outcome.
 
-    Labels: ``profile``, ``run_type``, ``outcome``
-    (``success`` | ``failure`` | ``degraded``).
+    Labels: ``profile``, ``run_type``, ``outcome`` (``success`` |
+    ``degraded`` | ``failure`` | ``skipped``) and ``severity``
+    (``success`` | ``expected_lossy`` | ``unexpected_failure`` |
+    ``not_applicable``) — both read from the
+    :class:`~influx.run_assessment.RunCompletionAssessment` the ledger
+    persisted, so the series and the ledger entry always agree.
     """
     return get_meter().counter(
         "influx_run_completions_total",

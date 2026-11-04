@@ -1,6 +1,6 @@
 """Promotion gate evaluating recent run health (issue #165).
 
-Builds on the :func:`influx.run_ledger.classify_degradation_severity`
+Builds on the :func:`influx.run_assessment.classify_degradation_severity`
 split from #164 to produce a single pass/fail signal a promotion
 script can consume:
 
@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from influx.run_ledger import classify_degradation_severity
+from influx.run_assessment import classify_degradation_severity
 
 __all__ = [
     "PromotionGateConfig",

@@ -49,7 +49,8 @@ from influx.config import (
     StorageConfig,
 )
 from influx.errors import NetworkError
-from influx.run_ledger import _KNOWN_DEGRADED_REASONS, RunLedger
+from influx.run_assessment import KNOWN_DEGRADED_REASONS, RunEvidence
+from influx.run_ledger import RunLedger
 from influx.sources.rss import RssFeedItem, build_rss_note_item
 from influx.storage import ArchiveResult
 from influx.telemetry import current_empty_source_writes
@@ -243,17 +244,19 @@ class TestEmptySourceWriteNoDegradedReason:
     quality/observability signal and must never degrade the run."""
 
     def test_not_a_known_degraded_reason(self) -> None:
-        assert "empty_source_writes" not in _KNOWN_DEGRADED_REASONS
-        assert "empty_source" not in _KNOWN_DEGRADED_REASONS
+        assert "empty_source_writes" not in KNOWN_DEGRADED_REASONS
+        assert "empty_source" not in KNOWN_DEGRADED_REASONS
 
     def test_empty_source_writes_do_not_degrade_run(self, tmp_path: Path) -> None:
         ledger = RunLedger(tmp_path / "state")
         ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
-        reasons = ledger.complete(
-            run_id="r-1",
-            sources_checked=5,
-            ingested=3,
-            empty_source_writes_total=5,
+        reasons = list(
+            ledger.complete(
+                run_id="r-1",
+                evidence=RunEvidence(
+                    sources_checked=5, ingested=3, empty_source_writes_total=5
+                ),
+            ).reasons
         )
 
         assert reasons == []

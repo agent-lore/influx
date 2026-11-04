@@ -7,11 +7,16 @@ import re
 from pathlib import Path
 from typing import Any
 
-from influx.run_ledger import (
-    _KNOWN_DEGRADED_REASONS,
-    RunLedger,
+from influx.run_assessment import (
+    KNOWN_DEGRADED_REASONS,
+    REASON_GUIDANCE,
+    STALL_METRIC_REASONS,
+    RunEvidence,
+    build_degradation_summary,
     classify_degradation_severity,
+    single_run_reasons,
 )
+from influx.run_ledger import RunLedger
 
 # ── Issue #164: degradation severity classification ──────────────────
 
@@ -83,32 +88,46 @@ class TestClassifyDegradationSeverity:
 
 
 class TestKnownDegradedReasonsCoverage:
-    """Every reason ``RunLedger.complete`` appends must be classified.
+    """Every reason the ledger can record is classified, metric-mapped and explained.
 
-    Scans the source of ``RunLedger.complete`` for the
-    ``reasons.append("…")`` literals and asserts each value lands in
-    :data:`_KNOWN_DEGRADED_REASONS`.  Catches the case where a new
-    degraded reason is added without simultaneously updating the
-    expected/unexpected mapping — the classifier would otherwise
-    silently default the unknown reason and the runbook contract
-    would silently drift.
+    Scans the two reason-deriving functions —
+    :func:`influx.run_assessment.single_run_reasons` (history-free) and
+    :meth:`RunLedger._scheduled_stall_reasons` (needs the prior-run
+    window) — for ``reasons.append("…")`` literals and asserts each
+    value is in :data:`KNOWN_DEGRADED_REASONS` and has operator
+    guidance.  A new degraded reason therefore cannot ship without its
+    severity bucket and its ``run flagged`` text; the stall-metric set
+    must also be a subset of the known reasons.
     """
 
     _APPEND_RE = re.compile(r'reasons\.append\(\s*"([^"]+)"\s*\)')
 
-    def test_complete_only_appends_classified_reasons(self) -> None:
-        source = inspect.getsource(RunLedger.complete)
-        appended = set(self._APPEND_RE.findall(source))
+    def _appended_reasons(self) -> set[str]:
+        appended: set[str] = set()
+        for fn in (single_run_reasons, RunLedger._scheduled_stall_reasons):
+            appended |= set(self._APPEND_RE.findall(inspect.getsource(fn)))
         # Sanity: the test would be a no-op if the regex caught nothing.
         assert appended, "expected to find at least one reasons.append() literal"
-        unknown = appended - _KNOWN_DEGRADED_REASONS
+        return appended
+
+    def test_every_appended_reason_is_classified(self) -> None:
+        unknown = self._appended_reasons() - KNOWN_DEGRADED_REASONS
         assert not unknown, (
-            "RunLedger.complete appends degraded reasons that are not in "
-            "_KNOWN_DEGRADED_REASONS: "
+            "degraded reasons are appended that are not in "
+            "KNOWN_DEGRADED_REASONS: "
             + ", ".join(sorted(unknown))
-            + ".  Add each to either _UNEXPECTED_FAILURE_REASONS or "
-            "_EXPECTED_LOSSY_REASONS in src/influx/run_ledger.py."
+            + ".  Add each to either UNEXPECTED_FAILURE_REASONS or "
+            "EXPECTED_LOSSY_REASONS in src/influx/run_assessment.py."
         )
+
+    def test_every_known_reason_is_appended_somewhere(self) -> None:
+        assert self._appended_reasons() == KNOWN_DEGRADED_REASONS
+
+    def test_every_known_reason_has_operator_guidance(self) -> None:
+        assert set(REASON_GUIDANCE) == KNOWN_DEGRADED_REASONS
+
+    def test_stall_metric_reasons_are_known(self) -> None:
+        assert STALL_METRIC_REASONS <= KNOWN_DEGRADED_REASONS
 
 
 class TestLedgerEntrySeverityField:
@@ -128,15 +147,19 @@ class TestLedgerEntrySeverityField:
         write_outcomes: dict[tuple[str, str], int] | None = None,
     ) -> list[str]:
         ledger.start(run_id=run_id, profile=profile, kind=kind, run_range=None)
-        return ledger.complete(
-            run_id=run_id,
-            sources_checked=sources_checked,
-            ingested=ingested,
-            fetched_total=fetched_total
-            if fetched_total is not None
-            else sources_checked,
-            archive_failures_total=archive_failures_total,
-            write_outcomes=write_outcomes,
+        return list(
+            ledger.complete(
+                run_id=run_id,
+                evidence=RunEvidence(
+                    sources_checked=sources_checked,
+                    ingested=ingested,
+                    fetched_total=fetched_total
+                    if fetched_total is not None
+                    else sources_checked,
+                    archive_failures_total=archive_failures_total,
+                    write_outcomes=write_outcomes or {},
+                ),
+            ).reasons
         )
 
     def test_clean_run_carries_success_severity(self, tmp_path: Path) -> None:
@@ -187,14 +210,22 @@ class TestDedupCacheLookupReason:
     def test_dedup_lookup_errors_fire_reason(self, tmp_path: Path) -> None:
         ledger = RunLedger(tmp_path / "state")
         ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
-        reasons = ledger.complete(
-            run_id="r-1",
-            sources_checked=3,
-            ingested=2,
-            fetched_total=3,
-            dedup_lookup_errors=[
-                {"source": "rss", "kind": "cache_lookup", "detail": "server exploded"},
-            ],
+        reasons = list(
+            ledger.complete(
+                run_id="r-1",
+                evidence=RunEvidence(
+                    sources_checked=3,
+                    ingested=2,
+                    fetched_total=3,
+                    dedup_lookup_errors=[
+                        {
+                            "source": "rss",
+                            "kind": "cache_lookup",
+                            "detail": "server exploded",
+                        },
+                    ],
+                ),
+            ).reasons
         )
         assert reasons == ["dedup_cache_lookup"]
         entry = ledger.recent()[0]
@@ -217,14 +248,16 @@ class TestDedupCacheLookupReason:
         ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
         ledger.complete(
             run_id="r-1",
-            sources_checked=3,
-            ingested=2,
-            fetched_total=3,
-            dedup_lookup_errors=[
-                {"source": "rss", "kind": "cache_lookup", "detail": "a"},
-                {"source": "rss", "kind": "cache_lookup", "detail": "b"},
-                {"source": "arxiv", "kind": "cache_lookup", "detail": "c"},
-            ],
+            evidence=RunEvidence(
+                sources_checked=3,
+                ingested=2,
+                fetched_total=3,
+                dedup_lookup_errors=[
+                    {"source": "rss", "kind": "cache_lookup", "detail": "a"},
+                    {"source": "rss", "kind": "cache_lookup", "detail": "b"},
+                    {"source": "arxiv", "kind": "cache_lookup", "detail": "c"},
+                ],
+            ),
         )
         summary = ledger.recent()[0]["degradation_summary"]
         assert summary["totals"]["dedup_lookup_errors"] == 3
@@ -236,8 +269,11 @@ class TestDedupCacheLookupReason:
     def test_clean_run_defaults_empty(self, tmp_path: Path) -> None:
         ledger = RunLedger(tmp_path / "state")
         ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
-        reasons = ledger.complete(
-            run_id="r-1", sources_checked=3, ingested=2, fetched_total=3
+        reasons = list(
+            ledger.complete(
+                run_id="r-1",
+                evidence=RunEvidence(sources_checked=3, ingested=2, fetched_total=3),
+            ).reasons
         )
         assert "dedup_cache_lookup" not in reasons
         entry = ledger.recent()[0]
@@ -254,7 +290,7 @@ def test_run_ledger_records_completed_run(tmp_path: Path) -> None:
         kind="manual",
         run_range={"days": 1},
     )
-    ledger.complete(run_id="run-1", sources_checked=8, ingested=3)
+    ledger.complete(run_id="run-1", evidence=RunEvidence(sources_checked=8, ingested=3))
 
     assert ledger.active_runs() == []
     recent = ledger.recent()
@@ -296,7 +332,9 @@ def test_run_ledger_recent_is_newest_first_and_filterable(tmp_path: Path) -> Non
             kind="manual",
             run_range=None,
         )
-        ledger.complete(run_id=run_id, sources_checked=1, ingested=1)
+        ledger.complete(
+            run_id=run_id, evidence=RunEvidence(sources_checked=1, ingested=1)
+        )
 
     assert [entry["run_id"] for entry in ledger.recent()] == ["run-2", "run-1"]
     assert [entry["run_id"] for entry in ledger.recent(profile="web-tech")] == ["run-2"]
@@ -336,7 +374,9 @@ def test_complete_without_source_errors_marks_run_not_degraded(
         kind="scheduled",
         run_range=None,
     )
-    ledger.complete(run_id="run-1", sources_checked=10, ingested=4)
+    ledger.complete(
+        run_id="run-1", evidence=RunEvidence(sources_checked=10, ingested=4)
+    )
 
     entry = ledger.recent()[0]
     assert entry["degraded"] is False
@@ -367,9 +407,9 @@ def test_complete_with_source_errors_marks_run_degraded(tmp_path: Path) -> None:
     ]
     ledger.complete(
         run_id="run-1",
-        sources_checked=0,
-        ingested=0,
-        source_acquisition_errors=errors,
+        evidence=RunEvidence(
+            sources_checked=0, ingested=0, source_acquisition_errors=errors
+        ),
     )
 
     entry = ledger.recent()[0]
@@ -394,7 +434,7 @@ def test_complete_without_retry_counts_persists_empty_dict(
         kind="scheduled",
         run_range=None,
     )
-    ledger.complete(run_id="run-1", sources_checked=3, ingested=2)
+    ledger.complete(run_id="run-1", evidence=RunEvidence(sources_checked=3, ingested=2))
     entry = ledger.recent()[0]
     assert entry["source_retry_counts"] == {}
 
@@ -414,9 +454,7 @@ def test_complete_records_source_retry_counts(tmp_path: Path) -> None:
     counts = {"arxiv": {"rate_limit": 2, "timeout": 1}}
     ledger.complete(
         run_id="run-1",
-        sources_checked=8,
-        ingested=3,
-        source_retry_counts=counts,
+        evidence=RunEvidence(sources_checked=8, ingested=3, source_retry_counts=counts),
     )
     entry = ledger.recent()[0]
     assert entry["source_retry_counts"] == {
@@ -452,7 +490,7 @@ def test_complete_without_tier3_fallbacks_persists_empty_dict(
         kind="scheduled",
         run_range=None,
     )
-    ledger.complete(run_id="run-1", sources_checked=3, ingested=2)
+    ledger.complete(run_id="run-1", evidence=RunEvidence(sources_checked=3, ingested=2))
     entry = ledger.recent()[0]
     assert entry["tier3_fallbacks"] == {}
 
@@ -475,9 +513,7 @@ def test_complete_records_tier3_fallbacks(tmp_path: Path) -> None:
     fallbacks = {"harmless": 4, "degraded": 1}
     ledger.complete(
         run_id="run-1",
-        sources_checked=8,
-        ingested=5,
-        tier3_fallbacks=fallbacks,
+        evidence=RunEvidence(sources_checked=8, ingested=5, tier3_fallbacks=fallbacks),
     )
     entry = ledger.recent()[0]
     assert entry["tier3_fallbacks"] == {"harmless": 4, "degraded": 1}
@@ -613,16 +649,20 @@ def _start_complete(
     if fetched_total is None:
         fetched_total = sources_checked if isinstance(sources_checked, int) else 0
     ledger.start(run_id=run_id, profile=profile, kind=kind, run_range=None)
-    return ledger.complete(
-        run_id=run_id,
-        sources_checked=sources_checked,
-        ingested=ingested,
-        fetched_total=fetched_total,
-        filter_errors_total=filter_errors_total,
-        invalid_url_rejections_total=invalid_url_rejections_total,
-        archive_failures_total=archive_failures_total,
-        source_acquisition_errors=source_acquisition_errors,
-        source_cooldown_skips=source_cooldown_skips,
+    return list(
+        ledger.complete(
+            run_id=run_id,
+            evidence=RunEvidence(
+                sources_checked=sources_checked,
+                ingested=ingested,
+                fetched_total=fetched_total,
+                filter_errors_total=filter_errors_total,
+                invalid_url_rejections_total=invalid_url_rejections_total,
+                archive_failures_total=archive_failures_total,
+                source_acquisition_errors=source_acquisition_errors or [],
+                source_cooldown_skips=source_cooldown_skips or [],
+            ),
+        ).reasons
     )
 
 
@@ -1354,7 +1394,11 @@ def test_complete_default_fetched_total_when_omitted(tmp_path: Path) -> None:
     """
     ledger = RunLedger(tmp_path / "state")
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
-    reasons = ledger.complete(run_id="r-1", sources_checked=4, ingested=2)
+    reasons = list(
+        ledger.complete(
+            run_id="r-1", evidence=RunEvidence(sources_checked=4, ingested=2)
+        ).reasons
+    )
     assert reasons == []
     entry = ledger.recent()[0]
     # ``fetched_total`` is recorded on every entry; absent when caller
@@ -1557,7 +1601,11 @@ def test_complete_default_filter_errors_total_when_omitted(tmp_path: Path) -> No
     """
     ledger = RunLedger(tmp_path / "state")
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
-    reasons = ledger.complete(run_id="r-1", sources_checked=4, ingested=2)
+    reasons = list(
+        ledger.complete(
+            run_id="r-1", evidence=RunEvidence(sources_checked=4, ingested=2)
+        ).reasons
+    )
     assert reasons == []
     entry = ledger.recent()[0]
     assert entry.get("filter_errors_total") is None
@@ -1751,7 +1799,7 @@ def test_degradation_summary_present_on_clean_run(tmp_path: Path) -> None:
     never need to defend against a missing field (#152)."""
     ledger = RunLedger(tmp_path / "state")
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
-    ledger.complete(run_id="r-1", sources_checked=5, ingested=3)
+    ledger.complete(run_id="r-1", evidence=RunEvidence(sources_checked=5, ingested=3))
 
     entry = ledger.recent()[0]
     summary = entry["degradation_summary"]
@@ -1781,10 +1829,12 @@ def test_degradation_summary_top_archive_by_domain(tmp_path: Path) -> None:
     ]
     ledger.complete(
         run_id="r-1",
-        sources_checked=10,
-        ingested=4,
-        archive_failures_total=len(archive),
-        archive_failures=archive,
+        evidence=RunEvidence(
+            sources_checked=10,
+            ingested=4,
+            archive_failures_total=len(archive),
+            archive_failures=archive,
+        ),
     )
 
     summary = ledger.recent()[0]["degradation_summary"]
@@ -1828,10 +1878,12 @@ def test_degradation_summary_archive_by_kind_uses_policy_tags(
     ]
     ledger.complete(
         run_id="r-1",
-        sources_checked=10,
-        ingested=5,
-        archive_failures_total=len(archive),
-        archive_failures=archive,
+        evidence=RunEvidence(
+            sources_checked=10,
+            ingested=5,
+            archive_failures_total=len(archive),
+            archive_failures=archive,
+        ),
     )
 
     by_kind = ledger.recent()[0]["degradation_summary"]["archive"]["by_kind"]
@@ -1866,9 +1918,9 @@ def test_degradation_summary_source_acquisition_breakdown(tmp_path: Path) -> Non
     ]
     ledger.complete(
         run_id="r-1",
-        sources_checked=2,
-        ingested=0,
-        source_acquisition_errors=errors,
+        evidence=RunEvidence(
+            sources_checked=2, ingested=0, source_acquisition_errors=errors
+        ),
     )
 
     summary = ledger.recent()[0]["degradation_summary"]
@@ -1904,10 +1956,12 @@ def test_degradation_summary_caps_breakdowns_at_top_n(tmp_path: Path) -> None:
             )
     ledger.complete(
         run_id="r-1",
-        sources_checked=20,
-        ingested=10,
-        archive_failures_total=len(archive),
-        archive_failures=archive,
+        evidence=RunEvidence(
+            sources_checked=20,
+            ingested=10,
+            archive_failures_total=len(archive),
+            archive_failures=archive,
+        ),
     )
 
     domains = ledger.recent()[0]["degradation_summary"]["archive"]["by_domain"]
@@ -1925,11 +1979,11 @@ def test_degradation_summary_does_not_count_cache_hits_as_degradation(
     (#152 acceptance criteria)."""
     ledger = RunLedger(tmp_path / "state")
     ledger.start(run_id="r-1", profile="p", kind="backfill", run_range=None)
-    reasons = ledger.complete(
-        run_id="r-1",
-        sources_checked=0,
-        ingested=0,
-        cache_hits_total=100,
+    reasons = list(
+        ledger.complete(
+            run_id="r-1",
+            evidence=RunEvidence(sources_checked=0, ingested=0, cache_hits_total=100),
+        ).reasons
     )
 
     entry = ledger.recent()[0]
@@ -1952,12 +2006,14 @@ def test_degradation_summary_includes_retries_recovered(tmp_path: Path) -> None:
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
     ledger.complete(
         run_id="r-1",
-        sources_checked=4,
-        ingested=2,
-        source_retry_counts={
-            "arxiv": {"rate_limit_upstream_capacity": 3, "network": 1},
-            "rss": {"timeout": 2},
-        },
+        evidence=RunEvidence(
+            sources_checked=4,
+            ingested=2,
+            source_retry_counts={
+                "arxiv": {"rate_limit_upstream_capacity": 3, "network": 1},
+                "rss": {"timeout": 2},
+            },
+        ),
     )
 
     summary = ledger.recent()[0]["degradation_summary"]
@@ -1986,22 +2042,24 @@ def test_degradation_summary_distinguishes_all_failure_classes(
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
     ledger.complete(
         run_id="r-1",
-        sources_checked=3,
-        ingested=1,
-        filter_errors_total=2,
-        invalid_url_rejections_total=4,
-        archive_failures_total=2,
-        archive_failures=[
-            {"url": "https://x.example/1", "tags": ["influx:archive-missing"]},
-            {
-                "url": "https://x.example/2",
-                "tags": ["influx:archive-missing", "influx:archive-rate-limited"],
-            },
-        ],
-        source_acquisition_errors=[
-            {"source": "arxiv", "kind": "timeout", "detail": "slow"},
-        ],
-        cache_hits_total=7,
+        evidence=RunEvidence(
+            sources_checked=3,
+            ingested=1,
+            filter_errors_total=2,
+            invalid_url_rejections_total=4,
+            archive_failures_total=2,
+            archive_failures=[
+                {"url": "https://x.example/1", "tags": ["influx:archive-missing"]},
+                {
+                    "url": "https://x.example/2",
+                    "tags": ["influx:archive-missing", "influx:archive-rate-limited"],
+                },
+            ],
+            source_acquisition_errors=[
+                {"source": "arxiv", "kind": "timeout", "detail": "slow"},
+            ],
+            cache_hits_total=7,
+        ),
     )
 
     totals = ledger.recent()[0]["degradation_summary"]["totals"]
@@ -2036,10 +2094,12 @@ def test_degradation_summary_top_n_is_deterministic_on_ties(
     ]
     ledger.complete(
         run_id="r-1",
-        sources_checked=2,
-        ingested=0,
-        archive_failures_total=len(archive),
-        archive_failures=archive,
+        evidence=RunEvidence(
+            sources_checked=2,
+            ingested=0,
+            archive_failures_total=len(archive),
+            archive_failures=archive,
+        ),
     )
 
     domains = [
@@ -2057,16 +2117,7 @@ def test_degradation_summary_top_n_is_deterministic_on_ties(
 def test_build_degradation_summary_handles_all_none(tmp_path: Path) -> None:
     """All-``None`` inputs produce a zero-shaped summary so the
     ``ledger.complete`` happy path doesn't have to defend (#152)."""
-    from influx.run_ledger import build_degradation_summary
-
-    summary = build_degradation_summary(
-        source_acquisition_errors=None,
-        archive_failures=None,
-        source_retry_counts=None,
-        filter_errors_total=None,
-        invalid_url_rejections_total=None,
-        cache_hits_total=None,
-    )
+    summary = build_degradation_summary(RunEvidence())
     assert summary["totals"]["archive_failures"] == 0
     assert summary["totals"]["source_acquisition_errors"] == 0
     assert summary["totals"]["retries_recovered"] == 0
@@ -2080,19 +2131,14 @@ def test_build_degradation_summary_ignores_unparseable_archive_urls(
 ) -> None:
     """Items with empty / malformed URLs still show up in by_kind
     (they're real failures) but do not pollute by_domain (#152)."""
-    from influx.run_ledger import build_degradation_summary
-
     summary = build_degradation_summary(
-        source_acquisition_errors=None,
-        archive_failures=[
-            {"url": "", "tags": ["influx:archive-missing"]},
-            {"url": "not-a-url", "tags": ["influx:archive-missing"]},
-            {"url": "https://real.example/x", "tags": ["influx:archive-missing"]},
-        ],
-        source_retry_counts=None,
-        filter_errors_total=None,
-        invalid_url_rejections_total=None,
-        cache_hits_total=None,
+        RunEvidence(
+            archive_failures=[
+                {"url": "", "tags": ["influx:archive-missing"]},
+                {"url": "not-a-url", "tags": ["influx:archive-missing"]},
+                {"url": "https://real.example/x", "tags": ["influx:archive-missing"]},
+            ],
+        )
     )
     assert summary["totals"]["archive_failures"] == 3
     by_kind = {row["kind"]: row["count"] for row in summary["archive"]["by_kind"]}
@@ -2113,14 +2159,16 @@ def test_degradation_summary_aggregates_writes_by_outcome(tmp_path: Path) -> Non
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
     ledger.complete(
         run_id="r-1",
-        sources_checked=4,
-        ingested=2,
-        write_outcomes={
-            ("created", "arxiv"): 2,
-            ("duplicate", "arxiv"): 3,
-            ("duplicate", "rss"): 1,
-            ("invalid_input", "rss"): 1,
-        },
+        evidence=RunEvidence(
+            sources_checked=4,
+            ingested=2,
+            write_outcomes={
+                ("created", "arxiv"): 2,
+                ("duplicate", "arxiv"): 3,
+                ("duplicate", "rss"): 1,
+                ("invalid_input", "rss"): 1,
+            },
+        ),
     )
 
     summary = ledger.recent()[0]["degradation_summary"]
@@ -2150,14 +2198,18 @@ def test_degradation_summary_duplicate_only_run_is_not_degraded(
     not silently re-broken by the write-outcome plumbing."""
     ledger = RunLedger(tmp_path / "state")
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
-    reasons = ledger.complete(
-        run_id="r-1",
-        sources_checked=5,
-        ingested=0,
-        write_outcomes={
-            ("duplicate", "arxiv"): 4,
-            ("duplicate", "rss"): 1,
-        },
+    reasons = list(
+        ledger.complete(
+            run_id="r-1",
+            evidence=RunEvidence(
+                sources_checked=5,
+                ingested=0,
+                write_outcomes={
+                    ("duplicate", "arxiv"): 4,
+                    ("duplicate", "rss"): 1,
+                },
+            ),
+        ).reasons
     )
 
     entry = ledger.recent()[0]
@@ -2194,18 +2246,22 @@ def test_degradation_summary_invalid_note_state_drives_degradation(
     ``degraded_reasons`` (#152 review acceptance criteria)."""
     ledger = RunLedger(tmp_path / "state")
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
-    reasons = ledger.complete(
-        run_id="r-1",
-        sources_checked=5,
-        ingested=2,
-        write_outcomes={
-            ("created", "arxiv"): 2,
-            ("duplicate", "arxiv"): 1,  # NOT degrading
-            ("invalid_input", "rss"): 1,
-            ("version_conflict", "arxiv"): 1,
-            ("slug_collision", "arxiv"): 1,
-            ("content_too_large_skipped", "rss"): 1,
-        },
+    reasons = list(
+        ledger.complete(
+            run_id="r-1",
+            evidence=RunEvidence(
+                sources_checked=5,
+                ingested=2,
+                write_outcomes={
+                    ("created", "arxiv"): 2,
+                    ("duplicate", "arxiv"): 1,  # NOT degrading
+                    ("invalid_input", "rss"): 1,
+                    ("version_conflict", "arxiv"): 1,
+                    ("slug_collision", "arxiv"): 1,
+                    ("content_too_large_skipped", "rss"): 1,
+                },
+            ),
+        ).reasons
     )
 
     entry = ledger.recent()[0]
@@ -2243,10 +2299,9 @@ def test_summary_thin_drops_total_persists_on_ledger_entry(tmp_path: Path) -> No
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
     ledger.complete(
         run_id="r-1",
-        sources_checked=3,
-        ingested=3,
-        fetched_total=10,
-        summary_thin_drops_total=7,
+        evidence=RunEvidence(
+            sources_checked=3, ingested=3, fetched_total=10, summary_thin_drops_total=7
+        ),
     )
     entry = ledger.recent()[0]
     assert entry["summary_thin_drops_total"] == 7
@@ -2267,13 +2322,17 @@ def test_summary_thin_drops_total_does_not_trigger_archive_acquisition(
     """
     ledger = RunLedger(tmp_path / "state")
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
-    reasons = ledger.complete(
-        run_id="r-1",
-        sources_checked=3,
-        ingested=3,
-        fetched_total=53,
-        archive_failures_total=None,
-        summary_thin_drops_total=50,
+    reasons = list(
+        ledger.complete(
+            run_id="r-1",
+            evidence=RunEvidence(
+                sources_checked=3,
+                ingested=3,
+                fetched_total=53,
+                archive_failures_total=None,
+                summary_thin_drops_total=50,
+            ),
+        ).reasons
     )
     assert reasons == []
     entry = ledger.recent()[0]
@@ -2294,28 +2353,17 @@ def test_summary_thin_drops_total_defaults_to_none(tmp_path: Path) -> None:
     ledger.start(run_id="r-1", profile="p", kind="scheduled", run_range=None)
     ledger.complete(
         run_id="r-1",
-        sources_checked=1,
-        ingested=1,
-        fetched_total=1,
+        evidence=RunEvidence(sources_checked=1, ingested=1, fetched_total=1),
     )
     entry = ledger.recent()[0]
     assert entry["summary_thin_drops_total"] is None
 
 
 def test_build_degradation_summary_accepts_no_write_outcomes(tmp_path: Path) -> None:
-    """``write_outcomes=None`` produces a zero-shaped writes /
+    """Evidence without write outcomes produces a zero-shaped writes /
     invalid_note_state block so legacy callers (and the ``fail`` /
     ``skip`` paths) don't break (#152 review)."""
-    from influx.run_ledger import build_degradation_summary
-
-    summary = build_degradation_summary(
-        source_acquisition_errors=None,
-        archive_failures=None,
-        source_retry_counts=None,
-        filter_errors_total=None,
-        invalid_url_rejections_total=None,
-        cache_hits_total=None,
-    )
+    summary = build_degradation_summary(RunEvidence())
     assert summary["totals"]["writes"] == 0
     assert summary["totals"]["invalid_note_state"] == 0
     assert summary["writes"]["by_outcome"] == []

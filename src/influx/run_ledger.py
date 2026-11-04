@@ -14,507 +14,24 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
+
+from influx.run_assessment import (
+    RunCompletionAssessment,
+    RunEvidence,
+    build_degradation_summary,
+    single_run_reasons,
+)
 
 logger = logging.getLogger(__name__)
 
 RunEntry = dict[str, Any]
 
-# How many prior runs to consider when computing the stall flags.
-#
-# Twenty is chosen to roughly match a *day* of scheduled runs at the
-# typical hourly cadence, so the historical-ratchet for #50
-# (``fetch_stall``) and #85 (``filter_stall``) tolerates a half-day
-# window of zero-checked runs before stale history disqualifies the
-# profile from ratcheting.  It also matches the historical default of
-# :meth:`recent` which the ``ingestion_stall`` (#36) check used
-# implicitly.
+# How many prior runs the stall checks look back over: roughly a day of
+# hourly scheduled runs, so the historical ratchet (#50 / #85) tolerates a
+# half-day of zero-checked runs before stale history disqualifies a
+# profile.
 _STALL_HISTORY_LIMIT = 20
-
-
-# How many entries to surface in each top-N breakdown inside the
-# ``degradation_summary`` (#152).  Five is enough to spotlight the main
-# drivers (typically a single domain or kind dominates) without dumping
-# the long tail of one-off failures into the ledger and the
-# ``/runs/recent`` payload.  Tied to a constant so the bound is
-# discoverable from one place.
-_DEGRADATION_SUMMARY_TOP_N = 5
-
-
-# Issue #164: severity classification of degraded reasons.  Splits the
-# existing flat ``degraded_reasons`` list into two operational
-# severities so dashboards / paging / triage can separate
-# release-noise (tolerated upstream lossiness) from real breakage
-# (data integrity / pipeline regressions).
-#
-# Reasons listed here ALWAYS escalate the run to
-# ``unexpected_failure`` even when expected-lossy reasons co-occur.
-# This matches the issue's acceptance criterion ("Invalid note state
-# or malformed persisted metadata is always treated as unexpected
-# failure").
-#
-# Reasons NOT in this set are classified as ``expected_lossy`` when
-# they are the only reasons present:
-#
-# * ``source_acquisition`` — transient upstream errors that the
-#   in-fetch retry loop already absorbed; the swallowed-error list
-#   is surfaced for operator awareness but does not warrant paging.
-# * ``source_cooldown_skip`` — we intentionally backed off; the
-#   operator's policy decision firing as designed.
-# * ``archive_acquisition`` — archive download failed for items that
-#   were still ingested (summary text / abstract preserved).  Policy
-#   modes (``unsupported`` / ``blocked``) are explicitly tolerated
-#   per #149 / #161; generic transient failures are also acceptable
-#   noise.
-#
-# Stalls and ``invalid_*`` shapes are unexpected because they
-# represent actionable regressions — a 2-run streak of "nothing
-# fetched / ingested / passed the filter" or an upstream feed
-# emitting only broken URLs.  ``filter_error`` is unexpected because
-# the in-fetch scorer execution failed (provider config / model
-# availability / response schema bug) — not a soft rate-limit.
-_UNEXPECTED_FAILURE_REASONS: frozenset[str] = frozenset(
-    {
-        "invalid_note_state",
-        "invalid_url_stall",
-        "ingestion_stall",
-        "fetch_stall",
-        "filter_stall",
-        "filter_error",
-        # #234: the pre-acquire dedup helper swallowed at least one
-        # per-candidate ``cache_lookup`` LithosError.  Unexpected like
-        # ``filter_error`` — pipeline-infrastructure execution failed
-        # (Lithos-side tool error), not expected upstream lossiness —
-        # and immediately actionable: check Lithos health / server
-        # logs, not the feed.
-        "dedup_cache_lookup",
-    }
-)
-
-
-# Issue #164 review: the complement set of expected-lossy reasons.
-# Together with :data:`_UNEXPECTED_FAILURE_REASONS` this is the
-# exhaustive list of degraded reasons :meth:`RunLedger.complete` may
-# append.  A meta-test in ``tests/unit/test_run_ledger.py`` scans the
-# source of ``complete`` and asserts every ``reasons.append("…")``
-# literal lands in :data:`_KNOWN_DEGRADED_REASONS`, so a new reason
-# cannot be added without an explicit severity classification.
-_EXPECTED_LOSSY_REASONS: frozenset[str] = frozenset(
-    {
-        "source_acquisition",
-        "source_cooldown_skip",
-        "archive_acquisition",
-        # Issue #177: ``invalid_url_rejections`` fires when an upstream
-        # feed is shipping many bad URLs (loopback / private / scheme
-        # / malformed) per run but at least some good ones still
-        # reach the filter — distinct from ``invalid_url_stall``,
-        # which requires that EVERY URL be rejected.  The Sourcegraph
-        # 5174 leak (2026-05-09 → 2026-05-10) is the canonical
-        # incident: 30 URLs/run rejected silently for five days
-        # because the stall variant never tripped.  Classed as
-        # expected_lossy because the validator is doing its job; the
-        # signal is "go look at this feed" rather than a data
-        # integrity regression.
-        "invalid_url_rejections",
-    }
-)
-
-
-# Issue #177: ``invalid_url_rejections`` burst threshold — fires when
-# ``invalid_url_rejections_total`` for a single run meets or exceeds
-# this value AND ``invalid_url_stall`` is not already firing (the
-# stall variant is the all-bad case; this is the many-bad case).  Set
-# above the noise floor of occasional typo'd entries in an otherwise
-# healthy feed (~1–3) and well below the Sourcegraph incident shape
-# (~30/run).  Operator tunable in a follow-up if the default rate
-# of false positives proves wrong.
-_INVALID_URL_REJECTIONS_BURST_THRESHOLD: int = 10
-
-
-# Union of the two classified sets.  Used by the meta-test only;
-# production callers consult the individual sets.
-_KNOWN_DEGRADED_REASONS: frozenset[str] = (
-    _UNEXPECTED_FAILURE_REASONS | _EXPECTED_LOSSY_REASONS
-)
-
-
-# Severity literal — surfaced on the ledger entry as
-# ``degradation_severity`` and as the ``severity`` label on the
-# ``run_completions`` metric.  Mutually exclusive across a single
-# run; a run with mixed reasons is escalated to the higher severity
-# (``unexpected_failure`` beats ``expected_lossy``).
-_SeverityLiteral = Literal["success", "expected_lossy", "unexpected_failure"]
-
-
-def classify_degradation_severity(degraded_reasons: list[str]) -> _SeverityLiteral:
-    """Return the severity classification for *degraded_reasons*.
-
-    * ``"success"`` when no reasons fired.
-    * ``"unexpected_failure"`` when any reason in
-      :data:`_UNEXPECTED_FAILURE_REASONS` is present.
-    * ``"expected_lossy"`` otherwise (only tolerated reasons fired).
-
-    Public — exposed for callers (run service, admin HTTP) that need
-    to surface severity without re-implementing the mapping.  The
-    classification is stable for a given reason list and does not
-    consult any ambient state.
-    """
-    if not degraded_reasons:
-        return "success"
-    for reason in degraded_reasons:
-        if reason in _UNEXPECTED_FAILURE_REASONS:
-            return "unexpected_failure"
-    return "expected_lossy"
-
-
-def _top_n_by_count(counts: dict[str, int], *, n: int) -> list[dict[str, Any]]:
-    """Return *counts* as a bounded, sorted ``[{"key": ..., "count": ...}, ...]`` list.
-
-    Sorted descending by count then ascending by key so the top-N is
-    deterministic across runs with the same shape.  Only positive
-    counts are surfaced (zero-count keys are noise).  Caller supplies
-    the wrapping key name (``"kind"`` / ``"domain"`` / ``"source"``)
-    by mapping the result; this helper keeps the sort + truncate
-    discipline in one place.
-    """
-    filtered = [(k, v) for k, v in counts.items() if v > 0]
-    filtered.sort(key=lambda kv: (-kv[1], kv[0]))
-    return [{"key": k, "count": v} for k, v in filtered[:n]]
-
-
-def _archive_failure_kind_from_tags(tags: list[str]) -> str:
-    """Classify a degraded item's archive failure kind from its note tags.
-
-    Returns one of: ``"blocked"``, ``"rate_limited"``,
-    ``"missing_by_policy"``, or ``"unspecified"``.  The classification
-    is structural (it mirrors the tag taxonomy from
-    :mod:`influx.archive_policy`) rather than parsing free-form error
-    detail strings, so future taxonomy refinements only need to add
-    cases here.
-
-    ``"unspecified"`` is the default for items that landed
-    ``influx:archive-missing`` without a more specific policy tag —
-    these are generic upstream failures (HTTP 5xx, timeouts, content
-    type mismatches) that the archive policy did not classify into a
-    structural bucket.
-    """
-    tag_set = set(tags)
-    if "influx:archive-skipped-by-policy" in tag_set:
-        return "missing_by_policy"
-    if "influx:archive-blocked" in tag_set:
-        return "blocked"
-    if "influx:archive-rate-limited" in tag_set:
-        return "rate_limited"
-    return "unspecified"
-
-
-def _domain_from_url(url: str) -> str:
-    """Return the lowercase host of *url* or ``""`` when unparseable.
-
-    Duplicated locally so :mod:`influx.run_ledger` does not depend on
-    :mod:`influx.archive_policy` (and indirectly :mod:`re`/parsers it
-    pulls).  Mirror of
-    :func:`influx.archive_policy.extract_domain`.
-    """
-    if not url:
-        return ""
-    try:
-        from urllib.parse import urlparse
-
-        host = urlparse(url).hostname or ""
-    except (TypeError, ValueError):
-        return ""
-    return host.lower()
-
-
-# Concrete archive-failure record consumed by
-# :func:`build_degradation_summary` — one entry per item the run ingested
-# with ``influx:archive-missing``.  ``url`` is used to derive the domain;
-# ``tags`` are scanned for the per-policy archive tags so the summary
-# can split blocked / rate-limited / skipped-by-policy from the long
-# tail of generic ``unspecified`` failures.
-ArchiveFailureRecord = dict[str, Any]
-
-
-# Write-outcome strings that represent a materially-failed write that
-# the run continued past — issue #152 review.  These count toward the
-# ``invalid_note_state.by_kind`` breakdown AND the ``invalid_note_state``
-# degraded reason.  Anything else (``created``, ``updated``,
-# ``duplicate`` …) is recorded under ``writes.by_outcome`` for
-# operational visibility but does NOT count as degradation.
-#
-# Membership rationale:
-#
-# - ``invalid_input`` — Lithos rejected the payload as malformed
-#   (missing required field / bad schema); the item was skipped.
-# - ``version_conflict`` — both retries exhausted; the write was
-#   skipped.
-# - ``slug_collision`` — the slug-collision recovery chain
-#   (#31 / #148) gave up; the item was skipped and a backlog entry
-#   was appended.
-# - ``content_too_large`` — the Tier-2 trim retry was not invoked or
-#   bubbled out of the trimming retry path; the item was skipped.
-# - ``content_too_large_skipped`` — the Tier-2 trim retry also
-#   produced ``content_too_large``; the item was skipped.
-#
-# ``duplicate`` is deliberately NOT in this set: PR #153 / issue #148
-# formalised that duplicate writes are the expected outcome of
-# scheduled re-runs and must not be treated as degradation.
-_INVALID_NOTE_STATE_OUTCOMES: frozenset[str] = frozenset(
-    {
-        "invalid_input",
-        "version_conflict",
-        "slug_collision",
-        "content_too_large",
-        "content_too_large_skipped",
-    }
-)
-
-
-def _is_invalid_note_state_outcome(outcome: str) -> bool:
-    """Return ``True`` when *outcome* counts as a real write failure (#152).
-
-    Used by :func:`build_degradation_summary` to gate the
-    ``invalid_note_state`` bucket so duplicate / created / updated
-    outcomes do not inflate degradation counts.
-    """
-    return outcome in _INVALID_NOTE_STATE_OUTCOMES
-
-
-# Per-run write-outcome counter shape consumed by
-# :func:`build_degradation_summary`.  Keyed by ``(outcome, source)``
-# tuples to keep the per-source attribution (an arXiv ``duplicate`` is
-# operationally different from an RSS ``duplicate`` even though the
-# outcome string is the same).  Mirrors
-# :data:`influx.telemetry.WriteOutcomeCounts`.
-WriteOutcomeCounts = dict[tuple[str, str], int]
-
-
-def build_degradation_summary(
-    *,
-    source_acquisition_errors: list[dict[str, str]] | None,
-    archive_failures: list[ArchiveFailureRecord] | None,
-    source_retry_counts: dict[str, dict[str, int]] | None,
-    filter_errors_total: int | None,
-    invalid_url_rejections_total: int | None,
-    cache_hits_total: int | None,
-    write_outcomes: WriteOutcomeCounts | None = None,
-    dedup_lookup_errors: list[dict[str, str]] | None = None,
-    top_n: int = _DEGRADATION_SUMMARY_TOP_N,
-) -> dict[str, Any]:
-    """Build the bounded ``degradation_summary`` block for one run (#152).
-
-    The summary is additive over the existing per-reason totals on the
-    ledger entry: it does not replace ``degraded`` /
-    ``degraded_reasons`` / ``source_acquisition_errors`` /
-    ``archive_failures_total`` — it provides the per-source / per-domain
-    / per-failure-class top-N breakdowns operators need to identify
-    drivers (arXiv 429s, IEEE 403s, slow timeouts) without grepping
-    raw event logs.
-
-    Shape::
-
-        {
-            "totals": {
-                "source_acquisition_errors": int,
-                "archive_failures": int,
-                "filter_errors": int,
-                "invalid_url_rejections": int,
-                "cache_hits": int,
-                "retries_recovered": int,
-                "writes": int,
-                "invalid_note_state": int,
-            },
-            "archive": {
-                "by_kind":   [{"kind": "...", "count": N}, ...],
-                "by_domain": [{"domain": "...", "count": N}, ...],
-            },
-            "source_acquisition": {
-                "by_kind":   [{"kind": "...", "count": N}, ...],
-                "by_source": [{"source": "...", "count": N}, ...],
-            },
-            "retries_recovered": {
-                "by_kind":   [{"kind": "...", "count": N}, ...],
-                "by_source": [{"source": "...", "count": N}, ...],
-            },
-            "writes": {
-                "by_outcome": [{"outcome": "...", "count": N}, ...],
-                "by_source":  [{"source":  "...", "count": N}, ...],
-            },
-            "invalid_note_state": {
-                "by_kind":   [{"kind":   "...", "count": N}, ...],
-                "by_source": [{"source": "...", "count": N}, ...],
-            },
-        }
-
-    Design notes:
-
-    - **Dedupe is not degradation.**  ``cache_hits`` is reported under
-      ``totals`` so operators can see the dedupe volume, but it is
-      deliberately segregated from the archive / source-acquisition
-      breakdowns.  A run whose only "issue" is cache hits is not a
-      degraded run (#152 acceptance criteria).
-    - **Write-time duplicate outcomes are not degradation either.**
-      Every write outcome — including ``created`` / ``updated`` /
-      ``duplicate`` — is surfaced under ``writes.by_outcome`` so the
-      dedupe volume is visible to operators, but only the
-      invalid-note-state outcomes (``invalid_input``,
-      ``version_conflict``, ``slug_collision``,
-      ``content_too_large*``) feed into the ``invalid_note_state``
-      bucket.  PR #153 / issue #148 formalised the duplicate-is-OK
-      contract: a scheduled re-run whose every write returns
-      ``duplicate`` is steady-state, not a regression (#152 review).
-    - **Top-N bounded.**  Each breakdown is truncated to *top_n* entries
-      sorted descending by count.  The long tail is intentionally
-      dropped — operators inspecting recent runs need to see the
-      dominant drivers, not the every-warning histogram.
-    - **Failure-class taxonomy is shallow.**  Archive failures are
-      bucketed by ``blocked`` / ``rate_limited`` / ``missing_by_policy``
-      / ``unspecified``; source-acquisition failures use the refined
-      ``kind`` already attached by the source adapter (``rate_limit``,
-      ``rate_limit_upstream_capacity``, ``rate_limit_local``,
-      ``rate_limit_unknown``, ``timeout``, ``network``, ``ssrf``,
-      ``oversize``, etc.).  New refinements (e.g. issue #145's
-      arXiv 429 split) flow through automatically because the
-      classification is captured at error-record time, not here.
-    """
-    errors = source_acquisition_errors or []
-    archive = archive_failures or []
-    retries = source_retry_counts or {}
-    writes = write_outcomes or {}
-    lookup_errors = dedup_lookup_errors or []
-
-    archive_by_kind: dict[str, int] = {}
-    archive_by_domain: dict[str, int] = {}
-    for record in archive:
-        kind = _archive_failure_kind_from_tags(list(record.get("tags") or []))
-        archive_by_kind[kind] = archive_by_kind.get(kind, 0) + 1
-        domain = _domain_from_url(str(record.get("url") or ""))
-        if domain:
-            archive_by_domain[domain] = archive_by_domain.get(domain, 0) + 1
-
-    source_by_kind: dict[str, int] = {}
-    source_by_source: dict[str, int] = {}
-    for err in errors:
-        kind = str(err.get("kind") or "unknown")
-        source_by_kind[kind] = source_by_kind.get(kind, 0) + 1
-        source = str(err.get("source") or "unknown")
-        source_by_source[source] = source_by_source.get(source, 0) + 1
-
-    # #234: swallowed pre-acquire cache_lookup failures, bucketed by the
-    # bounded source label.  Kept out of ``source_acquisition.*`` so the
-    # Lithos-side failure mode never masquerades as an upstream one.
-    dedup_lookup_by_source: dict[str, int] = {}
-    for err in lookup_errors:
-        source = str(err.get("source") or "unknown")
-        dedup_lookup_by_source[source] = dedup_lookup_by_source.get(source, 0) + 1
-
-    retries_by_kind: dict[str, int] = {}
-    retries_by_source: dict[str, int] = {}
-    retries_total = 0
-    for source, by_kind in retries.items():
-        for kind, count in by_kind.items():
-            retries_by_kind[kind] = retries_by_kind.get(kind, 0) + count
-            retries_by_source[source] = retries_by_source.get(source, 0) + count
-            retries_total += count
-
-    # #152 review: aggregate per-(outcome, source) write counts into the
-    # two parallel views the ledger surfaces.  ``writes.*`` carries
-    # every outcome — including the benign ``created`` / ``updated`` /
-    # ``duplicate`` cases — so operators see the dedupe volume at the
-    # write layer alongside the cache-hit total.  ``invalid_note_state.*``
-    # filters down to the materially-failed outcomes
-    # (:data:`_INVALID_NOTE_STATE_OUTCOMES`) so a duplicate-heavy run
-    # doesn't inflate the degradation reason list.
-    writes_by_outcome: dict[str, int] = {}
-    writes_by_source: dict[str, int] = {}
-    writes_total = 0
-    invalid_note_state_by_kind: dict[str, int] = {}
-    invalid_note_state_by_source: dict[str, int] = {}
-    invalid_note_state_total = 0
-    for (outcome, source), count in writes.items():
-        if count <= 0:
-            continue
-        writes_by_outcome[outcome] = writes_by_outcome.get(outcome, 0) + count
-        writes_by_source[source] = writes_by_source.get(source, 0) + count
-        writes_total += count
-        if _is_invalid_note_state_outcome(outcome):
-            invalid_note_state_by_kind[outcome] = (
-                invalid_note_state_by_kind.get(outcome, 0) + count
-            )
-            invalid_note_state_by_source[source] = (
-                invalid_note_state_by_source.get(source, 0) + count
-            )
-            invalid_note_state_total += count
-
-    def _renamed(rows: list[dict[str, Any]], key_name: str) -> list[dict[str, Any]]:
-        """Rename the helper's neutral ``"key"`` field to the caller's label."""
-        return [{key_name: row["key"], "count": row["count"]} for row in rows]
-
-    return {
-        "totals": {
-            "source_acquisition_errors": len(errors),
-            "archive_failures": len(archive),
-            "filter_errors": int(filter_errors_total or 0),
-            "invalid_url_rejections": int(invalid_url_rejections_total or 0),
-            "cache_hits": int(cache_hits_total or 0),
-            "retries_recovered": retries_total,
-            # #152 review: write-layer totals.  ``writes`` covers every
-            # outcome (including duplicate / created / updated);
-            # ``invalid_note_state`` is the strict subset that feeds the
-            # degraded-reasons list.
-            "writes": writes_total,
-            "invalid_note_state": invalid_note_state_total,
-            # #234: swallowed pre-acquire cache_lookup failures.
-            "dedup_lookup_errors": len(lookup_errors),
-        },
-        "archive": {
-            "by_kind": _renamed(_top_n_by_count(archive_by_kind, n=top_n), "kind"),
-            "by_domain": _renamed(
-                _top_n_by_count(archive_by_domain, n=top_n), "domain"
-            ),
-        },
-        "source_acquisition": {
-            "by_kind": _renamed(_top_n_by_count(source_by_kind, n=top_n), "kind"),
-            "by_source": _renamed(_top_n_by_count(source_by_source, n=top_n), "source"),
-        },
-        "retries_recovered": {
-            "by_kind": _renamed(_top_n_by_count(retries_by_kind, n=top_n), "kind"),
-            "by_source": _renamed(
-                _top_n_by_count(retries_by_source, n=top_n), "source"
-            ),
-        },
-        # #152 review: all write outcomes including duplicate / dedupe.
-        # NOT a degradation driver — operators consult this to see the
-        # dedupe volume at the write layer (complementing
-        # ``totals.cache_hits`` which counts the pre-write cache).
-        "writes": {
-            "by_outcome": _renamed(
-                _top_n_by_count(writes_by_outcome, n=top_n), "outcome"
-            ),
-            "by_source": _renamed(_top_n_by_count(writes_by_source, n=top_n), "source"),
-        },
-        # #152 review: degrading write-time outcomes only
-        # (``invalid_input`` / ``version_conflict`` / ``slug_collision``
-        # / ``content_too_large*``).  When the total is non-zero, the
-        # caller appends ``invalid_note_state`` to the degraded reasons.
-        "invalid_note_state": {
-            "by_kind": _renamed(
-                _top_n_by_count(invalid_note_state_by_kind, n=top_n), "kind"
-            ),
-            "by_source": _renamed(
-                _top_n_by_count(invalid_note_state_by_source, n=top_n), "source"
-            ),
-        },
-        # #234: swallowed pre-acquire cache_lookup failures, by bounded
-        # source label.  When the total is non-zero, the caller appends
-        # ``dedup_cache_lookup`` to the degraded reasons.
-        "dedup_lookup": {
-            "by_source": _renamed(
-                _top_n_by_count(dedup_lookup_by_source, n=top_n), "source"
-            ),
-        },
-    }
 
 
 @dataclass(frozen=True)
@@ -624,348 +141,90 @@ class RunLedger:
             logger.warning("failed to update active run ledger", exc_info=True)
 
     def complete(
-        self,
-        *,
-        run_id: str,
-        sources_checked: int | None,
-        ingested: int | None,
-        fetched_total: int | None = None,
-        filter_errors_total: int | None = None,
-        invalid_url_rejections_total: int | None = None,
-        archive_failures_total: int | None = None,
-        summary_thin_drops_total: int | None = None,
-        empty_source_writes_total: int | None = None,
-        source_acquisition_errors: list[dict[str, str]] | None = None,
-        source_cooldown_skips: list[dict[str, str]] | None = None,
-        dedup_lookup_errors: list[dict[str, str]] | None = None,
-        source_retry_counts: dict[str, dict[str, int]] | None = None,
-        tier3_fallbacks: dict[str, int] | None = None,
-        archive_failures: list[ArchiveFailureRecord] | None = None,
-        cache_hits_total: int | None = None,
-        write_outcomes: WriteOutcomeCounts | None = None,
-    ) -> list[str]:
-        """Mark an active run as completed and append it to history.
+        self, *, run_id: str, evidence: RunEvidence
+    ) -> RunCompletionAssessment:
+        """Finalise an active run as ``completed`` and return its assessment.
 
-        Returns the structured ``degraded_reasons`` list that was
-        recorded.  Possible values:
-
-        - ``"source_acquisition"`` (issue #20) — at least one
-          source-fetch failure was swallowed.
-        - ``"source_cooldown_skip"`` (issue #146) — at least one
-          source fetch was deliberately skipped because the
-          source-specific adaptive 429 cooldown was active.  Distinct
-          from ``source_acquisition`` because the run *chose* not to
-          call upstream rather than tried and lost.  Single-run
-          signal — like ``filter_error`` — so operators see the skip
-          immediately even on the first cooldown-suppressed run.
-        - ``"dedup_cache_lookup"`` (issue #234) — the pre-acquire
-          dedup helper swallowed at least one per-candidate
-          ``cache_lookup`` :class:`~influx.errors.LithosError` and
-          skipped that candidate for this run.  Single-run signal —
-          like ``filter_error`` — because a Lithos-side tool failure
-          is immediately actionable (check Lithos health / server
-          logs, not the upstream feed).
-        - ``"filter_error"`` (issue #85 review) — the LLM filter
-          scorer raised :class:`FilterScorerError` (transport, parse,
-          or provider failure) at least once during this run.  Single-
-          run signal — no consecutive-runs gate, since one filter
-          execution failure is immediately actionable.  Mutually
-          exclusive with ``filter_stall``: when both would apply,
-          ``filter_error`` wins because the scorer-failure diagnosis
-          is more specific.
-        - ``"archive_acquisition"`` — at least one accepted item was
-          ingested with ``influx:archive-missing`` after archive
-          acquisition failed, so note quality degraded even though the
-          run continued.
-        - ``"ingestion_stall"`` (issue #36) — this and the immediately
-          prior scheduled run both saw ``ingested == 0`` despite
-          ``sources_checked > 0``.  Typical cause: every candidate hits
-          ``slug_collision``/``duplicate``.
-        - ``"fetch_stall"`` (issue #50) — this and the immediately
-          prior scheduled run both saw ``fetched_total == 0`` (no
-          source returned any items at all), AND the profile has
-          historically seen ``sources_checked > 0``.  Typical cause:
-          too-narrow ``lookback_days`` or an upstream feed shape change.
-        - ``"filter_stall"`` (issue #85) — this and the immediately
-          prior scheduled run both saw ``fetched_total > 0`` but
-          ``sources_checked == 0`` (the LLM filter ran cleanly and
-          rejected every candidate), AND the profile has historically
-          seen ``sources_checked > 0``.  Typical cause: profile
-          description drift, filter prompt regression, or
-          ``min_score_in_results`` set too high.  Requires
-          ``filter_errors_total == 0`` so a scorer failure produces
-          ``filter_error`` rather than this, AND
-          ``invalid_url_rejections_total < fetched_total`` so a feed
-          whose entries were all URL-rejected pre-filter produces
-          ``invalid_url_stall`` rather than this.
-        - ``"invalid_url_stall"`` (issue #131) — the feed returned
-          items but every URL was upstream-malformed (loopback,
-          private, link-local, multicast, unparseable, or
-          disallowed-scheme), so nothing reached the LLM filter.
-          Single-run signal — like ``filter_error`` — because URL
-          malformation is an immediately actionable upstream bug.
-        - ``"invalid_url_rejections"`` (issue #177) — the feed
-          shipped many bad URLs per run but at least some good ones
-          still reached the filter.  Distinct from
-          ``invalid_url_stall``: this is the partial-bad case.
-          Fires when ``invalid_url_rejections_total`` meets or
-          exceeds :data:`_INVALID_URL_REJECTIONS_BURST_THRESHOLD`
-          (currently ``10``).  Slotted into ``expected_lossy``
-          because the validator is doing its job — the signal is
-          "operator should look at this feed" rather than a data
-          integrity regression.  Suppressed when
-          ``invalid_url_stall`` already fires.
-        - ``"invalid_note_state"`` (issue #152 review) — at least one
-          write-time outcome landed in the materially-failed set
-          (``invalid_input``, ``version_conflict``, ``slug_collision``,
-          or ``content_too_large*``) so an accepted item was dropped at
-          the write layer.  Distinct from ``duplicate``, which is the
-          expected steady-state outcome of scheduled re-runs and
-          deliberately does NOT count toward degradation (PR #153 /
-          issue #148 contract).  Single-run signal — these failure
-          shapes are immediately actionable (schema drift / repair
-          backlog / upstream id collision) and do not need a
-          consecutive-runs ratchet.
-
-        ``fetch_stall`` and ``filter_stall`` partition the
-        ``sources_checked == 0`` space by ``fetched_total``: they are
-        mutually exclusive on a single run.  ``ingestion_stall``
-        requires ``sources_checked > 0``, so it is mutually exclusive
-        with both.  ``filter_error`` and ``filter_stall`` are mutually
-        exclusive because they describe distinct failure shapes (scorer
-        broken vs scorer-rejected-all); ``filter_error`` is independent
-        of ``ingestion_stall`` and ``fetch_stall`` and may co-occur
-        with either if a partial-failure run still ingested or
-        legitimately fetched nothing from some sources.
-
-        Returning the reasons lets the caller (the scheduler) emit
-        per-reason metrics without re-deriving the logic.
+        The history-free reasons come from
+        :func:`influx.run_assessment.single_run_reasons`; the ledger adds
+        the scheduled-only stall family it alone can see
+        (:meth:`_scheduled_stall_reasons`).  The assessment is what gets
+        persisted and what the run service derives metrics and logs from.
         """
-        errors = list(source_acquisition_errors or [])
-        cooldown_skips = list(source_cooldown_skips or [])
-        lookup_errors = list(dedup_lookup_errors or [])
-        reasons: list[str] = []
-        if errors:
-            reasons.append("source_acquisition")
-        # Issue #146: cooldown skips are reported as a *separate*
-        # degraded reason so operator dashboards can distinguish
-        # "we backed off on purpose" from "we tried and lost".  Both
-        # may co-occur within a single run (e.g. arXiv cooldown, RSS
-        # network failure) — the run-level summary surfaces both.
-        if cooldown_skips:
-            reasons.append("source_cooldown_skip")
-        # #234: at least one pre-acquire ``cache_lookup`` LithosError
-        # was swallowed (candidate skipped this run).  Separate reason
-        # from ``source_acquisition`` because the failed call is
-        # Influx→Lithos, not Influx→upstream — operators should check
-        # Lithos health, not the feed.
-        if lookup_errors:
-            reasons.append("dedup_cache_lookup")
-
-        # #85 review: filter_error fires immediately on any
-        # FilterScorerError catch, regardless of run kind.  Operators
-        # need to know about scorer execution failures even on manual
-        # / backfill runs (where the stall family doesn't apply).
-        # Mutual exclusion with filter_stall is enforced below by
-        # gating the filter_stall branch on filter_errors_total == 0.
-        has_filter_error = (
-            isinstance(filter_errors_total, int) and filter_errors_total > 0
-        )
-        if has_filter_error:
-            reasons.append("filter_error")
-        if isinstance(archive_failures_total, int) and archive_failures_total > 0:
-            reasons.append("archive_acquisition")
-
-        # #152 review: ``invalid_note_state`` fires when any write-time
-        # outcome lands in the materially-failed set (see
-        # :data:`_INVALID_NOTE_STATE_OUTCOMES`).  ``duplicate`` outcomes
-        # are deliberately excluded — they are the contract-expected
-        # outcome of scheduled re-runs (PR #153 / issue #148).
-        # Single-run signal because the underlying shapes (schema
-        # drift, repair backlog, version conflict) are immediately
-        # actionable, not noisy/transient.
-        invalid_note_state_total = sum(
-            count
-            for (outcome, _source), count in (write_outcomes or {}).items()
-            if _is_invalid_note_state_outcome(outcome) and count > 0
-        )
-        if invalid_note_state_total > 0:
-            reasons.append("invalid_note_state")
-
-        # #131 review concern 2: ``invalid_url_stall`` fires when the
-        # feed returned items but every URL was upstream-malformed
-        # (loopback / private / link-local / multicast / unparseable /
-        # disallowed scheme), so nothing reached the LLM filter.
-        # Single-run signal — like ``filter_error`` and
-        # ``archive_acquisition`` — because URL malformation is a
-        # clear-cut, immediately actionable upstream bug, not a
-        # noisy/transient signal that needs a consecutive-runs ratchet.
-        # Mutually exclusive with ``filter_stall`` (the gate below
-        # enforces ``items_reached_filter > 0``) and with
-        # ``fetch_stall`` (which requires ``fetched_total == 0``).
-        items_reached_filter = (
-            (fetched_total - invalid_url_rejections_total)
-            if isinstance(fetched_total, int)
-            and isinstance(invalid_url_rejections_total, int)
-            else None
-        )
-        has_invalid_url_stall = (
-            isinstance(invalid_url_rejections_total, int)
-            and invalid_url_rejections_total > 0
-            and isinstance(fetched_total, int)
-            and fetched_total > 0
-            and items_reached_filter == 0
-        )
-        if has_invalid_url_stall:
-            reasons.append("invalid_url_stall")
-
-        # Issue #177: ``invalid_url_rejections`` (burst).  Fires when
-        # a run's URL-rejection count meets or exceeds
-        # :data:`_INVALID_URL_REJECTIONS_BURST_THRESHOLD` while at
-        # least some items still reached the filter — the partial-bad
-        # case that the stall variant above misses.  Suppressed when
-        # ``invalid_url_stall`` already fires (the stall is the
-        # more-specific signal for the all-bad case).
-        has_invalid_url_burst = (
-            not has_invalid_url_stall
-            and isinstance(invalid_url_rejections_total, int)
-            and invalid_url_rejections_total >= _INVALID_URL_REJECTIONS_BURST_THRESHOLD
-        )
-        if has_invalid_url_burst:
-            reasons.append("invalid_url_rejections")
-
-        # Resolve profile + kind once for the stall checks.  All three
-        # stall flags only apply to scheduled runs (backfills
-        # legitimately ingest 0 when every candidate is a cache hit,
-        # and operator-triggered manual runs may use a deliberately
-        # narrow lookback).
-        active = self._read_active()
-        entry = active.get(run_id, {})
+        entry = self._read_active().get(run_id, {})
         profile = entry.get("profile")
         kind = entry.get("kind")
-        is_scheduled = isinstance(profile, str) and kind == "scheduled"
+        reasons = single_run_reasons(evidence)
+        if isinstance(profile, str) and kind == "scheduled":
+            reasons.extend(
+                self._scheduled_stall_reasons(
+                    profile=profile, run_id=run_id, evidence=evidence
+                )
+            )
+        assessment = RunCompletionAssessment(
+            run_id=run_id,
+            profile=profile if isinstance(profile, str) else None,
+            kind=kind if isinstance(kind, str) else None,
+            status="completed",
+            evidence=evidence,
+            reasons=tuple(reasons),
+            degradation_summary=build_degradation_summary(evidence),
+        )
+        self._finish(assessment)
+        return assessment
 
-        # #36 ingestion-stall detection: only meaningful when the run
-        # actually inspected something.
-        if (
-            is_scheduled
-            and isinstance(ingested, int)
-            and ingested == 0
-            and isinstance(sources_checked, int)
-            and sources_checked > 0
-        ):
-            # Count consecutive prior scheduled runs for the same
-            # profile that match the stall shape.  We add 1 for *this*
-            # run since it hasn't been written yet.
-            assert isinstance(profile, str)  # narrowed by is_scheduled
-            consecutive = 1 + self._consecutive_zero_ingestion_runs(
+    def _scheduled_stall_reasons(
+        self, *, profile: str, run_id: str, evidence: RunEvidence
+    ) -> list[str]:
+        """The history-dependent reasons, scheduled runs only.
+
+        Backfills legitimately ingest 0 when every candidate is a cache
+        hit, manual runs may use a deliberately narrow lookback, and
+        inbox runs are single-item — so none of them ratchet.
+
+        - ``ingestion_stall`` (#36): this and the prior scheduled run
+          both ingested 0 with ``sources_checked > 0``.
+        - ``fetch_stall`` (#50) / ``filter_stall`` (#85) partition the
+          ``sources_checked == 0`` space by ``fetched_total``, each
+          needing a 2-run streak plus the historical ratchet ("this
+          profile has seen ``sources_checked > 0`` before").
+          ``filter_stall`` yields to the more specific ``filter_error``
+          and ``invalid_url_stall``; ``fetch_stall`` is fully explained
+          by a cooldown skip on the current run (#163 review) and
+          ignores cooldown-skipped priors in its streak.
+        """
+        reasons: list[str] = []
+        sources_checked = evidence.sources_checked
+        if not isinstance(sources_checked, int):
+            return reasons
+        if sources_checked > 0:
+            if evidence.ingested == 0:
+                streak = 1 + self._consecutive_zero_ingestion_runs(
+                    profile=profile, exclude_run_id=run_id
+                )
+                if streak >= 2:
+                    reasons.append("ingestion_stall")
+            return reasons
+        if isinstance(evidence.fetched_total, int) and evidence.fetched_total > 0:
+            if evidence.has_filter_error or evidence.has_invalid_url_stall:
+                return reasons
+            streak = 1 + self._consecutive_zero_check_with_fetch_runs(
                 profile=profile, exclude_run_id=run_id
             )
-            if consecutive >= 2:
-                reasons.append("ingestion_stall")
-
-        # #50 / #85: zero-sources_checked split.  ``fetch_stall`` keeps
-        # the original semantics — *no items reached the filter* —
-        # while ``filter_stall`` (#85) catches the case where sources
-        # fetched normally but the filter rejected every candidate.
-        # Both share the historical-ratchet ("profile has previously
-        # seen ``sources_checked > 0``") that silences brand-new
-        # profiles and profiles that genuinely never receive items.
-        if is_scheduled and isinstance(sources_checked, int) and sources_checked == 0:
-            assert isinstance(profile, str)  # narrowed by is_scheduled
-
-            if isinstance(fetched_total, int) and fetched_total > 0:
-                # #85 filter_stall: items WERE fetched, the filter
-                # rejected them all.  Requires filter_errors_total == 0
-                # — a scorer-execution failure has a distinct, more
-                # specific reason (``filter_error``) and shouldn't
-                # double-fire as a filter_stall (#85 review).  #131
-                # review concern 2: also requires that items actually
-                # reached the filter (i.e. weren't all dropped pre-acquire
-                # by the URL validator); otherwise ``invalid_url_stall``
-                # is the correct diagnosis.  Streak counts prior
-                # scheduled runs that match the same shape
-                # (sources_checked == 0 AND fetched_total > 0).
-                if has_filter_error or has_invalid_url_stall:
-                    pass  # more-specific reason already appended above
-                else:
-                    consecutive_filter = (
-                        1
-                        + self._consecutive_zero_check_with_fetch_runs(
-                            profile=profile, exclude_run_id=run_id
-                        )
-                    )
-                    if consecutive_filter >= 2 and self._has_prior_non_zero_fetch(
-                        profile=profile, exclude_run_id=run_id
-                    ):
-                        reasons.append("filter_stall")
-            else:
-                # #50 fetch_stall: nothing was fetched at all.  Either
-                # ``fetched_total`` was explicitly 0 or the caller
-                # didn't supply one (legacy path) — both fall to
-                # fetch_stall to preserve pre-#85 semantics.
-                #
-                # Issue #163 review: when the current run also has
-                # ``source_cooldown_skips`` non-empty, the zeros are
-                # fully explained by the cooldown — adding fetch_stall
-                # on top would mis-route the operator to "upstream
-                # drift / lookback problem" when the truth is "we
-                # deliberately did not fetch".  ``_consecutive_zero_fetch_runs``
-                # already skips prior cooldown-skipped runs (see
-                # :meth:`_is_zero_fetch_entry`) so the streak is not
-                # polluted by past cooldown runs either.
-                if cooldown_skips:
-                    consecutive_zero_fetch = 0
-                else:
-                    consecutive_zero_fetch = 1 + self._consecutive_zero_fetch_runs(
-                        profile=profile, exclude_run_id=run_id
-                    )
-                if consecutive_zero_fetch >= 2 and self._has_prior_non_zero_fetch(
-                    profile=profile, exclude_run_id=run_id
-                ):
-                    reasons.append("fetch_stall")
-
-        # #152: build the bounded degradation summary alongside the
-        # existing per-reason totals.  Computed at ``complete`` time so
-        # the persisted entry carries a stable snapshot — downstream
-        # consumers (``/runs/recent``) don't need to re-derive it from
-        # raw event logs.  Dedupe cache-hits are surfaced under
-        # ``totals.cache_hits`` but deliberately NOT folded into the
-        # archive / source-acquisition breakdowns (#152 acceptance
-        # criteria: a run whose only "issue" is cache hits is not
-        # degraded).
-        degradation_summary = build_degradation_summary(
-            source_acquisition_errors=errors,
-            archive_failures=archive_failures,
-            source_retry_counts=source_retry_counts,
-            filter_errors_total=filter_errors_total,
-            invalid_url_rejections_total=invalid_url_rejections_total,
-            cache_hits_total=cache_hits_total,
-            write_outcomes=write_outcomes,
-            dedup_lookup_errors=lookup_errors,
+            if streak >= 2 and self._has_prior_non_zero_fetch(
+                profile=profile, exclude_run_id=run_id
+            ):
+                reasons.append("filter_stall")
+            return reasons
+        if evidence.source_cooldown_skips:
+            return reasons
+        streak = 1 + self._consecutive_zero_fetch_runs(
+            profile=profile, exclude_run_id=run_id
         )
-
-        self._finish(
-            run_id=run_id,
-            status="completed",
-            sources_checked=sources_checked,
-            ingested=ingested,
-            fetched_total=fetched_total,
-            filter_errors_total=filter_errors_total,
-            invalid_url_rejections_total=invalid_url_rejections_total,
-            archive_failures_total=archive_failures_total,
-            summary_thin_drops_total=summary_thin_drops_total,
-            empty_source_writes_total=empty_source_writes_total,
-            error=None,
-            degraded=bool(reasons),
-            source_acquisition_errors=errors,
-            source_cooldown_skips=cooldown_skips,
-            dedup_lookup_errors=lookup_errors,
-            degraded_reasons=reasons,
-            source_retry_counts=source_retry_counts,
-            tier3_fallbacks=tier3_fallbacks,
-            degradation_summary=degradation_summary,
-        )
+        if streak >= 2 and self._has_prior_non_zero_fetch(
+            profile=profile, exclude_run_id=run_id
+        ):
+            reasons.append("fetch_stall")
         return reasons
 
     def _consecutive_zero_ingestion_runs(
@@ -1105,36 +364,36 @@ class RunLedger:
                 return True
         return False
 
-    def fail(self, *, run_id: str, error: str) -> None:
-        """Mark an active run as failed and append it to history."""
-        self._finish(
-            run_id=run_id,
-            status="failed",
-            sources_checked=None,
-            ingested=None,
-            error=error,
-            degraded=False,
-            source_acquisition_errors=[],
-        )
+    def fail(self, *, run_id: str, error: str) -> RunCompletionAssessment:
+        """Finalise an active run as ``failed`` (the body raised)."""
+        return self._finish_without_evidence(run_id, status="failed", error=error)
 
-    def skip(self, *, run_id: str, reason: str) -> None:
-        """Mark an active run as ``skipped`` and append it to history (#40).
+    def skip(self, *, run_id: str, reason: str) -> RunCompletionAssessment:
+        """Finalise an active run as ``skipped`` (#40).
 
-        Distinct from ``fail``: ``failed`` means the run started and
-        crashed; ``skipped`` means the run never started any
-        source-fetch / LLM / write work because a circuit breaker (e.g.
-        Lithos extended outage) opened first.  ``reason`` is recorded
-        so dashboards can distinguish skip causes.
+        Distinct from ``fail``: the run never started any source-fetch /
+        LLM / write work because a circuit breaker opened first.
+        ``reason`` lands in the entry's ``error`` field.
         """
-        self._finish(
+        return self._finish_without_evidence(run_id, status="skipped", error=reason)
+
+    def _finish_without_evidence(
+        self, run_id: str, *, status: str, error: str
+    ) -> RunCompletionAssessment:
+        entry = self._read_active().get(run_id, {})
+        profile = entry.get("profile")
+        kind = entry.get("kind")
+        assessment = RunCompletionAssessment(
             run_id=run_id,
-            status="skipped",
-            sources_checked=None,
-            ingested=None,
-            error=reason,
-            degraded=False,
-            source_acquisition_errors=[],
+            profile=profile if isinstance(profile, str) else None,
+            kind=kind if isinstance(kind, str) else None,
+            status="failed" if status == "failed" else "skipped",
+            evidence=RunEvidence(),
+            reasons=(),
+            error=error,
         )
+        self._finish(assessment)
+        return assessment
 
     def record_unresolved_slug_collision(
         self,
@@ -1302,35 +561,15 @@ class RunLedger:
                 latest[profile] = entry
         return latest
 
-    def _finish(
-        self,
-        *,
-        run_id: str,
-        status: str,
-        sources_checked: int | None,
-        ingested: int | None,
-        error: str | None,
-        fetched_total: int | None = None,
-        filter_errors_total: int | None = None,
-        invalid_url_rejections_total: int | None = None,
-        archive_failures_total: int | None = None,
-        summary_thin_drops_total: int | None = None,
-        empty_source_writes_total: int | None = None,
-        degraded: bool = False,
-        source_acquisition_errors: list[dict[str, str]] | None = None,
-        source_cooldown_skips: list[dict[str, str]] | None = None,
-        dedup_lookup_errors: list[dict[str, str]] | None = None,
-        degraded_reasons: list[str] | None = None,
-        source_retry_counts: dict[str, dict[str, int]] | None = None,
-        tier3_fallbacks: dict[str, int] | None = None,
-        degradation_summary: dict[str, Any] | None = None,
-    ) -> None:
+    def _finish(self, assessment: RunCompletionAssessment) -> None:
+        """Move the run from the active snapshot to history, as assessed."""
+        evidence = assessment.evidence
         try:
             active = self._read_active()
-            entry = active.pop(run_id, None)
+            entry = active.pop(assessment.run_id, None)
             if entry is None:
                 entry = {
-                    "run_id": run_id,
+                    "run_id": assessment.run_id,
                     "profile": None,
                     "kind": None,
                     "status": "running",
@@ -1339,70 +578,41 @@ class RunLedger:
                 }
 
             completed_at = datetime.now(UTC)
-
             entry.update(
                 {
-                    "status": status,
+                    "status": assessment.status,
                     "completed_at": completed_at.isoformat(),
                     "duration_seconds": self._duration_seconds(
                         entry.get("started_at"),
                         completed_at,
                     ),
-                    "sources_checked": sources_checked,
-                    "ingested": ingested,
-                    "fetched_total": fetched_total,
-                    "filter_errors_total": filter_errors_total,
-                    "invalid_url_rejections_total": invalid_url_rejections_total,
-                    "archive_failures_total": archive_failures_total,
-                    # Issue #166: persist per-run total of thin-summary
-                    # suppressions so operators can see how many items
-                    # the rule is dropping without scraping logs.
-                    "summary_thin_drops_total": summary_thin_drops_total,
-                    # Issue #189: persist per-run count of source-less
-                    # writes so operators can measure the rate without
-                    # scraping logs.  Observe-only; not a failure total.
-                    "empty_source_writes_total": empty_source_writes_total,
-                    "error": error,
-                    "degraded": degraded,
-                    "degraded_reasons": list(degraded_reasons or []),
-                    # Issue #164: precompute the severity bucket from
-                    # the reason list so downstream consumers
-                    # (``/runs/recent``, dashboards, paging) read a
-                    # stable classification without reimplementing the
-                    # mapping.  ``"unexpected_failure"`` wins when any
-                    # unexpected reason co-occurs with expected-lossy
-                    # ones.
-                    "degradation_severity": classify_degradation_severity(
-                        list(degraded_reasons or [])
+                    "sources_checked": evidence.sources_checked,
+                    "ingested": evidence.ingested,
+                    "fetched_total": evidence.fetched_total,
+                    "filter_errors_total": evidence.filter_errors_total,
+                    "invalid_url_rejections_total": (
+                        evidence.invalid_url_rejections_total
                     ),
-                    "source_acquisition_errors": list(source_acquisition_errors or []),
-                    # Issue #146: persist cooldown skips alongside
-                    # ``source_acquisition_errors`` so the same JSONL
-                    # consumers can read both lists with the same shape.
-                    "source_cooldown_skips": list(source_cooldown_skips or []),
-                    # #234: persist swallowed pre-acquire cache_lookup
-                    # failures with the same source/kind/detail shape so
-                    # JSONL consumers can scan a uniform schema.
-                    "dedup_lookup_errors": list(dedup_lookup_errors or []),
-                    # #129: deep-copy the per-source retry-count dict so
-                    # later mutations of the contextvar bucket do not
-                    # leak into the persisted ledger entry.
+                    "archive_failures_total": evidence.archive_failures_total,
+                    "summary_thin_drops_total": evidence.summary_thin_drops_total,
+                    "empty_source_writes_total": evidence.empty_source_writes_total,
+                    "error": assessment.error,
+                    "degraded": assessment.degraded,
+                    "degraded_reasons": list(assessment.reasons),
+                    "degradation_severity": assessment.severity,
+                    "source_acquisition_errors": list(
+                        evidence.source_acquisition_errors
+                    ),
+                    "source_cooldown_skips": list(evidence.source_cooldown_skips),
+                    "dedup_lookup_errors": list(evidence.dedup_lookup_errors),
+                    # Copies, so later mutation of the run's contextvar
+                    # buckets cannot leak into the persisted entry.
                     "source_retry_counts": {
                         source: dict(by_kind)
-                        for source, by_kind in (source_retry_counts or {}).items()
+                        for source, by_kind in evidence.source_retry_counts.items()
                     },
-                    # #151: shallow-copy the Tier 3 fallback counts so
-                    # later mutations of the contextvar bucket do not
-                    # leak into the persisted ledger entry.  ``int``
-                    # values are already immutable, so a flat ``dict()``
-                    # is sufficient.
-                    "tier3_fallbacks": dict(tier3_fallbacks or {}),
-                    # #152: persist the precomputed degradation summary
-                    # so downstream consumers (``/runs/recent``) see the
-                    # top-N breakdowns without re-aggregating.  ``None``
-                    # on the fail / skip / abandon paths — those use
-                    # the legacy zero-data shape.
-                    "degradation_summary": degradation_summary,
+                    "tier3_fallbacks": dict(evidence.tier3_fallbacks),
+                    "degradation_summary": assessment.degradation_summary,
                 }
             )
             self._append(entry)
