@@ -41,7 +41,7 @@ Notifications = "Post-run webhook / digest notification dispatch."
 Config        = "Pydantic config schema / loading, health probes, slug generation, and prompt templates."
 Observability = "OpenTelemetry tracing, metrics, and structured logging setup."
 Schemas       = "The LLM extraction contracts (Pydantic filter / enrichment / extraction models)."
-Common        = "Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP client, shared enums, and the Source seam contracts (Candidate / ScoredCandidate / Source Protocol)."
+Common        = "Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger and its RunCompletionAssessment, HTTP client, shared enums, and the Source seam contracts (Candidate / ScoredCandidate / Source Protocol)."
 
 [components]
 Entrypoint    = ["influx.main", "influx.__main__"]
@@ -58,7 +58,7 @@ Notifications = ["influx.notifications"]
 Config        = ["influx.config", "influx.probes", "influx.slugs", "influx.prompts", "influx.llm_request"]
 Observability = ["influx.telemetry", "influx.metrics", "influx.logging_config"]
 Schemas       = ["influx.schemas"]
-Common        = ["influx.errors", "influx.coordinator", "influx.run_ledger", "influx.thin_summary", "influx.http_client", "influx.source_kind", "influx.source"]
+Common        = ["influx.errors", "influx.coordinator", "influx.run_ledger", "influx.run_assessment", "influx.thin_summary", "influx.http_client", "influx.source_kind", "influx.source"]
 
 [tiers]
 Entrypoints = ["Entrypoint", "HttpApi", "Orchestration"]
@@ -81,7 +81,7 @@ module_cycles          = 3    # goal: 0
 modules_over_800_lines = 11   # 12->11 after finding 4 split http_api's orchestration into run_dispatch; direction: down, no new ones
 max_module_lines       = 2000 # stop-loss; largest today is sources.arxiv at 1912
 cross_module_private_refs = 5   # measured 2026-07; extraction.html helpers x4, telemetry x1; goal: 0
-tests_private_imports     = 79  # 91->80 after 3b moved archive-identity tests onto the Source seam; 80->79 after c1196e30 retired the content-merge helper; direction: down
+tests_private_imports     = 77  # 91->80 after 3b moved archive-identity tests onto the Source seam; 80->79 after c1196e30 retired the content-merge helper; 79->77 after efc53838 made the degraded-reason sets public on run_assessment (the meta-tests pin a contract, not an internal); direction: down
 
 # Domain class diagram: scoped to the LLM extraction contracts (schemas) and the
 # run-cycle data types — the same narrow scope as before this kit landed. Every
@@ -91,7 +91,7 @@ tests_private_imports     = 79  # 91->80 after 3b moved archive-identity tests o
 # (test_every_model_is_scanned_or_excluded) passes. Widen include_modules to
 # diagram more of the domain.
 [domain]
-include_modules = ["influx.schemas", "influx.run", "influx.lcma_wiring"]
+include_modules = ["influx.schemas", "influx.run", "influx.lcma_wiring", "influx.run_assessment"]
 exclude_modules = [
     "influx.config",
     "influx.errors",

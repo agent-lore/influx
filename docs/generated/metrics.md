@@ -15,7 +15,7 @@
     "seams": "measured",
     "structure": "measured"
   },
-  "config_hash": "2bdc90b54448a10dd1106e315cd29939892c6262dfb2cc7523cc0c15e4fef8b2",
+  "config_hash": "dee5c65079838c294aae4a18ca5b75be2d1215af87e86e1ec5a05c67590d8dd9",
   "definitions": {
     "complexity": 1,
     "structure": 1,
@@ -58,7 +58,8 @@
       "include_modules": [
         "influx.schemas",
         "influx.run",
-        "influx.lcma_wiring"
+        "influx.lcma_wiring",
+        "influx.run_assessment"
       ]
     },
     "excluded": [
@@ -78,7 +79,7 @@
       "tests/test_quality.py"
     ]
   },
-  "source_hash": "a7920f3c15092d351444a9bafb721f36d64c9a0e748fcb7602f013b471df1df7",
+  "source_hash": "c6265592bdefe6a31c5aac92be6459bff8051a93142d40277f2b4e98a7e0af74",
   "tools": {
     "grimp": "3.14",
     "networkx": "3.6.1"
@@ -108,8 +109,8 @@ in the same PR. Lower thresholds when that protects useful improvements.
 | `cross_module_private_refs` | 5 | 5 | 0 | invariant |
 | `max_module_lines` | 1890 | 2000 | 110 | review |
 | `module_cycles` | 3 | 3 | 0 | invariant |
-| `modules_over_800_lines` | 11 | 11 | 0 | review |
-| `tests_private_imports` | 79 | 79 | 0 | invariant |
+| `modules_over_800_lines` | 9 | 11 | 2 | review |
+| `tests_private_imports` | 77 | 77 | 0 | invariant |
 
 ### Quality review
 
@@ -145,12 +146,10 @@ in the same PR. Lower thresholds when that protects useful improvements.
 | unchanged | function_complexity | influx.repair.compute_clearing | 16 | 16 | review | — |
 | unchanged | function_complexity | influx.repair.select_stages | 12 | 12 | review | — |
 | unchanged | function_complexity | influx.run._run_ingest_stage | 26 | 26 | review | — |
+| unchanged | function_complexity | influx.run_assessment.build_degradation_summary | 13 | 13 | review | — |
+| unchanged | function_complexity | influx.run_assessment.single_run_reasons | 11 | 11 | review | — |
 | unchanged | function_complexity | influx.run_dedup.dedup_scored_candidates | 17 | 17 | review | — |
-| unchanged | function_complexity | influx.run_ledger.RunLedger._finish | 11 | 11 | review | — |
-| unchanged | function_complexity | influx.run_ledger.RunLedger.complete | 47 | 47 | review | — |
-| unchanged | function_complexity | influx.run_ledger.build_degradation_summary | 23 | 23 | review | — |
-| unchanged | function_complexity | influx.run_service._format_top_drivers_tail | 15 | 15 | review | — |
-| unchanged | function_complexity | influx.run_service.ledger_lifecycle | 52 | 52 | review | — |
+| unchanged | function_complexity | influx.run_ledger.RunLedger._scheduled_stall_reasons | 14 | 14 | review | — |
 | unchanged | function_complexity | influx.scheduler.InfluxScheduler._fire_tick | 12 | 12 | review | — |
 | unchanged | function_complexity | influx.schemas._harden_for_openai_strict | 14 | 14 | review | — |
 | unchanged | function_complexity | influx.sources.arxiv.ArxivSource.fetch_candidates | 11 | 11 | review | — |
@@ -197,13 +196,11 @@ in the same PR. Lower thresholds when that protects useful improvements.
 | unchanged | function_length | influx.repair_hooks._make_text_extraction_hook | 81 | 81 | review | — |
 | unchanged | function_length | influx.run.Run.execute | 101 | 101 | review | — |
 | unchanged | function_length | influx.run._run_ingest_stage | 249 | 249 | review | — |
+| unchanged | function_length | influx.run_assessment.build_degradation_summary | 109 | 109 | review | — |
 | unchanged | function_length | influx.run_dedup.dedup_scored_candidates | 145 | 145 | review | — |
 | unchanged | function_length | influx.run_dispatch.RunDispatcher._run_many_and_release | 79 | 79 | review | — |
-| unchanged | function_length | influx.run_ledger.RunLedger._finish | 107 | 107 | review | — |
-| unchanged | function_length | influx.run_ledger.RunLedger.complete | 344 | 344 | review | — |
 | unchanged | function_length | influx.run_ledger.RunLedger.start | 79 | 79 | review | — |
-| unchanged | function_length | influx.run_ledger.build_degradation_summary | 225 | 225 | review | — |
-| unchanged | function_length | influx.run_service.ledger_lifecycle | 649 | 649 | review | — |
+| unchanged | function_length | influx.run_service.ledger_lifecycle | 107 | 107 | review | — |
 | unchanged | function_length | influx.service.create_app | 136 | 136 | review | — |
 | unchanged | function_length | influx.sources.arxiv.ArxivSource.fetch_candidates | 133 | 133 | review | — |
 | unchanged | function_length | influx.sources.arxiv._fetch_arxiv_items | 96 | 96 | review | — |
@@ -226,13 +223,12 @@ in the same PR. Lower thresholds when that protects useful improvements.
 | unchanged | module_lines | influx.repair | 1736 | 1736 | review | — |
 | unchanged | module_lines | influx.repair_hooks | 941 | 941 | review | — |
 | unchanged | module_lines | influx.run | 1012 | 1012 | review | — |
-| unchanged | module_lines | influx.run_ledger | 1457 | 1457 | review | — |
-| unchanged | module_lines | influx.run_service | 890 | 890 | review | — |
 | unchanged | module_lines | influx.sources.arxiv | 1863 | 1863 | review | — |
 | unchanged | module_lines | influx.sources.rss | 1226 | 1226 | review | — |
 | unchanged | module_lines | influx.telemetry | 1035 | 1035 | review | — |
 - branch_coverage: missing; value —; scope not recorded; evidence not recorded
 - mutation: missing; value —; scope not recorded; evidence not recorded
+- Review lowering budget modules_over_800_lines: actual 9, accepted ceiling 11.
 - Review lowering budget max_module_lines: actual 1890, accepted ceiling 2000.
 
 
@@ -254,7 +250,7 @@ Optional measurements are source-bound; missing or stale evidence is not a score
 
 ## Import graph
 
-- Cross-component edges: **62** (194 module-level)
+- Cross-component edges: **62** (195 module-level)
 - Component cycles: Common ↔ Config; Enrich ↔ Repair ↔ Sources ↔ Storage; HttpApi ↔ Orchestration
 - Module cycles: influx.http_api ↔ influx.inbox ↔ influx.run ↔ influx.run_dispatch ↔ influx.run_service ↔ influx.scheduler ↔ influx.service; influx.repair ↔ influx.repair_hooks; influx.sources ↔ influx.sources.arxiv ↔ influx.sources.rss
 - Tier-skipping edges (Entrypoints → Foundation): 9 (Entrypoint -> Common, Entrypoint -> Config, Entrypoint -> Observability, HttpApi -> Common, HttpApi -> Config, HttpApi -> Observability, Orchestration -> Common, Orchestration -> Config, Orchestration -> Observability)
@@ -267,7 +263,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 | Component | Modules | Lines | SLOC | Fan-in | Fan-out | Instability | Max complexity | Functions > 10 |
 |---|---:|---:|---:|---:|---:|---:|---|---:|
-| Common | 7 | 2837 | 2075 | 12 | 1 | 0.08 | 47 (`influx.run_ledger.RunLedger.complete`) | 4 |
+| Common | 8 | 2700 | 2139 | 12 | 1 | 0.08 | 14 (`influx.http_client.guarded_fetch`) | 4 |
 | Config | 5 | 1752 | 1270 | 11 | 1 | 0.08 | 14 (`influx.config.NotificationWebhookConfig._validate_type_specific_fields`) | 1 |
 | Enrich | 2 | 1003 | 806 | 2 | 5 | 0.71 | 22 (`influx.cascade.Cascade.enrich`) | 2 |
 | Entrypoint | 2 | 561 | 443 | 0 | 5 | 1.00 | 14 (`influx.main._cmd_backfill`) | 2 |
@@ -276,8 +272,8 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | HttpApi | 3 | 1141 | 918 | 2 | 8 | 0.80 | 15 (`influx.http_api.post_backfills`) | 3 |
 | LithosBridge | 9 | 4546 | 3627 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
-| Observability | 3 | 1919 | 1408 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
-| Orchestration | 7 | 4773 | 3812 | 1 | 11 | 0.92 | 52 (`influx.run_service.ledger_lifecycle`) | 11 |
+| Observability | 3 | 1923 | 1412 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
+| Orchestration | 7 | 4361 | 3596 | 1 | 11 | 0.92 | 32 (`influx.inbox.InboxTick._ingest_item`) | 9 |
 | Repair | 5 | 3984 | 3041 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 331 | 247 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
 | Sources | 10 | 4490 | 3450 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
@@ -285,41 +281,39 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **61**, lines: **29754**, SLOC: **23104**
+- Modules: **62**, lines: **29209**, SLOC: **22956**
 - Largest module: `influx.lithos_client` (1890 lines)
-- Modules over 800 lines: **11**
+- Modules over 800 lines: **9**
   - `influx.config`
   - `influx.inbox`
   - `influx.lithos_client`
   - `influx.repair`
   - `influx.repair_hooks`
   - `influx.run`
-  - `influx.run_ledger`
-  - `influx.run_service`
   - `influx.sources.arxiv`
   - `influx.sources.rss`
   - `influx.telemetry`
 
 ## Complexity
 
-- Functions: **709**, cyclomatic > 10: **45**
-- Cyclomatic distribution: median **3**, p90 **9**, max **52**
-- Function length (lines): median 18, p90 67, max 649 (`influx.run_service.ledger_lifecycle`); over 75: **59**
+- Functions: **732**, cyclomatic > 10: **43**
+- Cyclomatic distribution: median **3**, p90 **9**, max **32**
+- Function length (lines): median 17, p90 66, max 377 (`influx.sources.rss.build_rss_note_item`); over 75: **57**
 
 Top 10 most complex functions:
 
 | Complexity | Length | Function |
 |---:|---:|---|
-| 52 | 649 | `influx.run_service.ledger_lifecycle` |
-| 47 | 344 | `influx.run_ledger.RunLedger.complete` |
 | 32 | 256 | `influx.inbox.InboxTick._ingest_item` |
 | 28 | 327 | `influx.sources.arxiv.build_arxiv_note_item` |
 | 28 | 377 | `influx.sources.rss.build_rss_note_item` |
 | 26 | 148 | `influx.repair._process_sweep_note` |
 | 26 | 249 | `influx.run._run_ingest_stage` |
-| 23 | 225 | `influx.run_ledger.build_degradation_summary` |
 | 22 | 165 | `influx.cascade.Cascade.enrich` |
 | 20 | 108 | `influx.promotion_gate.evaluate_promotion_gate` |
+| 20 | 141 | `influx.sources.inbox.build_inbox_note_item` |
+| 18 | 217 | `influx.sources.arxiv._fetch_with_retry` |
+| 17 | 81 | `influx.inbox.InboxTick.execute` |
 
 ## Seams
 
@@ -332,7 +326,7 @@ Private-name reaches across module seams. Both counts can be pinned as
   - `influx.logging_config -> influx.telemetry._build_logger_provider`
   - `influx.repair_hooks -> influx.extraction.html._clean_html_fragments`
   - `influx.repair_hooks -> influx.extraction.html._strip_tags`
-- Tests importing src privates: **79**
+- Tests importing src privates: **77**
   - `tests/unit/test_lithos_client.py -> influx.lithos_client._classify_squatter (x10)`
   - `tests/integration/test_serve.py -> influx.main._cmd_serve (x5)`
   - `tests/unit/test_lithos_client.py -> influx.lithos_client._existing_id_from_detail (x4)`
@@ -367,5 +361,5 @@ Private-name reaches across module seams. Both counts can be pinned as
 
 ## Domain & tests
 
-- Domain models: **17** (5 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.49** (73996 test lines / 29754 source lines)
+- Domain models: **20** (6 associations, 0 without docstrings)
+- Test-to-source line ratio: **2.55** (74419 test lines / 29209 source lines)

@@ -23,6 +23,7 @@ from influx.config import (
     ScheduleConfig,
 )
 from influx.coordinator import RunKind
+from influx.run_assessment import RunEvidence
 from influx.run_ledger import RunLedger
 from influx.sources.arxiv import (
     ArxivCooldownError,
@@ -117,22 +118,28 @@ async def test_cooldown_skips_propagate_into_run_ledger(tmp_path: Any) -> None:
     ledger = RunLedger(tmp_path / "state")
     ledger.start(run_id="r1", profile="p", kind="scheduled", run_range=None)
 
-    reasons = ledger.complete(
-        run_id="r1",
-        sources_checked=0,
-        ingested=0,
-        fetched_total=0,
-        filter_errors_total=0,
-        invalid_url_rejections_total=0,
-        archive_failures_total=0,
-        source_acquisition_errors=[],
-        source_cooldown_skips=[
-            {
-                "source": "arxiv",
-                "kind": "cooldown_active",
-                "detail": "remaining_seconds=540.0 classification=upstream_capacity",
-            }
-        ],
+    reasons = list(
+        ledger.complete(
+            run_id="r1",
+            evidence=RunEvidence(
+                sources_checked=0,
+                ingested=0,
+                fetched_total=0,
+                filter_errors_total=0,
+                invalid_url_rejections_total=0,
+                archive_failures_total=0,
+                source_acquisition_errors=[],
+                source_cooldown_skips=[
+                    {
+                        "source": "arxiv",
+                        "kind": "cooldown_active",
+                        "detail": (
+                            "remaining_seconds=540.0 classification=upstream_capacity"
+                        ),
+                    }
+                ],
+            ),
+        ).reasons
     )
 
     assert "source_cooldown_skip" in reasons
@@ -158,24 +165,30 @@ async def test_source_acquisition_and_cooldown_skip_can_coexist(tmp_path: Any) -
     ledger = RunLedger(tmp_path / "state")
     ledger.start(run_id="r1", profile="p", kind="scheduled", run_range=None)
 
-    reasons = ledger.complete(
-        run_id="r1",
-        sources_checked=0,
-        ingested=0,
-        fetched_total=0,
-        filter_errors_total=0,
-        invalid_url_rejections_total=0,
-        archive_failures_total=0,
-        source_acquisition_errors=[
-            {"source": "rss", "kind": "timeout", "detail": "boom"},
-        ],
-        source_cooldown_skips=[
-            {
-                "source": "arxiv",
-                "kind": "cooldown_active",
-                "detail": "remaining_seconds=540.0 classification=upstream_capacity",
-            }
-        ],
+    reasons = list(
+        ledger.complete(
+            run_id="r1",
+            evidence=RunEvidence(
+                sources_checked=0,
+                ingested=0,
+                fetched_total=0,
+                filter_errors_total=0,
+                invalid_url_rejections_total=0,
+                archive_failures_total=0,
+                source_acquisition_errors=[
+                    {"source": "rss", "kind": "timeout", "detail": "boom"},
+                ],
+                source_cooldown_skips=[
+                    {
+                        "source": "arxiv",
+                        "kind": "cooldown_active",
+                        "detail": (
+                            "remaining_seconds=540.0 classification=upstream_capacity"
+                        ),
+                    }
+                ],
+            ),
+        ).reasons
     )
 
     assert "source_acquisition" in reasons

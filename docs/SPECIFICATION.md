@@ -765,7 +765,7 @@ Metric instruments cover run lifecycle, the source funnel, write outcomes, and f
 | Instrument | Type | Labels |
 |---|---|---|
 | `influx_run_starts_total` | Counter | `profile`, `run_type` |
-| `influx_run_completions_total` | Counter | `profile`, `run_type`, `outcome` (`success` \| `failure` \| `degraded`) |
+| `influx_run_completions_total` | Counter | `profile`, `run_type`, `outcome` (`success` \| `degraded` \| `failure` \| `skipped`), `severity` (`success` \| `expected_lossy` \| `unexpected_failure` \| `not_applicable`) |
 | `influx_run_duration_seconds` | Histogram (s) | `profile`, `run_type` |
 | `influx_active_runs` | UpDownCounter | `profile` |
 | `influx_source_candidates_fetched_total` | Counter | `profile`, `source` |

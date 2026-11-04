@@ -16,7 +16,7 @@ Schedules ticks and drives per-Profile Runs / inbox ticks end-to-end (Run / RunS
 | `influx.inbox_overrides` | S | 2 | 4 |
 | `influx.run` | L | 12 | 2 |
 | `influx.run_dispatch` | M | 3 | 0 |
-| `influx.run_service` | L | 1 | 1 |
+| `influx.run_service` | M | 1 | 1 |
 | `influx.scheduler` | M | 1 | 2 |
 
 ## Public API

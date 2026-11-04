@@ -3,6 +3,50 @@
 
 # Domain model
 
+## Common
+
+```mermaid
+classDiagram
+  class RunCompletionAssessment {
+    +run_id str
+    +profile str | None
+    +kind str | None
+    +status TerminalStatus
+    +reasons DegradedReasons
+    +error str | None
+    +degradation_summary dict[str, Any] | None
+  }
+  class RunEvidence {
+    +sources_checked int | None
+    +ingested int | None
+    +fetched_total int | None
+    +filter_errors_total int | None
+    +invalid_url_rejections_total int | None
+    +archive_failures_total int | None
+    +archive_blocked_total int
+    +archive_rate_limited_total int
+    +archive_skipped_by_policy_total int
+    +archive_unsupported_total int
+    +summary_thin_drops_total int | None
+    +empty_source_writes_total int | None
+    +cache_hits_total int | None
+    +source_acquisition_errors Sequence[dict[str, str]]
+    +source_cooldown_skips Sequence[dict[str, str]]
+    +dedup_lookup_errors Sequence[dict[str, str]]
+    +archive_failures Sequence[ArchiveFailureRecord]
+    +source_retry_counts Mapping[str, Mapping[str, int]]
+    +tier3_fallbacks Mapping[str, int]
+    +write_outcomes WriteOutcomeCounts
+  }
+  class RunNotice {
+    +name str
+    +count_label str
+    +count int
+    +guidance str
+  }
+  RunCompletionAssessment "1" --> "1" RunEvidence : evidence
+```
+
 ## LithosBridge
 
 ```mermaid

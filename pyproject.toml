@@ -94,6 +94,7 @@ source_modules = [
     "influx.errors",
     "influx.coordinator",
     "influx.run_ledger",
+    "influx.run_assessment",
     "influx.thin_summary",
     "influx.http_client",
     "influx.source_kind",

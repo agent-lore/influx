@@ -3,8 +3,8 @@
     "components": {
       "Common": {
         "functions_over_10": 4,
-        "max_complexity": 47,
-        "max_function": "influx.run_ledger.RunLedger.complete"
+        "max_complexity": 14,
+        "max_function": "influx.http_client.guarded_fetch"
       },
       "Config": {
         "functions_over_10": 1,
@@ -52,9 +52,9 @@
         "max_function": "influx.logging_config.setup_logging"
       },
       "Orchestration": {
-        "functions_over_10": 11,
-        "max_complexity": 52,
-        "max_function": "influx.run_service.ledger_lifecycle"
+        "functions_over_10": 9,
+        "max_complexity": 32,
+        "max_function": "influx.inbox.InboxTick._ingest_item"
       },
       "Repair": {
         "functions_over_10": 6,
@@ -78,27 +78,17 @@
       }
     },
     "function_lengths": {
-      "max": 649,
-      "max_function": "influx.run_service.ledger_lifecycle",
-      "median": 18,
-      "over_75": 59,
-      "p90": 67
+      "max": 377,
+      "max_function": "influx.sources.rss.build_rss_note_item",
+      "median": 17,
+      "over_75": 57,
+      "p90": 66
     },
-    "functions_over_10": 45,
-    "max": 52,
+    "functions_over_10": 43,
+    "max": 32,
     "median": 3,
     "p90": 9,
     "top_functions": [
-      {
-        "complexity": 52,
-        "length": 649,
-        "qualname": "influx.run_service.ledger_lifecycle"
-      },
-      {
-        "complexity": 47,
-        "length": 344,
-        "qualname": "influx.run_ledger.RunLedger.complete"
-      },
       {
         "complexity": 32,
         "length": 256,
@@ -125,11 +115,6 @@
         "qualname": "influx.run._run_ingest_stage"
       },
       {
-        "complexity": 23,
-        "length": 225,
-        "qualname": "influx.run_ledger.build_degradation_summary"
-      },
-      {
         "complexity": 22,
         "length": 165,
         "qualname": "influx.cascade.Cascade.enrich"
@@ -138,9 +123,24 @@
         "complexity": 20,
         "length": 108,
         "qualname": "influx.promotion_gate.evaluate_promotion_gate"
+      },
+      {
+        "complexity": 20,
+        "length": 141,
+        "qualname": "influx.sources.inbox.build_inbox_note_item"
+      },
+      {
+        "complexity": 18,
+        "length": 217,
+        "qualname": "influx.sources.arxiv._fetch_with_retry"
+      },
+      {
+        "complexity": 17,
+        "length": 81,
+        "qualname": "influx.inbox.InboxTick.execute"
       }
     ],
-    "total_functions": 709
+    "total_functions": 732
   },
   "components": {
     "Common": {
@@ -148,6 +148,7 @@
         "influx.errors",
         "influx.coordinator",
         "influx.run_ledger",
+        "influx.run_assessment",
         "influx.thin_summary",
         "influx.http_client",
         "influx.source_kind",
@@ -272,8 +273,8 @@
     }
   },
   "domain": {
-    "associations": 5,
-    "models": 17,
+    "associations": 6,
+    "models": 20,
     "models_without_docstrings": 0,
     "relationships": [
       {
@@ -299,6 +300,12 @@
         "field": "plan",
         "source": "Run",
         "target": "RunPlan"
+      },
+      {
+        "cardinality": "1",
+        "field": "evidence",
+        "source": "RunCompletionAssessment",
+        "target": "RunEvidence"
       },
       {
         "cardinality": "0..*",
@@ -405,6 +412,50 @@
       "fields": {
         "degraded_reasons": "tuple[str, ...]",
         "health_actions": "tuple[HealthAction, ...]"
+      }
+    },
+    "influx.run_assessment.RunCompletionAssessment": {
+      "fields": {
+        "degradation_summary": "dict[str, Any] | None",
+        "error": "str | None",
+        "evidence": "RunEvidence",
+        "kind": "str | None",
+        "profile": "str | None",
+        "reasons": "DegradedReasons",
+        "run_id": "str",
+        "status": "TerminalStatus"
+      }
+    },
+    "influx.run_assessment.RunEvidence": {
+      "fields": {
+        "archive_blocked_total": "int",
+        "archive_failures": "Sequence[ArchiveFailureRecord]",
+        "archive_failures_total": "int | None",
+        "archive_rate_limited_total": "int",
+        "archive_skipped_by_policy_total": "int",
+        "archive_unsupported_total": "int",
+        "cache_hits_total": "int | None",
+        "dedup_lookup_errors": "Sequence[dict[str, str]]",
+        "empty_source_writes_total": "int | None",
+        "fetched_total": "int | None",
+        "filter_errors_total": "int | None",
+        "ingested": "int | None",
+        "invalid_url_rejections_total": "int | None",
+        "source_acquisition_errors": "Sequence[dict[str, str]]",
+        "source_cooldown_skips": "Sequence[dict[str, str]]",
+        "source_retry_counts": "Mapping[str, Mapping[str, int]]",
+        "sources_checked": "int | None",
+        "summary_thin_drops_total": "int | None",
+        "tier3_fallbacks": "Mapping[str, int]",
+        "write_outcomes": "WriteOutcomeCounts"
+      }
+    },
+    "influx.run_assessment.RunNotice": {
+      "fields": {
+        "count": "int",
+        "count_label": "str",
+        "guidance": "str",
+        "name": "str"
       }
     },
     "influx.schemas.FilterResponse": {
@@ -3294,7 +3345,7 @@
     },
     "influx.metrics.run_completions": {
       "complexity": 1,
-      "length": 10,
+      "length": 14,
       "module": "influx.metrics",
       "path": "src/influx/metrics.py",
       "paths": [
@@ -4768,6 +4819,222 @@
         "src/influx/run.py"
       ]
     },
+    "influx.run_assessment.RunCompletionAssessment.degraded": {
+      "complexity": 1,
+      "length": 2,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunCompletionAssessment.notices": {
+      "complexity": 3,
+      "length": 6,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunCompletionAssessment.outcome": {
+      "complexity": 4,
+      "length": 6,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunCompletionAssessment.severity": {
+      "complexity": 2,
+      "length": 4,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunCompletionAssessment.stall_metric_reasons": {
+      "complexity": 3,
+      "length": 2,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunCompletionAssessment.top_drivers": {
+      "complexity": 2,
+      "length": 5,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunCompletionAssessment.warning_detail": {
+      "complexity": 2,
+      "length": 5,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunEvidence.has_filter_error": {
+      "complexity": 2,
+      "length": 4,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunEvidence.has_invalid_url_stall": {
+      "complexity": 5,
+      "length": 9,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunEvidence.invalid_note_state_by_kind": {
+      "complexity": 4,
+      "length": 6,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunEvidence.invalid_note_state_total": {
+      "complexity": 4,
+      "length": 6,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.RunEvidence.items_reached_filter": {
+      "complexity": 3,
+      "length": 7,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment._archive_failure_kind_from_tags": {
+      "complexity": 4,
+      "length": 12,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment._by_kind_digest": {
+      "complexity": 3,
+      "length": 9,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment._count_by": {
+      "complexity": 5,
+      "length": 8,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment._domain_from_url": {
+      "complexity": 4,
+      "length": 11,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment._is_invalid_note_state_outcome": {
+      "complexity": 1,
+      "length": 2,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment._renamed": {
+      "complexity": 2,
+      "length": 2,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment._top_drivers": {
+      "complexity": 9,
+      "length": 22,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment._top_n_by_count": {
+      "complexity": 4,
+      "length": 6,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.build_degradation_summary": {
+      "complexity": 13,
+      "length": 109,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.build_degradation_summary.top": {
+      "complexity": 1,
+      "length": 2,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.classify_degradation_severity": {
+      "complexity": 4,
+      "length": 14,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
+    "influx.run_assessment.single_run_reasons": {
+      "complexity": 11,
+      "length": 42,
+      "module": "influx.run_assessment",
+      "path": "src/influx/run_assessment.py",
+      "paths": [
+        "src/influx/run_assessment.py"
+      ]
+    },
     "influx.run_dedup._metric_source": {
       "complexity": 4,
       "length": 16,
@@ -4913,8 +5180,17 @@
       ]
     },
     "influx.run_ledger.RunLedger._finish": {
-      "complexity": 11,
-      "length": 107,
+      "complexity": 4,
+      "length": 58,
+      "module": "influx.run_ledger",
+      "path": "src/influx/run_ledger.py",
+      "paths": [
+        "src/influx/run_ledger.py"
+      ]
+    },
+    "influx.run_ledger.RunLedger._finish_without_evidence": {
+      "complexity": 4,
+      "length": 17,
       "module": "influx.run_ledger",
       "path": "src/influx/run_ledger.py",
       "paths": [
@@ -4942,6 +5218,15 @@
     "influx.run_ledger.RunLedger._read_active": {
       "complexity": 7,
       "length": 18,
+      "module": "influx.run_ledger",
+      "path": "src/influx/run_ledger.py",
+      "paths": [
+        "src/influx/run_ledger.py"
+      ]
+    },
+    "influx.run_ledger.RunLedger._scheduled_stall_reasons": {
+      "complexity": 14,
+      "length": 53,
       "module": "influx.run_ledger",
       "path": "src/influx/run_ledger.py",
       "paths": [
@@ -4985,8 +5270,8 @@
       ]
     },
     "influx.run_ledger.RunLedger.complete": {
-      "complexity": 47,
-      "length": 344,
+      "complexity": 5,
+      "length": 32,
       "module": "influx.run_ledger",
       "path": "src/influx/run_ledger.py",
       "paths": [
@@ -4995,7 +5280,7 @@
     },
     "influx.run_ledger.RunLedger.fail": {
       "complexity": 1,
-      "length": 11,
+      "length": 3,
       "module": "influx.run_ledger",
       "path": "src/influx/run_ledger.py",
       "paths": [
@@ -5040,7 +5325,7 @@
     },
     "influx.run_ledger.RunLedger.skip": {
       "complexity": 1,
-      "length": 18,
+      "length": 8,
       "module": "influx.run_ledger",
       "path": "src/influx/run_ledger.py",
       "paths": [
@@ -5074,69 +5359,6 @@
         "src/influx/run_ledger.py"
       ]
     },
-    "influx.run_ledger._archive_failure_kind_from_tags": {
-      "complexity": 4,
-      "length": 24,
-      "module": "influx.run_ledger",
-      "path": "src/influx/run_ledger.py",
-      "paths": [
-        "src/influx/run_ledger.py"
-      ]
-    },
-    "influx.run_ledger._domain_from_url": {
-      "complexity": 4,
-      "length": 17,
-      "module": "influx.run_ledger",
-      "path": "src/influx/run_ledger.py",
-      "paths": [
-        "src/influx/run_ledger.py"
-      ]
-    },
-    "influx.run_ledger._is_invalid_note_state_outcome": {
-      "complexity": 1,
-      "length": 8,
-      "module": "influx.run_ledger",
-      "path": "src/influx/run_ledger.py",
-      "paths": [
-        "src/influx/run_ledger.py"
-      ]
-    },
-    "influx.run_ledger._top_n_by_count": {
-      "complexity": 4,
-      "length": 13,
-      "module": "influx.run_ledger",
-      "path": "src/influx/run_ledger.py",
-      "paths": [
-        "src/influx/run_ledger.py"
-      ]
-    },
-    "influx.run_ledger.build_degradation_summary": {
-      "complexity": 23,
-      "length": 225,
-      "module": "influx.run_ledger",
-      "path": "src/influx/run_ledger.py",
-      "paths": [
-        "src/influx/run_ledger.py"
-      ]
-    },
-    "influx.run_ledger.build_degradation_summary._renamed": {
-      "complexity": 2,
-      "length": 3,
-      "module": "influx.run_ledger",
-      "path": "src/influx/run_ledger.py",
-      "paths": [
-        "src/influx/run_ledger.py"
-      ]
-    },
-    "influx.run_ledger.classify_degradation_severity": {
-      "complexity": 4,
-      "length": 19,
-      "module": "influx.run_ledger",
-      "path": "src/influx/run_ledger.py",
-      "paths": [
-        "src/influx/run_ledger.py"
-      ]
-    },
     "influx.run_service.RunService._record_skip": {
       "complexity": 1,
       "length": 13,
@@ -5164,9 +5386,45 @@
         "src/influx/run_service.py"
       ]
     },
-    "influx.run_service._format_top_drivers_tail": {
-      "complexity": 15,
-      "length": 54,
+    "influx.run_service._bind_run_counters": {
+      "complexity": 3,
+      "length": 8,
+      "module": "influx.run_service",
+      "path": "src/influx/run_service.py",
+      "paths": [
+        "src/influx/run_service.py"
+      ]
+    },
+    "influx.run_service._evidence_from": {
+      "complexity": 10,
+      "length": 42,
+      "module": "influx.run_service",
+      "path": "src/influx/run_service.py",
+      "paths": [
+        "src/influx/run_service.py"
+      ]
+    },
+    "influx.run_service._log_completion": {
+      "complexity": 7,
+      "length": 60,
+      "module": "influx.run_service",
+      "path": "src/influx/run_service.py",
+      "paths": [
+        "src/influx/run_service.py"
+      ]
+    },
+    "influx.run_service._read_run_counters": {
+      "complexity": 3,
+      "length": 6,
+      "module": "influx.run_service",
+      "path": "src/influx/run_service.py",
+      "paths": [
+        "src/influx/run_service.py"
+      ]
+    },
+    "influx.run_service._record_completion": {
+      "complexity": 2,
+      "length": 17,
       "module": "influx.run_service",
       "path": "src/influx/run_service.py",
       "paths": [
@@ -5174,8 +5432,8 @@
       ]
     },
     "influx.run_service.ledger_lifecycle": {
-      "complexity": 52,
-      "length": 649,
+      "complexity": 8,
+      "length": 107,
       "module": "influx.run_service",
       "path": "src/influx/run_service.py",
       "paths": [
@@ -6916,7 +7174,7 @@
       }
     },
     "cross_component_edges": 62,
-    "cross_component_module_edges": 194,
+    "cross_component_module_edges": 195,
     "edges": [
       {
         "imports": [
@@ -7199,6 +7457,7 @@
           "influx.run_dispatch -> influx.coordinator",
           "influx.run_dispatch -> influx.run_ledger",
           "influx.run_service -> influx.errors",
+          "influx.run_service -> influx.run_assessment",
           "influx.run_service -> influx.run_ledger",
           "influx.scheduler -> influx.coordinator",
           "influx.scheduler -> influx.run_ledger",
@@ -7300,7 +7559,7 @@
       },
       {
         "imports": [
-          "influx.promotion_gate -> influx.run_ledger",
+          "influx.promotion_gate -> influx.run_assessment",
           "influx.repair -> influx.errors",
           "influx.repair -> influx.source",
           "influx.repair_counters -> influx.errors",
@@ -7533,7 +7792,7 @@
       "seams": "measured",
       "structure": "measured"
     },
-    "config_hash": "2bdc90b54448a10dd1106e315cd29939892c6262dfb2cc7523cc0c15e4fef8b2",
+    "config_hash": "dee5c65079838c294aae4a18ca5b75be2d1215af87e86e1ec5a05c67590d8dd9",
     "definitions": {
       "complexity": 1,
       "structure": 1,
@@ -7576,7 +7835,8 @@
         "include_modules": [
           "influx.schemas",
           "influx.run",
-          "influx.lcma_wiring"
+          "influx.lcma_wiring",
+          "influx.run_assessment"
         ]
       },
       "excluded": [
@@ -7596,7 +7856,7 @@
         "tests/test_quality.py"
       ]
     },
-    "source_hash": "a7920f3c15092d351444a9bafb721f36d64c9a0e748fcb7602f013b471df1df7",
+    "source_hash": "c6265592bdefe6a31c5aac92be6459bff8051a93142d40277f2b4e98a7e0af74",
     "tools": {
       "grimp": "3.14",
       "networkx": "3.6.1"
@@ -7838,10 +8098,10 @@
     "influx.metrics": {
       "component": "Observability",
       "functions": 32,
-      "lines": 711,
+      "lines": 715,
       "max_complexity": 1,
       "path": "src/influx/metrics.py",
-      "sloc": 579
+      "sloc": 583
     },
     "influx.note_merge": {
       "component": "LithosBridge",
@@ -7939,6 +8199,14 @@
       "path": "src/influx/run.py",
       "sloc": 799
     },
+    "influx.run_assessment": {
+      "component": "Common",
+      "functions": 24,
+      "lines": 653,
+      "max_complexity": 13,
+      "path": "src/influx/run_assessment.py",
+      "sloc": 527
+    },
     "influx.run_dedup": {
       "component": "Feedback",
       "functions": 3,
@@ -7957,19 +8225,19 @@
     },
     "influx.run_ledger": {
       "component": "Common",
-      "functions": 30,
-      "lines": 1457,
-      "max_complexity": 47,
+      "functions": 25,
+      "lines": 667,
+      "max_complexity": 14,
       "path": "src/influx/run_ledger.py",
-      "sloc": 1020
+      "sloc": 557
     },
     "influx.run_service": {
       "component": "Orchestration",
-      "functions": 5,
-      "lines": 890,
-      "max_complexity": 52,
+      "functions": 9,
+      "lines": 478,
+      "max_complexity": 10,
       "path": "src/influx/run_service.py",
-      "sloc": 624
+      "sloc": 408
     },
     "influx.scheduler": {
       "component": "Orchestration",
@@ -8108,8 +8376,8 @@
       "cross_module_private_refs": 5,
       "max_module_lines": 1890,
       "module_cycles": 3,
-      "modules_over_800_lines": 11,
-      "tests_private_imports": 79
+      "modules_over_800_lines": 9,
+      "tests_private_imports": 77
     },
     "budgets": {
       "component_cycles": 3,
@@ -8118,7 +8386,7 @@
       "max_module_lines": 2000,
       "module_cycles": 3,
       "modules_over_800_lines": 11,
-      "tests_private_imports": 79
+      "tests_private_imports": 77
     },
     "enforce_new": false,
     "enforce_worsened": false,
@@ -8184,19 +8452,19 @@
       "tests/unit/test_arxiv_fetcher.py -> influx.sources.arxiv._classify_arxiv_429",
       "tests/unit/test_arxiv_fetcher.py -> influx.sources.arxiv._extract_arxiv_429_classification"
     ],
-    "tests_private_imports": 79
+    "tests_private_imports": 77
   },
   "size": {
     "components": {
       "Common": {
-        "classes": 17,
-        "functions": 66,
+        "classes": 20,
+        "functions": 85,
         "largest_module": "influx.run_ledger",
-        "largest_module_lines": 1457,
-        "lines": 2837,
-        "modules": 7,
-        "public_symbols": 34,
-        "sloc": 2075
+        "largest_module_lines": 667,
+        "lines": 2700,
+        "modules": 8,
+        "public_symbols": 38,
+        "sloc": 2139
       },
       "Config": {
         "classes": 29,
@@ -8283,20 +8551,20 @@
         "functions": 74,
         "largest_module": "influx.telemetry",
         "largest_module_lines": 1035,
-        "lines": 1919,
+        "lines": 1923,
         "modules": 3,
         "public_symbols": 51,
-        "sloc": 1408
+        "sloc": 1412
       },
       "Orchestration": {
         "classes": 28,
-        "functions": 90,
+        "functions": 94,
         "largest_module": "influx.inbox",
         "largest_module_lines": 1742,
-        "lines": 4773,
+        "lines": 4361,
         "modules": 7,
         "public_symbols": 38,
-        "sloc": 3812
+        "sloc": 3596
       },
       "Repair": {
         "classes": 17,
@@ -8348,19 +8616,17 @@
       "influx.repair",
       "influx.repair_hooks",
       "influx.run",
-      "influx.run_ledger",
-      "influx.run_service",
       "influx.sources.arxiv",
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 29754,
-    "total_modules": 61,
-    "total_sloc": 23104
+    "total_lines": 29209,
+    "total_modules": 62,
+    "total_sloc": 22956
   },
   "tests": {
-    "ratio": 2.49,
-    "src_lines": 29754,
-    "test_lines": 73996
+    "ratio": 2.55,
+    "src_lines": 29209,
+    "test_lines": 74419
   }
 }

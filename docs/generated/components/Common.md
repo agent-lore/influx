@@ -3,7 +3,7 @@
 
 # Common
 
-Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP client, shared enums, and the Source seam contracts (Candidate / ScoredCandidate / Source Protocol).
+Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger and its RunCompletionAssessment, HTTP client, shared enums, and the Source seam contracts (Candidate / ScoredCandidate / Source Protocol).
 
 **Tier:** Foundation
 
@@ -14,7 +14,8 @@ Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP c
 | `influx.coordinator` | XS | 3 | 0 |
 | `influx.errors` | S | 7 | 1 |
 | `influx.http_client` | M | 1 | 7 |
-| `influx.run_ledger` | L | 1 | 2 |
+| `influx.run_assessment` | M | 3 | 3 |
+| `influx.run_ledger` | M | 1 | 0 |
 | `influx.source` | S | 5 | 5 |
 | `influx.source_kind` | S | 0 | 1 |
 | `influx.thin_summary` | S | 0 | 1 |
@@ -46,9 +47,15 @@ Cross-cutting foundation: errors, per-Profile run coordinator, RunLedger, HTTP c
 - def `aguarded_fetch` — Async wrapper: offloads :func:`guarded_fetch` to a worker thread.
 - def `aguarded_post_json_fetch` — Async wrapper: offloads :func:`guarded_post_json_fetch` to a worker thread.
 
+### `influx.run_assessment`
+- def `classify_degradation_severity` — Return the severity bucket for *degraded_reasons*.
+- class `RunEvidence` — What one run observed, handed to the ledger at completion time.
+- def `single_run_reasons` — The degraded reasons that need no run history.
+- def `build_degradation_summary` — The bounded, top-N ``degradation_summary`` block for one run (#152).
+- class `RunNotice` — An observe-only INFO line: a count worth seeing that is not degradation.
+- class `RunCompletionAssessment` — The ledger's verdict on one finished run.
+
 ### `influx.run_ledger`
-- def `classify_degradation_severity` — Return the severity classification for *degraded_reasons*.
-- def `build_degradation_summary` — Build the bounded ``degradation_summary`` block for one run (#152).
 - class `RunLedger` — Append-only local run ledger backed by JSON files.
 
 ### `influx.source`
