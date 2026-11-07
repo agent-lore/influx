@@ -129,6 +129,19 @@ def test_label_then_grade_and_compare(
     assert "## Filter: graded against your labels" in report
 
 
+def test_label_ignores_host_paths_of_the_config(
+    influx_config_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prod config names container paths (``inbox.pdf_root``) that need
+    not exist where the harness runs; the evals never use them."""
+    root, common = _two_runs(influx_config_env, tmp_path, monkeypatch)
+    with influx_config_env.open("a") as fh:
+        fh.write('\n[inbox]\npdf_root = "/nonexistent/prod-pdf-inbox"\n')
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "q")
+
+    assert cli.main(["label", *common, "--dataset", "d"]) == 0
+
+
 def test_grade_without_labels_fails_clearly(
     influx_config_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

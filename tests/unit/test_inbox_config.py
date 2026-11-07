@@ -10,7 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from influx.config import AppConfig, InboxConfig, PromptEntryConfig, PromptsConfig
+from influx.config import (
+    AppConfig,
+    InboxConfig,
+    PromptEntryConfig,
+    PromptsConfig,
+    load_config,
+)
 from influx.errors import ConfigError
 
 
@@ -70,6 +76,27 @@ def test_pdf_root_resolves_to_absolute(tmp_path: Path) -> None:
     assert config.pdf_root is not None
     assert Path(config.pdf_root).is_absolute()
     assert Path(config.pdf_root) == inbox_dir.resolve()
+
+
+def _with_missing_pdf_root(config_path: Path) -> Path:
+    with config_path.open("a") as fh:
+        fh.write('\n[inbox]\npdf_root = "/nonexistent/prod-pdf-inbox"\n')
+    return config_path
+
+
+def test_load_config_checks_pdf_root_by_default(influx_config_env: Path) -> None:
+    with pytest.raises(ConfigError, match="pdf_root is not a directory"):
+        load_config(_with_missing_pdf_root(influx_config_env))
+
+
+def test_load_config_can_skip_host_path_checks(influx_config_env: Path) -> None:
+    """A tool reading a deployment's config on another host (the eval
+    harness) must not need that deployment's directories to exist."""
+    config = load_config(
+        _with_missing_pdf_root(influx_config_env), check_host_paths=False
+    )
+
+    assert config.inbox.pdf_root == "/nonexistent/prod-pdf-inbox"
 
 
 # ── #292: filter-unavailable retry knobs ─────────────────────────────

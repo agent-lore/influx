@@ -79,7 +79,7 @@
       "tests/test_quality.py"
     ]
   },
-  "source_hash": "c6265592bdefe6a31c5aac92be6459bff8051a93142d40277f2b4e98a7e0af74",
+  "source_hash": "8ff034cf6b610902b9f6e52403ed7679c366b8dd50ba95dbe11392a98415e0cd",
   "tools": {
     "grimp": "3.14",
     "networkx": "3.6.1"
@@ -217,7 +217,7 @@ in the same PR. Lower thresholds when that protects useful improvements.
 | unchanged | function_length | influx.sources.rss.parse_feed | 106 | 106 | review | — |
 | unchanged | function_length | influx.storage.download_archive | 204 | 204 | review | — |
 | unchanged | function_length | influx.storage.download_archive_autodetect | 167 | 167 | review | — |
-| unchanged | module_lines | influx.config | 983 | 983 | review | — |
+| unchanged | module_lines | influx.config | 1003 | 1003 | review | — |
 | unchanged | module_lines | influx.inbox | 1742 | 1742 | review | — |
 | unchanged | module_lines | influx.lithos_client | 1890 | 1890 | review | — |
 | unchanged | module_lines | influx.repair | 1736 | 1736 | review | — |
@@ -264,7 +264,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Component | Modules | Lines | SLOC | Fan-in | Fan-out | Instability | Max complexity | Functions > 10 |
 |---|---:|---:|---:|---:|---:|---:|---|---:|
 | Common | 8 | 2700 | 2139 | 12 | 1 | 0.08 | 14 (`influx.http_client.guarded_fetch`) | 4 |
-| Config | 5 | 1752 | 1270 | 11 | 1 | 0.08 | 14 (`influx.config.NotificationWebhookConfig._validate_type_specific_fields`) | 1 |
+| Config | 5 | 1772 | 1287 | 11 | 1 | 0.08 | 14 (`influx.config.NotificationWebhookConfig._validate_type_specific_fields`) | 1 |
 | Enrich | 2 | 1003 | 806 | 2 | 5 | 0.71 | 22 (`influx.cascade.Cascade.enrich`) | 2 |
 | Entrypoint | 2 | 561 | 443 | 0 | 5 | 1.00 | 14 (`influx.main._cmd_backfill`) | 2 |
 | Feedback | 3 | 602 | 477 | 1 | 4 | 0.80 | 17 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
@@ -281,7 +281,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **62**, lines: **29209**, SLOC: **22956**
+- Modules: **62**, lines: **29229**, SLOC: **22973**
 - Largest module: `influx.lithos_client` (1890 lines)
 - Modules over 800 lines: **9**
   - `influx.config`
@@ -362,4 +362,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **20** (6 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.55** (74419 test lines / 29209 source lines)
+- Test-to-source line ratio: **2.55** (74459 test lines / 29229 source lines)

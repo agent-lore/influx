@@ -16,7 +16,14 @@ from typing import Any, ClassVar, Literal
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from influx.errors import ConfigError
 from influx.prompts import load_prompt, validate_prompt_variables
@@ -56,6 +63,10 @@ __all__ = [
     "find_config_path",
     "load_config",
 ]
+
+# Validation-context key: ``False`` skips checks that a configured directory
+# exists on this machine (see ``load_config(check_host_paths=...)``).
+_CHECK_HOST_PATHS = "check_host_paths"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -186,7 +197,7 @@ class InboxConfig(BaseModel):
 
     @field_validator("pdf_root")
     @classmethod
-    def _valid_pdf_root(cls, v: str | None) -> str | None:
+    def _valid_pdf_root(cls, v: str | None, info: ValidationInfo) -> str | None:
         # When set, must name an existing directory; canonicalise to an
         # absolute path so the per-task path-trust check (§16.3) compares
         # against a stable root.  ``None`` leaves local-PDF intake off.
@@ -196,7 +207,8 @@ class InboxConfig(BaseModel):
         # canonical path the per-task containment check compares against
         # (independent of the process CWD at config-load time).
         p = Path(v).expanduser().resolve()
-        if not p.is_dir():
+        check = (info.context or {}).get(_CHECK_HOST_PATHS, True)
+        if check and not p.is_dir():
             raise ConfigError(f"inbox.pdf_root is not a directory: {v!r}")
         return str(p)
 
@@ -940,6 +952,7 @@ def load_config(
     path: Path | None = None,
     *,
     check_api_keys: bool = True,
+    check_host_paths: bool = True,
 ) -> AppConfig:
     """Load, validate, and return the v0.7 ``AppConfig``.
 
@@ -956,6 +969,11 @@ def load_config(
         provider's ``api_key_env`` is unset.  Set to ``False`` for
         long-running ``serve`` mode where the background probe loop
         (``probes.py``) monitors credential presence instead.
+    check_host_paths:
+        When ``True`` (default), raise ``ConfigError`` if a directory
+        the running service needs (``inbox.pdf_root``) does not exist.
+        Set to ``False`` for tools that only read a deployment's config
+        from another machine, such as the eval harness.
     """
     load_dotenv()
     config_path = path if path is not None else find_config_path()
@@ -972,7 +990,9 @@ def load_config(
     _resolve_prompt_paths(raw, config_dir=config_path.parent)
 
     try:
-        cfg = AppConfig.model_validate(raw)
+        cfg = AppConfig.model_validate(
+            raw, context={_CHECK_HOST_PATHS: check_host_paths}
+        )
     except ValidationError as exc:
         raise ConfigError(f"{config_path}: {exc}") from exc
 
