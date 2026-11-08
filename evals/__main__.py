@@ -99,7 +99,9 @@ def _setup(args: argparse.Namespace):
     )
     if args.env_file:
         load_dotenv(args.env_file)
-    return load_config(args.config, check_api_keys=False)
+    # The config is usually prod's, read from the host: its container
+    # paths (inbox.pdf_root) need not exist here, and no eval uses them.
+    return load_config(args.config, check_api_keys=False, check_host_paths=False)
 
 
 def _gate_thresholds(config: AppConfig) -> dict[str, tuple[int, int, int]]:

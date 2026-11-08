@@ -1022,8 +1022,8 @@
       ]
     },
     "influx.config.InboxConfig._valid_pdf_root": {
-      "complexity": 3,
-      "length": 13,
+      "complexity": 5,
+      "length": 14,
       "module": "influx.config",
       "path": "src/influx/config.py",
       "paths": [
@@ -1221,7 +1221,7 @@
     },
     "influx.config.load_config": {
       "complexity": 6,
-      "length": 45,
+      "length": 53,
       "module": "influx.config",
       "path": "src/influx/config.py",
       "paths": [
@@ -7856,7 +7856,7 @@
         "tests/test_quality.py"
       ]
     },
-    "source_hash": "c6265592bdefe6a31c5aac92be6459bff8051a93142d40277f2b4e98a7e0af74",
+    "source_hash": "8ff034cf6b610902b9f6e52403ed7679c366b8dd50ba95dbe11392a98415e0cd",
     "tools": {
       "grimp": "3.14",
       "networkx": "3.6.1"
@@ -7922,10 +7922,10 @@
     "influx.config": {
       "component": "Config",
       "functions": 28,
-      "lines": 983,
+      "lines": 1003,
       "max_complexity": 14,
       "path": "src/influx/config.py",
-      "sloc": 664
+      "sloc": 681
     },
     "influx.coordinator": {
       "component": "Common",
@@ -8470,11 +8470,11 @@
         "classes": 29,
         "functions": 55,
         "largest_module": "influx.config",
-        "largest_module_lines": 983,
-        "lines": 1752,
+        "largest_module_lines": 1003,
+        "lines": 1772,
         "modules": 5,
         "public_symbols": 39,
-        "sloc": 1270
+        "sloc": 1287
       },
       "Enrich": {
         "classes": 4,
@@ -8620,13 +8620,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 29209,
+    "total_lines": 29229,
     "total_modules": 62,
-    "total_sloc": 22956
+    "total_sloc": 22973
   },
   "tests": {
     "ratio": 2.55,
-    "src_lines": 29209,
-    "test_lines": 74419
+    "src_lines": 29229,
+    "test_lines": 74459
   }
 }
