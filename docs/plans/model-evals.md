@@ -1,6 +1,7 @@
 # Model evals and the GPT-4.1-mini → GPT-6 Luna migration
 
-Status: **harness shipped; migration in progress**
+Status: **harness shipped; all three slots on Luna since 2026-10-15; filter
+graded against human labels and relevance lowered to 6 on 2026-11-08 (§7.6)**
 Date: 2026-10-15
 Scope: Influx only (its three `[models.*]` slots). The sibling Lithos project
 has its own model usage and is planned separately.
@@ -257,6 +258,12 @@ so `none` stays.
 > within those three. `compare` now takes flips at each profile's gate for
 > both the report and the judge.
 
+> **Against human labels (2026-11-08).** On the 55 flips the operator's
+> labels side with Luna 33 times and with 4.1-mini 22 times. Luna is right
+> more often, but less decisively than the judge's 33–8 suggests, and its
+> strictness costs recall: 18 of the items only 4.1-mini passed were ones
+> the operator wanted. See §7.6.
+
 ### 7.4 Tier 1 / Tier 3: judge prefers Luna
 
 | slot | Luna wins | baseline wins | ties | mean judge score baseline → Luna |
@@ -280,6 +287,74 @@ and `request_timeout = 120`. The §5 filter-agreement bar was not met, but
 it assumed the baseline was right; the judged flips say otherwise, so the
 bar for the *next* migration is agreement with Luna.
 
+### 7.6 Filter against human labels (2026-11-08)
+
+The operator labelled all 230 `oct15` candidates with `evals label`, blind
+(no model scores shown), on the pipeline's tiers: 165 skip, 58 ingest, 7
+full text, 0 deep extract. Relevance is sparse and uneven: 4 of 30 for
+ai-agents and 2 of 30 for knowledge-systems, against 15–16 of 30 for
+ai-foundations and robotics. Feeds that publish their whole archive fill
+some profiles' RSS pools with old, off-topic posts (#320).
+
+**Ingest gate**, each profile at its own `relevance` (7; 6 for
+retro-computing):
+
+| run | precision | recall | F1 | kappa |
+|---|---:|---:|---:|---:|
+| gpt41mini | 49% | 58% | 0.54 | 0.33 |
+| luna-strict (prod) | 65% | 34% | 0.44 | 0.31 |
+| luna-none | 60% | 32% | 0.42 | 0.28 |
+| luna-low-filter | 57% | 32% | 0.41 | 0.26 |
+
+Luna lets in less noise but finds only a third of what the operator
+wanted. The three Luna variants differ by two or three items, which is
+noise at 65 positives.
+
+**The flips.** Of the 49 items 4.1-mini passed and Luna rejected, 31 were
+noise and 18 were wanted. Of the 6 Luna passed alone, 2 were wanted. On
+the 53 judged flips the judge agreed with the labels 32 times, disagreed 9
+times and tied 12 times, so it matched the labels on 78% of its non-tie
+calls. Eight of its nine disagreements backed Luna: six where Luna had
+rejected an item the operator wanted, and two where it had let in noise.
+The judge is a usable proxy, but it leans towards Luna.
+
+**Where Luna misses.** Of luna-strict's 43 missed items, 34 were omitted
+(scored below `min_score_in_results = 6`) and 9 scored 6. About half are in
+two profiles: ai-foundations (1 of 15 found) and morrow (0 of 7).
+- Luna gives the descriptions' MEDIUM-interest topics a 6, which falls
+  below relevance 7. In ai-foundations it scored all three
+  computational-neuroscience papers the operator wanted a 6; 4.1-mini
+  scored two of them 7–8.
+- About half of the ai-foundations positives fall outside its description,
+  such as essays and statistics/methods papers. The description excludes
+  "engineering-focused ML papers without theoretical novelty", and Luna
+  applies that.
+- morrow is meant to be restrictive. After reviewing Luna's misses, the
+  operator relabelled 6 of its 7 positives as skip, so morrow's labels are
+  no longer blind. With that revision the mix is 171 / 52 / 7 / 0.
+
+**Higher gates.** Seven items were labelled full text. luna-strict scored
+none of them 8 or more, and promoted 13 items labelled lower; 4.1-mini
+found 2 and promoted 39. Nothing was labelled deep extract, while Luna
+promoted 4 items to 9 or more and 4.1-mini 15. There are too few positives
+to judge either gate.
+
+**Decision: prod `relevance` lowered from 7 to 6 on every profile.**
+retro-computing was already at 6. The filter prompt already returns every
+item scoring 6 or more, so the effect could be measured from the stored
+replies without a re-run. With the revised labels:
+
+| run | relevance | precision | recall | F1 |
+|---|---:|---:|---:|---:|
+| gpt41mini | 7 | 47% | 61% | 0.53 |
+| luna-strict | 7 | 65% | 37% | 0.47 |
+| luna-strict | 6 | 57% | 51% | 0.54 |
+
+At 6, Luna ingests about 55% more items than at 7: 53 of the 230
+candidates instead of 34. The threshold was chosen on the same set it is
+graded on, so these figures flatter it. A fresh, blind-labelled dataset is
+the real test (§8).
+
 ## 8. Later
 
 - Record `usage` (tokens, cost) per production call in telemetry so the
@@ -291,4 +366,15 @@ bar for the *next* migration is agreement with Luna.
   1 ingest, 2 full text, 3 deep extract) into `datasets/<name>/labels.jsonl`;
   `evals grade` (and `compare`, whenever labels exist) reports per-gate
   precision/recall/kappa against them and checks the judge's filter-flip
-  verdicts against the labels. Next: label `oct15`.
+  verdicts against the labels. `oct15` was labelled on 2026-11-08 (§7.6).
+- Re-test relevance 6 on a fresh, blind-labelled dataset, no earlier than
+  2026-11-29. Build it with `--batches-per-profile 3` so the full-text and
+  deep-extract gates have some positives.
+- Decide whether to widen the ai-foundations description to cover what the
+  operator actually labelled relevant (§7.6), or to keep the narrower scope.
+- For the next filter migration, grade against labels first
+  (`docs/operations/model-evals.md` §5). This replaces §7.5's "agreement
+  with Luna" bar. The judge agreed with the labels on 78% of its decisive
+  filter calls, and leaned towards Luna.
+- Filter spend: every scheduled run re-scores each RSS feed's whole archive
+  (#320).
