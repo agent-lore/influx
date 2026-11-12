@@ -2,8 +2,6 @@
 
 Influx ingests research and technical content for configured **Profiles**, scores it against per-Profile relevance, enriches it through a tiered cascade, and writes canonical notes into Lithos. This file pins the vocabulary the codebase and its docs should use.
 
-Some terms below are marked _(proposed)_ — they name modules agreed during architecture grilling but not yet present in code. Drop the marker as each lands.
-
 ## Language
 
 ### Domain — content and scoring
@@ -13,7 +11,7 @@ A named interest scope with its own description, score thresholds, source list, 
 _Avoid_: topic, channel, feed.
 
 **Source**:
-A place candidates come from — currently `arxiv` or `rss`/`blog`. Each Source is an adapter that exposes `fetch_candidates` (bulk per Profile) and `acquire` (per item: download, archive, extract). Both arXiv and RSS run in production through this seam; scoring is delegated to the shared **Filter** (finding 2). The manual **Inbox** intake reuses the same scorer but stays a separate fan-out rather than a Source (it scores one submitted item against many Profiles).
+A place candidates come from — currently `arxiv` or `rss`/`blog`. Each Source is an adapter that exposes `fetch_candidates` (bulk per Profile) and `acquire` (per item: download, archive, extract). Both arXiv and RSS run in production through this seam; scoring is delegated to the shared **Filter**. The manual **Inbox** intake reuses the same scorer but stays a separate fan-out rather than a Source (it scores one submitted item against many Profiles).
 _Avoid_: provider (used for OpenAI-compatible model providers).
 
 **Candidate**:
@@ -40,7 +38,7 @@ The **Cascade**'s output for one Acquired: optional Tier 1 result, optional full
 Produces a **CanonicalNote** from an Acquired plus EnrichedSections plus the score/reason. Owns the canonical Markdown shape from spec section 9.
 
 **CanonicalNote**:
-An Influx-authored Markdown note: typed frontmatter, fixed section order (`## Archive`, `## Summary`, `## Full Text`, `## Claims`, `## Datasets & Benchmarks`, `## Builds On`, `## Open Questions`, `## Profile Relevance`, `## User Notes`), and stable tag conventions. `## User Notes` is preserved byte-exactly across rewrites.
+An Influx-authored Markdown note: typed frontmatter, fixed section order (`## Archive`, `## Summary`, `## Full Text`, `## Claims`, `## Datasets & Benchmarks`, `## Builds On`, `## Open Questions`, `## Repair`, `## Profile Relevance`, `## User Notes`), and stable tag conventions. `## Repair` is written by the **Repair sweep** and carried forward on re-ingest; a note the sweep has never touched has none. `## User Notes` is preserved byte-exactly across rewrites.
 
 **RepairCounters**:
 Per-tier attempt counter persisted in the note's `## Repair` section. Read on tier entry (skip if `tier{N}-terminal` is set), advanced on counted (parse/validate) failures, never advanced on transient failures. Reaches the cap → adds `influx:tier{N}-terminal`. The repair sweep owns the full lifecycle (read → advance → terminal) via `Cascade.enrich`; the create path enriches with a zero counter but preserves an existing note's `## Repair` section across a multi-profile re-ingest, so caps survive.
@@ -48,7 +46,7 @@ Per-tier attempt counter persisted in the note's `## Repair` section. Read on ti
 ### Domain — execution
 
 **Run**:
-One end-to-end execution of the ingestion pipeline for one Profile. Constructed from a **RunPlan** plus dependencies; produces a **RunOutcome**. Lives in `src/influx/run.py` as `Run.execute()`. Currently used by the scheduled-tick path; manual + backfill entry points migrate in #59 / #60.
+One end-to-end execution of the ingestion pipeline for one Profile. Constructed from a **RunPlan** plus dependencies; produces a **RunOutcome**. Lives in `src/influx/run.py` as `Run.execute()`. Every entry point — scheduled tick, manual run, backfill and inbox dispatch — executes a Run through **RunService**.
 _Avoid_: job, task (Lithos has its own `lithos_task_*`), tick.
 
 **RunPlan**:
@@ -67,7 +65,7 @@ The per-Run stage that lists `influx:repair-needed` notes for the Profile and re
 A Run over an explicit date window that skips the repair sweep, skips already-cached items, and emits no notifications. Estimates above 1000 require explicit `confirm`.
 
 **LcmaWiring**:
-The post-write step that calls `lithos_retrieve` for related notes, upserts `related_to` edges above `thresholds.lcma_edge_score`, and resolves Tier 3 `builds_on` entries via `lithos_cache_lookup` to upsert `builds_on` edges. Runs after every successful write. _(proposed as a separate collaborator of the Run module)_
+The post-write step that calls `lithos_retrieve` for related notes, upserts `related_to` edges above `thresholds.lcma_edge_score`, and resolves Tier 3 `builds_on` entries via `lithos_cache_lookup` to upsert `builds_on` edges. Runs after every successful write. Lives in `src/influx/lcma_wiring.py` as `wire()`, a collaborator of the Run module.
 
 **RunService**:
 The collaborator that owns "build RunPlan → execute Run → dispatch notifications → record outcome" for one request. The scheduler's three entry points (scheduled tick, `POST /runs`, `POST /backfills`) route through `scheduler.run_profile`, which builds the RunPlan via `RunPlan.for_request` and hands it to RunService. Lives in `src/influx/run_service.py` as `RunService.execute()`.
