@@ -7856,7 +7856,7 @@
         "tests/test_quality.py"
       ]
     },
-    "source_hash": "8ff034cf6b610902b9f6e52403ed7679c366b8dd50ba95dbe11392a98415e0cd",
+    "source_hash": "19efa1059c5bd5f6554557c5659b41dfc7d153a98fa47cc8d1a38eac78b41197",
     "tools": {
       "grimp": "3.14",
       "networkx": "3.6.1"

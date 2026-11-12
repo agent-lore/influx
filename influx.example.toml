@@ -39,7 +39,7 @@ misfire_grace_seconds = 3600    # tolerate missed fires within an hour
 [storage]
 archive_dir = "/archive"
 state_dir = "/state"
-retain_days = 3650              # ~10 years
+retain_days = 3650              # accepted and validated, but nothing reads it yet
 max_download_bytes = 52_428_800 # 50 MB per file
 download_timeout_seconds = 30
 
@@ -242,9 +242,11 @@ extra_headers = { "HTTP-Referer" = "https://github.com/agent-lore/influx", "X-Op
 # Models (filter / enrich / extract)
 # ---------------------------------------------------------------------------
 
+# `model` is sent to the provider unchanged, so use that provider's own id:
+# "gpt-4.1-mini" on OpenAI directly, "openai/gpt-4.1-mini" through OpenRouter.
 [models.filter]
 provider = "openai"
-model = "openai/gpt-4.1-mini"
+model = "gpt-4.1-mini"
 temperature = 0.0
 max_tokens = 2048
 request_timeout = 30
@@ -253,7 +255,7 @@ json_mode = true
 
 [models.enrich]
 provider = "openai"
-model = "openai/gpt-4.1-mini"
+model = "gpt-4.1-mini"
 temperature = 0.2
 request_timeout = 30
 max_retries = 2

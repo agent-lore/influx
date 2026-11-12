@@ -107,6 +107,33 @@ Three quick signals, all read-only:
     prompt, or `min_score_in_results` — those are the `filter_stall`
     signals; this one is purely about filter execution.  Mutually
     exclusive with `filter_stall`.
+  - `source_cooldown_skip` (issue #146) — an arXiv fetch was skipped
+    on purpose after repeated 429 bursts.  Distinct from
+    `source_acquisition` (tried and failed); see
+    `resilience.arxiv_429_cooldown_threshold` /
+    `arxiv_429_cooldown_seconds` and §9.
+  - `dedup_cache_lookup` (issue #234) — `lithos_cache_lookup` failed
+    for at least one candidate.  Those candidates were skipped before
+    acquisition and are re-checked next run.  Check Lithos health and
+    `cache_lookup` server errors, not the upstream feed.
+  - `archive_acquisition` (issue #149) — accepted items were ingested
+    with `influx:archive-missing` after the archive download failed.
+    The `run flagged` line splits the count into blocked,
+    rate-limited and skipped-by-policy.
+  - `invalid_note_state` — at least one write ended in
+    `invalid_input`, `version_conflict`, `slug_collision`,
+    `content_too_large` or `content_too_large_skipped`.  Check schema
+    drift, the repair backlog, or upstream id collisions.
+    `duplicate` outcomes are excluded.
+  - `invalid_url_stall` (issue #131) — the feed returned items but
+    every entry link was malformed, so nothing reached the filter.
+    See §8e.
+  - `invalid_url_rejections` (issue #177) — 10 or more entry links
+    were rejected in one run while some items still reached the
+    filter.  Suppressed when `invalid_url_stall` applies.  See §8e.
+
+  The rules and guidance text for every reason live in
+  `src/influx/run_assessment.py`.
 
   The three stall reasons (`ingestion_stall`, `fetch_stall`,
   `filter_stall`) are mutually exclusive on any single run.
@@ -131,7 +158,7 @@ Three quick signals, all read-only:
   |----------|----------|-----------------|
   | `success` | `degraded_reasons` empty | None |
   | `expected_lossy` | only `source_acquisition`, `source_cooldown_skip`, `archive_acquisition`, `invalid_url_rejections` present | Glance; investigate only if frequency spikes. These are tolerated upstream / policy-driven outcomes. |
-  | `unexpected_failure` | any of `invalid_note_state`, `invalid_url_stall`, `ingestion_stall`, `fetch_stall`, `filter_stall`, `filter_error` present | Triage — actionable regression signal. |
+  | `unexpected_failure` | any of `invalid_note_state`, `invalid_url_stall`, `ingestion_stall`, `fetch_stall`, `filter_stall`, `filter_error`, `dedup_cache_lookup` present | Triage — actionable regression signal. |
   | `not_applicable` | `outcome=skipped` (circuit breaker fired) or `outcome=failure` (body raised before reasons were computed) | Read the existing `outcome` label — `severity` is set to a constant so the metric series shape stays uniform across all completions. The ledger entry carries the same value, so a `skipped` / `failed` run never reads as `success`. |
 
   When unexpected and lossy reasons co-occur on the same run (the
