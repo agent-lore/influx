@@ -124,12 +124,18 @@ exclude_modules = [
     "influx.urls",
 ]
 
-# Kit 1.6: merge this baseline before enabling changed-code review gates.
+# Changed-code gates (the kit 1.6 baseline merged in #316). `enforce_new` fails a
+# PR that adds a finding: a function or module over a threshold that was not over
+# it at the PR base. `enforce_worsened` stays off: nine modules are already over
+# `module_lines`, so it would fail any PR that adds a line to one of them.
+# A PR that changes the measurement tools (grimp, networkx) is not comparable
+# with its base and fails while a gate is on; switch the gate off in that PR and
+# back on in the next.
 [review]
 function_complexity = 10
 function_length = 75
 module_lines = 800
-enforce_new = false
+enforce_new = true
 enforce_worsened = false
 
 # Dependency/cycle contracts remain invariants; size/count thresholds prompt review.

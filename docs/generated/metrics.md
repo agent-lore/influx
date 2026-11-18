@@ -15,7 +15,7 @@
     "seams": "measured",
     "structure": "measured"
   },
-  "config_hash": "dee5c65079838c294aae4a18ca5b75be2d1215af87e86e1ec5a05c67590d8dd9",
+  "config_hash": "02eb5cb97b0b4a6ddae6f1b315d4cb9eb4293b273bc5eb09b14b40fb016be5b2",
   "definitions": {
     "complexity": 1,
     "structure": 1,
