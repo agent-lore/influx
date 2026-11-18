@@ -52,5 +52,9 @@ and optional new/worsened-code gates. If keeping code together is clearer, recor
 a proportionate, bounded `[[exceptions]]` entry with a reason and review reference,
 or explain a threshold adjustment in the same PR. Never automatically raise
 budgets or bypass an invariant. Lower thresholds when that protects useful gains.
-Changed-code gates remain disabled until the first 1.6 baseline is merged.
+`enforce_new` is on: the `diagrams` CI job fails a PR that adds a function or
+module over a `[review]` threshold, or pushes an existing one across it, unless
+it carries an exception. `enforce_worsened` is off, so growth in code that is
+already over a threshold is reported in the job summary but does not fail the PR.
+Run `make metrics-diff` to see the comparison locally.
 See `docs/quality-guide.md` for the migration and evidence contracts.

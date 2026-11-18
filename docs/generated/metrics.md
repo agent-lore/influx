@@ -15,7 +15,7 @@
     "seams": "measured",
     "structure": "measured"
   },
-  "config_hash": "dee5c65079838c294aae4a18ca5b75be2d1215af87e86e1ec5a05c67590d8dd9",
+  "config_hash": "02eb5cb97b0b4a6ddae6f1b315d4cb9eb4293b273bc5eb09b14b40fb016be5b2",
   "definitions": {
     "complexity": 1,
     "structure": 1,
@@ -79,7 +79,7 @@
       "tests/test_quality.py"
     ]
   },
-  "source_hash": "8ff034cf6b610902b9f6e52403ed7679c366b8dd50ba95dbe11392a98415e0cd",
+  "source_hash": "19efa1059c5bd5f6554557c5659b41dfc7d153a98fa47cc8d1a38eac78b41197",
   "tools": {
     "grimp": "3.14",
     "networkx": "3.6.1"

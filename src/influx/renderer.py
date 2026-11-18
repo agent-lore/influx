@@ -213,8 +213,8 @@ def render_note(
     tier3_extraction:
         Tier-3 deep extraction result. When provided, emits ``## Claims``,
         ``## Datasets & Benchmarks``, ``## Builds On``, ``## Open Questions``
-        sections. ``potential_connections`` is NOT rendered (consumed by
-        PRD 08 LCMA only). When ``None`` all four sections are omitted
+        sections. ``potential_connections`` is NOT rendered; nothing reads
+        it after validation. When ``None`` all four sections are omitted
         (FR-ENR-6).
     user_notes:
         Byte-exact ``## User Notes`` region from a previous parse,

@@ -1,7 +1,7 @@
 # Influx - Specification
 
 Version: 0.1.0
-Date: 2026-10-11
+Date: 2026-11-12
 Status: Aligned with Implementation (maintained as a living document; the date is the last reconciliation against the code)
 
 ---
@@ -120,12 +120,12 @@ Environment overrides are applied for selected runtime values. The complete anno
 - `[influx]`: `note_schema_version`, stamped as `schema:<version>` on Influx-authored notes.
 - `[lithos]`: Lithos MCP endpoint and transport. Only `transport = "sse"` is supported.
 - `[schedule]`: cron expression, timezone, misfire grace, shutdown grace, optional initial-tick jitter (`initial_jitter_seconds`), and optional inter-profile gap (`inter_profile_gap_seconds`).
-- `[storage]`: archive directory, local state directory, retention setting, max download size, and download timeout. `[storage.archive_policy]` adds per-domain acquisition modes (`blocked`, `rate_limited`, `skip`, `unsupported`) merged over a built-in default set (`include_defaults`).
+- `[storage]`: archive directory, local state directory, retention setting (`retain_days`, validated but not consulted), max download size, and download timeout. `[storage.archive_policy]` adds per-domain acquisition modes (`blocked`, `rate_limited`, `skip`, `unsupported`) merged over a built-in default set (`include_defaults`).
 - `[notifications]`: outbound timeout plus typed `[[notifications.webhooks]]` sinks. `notifications.webhook_url` remains as a legacy single-sink generic-digest fallback.
 - `[security]`: outbound/private-IP and remote-admin bind policy.
 - `[[profiles]]`: profile name, description, thresholds, and source configuration.
 - `[providers.*]`: OpenAI-compatible provider base URLs, API-key environment variables, and extra headers.
-- `[models.*]`: model slots for `filter`, `enrich`, and `extract`.
+- `[models.*]`: model slots for `filter`, `enrich`, and `extract`. Each slot names a provider and model and sets `temperature`, `max_tokens`, `request_timeout`, `max_retries`, `json_mode`, `json_schema_strict`, and `reasoning_effort` (§7.5).
 - `[prompts.*]`: inline prompt text or prompt file paths for `filter`, `tier1_enrich`, and `tier3_extract`.
 - `[filter]`: batch size and negative-example tuning.
 - `[extraction]`: minimum extracted text lengths, thin-summary suppression threshold (`min_summary_chars`, default 80), and stripped HTML tags.
@@ -328,7 +328,19 @@ For candidates with `score >= thresholds.deep_extract` and available full text, 
 }
 ```
 
-`claims` must contain 1 to 10 items. Other lists contain 0 to 10 items. Each item is trimmed and truncated to 500 characters. Notes render claims, datasets, builds-on, and open-questions sections; `potential_connections` is consumed by LCMA-related logic and is not rendered in the note.
+`claims` must contain 1 to 10 items. Other lists contain 0 to 10 items. Each item is trimmed and truncated to 500 characters. Notes render claims, datasets, builds-on, and open-questions sections. `potential_connections` is validated with the rest of the response but nothing reads it afterwards: it is not rendered in the note and is not used for LCMA edges.
+
+### 7.5 Model Slot Request Shape
+
+All three slots send an OpenAI-compatible `/chat/completions` request built by `llm_request.build_chat_request`:
+
+- `json_mode = true` sends `response_format = {"type": "json_object"}`.
+- `json_schema_strict = true` sends the structured-outputs `json_schema` response format pinning the caller's output schema instead. It needs a provider and model that support structured outputs, and falls back to `json_object` when the caller has no schema to pin.
+- `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) is sent only when the slot sets it. Leave it unset for models without a reasoning mode.
+- `temperature` is sent only when `reasoning_effort` is unset or `"none"`, because reasoning models reject sampling parameters while reasoning is on.
+- `max_tokens` is sent only when set. With reasoning on, hidden reasoning tokens count against it.
+
+A model or slot-setting change is measured with the eval harness before it ships; see `docs/operations/model-evals.md`.
 
 ---
 
@@ -382,7 +394,15 @@ Ledger entries include:
 - `duration_seconds`
 - `sources_checked`
 - `ingested`
+- `fetched_total`
 - `error`
+- `degraded`: true exactly when `degraded_reasons` is non-empty
+- `degraded_reasons` (§13.1)
+- `degradation_severity`: `success`, `expected_lossy`, `unexpected_failure`, or `not_applicable` for failed and skipped runs
+- `degradation_summary`: bounded top-N breakdowns by source, domain and failure kind
+- per-run evidence: `filter_errors_total`, `invalid_url_rejections_total`, `archive_failures_total`, `summary_thin_drops_total`, `empty_source_writes_total`, `source_acquisition_errors`, `source_cooldown_skips`, `dedup_lookup_errors`, `source_retry_counts`, `tier3_fallbacks`
+
+The completion fields are written from one `RunCompletionAssessment` (`src/influx/run_assessment.py`), built by `RunLedger.complete` from the Run's `RunEvidence`. The same assessment supplies the `influx_run_completions_total` labels and the `run flagged` / `run completed` log lines, so the three agree.
 
 ### 8A.3 Semantics
 
@@ -457,6 +477,7 @@ Omitted sections:
 - `## Summary` is omitted when neither Tier 1 enrichment nor plain summary is available.
 - `## Full Text` is omitted when full text is unavailable.
 - Tier 3 sections are omitted when Tier 3 extraction is unavailable.
+- `## Repair` (§11.1) sits between `## Open Questions` and `## Profile Relevance` and is written by the repair sweep and carried forward on re-ingest; a note the sweep has never touched has none.
 - `## Profile Relevance` is always emitted, even when empty.
 - `## User Notes` is always appended and is preserved byte-exactly on rewrites.
 
@@ -744,15 +765,23 @@ Readiness is degraded when:
 
 When the Lithos probe has been ``degraded`` for **3 consecutive cycles** (default; see `ProbeLoop.lithos_circuit_open`), `RunService.execute()` short-circuits — the run is recorded as ``status="skipped", error="lithos_unhealthy"`` in the run ledger, the `influx_runs_skipped_total{profile, reason="lithos_unhealthy"}` metric ticks, and no source-fetch / LLM-filter / write work is performed.  The breaker closes automatically on the first ``ok`` probe; subsequent runs proceed normally.  This prevents an extended Lithos outage from burning LLM tokens against a write path that will fail (#40).  The parallel LCMA-tools probe (#69) drives a sibling `lcma_tools_unavailable` gate with the same skip semantics.
 
-Run-ledger entries carry a structured `degraded_reasons` field listing why a completed run was marked `degraded=True`.  Today the values are:
+Run-ledger entries carry a structured `degraded_reasons` field listing why a completed run was marked `degraded=True`.  The values are:
 
 - `"source_acquisition"` — at least one source-fetch failure was swallowed during the run (issue #20).
 - `"ingestion_stall"` — this and the immediately prior scheduled run for the same profile both saw `ingested == 0` despite `sources_checked > 0` (issue #36).  Typical causes: every candidate hit `slug_collision`/`duplicate`, all writes were cache-merge with no new content, or upstream sources started returning content the profile no longer accepts.  Backfills are excluded from this check (their ingest pattern is fundamentally different — they legitimately ingest 0 when every candidate is a cache hit).
 - `"fetch_stall"` — this and the immediately prior scheduled run for the same profile both saw `fetched_total == 0` (no source returned any items at all), AND the profile has historically seen `sources_checked > 0` within the recent ledger window (issue #50).  Typical cause: too-narrow `lookback_days` or an upstream feed shape change leaving the fetch path empty.  The historical ratchet silences brand-new profiles and profiles that genuinely never receive items.  Backfills are excluded.
 - `"filter_stall"` — this and the immediately prior scheduled run for the same profile both saw `fetched_total > 0 AND sources_checked == 0` (sources fetched normally and the LLM filter ran cleanly but rejected every candidate), AND the profile has historically seen `sources_checked > 0` within the recent ledger window (issue #85).  Typical cause: profile description drift, filter prompt regression, or `min_score_in_results` set too high.  Mutually exclusive with `fetch_stall` (different `fetched_total` conditions) and with `ingestion_stall` (different `sources_checked` conditions).  Requires `filter_errors_total == 0` so a scorer execution failure produces `filter_error` rather than this.  Backfills are excluded.
 - `"filter_error"` — the LLM filter scorer raised `FilterScorerError` at least once during this run (issue #85, follow-up to PR review).  This is a single-run signal — no consecutive-runs gate, no historical ratchet, and not gated on `kind=scheduled` — because a scorer execution failure (transport, parse, or provider error) is point-in-time and immediately actionable on any run kind.  Operator triage should look at provider configuration, model availability, and recent prompt/response schema changes — NOT at the profile description, filter prompt, or `min_score_in_results`.  Mutually exclusive with `filter_stall` (which describes a clean scorer run that rejected everything); when both shapes apply on a run, `filter_error` wins because the scorer-failure diagnosis is more specific.  May co-occur with `ingestion_stall`, `fetch_stall`, or `source_acquisition`.
+- `"source_cooldown_skip"` — an arXiv fetch was skipped on purpose after repeated 429 bursts (issue #146; `resilience.arxiv_429_cooldown_threshold` / `arxiv_429_cooldown_seconds`).  Distinct from `source_acquisition`, which means a fetch was tried and failed; both can occur in one run.
+- `"dedup_cache_lookup"` — `lithos_cache_lookup` failed for at least one candidate (issue #234).  Those candidates are skipped before acquisition and re-checked on the next run.  The failed call is Influx to Lithos, so triage starts with Lithos health, not the feed.
+- `"archive_acquisition"` — at least one accepted item was ingested with `influx:archive-missing` because its archive download failed (issue #149 splits the count into blocked, rate-limited and skipped-by-policy).
+- `"invalid_note_state"` — at least one write ended in `invalid_input`, `version_conflict`, `slug_collision`, `content_too_large` or `content_too_large_skipped`.  `duplicate` is excluded: it is the expected steady state of scheduled re-runs.
+- `"invalid_url_stall"` — the feed returned items but every entry link was rejected as malformed, so nothing reached the filter (issue #131).
+- `"invalid_url_rejections"` — at least 10 entry links were rejected in one run while some items still reached the filter (issue #177).  Suppressed when `invalid_url_stall` applies.
 
-Multiple reasons can apply to a single run, but the three stall reasons (`ingestion_stall`, `fetch_stall`, `filter_stall`) are mutually exclusive on any single run.  `filter_error` is mutually exclusive with `filter_stall` (same shape, different cause) but orthogonal to the rest.  `influx_ingestion_stall_runs_total{profile, reason}` ticks once per stall-flagged run, split by reason so dashboards can alert on each signal independently.
+Multiple reasons can apply to a single run, but the three stall reasons (`ingestion_stall`, `fetch_stall`, `filter_stall`) are mutually exclusive on any single run.  `filter_error` is mutually exclusive with `filter_stall` (same shape, different cause) but orthogonal to the rest.  `influx_ingestion_stall_runs_total{profile, reason}` ticks once per stall-flagged run, split by reason so dashboards can alert on each signal independently; `filter_error` and `invalid_url_stall` tick it too.
+
+Severity follows from the reason list.  `source_acquisition`, `source_cooldown_skip`, `archive_acquisition` and `invalid_url_rejections` are `expected_lossy`.  Any of `ingestion_stall`, `fetch_stall`, `filter_stall`, `filter_error`, `dedup_cache_lookup`, `invalid_note_state` or `invalid_url_stall` makes the run `unexpected_failure`.  The rules, severity sets and per-reason operator guidance live in `src/influx/run_assessment.py`; the three history-dependent stall reasons are detected by `RunLedger`.
 
 ### 13.2 Telemetry
 
