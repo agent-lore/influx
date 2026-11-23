@@ -140,7 +140,7 @@
         "qualname": "influx.inbox.InboxTick.execute"
       }
     ],
-    "total_functions": 733
+    "total_functions": 734
   },
   "components": {
     "Common": {
@@ -680,8 +680,8 @@
       ]
     },
     "influx.canonical_note._has_title_heading": {
-      "complexity": 4,
-      "length": 12,
+      "complexity": 1,
+      "length": 7,
       "module": "influx.canonical_note",
       "path": "src/influx/canonical_note.py",
       "paths": [
@@ -725,8 +725,17 @@
       ]
     },
     "influx.canonical_note._split_title": {
+      "complexity": 2,
+      "length": 12,
+      "module": "influx.canonical_note",
+      "path": "src/influx/canonical_note.py",
+      "paths": [
+        "src/influx/canonical_note.py"
+      ]
+    },
+    "influx.canonical_note._title_line_index": {
       "complexity": 4,
-      "length": 14,
+      "length": 18,
       "module": "influx.canonical_note",
       "path": "src/influx/canonical_note.py",
       "paths": [
@@ -7865,7 +7874,7 @@
         "tests/test_quality.py"
       ]
     },
-    "source_hash": "2106cb0cf25c3545a27c8a53c2638a19c43365a832baa8cd4b78b492f0295269",
+    "source_hash": "dc96df767dcdabd78ba6e82ede76942bc5596ba8157901956801186a557639d1",
     "tools": {
       "grimp": "3.14",
       "networkx": "3.6.1"
@@ -7914,11 +7923,11 @@
     },
     "influx.canonical_note": {
       "component": "LithosBridge",
-      "functions": 28,
-      "lines": 718,
+      "functions": 29,
+      "lines": 731,
       "max_complexity": 9,
       "path": "src/influx/canonical_note.py",
-      "sloc": 552
+      "sloc": 562
     },
     "influx.cascade": {
       "component": "Enrich",
@@ -8537,13 +8546,13 @@
       },
       "LithosBridge": {
         "classes": 14,
-        "functions": 136,
+        "functions": 137,
         "largest_module": "influx.lithos_client",
         "largest_module_lines": 1890,
-        "lines": 4546,
+        "lines": 4559,
         "modules": 9,
         "public_symbols": 61,
-        "sloc": 3627
+        "sloc": 3637
       },
       "Notifications": {
         "classes": 5,
@@ -8629,13 +8638,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 29327,
+    "total_lines": 29340,
     "total_modules": 62,
-    "total_sloc": 23044
+    "total_sloc": 23054
   },
   "tests": {
-    "ratio": 2.54,
-    "src_lines": 29327,
-    "test_lines": 74628
+    "ratio": 2.55,
+    "src_lines": 29340,
+    "test_lines": 74713
   }
 }

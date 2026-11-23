@@ -2461,3 +2461,59 @@ class TestSweepPolicySkippedArchiveTerminal:
         assert "archive_attempts: 1" in rewritten["content"]
         assert "influx:archive-terminal" not in rewritten["tags"]
         assert "influx:repair-needed" in rewritten["tags"]
+
+
+class TestSweepStrayH1InFullText:
+    """A fully repaired note is released despite an H1 in its Full Text.
+
+    Reproduces staging note ``590138e5`` (arXiv 2605.18583): archive
+    stored, ``text:html``, ``full-text`` and ``influx:deep-extracted`` all
+    present, yet ``influx:repair-needed`` survived every sweep and the
+    note was rewritten daily (v181).  ``read_note`` serves the body
+    without its title line, and the paper's Full Text holds a code
+    comment that looks like an H1.  The parser took that line as the
+    title and dropped ``## Archive`` above it, so no archive path was
+    found and the archive clearing condition never held.
+    """
+
+    CONTENT = (
+        "\n## Archive\npath: arxiv/2026/05/2605.18583.pdf\n\n"
+        "## Summary\nSummary\n\n"
+        "## Full Text\nif user.is_admin:\n# authentication check would go here\n\n"
+        "## Claims\n- A claim\n\n"
+        "## Profile Relevance\n### ai-coding\nScore: 9/10\nRelevant\n\n"
+        "## User Notes\n"
+    )
+
+    async def test_repaired_note_leaves_the_sweep(self) -> None:
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "590138e5", "title": "Overeager Coding Agents"}],
+            read_responses=[
+                {
+                    "id": "590138e5-56e2-42d5-8944-d9bffcc99f36",
+                    "title": "Overeager Coding Agents",
+                    "content": self.CONTENT,
+                    "tags": [
+                        "arxiv-id:2605.18583",
+                        "source:arxiv",
+                        "text:html",
+                        "full-text",
+                        "influx:repair-needed",
+                        "influx:deep-extracted",
+                        "profile:ai-coding",
+                    ],
+                    "source_url": "https://arxiv.org/abs/2605.18583",
+                    "confidence": 1.0,
+                    "version": 181,
+                }
+            ],
+        )
+
+        await sweep("ai-coding", client=client, config=config, hooks=SweepHooks())
+
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        assert "influx:repair-needed" not in write_calls[-1].args[1]["tags"]

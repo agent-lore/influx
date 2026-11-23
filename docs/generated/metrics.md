@@ -79,7 +79,7 @@
       "tests/test_quality.py"
     ]
   },
-  "source_hash": "2106cb0cf25c3545a27c8a53c2638a19c43365a832baa8cd4b78b492f0295269",
+  "source_hash": "dc96df767dcdabd78ba6e82ede76942bc5596ba8157901956801186a557639d1",
   "tools": {
     "grimp": "3.14",
     "networkx": "3.6.1"
@@ -270,7 +270,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Feedback | 3 | 602 | 477 | 1 | 4 | 0.80 | 17 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
 | Filter | 1 | 506 | 427 | 3 | 4 | 0.57 | 10 (`influx.filter.Filter.score`) | 0 |
 | HttpApi | 3 | 1141 | 918 | 2 | 8 | 0.80 | 15 (`influx.http_api.post_backfills`) | 3 |
-| LithosBridge | 9 | 4546 | 3627 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
+| LithosBridge | 9 | 4559 | 3637 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1923 | 1412 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
 | Orchestration | 7 | 4361 | 3596 | 1 | 11 | 0.92 | 32 (`influx.inbox.InboxTick._ingest_item`) | 9 |
@@ -281,7 +281,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **62**, lines: **29327**, SLOC: **23044**
+- Modules: **62**, lines: **29340**, SLOC: **23054**
 - Largest module: `influx.lithos_client` (1890 lines)
 - Modules over 800 lines: **9**
   - `influx.config`
@@ -296,7 +296,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **733**, cyclomatic > 10: **43**
+- Functions: **734**, cyclomatic > 10: **43**
 - Cyclomatic distribution: median **3**, p90 **9**, max **32**
 - Function length (lines): median 17, p90 66, max 377 (`influx.sources.rss.build_rss_note_item`); over 75: **57**
 
@@ -362,4 +362,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **20** (6 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.54** (74628 test lines / 29327 source lines)
+- Test-to-source line ratio: **2.55** (74713 test lines / 29340 source lines)

@@ -359,17 +359,32 @@ def parse_lenient(text: str, *, fallback_title: str = "") -> CanonicalNote:
 
 
 def _has_title_heading(text: str) -> bool:
-    """Return True when *text* contains a ``# ...`` (non-``##``) title line.
+    """Return True when *text* has a ``# ...`` title line.
 
-    Mirrors :func:`_split_title` detection exactly — the line is stripped
-    and ``## `` headings are excluded — so callers agree on what counts as
-    a title.
+    Shares :func:`_title_line_index` with :func:`_split_title`, so callers
+    agree on what counts as a title.
     """
-    for line in text.split("\n"):
+    return _title_line_index(text.split("\n")) is not None
+
+
+def _title_line_index(lines: list[str]) -> int | None:
+    """Return the index of the ``# <title>`` line, or ``None``.
+
+    The title is the first ``# `` line (stripped, so an indented one
+    counts), and only before the first ``## `` section: the canonical
+    note puts its title above every section.  A ``# `` line further down
+    is body text — a paper's code comment or a heading in its Full Text.
+    Taking that line as the title split the note there and discarded
+    ``## Archive`` and every section above it; the repair sweep then saw
+    no archive path and rewrote the note on every pass.
+    """
+    for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("# ") and not stripped.startswith("## "):
-            return True
-    return False
+        if stripped.startswith("## "):
+            return None
+        if stripped.startswith("# "):
+            return i
+    return None
 
 
 def _split_frontmatter(text: str) -> tuple[str, str]:
@@ -404,17 +419,15 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
 def _split_title(text: str) -> tuple[str, str]:
     """Return ``(title, body)`` from the text after any frontmatter.
 
-    The title is the first ``# <text>`` line; the body is everything after
-    it.  Raises :class:`NoteParseError` when no title heading is found.
+    The title is the ``# <text>`` line found by :func:`_title_line_index`;
+    the body is everything after it.  Raises :class:`NoteParseError` when
+    no title heading is found.
     """
     lines = text.split("\n")
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("# ") and not stripped.startswith("## "):
-            title = stripped[2:]
-            body = "\n".join(lines[i + 1 :])
-            return title, body
-    raise NoteParseError("No title heading '# ...' found in note")
+    i = _title_line_index(lines)
+    if i is None:
+        raise NoteParseError("No title heading '# ...' found in note")
+    return lines[i].strip()[2:], "\n".join(lines[i + 1 :])
 
 
 def _split_sections(body: str) -> tuple[list[Section], str | None]:

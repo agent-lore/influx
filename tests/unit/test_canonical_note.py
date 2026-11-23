@@ -167,6 +167,35 @@ class TestParse:
         note = cn.parse_lenient("## Archive\n## Summary\n", fallback_title="Doc")
         assert note.title == "Doc"
 
+    # The shape ``read_note`` serves for staging note 590138e5 (arXiv
+    # 2605.18583): no title line, and a paper's code comment in Full Text
+    # that looks like an H1.  Taking that line as the title discarded
+    # ``## Archive`` and every section before it, so the sweep saw no
+    # archive path, never cleared ``influx:repair-needed`` and rewrote the
+    # note every day (v181 on staging).
+    _STRIPPED_WITH_H1_IN_FULL_TEXT = (
+        "\n## Archive\npath: arxiv/2026/05/2605.18583.pdf\n\n"
+        "## Summary\nSummary\n\n"
+        "## Full Text\nif user.is_admin:\n# authentication check would go here\n\n"
+        "## Profile Relevance\n### ai-coding\nScore: 9/10\nRelevant\n\n"
+        "## User Notes\n"
+    )
+
+    def test_lenient_reattaches_title_despite_h1_in_full_text(self) -> None:
+        note = cn.parse_lenient(
+            self._STRIPPED_WITH_H1_IN_FULL_TEXT,
+            fallback_title="Overeager Coding Agents",
+        )
+        assert note.title == "Overeager Coding Agents"
+        archive = note.get_section(ARCHIVE)
+        assert archive is not None
+        assert "arxiv/2026/05/2605.18583.pdf" in archive.body
+
+    def test_parse_rejects_h1_after_a_section(self) -> None:
+        """Strict parse raises rather than splitting the note at the stray H1."""
+        with pytest.raises(NoteParseError):
+            cn.parse(self._STRIPPED_WITH_H1_IN_FULL_TEXT)
+
 
 # ── User Notes matcher semantics (§3 divergence matrix) ─────────────
 
