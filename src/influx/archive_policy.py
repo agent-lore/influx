@@ -119,13 +119,18 @@ ArchiveFailureKind = Literal[
     # unsupported items (the operator has already said "this domain
     # has no archive surface").
     "unsupported",
+    # 401 Unauthorized: the origin requires credentials the archive
+    # downloader never sends (WSJ's paywall answers 401, not 403), so it
+    # is as permanent as a 403 paywall.  Split out of ``http_4xx`` so the
+    # repair sweep can count it toward the archive cap.
+    "http_401",
     "http_403",
     "http_404",
-    # Issue #282: 410 Gone is the one 4xx besides 403/404 that is
-    # unambiguously permanent — the origin is asserting the resource is
-    # deliberately and irreversibly withdrawn.  Split out of ``http_4xx``
-    # so the repair sweep can count it toward the archive cap without
-    # also counting genuinely-retryable siblings like 408 / 425.
+    # Issue #282: 410 Gone is unambiguously permanent — the origin is
+    # asserting the resource is deliberately and irreversibly withdrawn.
+    # Split out of ``http_4xx`` so the repair sweep can count it toward
+    # the archive cap without also counting genuinely-retryable siblings
+    # like 408 / 425.
     "http_410",
     "http_429",
     "http_4xx",
@@ -502,6 +507,8 @@ def classify_failure_kind(
     http_match = _HTTP_PREFIX_RE.match(error)
     if http_match:
         code = int(http_match.group(1))
+        if code == 401:
+            return "http_401"
         if code == 403:
             if policy_mode == "blocked":
                 return "blocked"

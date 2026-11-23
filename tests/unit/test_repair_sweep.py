@@ -2310,3 +2310,154 @@ class TestSweepPaywalledArchiveConvergence:
         assert "archive_attempts: 0" in rewritten["content"]
         assert "influx:archive-terminal" not in rewritten["tags"]
         assert "influx:repair-needed" in rewritten["tags"]
+
+
+class TestSweepPolicySkippedArchiveTerminal:
+    """A policy-skipped archive goes terminal on its first sweep.
+
+    Reproduces staging note ``e194de38`` ("Parloa builds service agents
+    customers want to talk to", feed ``openai-news``).  It was acquired
+    with ``influx:archive-missing`` and no terminal tag, and openai.com
+    is now declared ``unsupported`` by the default archive policy.  The
+    archive layer therefore returns ``unsupported`` before any network
+    call on every pass.  While that was classified transient, the
+    counter never moved and every daily sweep rewrote the note
+    unchanged, reaching v179: each rewrite bumped the Lithos version
+    and re-ran the note's edge inference.
+
+    Acquisition already stamps these kinds ``influx:archive-terminal``
+    (``sources/rss.py``).  The sweep now does the same for notes acquired
+    before the policy, at once: retrying cannot change an answer that was
+    decided without a download.
+    """
+
+    KINDS = ("unsupported", "missing_by_policy", "non_html_source")
+
+    CONTENT = (
+        "# Parloa builds service agents customers want to talk to\n\n"
+        "## Archive\n\n"
+        "## Summary\nSummary\n\n"
+        "## Profile Relevance\n"
+        "### ai-agents\nScore: 7/10\nRelevant\n\n"
+        "## User Notes\n"
+    )
+
+    @classmethod
+    def _note(cls) -> dict[str, Any]:
+        return {
+            "id": "e194de38-5618-475a-842e-f0a92f983fa6",
+            "title": "Parloa builds service agents customers want to talk to",
+            "content": cls.CONTENT,
+            "tags": [
+                "source:blog",
+                "ingested-by:influx",
+                "schema:1",
+                "influx:archive-missing",
+                "influx:repair-needed",
+                "text:abstract-only",
+                "influx:text-terminal",
+                "profile:ai-agents",
+                "feed-slug:openai-news",
+            ],
+            "source_url": "https://openai.com/index/parloa",
+            "confidence": 1.0,
+            "version": 179,
+        }
+
+    @staticmethod
+    def _skipped(kind: str) -> Any:
+        def hook(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                f"archive_download retry failed: {kind}: archive skipped",
+                stage=kind,
+            )
+
+        return hook
+
+    @staticmethod
+    def _write_args(client: AsyncMock) -> dict[str, Any]:
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        return dict(write_calls[-1].args[1])
+
+    @pytest.mark.parametrize("kind", KINDS)
+    async def test_first_skip_flips_terminal_and_releases_note(self, kind: str) -> None:
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "e194de38", "title": "Parloa"}],
+            read_responses=[self._note()],
+        )
+
+        await sweep(
+            "ai-agents",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=self._skipped(kind)),
+        )
+
+        rewritten = self._write_args(client)
+        assert "influx:archive-terminal" in rewritten["tags"]
+        # The note leaves the sweep set, so nothing rewrites it again.
+        assert "influx:repair-needed" not in rewritten["tags"]
+        # Still factually archive-less, as after acquisition-time policy.
+        assert "influx:archive-missing" in rewritten["tags"]
+        # No attempt was made, so no attempt is counted.
+        assert rewritten["content"] == self.CONTENT
+
+    async def test_flip_is_logged_as_an_archive_terminal_flip(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Operators find it with ``influx-diagnose.py terminal-flips``."""
+        import logging
+
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "e194de38", "title": "Parloa"}],
+            read_responses=[self._note()],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="influx.repair"):
+            await sweep(
+                "ai-agents",
+                client=client,
+                config=config,
+                hooks=SweepHooks(archive_download=self._skipped("unsupported")),
+            )
+
+        flips = [
+            r
+            for r in caplog.records
+            if getattr(r, "sweep_stage", None) == "archive_terminal_flip"
+        ]
+        assert len(flips) == 1
+        assert getattr(flips[0], "kind", None) == "unsupported"
+        assert getattr(flips[0], "archive_attempts", None) == 0
+        assert getattr(flips[0], "note_id", None) == self._note()["id"]
+
+    async def test_blocked_still_counts_toward_the_cap(self) -> None:
+        """``blocked`` attempts the download, so it keeps the counted path.
+
+        A blocked domain can lift its block, and the sweep is how such a
+        note recovers.  Only kinds decided before any download go
+        terminal at once.
+        """
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "e194de38", "title": "Parloa"}],
+            read_responses=[self._note()],
+        )
+
+        await sweep(
+            "ai-agents",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=self._skipped("blocked")),
+        )
+
+        rewritten = self._write_args(client)
+        assert "archive_attempts: 1" in rewritten["content"]
+        assert "influx:archive-terminal" not in rewritten["tags"]
+        assert "influx:repair-needed" in rewritten["tags"]

@@ -56,7 +56,7 @@ The per-Run repair sweep, per-tier repair counters, archive policy, and promotio
 - def `parse_repair_section` — Parse the ``## Repair`` section of *content* into :class:`RepairCounters`.
 - def `render_repair_section` — Serialise *counters* as a ``## Repair`` section (trailing newline).
 - def `upsert_repair_section` — Return *content* with the ``## Repair`` section set to *counters*.
-- def `classify_failure` — Partition a sweep stage failure into transient vs counted.
+- def `classify_failure` — Partition a sweep stage failure into transient, counted or terminal.
 - def `terminal_tag_for` — Return the ``influx:<stage>-terminal`` tag for *stage*.
 - class `CountedFailureResult` — Outcome of recording one counted failure for a stage.
 - def `record_counted_failure` — Advance the per-stage counter, upsert ``## Repair``, check cap.

@@ -219,6 +219,7 @@ class TestAttemptModeClassification:
     @pytest.mark.parametrize(
         "status_code, expected_kind",
         [
+            (401, "http_401"),
             (403, "http_403"),
             (404, "http_404"),
             (429, "http_429"),

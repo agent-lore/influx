@@ -79,7 +79,7 @@
       "tests/test_quality.py"
     ]
   },
-  "source_hash": "19efa1059c5bd5f6554557c5659b41dfc7d153a98fa47cc8d1a38eac78b41197",
+  "source_hash": "2106cb0cf25c3545a27c8a53c2638a19c43365a832baa8cd4b78b492f0295269",
   "tools": {
     "grimp": "3.14",
     "networkx": "3.6.1"
@@ -117,7 +117,7 @@ in the same PR. Lower thresholds when that protects useful improvements.
 
 | Status | Metric | Target | Before | After | Policy | Exception |
 |---|---|---|---:|---:|---|---|
-| unchanged | function_complexity | influx.archive_policy.classify_failure_kind | 13 | 13 | review | — |
+| unchanged | function_complexity | influx.archive_policy.classify_failure_kind | 14 | 14 | review | — |
 | unchanged | function_complexity | influx.backfill.validate_backfill_range | 12 | 12 | review | — |
 | unchanged | function_complexity | influx.cascade.Cascade.enrich | 22 | 22 | review | — |
 | unchanged | function_complexity | influx.config.NotificationWebhookConfig._validate_type_specific_fields | 14 | 14 | review | — |
@@ -220,7 +220,7 @@ in the same PR. Lower thresholds when that protects useful improvements.
 | unchanged | module_lines | influx.config | 1003 | 1003 | review | — |
 | unchanged | module_lines | influx.inbox | 1742 | 1742 | review | — |
 | unchanged | module_lines | influx.lithos_client | 1890 | 1890 | review | — |
-| unchanged | module_lines | influx.repair | 1736 | 1736 | review | — |
+| unchanged | module_lines | influx.repair | 1795 | 1795 | review | — |
 | unchanged | module_lines | influx.repair_hooks | 941 | 941 | review | — |
 | unchanged | module_lines | influx.run | 1012 | 1012 | review | — |
 | unchanged | module_lines | influx.sources.arxiv | 1863 | 1863 | review | — |
@@ -274,14 +274,14 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1923 | 1412 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
 | Orchestration | 7 | 4361 | 3596 | 1 | 11 | 0.92 | 32 (`influx.inbox.InboxTick._ingest_item`) | 9 |
-| Repair | 5 | 3984 | 3041 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
+| Repair | 5 | 4082 | 3112 | 4 | 7 | 0.64 | 26 (`influx.repair._process_sweep_note`) | 6 |
 | Schemas | 1 | 331 | 247 | 3 | 0 | 0.00 | 14 (`influx.schemas._harden_for_openai_strict`) | 1 |
 | Sources | 10 | 4490 | 3450 | 3 | 8 | 0.73 | 28 (`influx.sources.arxiv.build_arxiv_note_item`) | 7 |
 | Storage | 1 | 720 | 588 | 3 | 3 | 0.50 | 14 (`influx.storage.download_archive`) | 2 |
 
 ## Size
 
-- Modules: **62**, lines: **29229**, SLOC: **22973**
+- Modules: **62**, lines: **29327**, SLOC: **23044**
 - Largest module: `influx.lithos_client` (1890 lines)
 - Modules over 800 lines: **9**
   - `influx.config`
@@ -296,7 +296,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Complexity
 
-- Functions: **732**, cyclomatic > 10: **43**
+- Functions: **733**, cyclomatic > 10: **43**
 - Cyclomatic distribution: median **3**, p90 **9**, max **32**
 - Function length (lines): median 17, p90 66, max 377 (`influx.sources.rss.build_rss_note_item`); over 75: **57**
 
@@ -362,4 +362,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **20** (6 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.55** (74459 test lines / 29229 source lines)
+- Test-to-source line ratio: **2.54** (74628 test lines / 29327 source lines)

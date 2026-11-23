@@ -781,11 +781,11 @@ class TestArchiveDownloadHookMetadataRecovery:
         assert hooks.archive_download is not None
         with pytest.raises(ExtractionError) as exc_info:
             hooks.archive_download(note)
-        # Reached RssSource and attempted a real download — NOT rejected
-        # at dispatch.  The network failure here is transient, so the
-        # note stays recoverable.
-        assert exc_info.value.stage != "unsupported_source"
-        assert classify_failure(exc_info.value, repair_stage="archive") == "transient"
+        # Reached RssSource and the archive layer — NOT rejected at
+        # dispatch.  The default policy declares openai.com unsupported,
+        # so the download stops there, before any network call.
+        assert exc_info.value.stage == "unsupported"
+        assert classify_failure(exc_info.value, repair_stage="archive") == "terminal"
 
     def test_unknown_source_with_feed_slug_reaches_rss_reacquirer(
         self, tmp_path: Path

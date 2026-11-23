@@ -393,13 +393,13 @@ class TestArchiveScopedPermanentHttpStages:
     re-selected and rewritten by every sweep — the production instance
     reached v43 at two versions per day.
 
-    The partition is by *permanence*, not by "is it an error": a 403
-    paywall, a 404, a 410 Gone, and an operator-declared ``blocked``
+    The partition is by *permanence*, not by "is it an error": a 401 or
+    403 paywall, a 404, a 410 Gone, and an operator-declared ``blocked``
     domain all return the same answer however many times we ask.  A 429,
     a 5xx, or a 408 do not.
     """
 
-    PERMANENT = ("http_403", "http_404", "http_410", "blocked")
+    PERMANENT = ("http_401", "http_403", "http_404", "http_410", "blocked")
     RECOVERABLE = ("http_429", "rate_limited", "http_4xx", "http_5xx", "network")
 
     @pytest.mark.parametrize("stage", PERMANENT)
@@ -474,7 +474,19 @@ class TestArchiveScopedSetIntegrity:
     # is not an ArchiveFailureKind — the repair hook raises it before any
     # download — but it shares the scope, so it belongs in this table.
     PERMANENT_FOR_ARCHIVE = frozenset(
-        {"http_403", "http_404", "http_410", "blocked", "unsupported_source"}
+        {
+            "http_401",
+            "http_403",
+            "http_404",
+            "http_410",
+            "blocked",
+            "unsupported_source",
+        }
+    )
+    # Decided before any download is attempted, from the URL or the
+    # operator's archive policy, so the stage goes terminal at once.
+    TERMINAL_FOR_ARCHIVE = frozenset(
+        {"missing_by_policy", "non_html_source", "unsupported"}
     )
     # Permanent everywhere, so counted regardless of stage.
     GLOBALLY_COUNTED = frozenset({"oversize"})
@@ -491,7 +503,12 @@ class TestArchiveScopedSetIntegrity:
         counted = self.PERMANENT_FOR_ARCHIVE | self.GLOBALLY_COUNTED
         for kind in sorted(self._all_kinds()):
             exc = ExtractionError("archive_download retry failed", stage=kind)
-            expected = "counted" if kind in counted else "transient"
+            if kind in self.TERMINAL_FOR_ARCHIVE:
+                expected = "terminal"
+            elif kind in counted:
+                expected = "counted"
+            else:
+                expected = "transient"
             assert classify_failure(exc, repair_stage="archive") == expected, kind
 
     def test_no_failure_kind_is_counted_outside_the_archive_stage(self) -> None:

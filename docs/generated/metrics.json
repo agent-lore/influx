@@ -140,7 +140,7 @@
         "qualname": "influx.inbox.InboxTick.execute"
       }
     ],
-    "total_functions": 732
+    "total_functions": 733
   },
   "components": {
     "Common": {
@@ -527,8 +527,8 @@
       ]
     },
     "influx.archive_policy.classify_failure_kind": {
-      "complexity": 13,
-      "length": 57,
+      "complexity": 14,
+      "length": 59,
       "module": "influx.archive_policy",
       "path": "src/influx/archive_policy.py",
       "paths": [
@@ -4162,6 +4162,15 @@
         "src/influx/repair.py"
       ]
     },
+    "influx.repair._flip_archive_terminal_without_attempt": {
+      "complexity": 3,
+      "length": 47,
+      "module": "influx.repair",
+      "path": "src/influx/repair.py",
+      "paths": [
+        "src/influx/repair.py"
+      ]
+    },
     "influx.repair._get_profile_thresholds": {
       "complexity": 3,
       "length": 10,
@@ -4217,8 +4226,8 @@
       ]
     },
     "influx.repair._run_archive_retry": {
-      "complexity": 4,
-      "length": 51,
+      "complexity": 5,
+      "length": 60,
       "module": "influx.repair",
       "path": "src/influx/repair.py",
       "paths": [
@@ -4388,8 +4397,8 @@
       ]
     },
     "influx.repair_counters.classify_failure": {
-      "complexity": 5,
-      "length": 43,
+      "complexity": 7,
+      "length": 52,
       "module": "influx.repair_counters",
       "path": "src/influx/repair_counters.py",
       "paths": [
@@ -7856,7 +7865,7 @@
         "tests/test_quality.py"
       ]
     },
-    "source_hash": "19efa1059c5bd5f6554557c5659b41dfc7d153a98fa47cc8d1a38eac78b41197",
+    "source_hash": "2106cb0cf25c3545a27c8a53c2638a19c43365a832baa8cd4b78b492f0295269",
     "tools": {
       "grimp": "3.14",
       "networkx": "3.6.1"
@@ -7882,10 +7891,10 @@
     "influx.archive_policy": {
       "component": "Repair",
       "functions": 9,
-      "lines": 565,
-      "max_complexity": 13,
+      "lines": 572,
+      "max_complexity": 14,
       "path": "src/influx/archive_policy.py",
-      "sloc": 356
+      "sloc": 359
     },
     "influx.audit_invalid_source": {
       "component": "Orchestration",
@@ -8169,19 +8178,19 @@
     },
     "influx.repair": {
       "component": "Repair",
-      "functions": 29,
-      "lines": 1736,
+      "functions": 30,
+      "lines": 1795,
       "max_complexity": 26,
       "path": "src/influx/repair.py",
-      "sloc": 1353
+      "sloc": 1408
     },
     "influx.repair_counters": {
       "component": "Repair",
       "functions": 11,
-      "lines": 438,
+      "lines": 470,
       "max_complexity": 8,
       "path": "src/influx/repair_counters.py",
-      "sloc": 322
+      "sloc": 335
     },
     "influx.repair_hooks": {
       "component": "Repair",
@@ -8568,13 +8577,13 @@
       },
       "Repair": {
         "classes": 17,
-        "functions": 80,
+        "functions": 81,
         "largest_module": "influx.repair",
-        "largest_module_lines": 1736,
-        "lines": 3984,
+        "largest_module_lines": 1795,
+        "lines": 4082,
         "modules": 5,
         "public_symbols": 39,
-        "sloc": 3041
+        "sloc": 3112
       },
       "Schemas": {
         "classes": 4,
@@ -8620,13 +8629,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 29229,
+    "total_lines": 29327,
     "total_modules": 62,
-    "total_sloc": 22973
+    "total_sloc": 23044
   },
   "tests": {
-    "ratio": 2.55,
-    "src_lines": 29229,
-    "test_lines": 74459
+    "ratio": 2.54,
+    "src_lines": 29327,
+    "test_lines": 74628
   }
 }

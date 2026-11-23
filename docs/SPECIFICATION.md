@@ -620,7 +620,7 @@ Raising the cap is not an alternative: it has been raised twice (#81 took it 10 
 
 #### Stage-scoped counting on archive
 
-Most discriminators classify the same way everywhere. Five do not — `unsupported_source`, `http_403`, `http_404`, `http_410`, and `blocked` are **counted for the archive stage only**. All five share one property: retrying returns the same answer forever.
+Most discriminators classify the same way everywhere. Six do not — `unsupported_source`, `http_401`, `http_403`, `http_404`, `http_410`, and `blocked` are **counted for the archive stage only**. All six share one property: retrying returns the same answer forever. Three more go terminal on their first failure without counting; see *Policy short-circuits* below.
 
 The archive-download hook raises it when no registered adapter owns the note, i.e. `repair_hooks._reacquirer_for_note` returns `None`. That is not a failed attempt but the absence of a code path, so retrying cannot change it — only shipping a resolver can. Left transient, such a note was re-selected and rewritten on every sweep indefinitely (observed in production at v108 after 36 days, with `archive_attempts` still 0), which pinned `updated_at` to "now" and dominated retrieval ranking.
 
@@ -638,12 +638,13 @@ The partition is by permanence, not by severity:
 
 | Counted (archive stage) | Transient |
 |---|---|
-| `http_403` — paywall / hard refusal | `http_429`, `rate_limited` — temporary by definition |
-| `http_404` — no such resource | `http_5xx` — server-side, recovers |
-| `http_410` — deliberately withdrawn | `http_4xx` — catch-all, holds retryable 408 / 425 |
-| `blocked` — operator-declared refusal | `network`, `timeout`, `dns`, `write` |
+| `http_401` — paywall answering 401 (wsj.com) | `http_429`, `rate_limited` — temporary by definition |
+| `http_403` — paywall / hard refusal | `http_5xx` — server-side, recovers |
+| `http_404` — no such resource | `http_4xx` — catch-all, holds retryable 408 / 425 |
+| `http_410` — deliberately withdrawn | `network`, `timeout`, `dns`, `write` |
+| `blocked` — operator-declared refusal | |
 
-`http_410` is split out of the `http_4xx` catch-all specifically so it can be counted without dragging its retryable neighbours along.
+`http_401` and `http_410` are split out of the `http_4xx` catch-all specifically so they can be counted without dragging their retryable neighbours along. `http_401` was added after a WSJ note reached v77 on staging: its paywall answers 401 rather than 403, and the catch-all kept it transient.
 
 **`blocked` is a backstop, not the primary path.** A note acquired while its domain already carried a `blocked` policy is stamped `influx:archive-terminal` at acquisition (§6.1), and `select_stages` then excludes it from archive retry entirely — it never reaches the counter. Counting `blocked` covers the notes that *do* reach the sweep without that tag:
 
@@ -652,6 +653,16 @@ The partition is by permanence, not by severity:
 - hand-edited or legacy notes predating the acquisition-time stamp.
 
 The two mechanisms are complementary: acquisition-time terminalisation avoids the retries entirely when the policy is known up front, and the cap converges the notes that predate it. The consequence of the acquisition-time stamp is that removing a domain from the blocked list does **not** automatically re-attempt already-terminalised notes; they need re-arming.
+
+##### Policy short-circuits go terminal at once
+
+`unsupported`, `missing_by_policy` and `non_html_source` are returned by the archive layer **before any download**, from the operator's archive policy (`unsupported`, `skip`) or the URL's shape. For the archive stage, `classify_failure` returns `terminal` for them rather than `counted`: the sweep adds `influx:archive-terminal` on the first failure, leaves `archive_attempts` unchanged, and logs an `archive_terminal_flip`.
+
+Acquisition already stamps these kinds terminal (§6.1), so only notes acquired before the policy reach the sweep with one. Counting them would retry an answer decided without a download, and while they were transient they were rewritten unchanged by every sweep: an openai.com note acquired before the `unsupported` policy reached v179 on staging. Every rewrite bumps the note's Lithos version, which re-runs Lithos's typed-edge inference on it.
+
+`blocked` keeps the counted path, because the download is still attempted and a domain can lift its block.
+
+The sweep does not add the kind's policy tag (`influx:archive-unsupported` …) the way acquisition does: `merge_tags` treats those tags as external and keeps them only from the note's existing tags. The kind is on the flip's log record.
 
 ##### Text clearing under an unreachable archive
 

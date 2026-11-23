@@ -50,6 +50,7 @@ from influx.repair_counters import (
     classify_failure,
     parse_repair_section,
     record_counted_failure,
+    terminal_tag_for,
     upsert_repair_section,
 )
 from influx.telemetry import current_run_id, get_tracer
@@ -1040,14 +1041,23 @@ def _run_archive_retry(
         failure_stage = (
             getattr(exc, "stage", "") or getattr(exc, "kind", "") or "archive_failed"
         )
-        new_tags = _apply_counted_failure(
-            note=note,
-            current_tags=current_tags,
-            exc=exc,
-            profile=profile,
-            stage="archive",
-            failure_stage=failure_stage,
-        )
+        if classify_failure(exc, repair_stage="archive") == "terminal":
+            new_tags = _flip_archive_terminal_without_attempt(
+                note,
+                current_tags=current_tags,
+                exc=exc,
+                profile=profile,
+                kind=failure_stage,
+            )
+        else:
+            new_tags = _apply_counted_failure(
+                note=note,
+                current_tags=current_tags,
+                exc=exc,
+                profile=profile,
+                stage="archive",
+                failure_stage=failure_stage,
+            )
         _log_stage_failure(
             "archive_download",
             note=note,
@@ -1055,6 +1065,55 @@ def _run_archive_retry(
             exc=exc,
         )
         return new_tags, archive_path, False
+
+
+def _flip_archive_terminal_without_attempt(
+    note: dict[str, Any],
+    *,
+    current_tags: list[str],
+    exc: BaseException,
+    profile: str,
+    kind: str,
+) -> list[str]:
+    """Mark the archive stage terminal when no download was attempted.
+
+    The archive layer returned *kind* (``unsupported``,
+    ``missing_by_policy`` or ``non_html_source``) before any network
+    call, from the URL's shape or the operator's archive policy, so the
+    note gets ``influx:archive-terminal`` as it would at acquisition.
+    The counter is left alone because nothing was attempted.
+    ``compute_clearing`` then waives the archive condition, so the note
+    leaves the sweep instead of being rewritten unchanged on every pass.
+
+    Acquisition also adds the kind's policy tag
+    (``influx:archive-unsupported`` …).  The sweep cannot: ``merge_tags``
+    treats those tags as external and keeps them only from the note's
+    existing tags.  The kind is in the flip's log record instead.
+    """
+    terminal_tag = terminal_tag_for("archive")
+    if terminal_tag in current_tags:
+        return list(current_tags)
+    new_tags = [*current_tags, terminal_tag]
+    note["tags"] = list(new_tags)
+    logger.warning(
+        "sweep: archive marked terminal without an attempt (%s) for %s",
+        kind,
+        note.get("id", "?"),
+        extra={
+            "sweep_stage": "archive_terminal_flip",
+            "note_id": note.get("id"),
+            "profile": profile,
+            "run_id": current_run_id.get() or "",
+            "archive_attempts": parse_repair_section(
+                str(note.get("content", ""))
+            ).archive_attempts,
+            "exc_type": type(exc).__name__,
+            "stage": getattr(exc, "stage", None),
+            "kind": kind,
+            "detail": getattr(exc, "detail", None),
+        },
+    )
+    return new_tags
 
 
 def _terminate_unsupported_text_source(note: dict[str, Any]) -> list[str]:
