@@ -287,6 +287,12 @@ the first failure: `{unsupported, missing_by_policy, non_html_source}`.
 The archive layer returns them before any download, from the archive
 policy or the URL's shape, so a retry cannot change the answer.
 
+Tier 2 counts `{min_length, extract}`: the sweep re-extracts full text
+only from the stored archive, so a page too short to pass
+`min_html_chars`, or one with no extractable text, fails the same way
+every time. Such a note reaches `influx:tier2-terminal` after three
+sweeps. `archive_read` stays transient.
+
 ### 4.4 Terminal-flip events
 
 When a per-stage counter reaches `REPAIR_COUNTED_CAP=3`, the sweep adds

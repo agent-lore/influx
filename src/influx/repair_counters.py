@@ -266,6 +266,16 @@ _COUNTED_STAGES: frozenset[str] = frozenset({"parse", "validate", "oversize"})
 #   with permanent semantics are broken out above.
 # * ``network`` / ``timeout`` / ``dns`` / ``write`` /
 #   ``content_type_mismatch`` — transport or local conditions.
+#
+# ``min_length`` / ``extract`` for Tier 2: the sweep re-runs Tier 2 only
+# from the note's stored archive (``repair_hooks.make_sweep_tier2_extractor``),
+# a file that doesn't change, so extracting it again gives the same text —
+# too short, or none at all.  Left transient, a forum post whose archive
+# extracts to 550 characters (under ``min_html_chars``) was rewritten by
+# every sweep, twice a day, in production.  ``archive_read`` stays
+# transient: a file-system error can clear.  Live extraction (the text
+# stage) raises the same discriminators and has its own fallback to
+# ``text:abstract-only``, so they stay transient there.
 _STAGE_SCOPED_COUNTED_STAGES: dict[CountedStage, frozenset[str]] = {
     "archive": frozenset(
         {
@@ -277,6 +287,7 @@ _STAGE_SCOPED_COUNTED_STAGES: dict[CountedStage, frozenset[str]] = {
             "blocked",
         }
     ),
+    "tier2": frozenset({"min_length", "extract"}),
 }
 
 # Discriminators that make a stage terminal on the first failure.
@@ -320,7 +331,8 @@ def classify_failure(
     archive_read, or anything we don't specifically recognise) leave the
     counter alone.  The next sweep retries them indefinitely.  Note that
     "HTTP" is no longer transient wholesale: the archive stage counts the
-    permanently-failing statuses — see
+    permanently-failing statuses, and Tier 2 counts an extraction that
+    fails on its stored archive — see
     :data:`_STAGE_SCOPED_COUNTED_STAGES`.
 
     Parameters

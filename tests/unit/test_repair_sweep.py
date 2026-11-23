@@ -1096,6 +1096,112 @@ class TestSweepTier2RecoveryViaCascade:
         assert getattr(rec, "stage", None) == "parse"
 
 
+class TestSweepTier2ShortArchive:
+    """Tier 2 on a stored archive that can't yield full text (prod 3705ff3c).
+
+    A forum post's archive extracts to 550 characters, under
+    ``min_html_chars``.  Tier 2 failed with ``min_length``, classed
+    transient, so it was never counted, logged nothing, and the note was
+    rewritten by every sweep, twice a day.  The archive is a fixed file:
+    the sweep now counts the failure, and the note leaves at the cap.
+    Runs the production extractor on a real archive file.
+    """
+
+    ARCHIVE = "rss/2026/09/forum-post.html"
+    PAGES = {
+        "min_length": (
+            "<html><head><title>Forum</title></head><body><article>"
+            "<h1>Re: Gotek touchscreen</h1><p>"
+            + "A new touchscreen for the Gotek drive. " * 8
+            + "</p></article></body></html>"
+        ),
+        "extract": "<html><body></body></html>",
+    }
+
+    @classmethod
+    def _note(cls, *, repair_section: str = "") -> dict[str, Any]:
+        body = (
+            "# Re: Gotek touchscreen\n\n"
+            "## Archive\n"
+            f"path: {cls.ARCHIVE}\n\n"
+            "## Summary\n### Contributions\n- A touchscreen for the Gotek\n\n"
+            f"{repair_section}"
+            "## Profile Relevance\n"
+            "### ai-robotics\nScore: 8/10\nNew hardware.\n\n"
+            "## User Notes\n"
+        )
+        return {
+            "id": "n1",
+            "title": "Re: Gotek touchscreen",
+            "content": body,
+            "tags": ["influx:repair-needed", "text:html", "profile:ai-robotics"],
+            "source_url": "https://forum.example.org/index.php?topic=1",
+            "confidence": 0.9,
+        }
+
+    @classmethod
+    async def _sweep_once(
+        cls, tmp_path: Any, stage: str, note: dict[str, Any]
+    ) -> dict[str, Any]:
+        from influx.repair_hooks import make_sweep_tier2_extractor
+
+        archive = tmp_path / cls.ARCHIVE
+        archive.parent.mkdir(parents=True)
+        archive.write_text(cls.PAGES[stage], encoding="utf-8")
+        config = _make_config()
+        config.storage = MagicMock(archive_dir=str(tmp_path))
+        config.extraction = MagicMock(
+            min_html_chars=1000, strip_tags=["script", "iframe", "object", "embed"]
+        )
+        client = _make_client(
+            list_items=[{"id": "n1", "title": note["title"]}], read_responses=[note]
+        )
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(),
+            cascade=_build_sweep_cascade(
+                config,
+                "ai-robotics",
+                tier2_extractor=make_sweep_tier2_extractor(config),
+            ),
+        )
+        writes = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        return dict(writes[-1].args[1])
+
+    @pytest.mark.parametrize("stage", ["min_length", "extract"])
+    async def test_first_failure_is_counted(self, tmp_path: Any, stage: str) -> None:
+        rewritten = await self._sweep_once(tmp_path, stage, self._note())
+        assert "tier2_attempts: 1" in rewritten["content"]
+        assert f'tier2_last_stage: "{stage}"' in rewritten["content"]
+        assert "influx:repair-needed" in rewritten["tags"]
+        assert "influx:tier2-terminal" not in rewritten["tags"]
+
+    @pytest.mark.parametrize("stage", ["min_length", "extract"])
+    async def test_at_the_cap_the_note_leaves_the_sweep(
+        self, tmp_path: Any, stage: str
+    ) -> None:
+        note = self._note(
+            repair_section=(
+                "## Repair\n"
+                "- tier2_attempts: 2\n"
+                f'- tier2_last_stage: "{stage}"\n'
+                '- tier2_last_error: "earlier failure"\n'
+                "- tier3_attempts: 0\n"
+                '- tier3_last_stage: ""\n'
+                '- tier3_last_error: ""\n\n'
+            )
+        )
+        rewritten = await self._sweep_once(tmp_path, stage, note)
+        assert "tier2_attempts: 3" in rewritten["content"]
+        assert "influx:tier2-terminal" in rewritten["tags"]
+        assert "influx:repair-needed" not in rewritten["tags"]
+        assert "full-text" not in rewritten["tags"]
+
+
 # ── Layer 2 self-repair: counter + terminal flip ─────────────────────
 
 

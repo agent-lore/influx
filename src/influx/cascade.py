@@ -616,11 +616,13 @@ def _advance_on_counted(
     reached on this advance — the trigger for emitting
     ``influx:<stage>-terminal``.  Transient failures (and the degenerate
     ``failure is None``) leave the counter untouched, matching
-    :func:`influx.repair_counters.classify_failure`.  The ``## Repair``
+    :func:`influx.repair_counters.classify_failure` for *stage* — some
+    discriminators are counted for one stage only (Tier 2 counts an
+    extraction failure on its stored archive).  The ``## Repair``
     bullet grammar stays in ``repair_counters`` (via ``bump_tier{2,3}``);
     this only decides *when* to advance.
     """
-    if failure is None or classify_failure(failure) != "counted":
+    if failure is None or classify_failure(failure, repair_stage=stage) != "counted":
         return counters, False
     failure_stage = getattr(failure, "stage", "") or ""
     error = str(failure)

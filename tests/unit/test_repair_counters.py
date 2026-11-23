@@ -518,3 +518,33 @@ class TestArchiveScopedSetIntegrity:
             assert classify_failure(exc, repair_stage="tier2") == "transient", kind
             assert classify_failure(exc, repair_stage="tier3") == "transient", kind
             assert classify_failure(exc) == "transient", kind
+
+
+class TestTier2ScopedExtractionStages:
+    """Tier 2 counts an extraction that fails on its stored archive.
+
+    The sweep re-runs Tier 2 only from the archive file, which doesn't
+    change, so ``min_length`` and ``extract`` come back the same every
+    pass.  Left transient, a forum post whose archive extracts to 550
+    characters was rewritten by every sweep, twice a day, in production.
+    """
+
+    EXTRACTION = ("min_length", "extract")
+
+    @pytest.mark.parametrize("stage", EXTRACTION)
+    def test_counted_for_tier2(self, stage: str) -> None:
+        exc = ExtractionError("archived HTML too short", stage=stage)
+        assert classify_failure(exc, repair_stage="tier2") == "counted"
+
+    @pytest.mark.parametrize("stage", EXTRACTION)
+    def test_transient_elsewhere(self, stage: str) -> None:
+        """Live extraction (the text stage) has its own fallback."""
+        exc = ExtractionError("extracted body too short", stage=stage)
+        assert classify_failure(exc) == "transient"
+        assert classify_failure(exc, repair_stage="archive") == "transient"
+        assert classify_failure(exc, repair_stage="tier3") == "transient"
+
+    def test_archive_read_stays_transient_for_tier2(self) -> None:
+        """A file-system error can clear."""
+        exc = ExtractionError("cannot read archive file", stage="archive_read")
+        assert classify_failure(exc, repair_stage="tier2") == "transient"

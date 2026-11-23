@@ -674,6 +674,12 @@ The notes released by the `unsupported_source` fix above did not hit this, becau
 
 **Operational consequence:** adding a resolver no longer recovers already-terminalised notes automatically. They must be re-armed — see below.
 
+#### Stage-scoped counting on Tier 2
+
+Tier 2 counts two discriminators that are transient elsewhere: `min_length` (the extracted text is shorter than `[extraction] min_html_chars`) and `extract` (the extractor returned nothing). The sweep re-runs Tier 2 only from the note's **stored archive**, a file that doesn't change, so extracting it again gives the same result. Counted, the note reaches `influx:tier2-terminal` after three sweeps, the full-text condition is waived (§5.3), and it leaves the sweep.
+
+Left transient, a forum post whose archive extracts to 550 characters was rewritten by every sweep, twice a day, in production. `archive_read` stays transient, since a file-system error can clear. The text stage raises the same two discriminators on a live fetch and keeps classifying them transient; it has its own fallback to `text:abstract-only`.
+
 #### Re-arming a terminal stage
 
 **The persisted counter is authoritative, not the tag.** Two different mechanisms read the terminal state, and a re-arm has to satisfy both:

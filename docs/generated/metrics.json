@@ -951,7 +951,7 @@
     },
     "influx.cascade._advance_on_counted": {
       "complexity": 5,
-      "length": 24,
+      "length": 26,
       "module": "influx.cascade",
       "path": "src/influx/cascade.py",
       "paths": [
@@ -4407,7 +4407,7 @@
     },
     "influx.repair_counters.classify_failure": {
       "complexity": 7,
-      "length": 52,
+      "length": 53,
       "module": "influx.repair_counters",
       "path": "src/influx/repair_counters.py",
       "paths": [
@@ -4695,7 +4695,7 @@
     },
     "influx.repair_hooks.make_sweep_tier2_extractor": {
       "complexity": 1,
-      "length": 33,
+      "length": 34,
       "module": "influx.repair_hooks",
       "path": "src/influx/repair_hooks.py",
       "paths": [
@@ -7874,7 +7874,7 @@
         "tests/test_quality.py"
       ]
     },
-    "source_hash": "dc96df767dcdabd78ba6e82ede76942bc5596ba8157901956801186a557639d1",
+    "source_hash": "f3060be83252e0e5ed696e64a8f0ffa15e40a4b1a02869c87abc7d15fdb9ea79",
     "tools": {
       "grimp": "3.14",
       "networkx": "3.6.1"
@@ -7932,10 +7932,10 @@
     "influx.cascade": {
       "component": "Enrich",
       "functions": 9,
-      "lines": 685,
+      "lines": 687,
       "max_complexity": 22,
       "path": "src/influx/cascade.py",
-      "sloc": 554
+      "sloc": 556
     },
     "influx.config": {
       "component": "Config",
@@ -8196,18 +8196,18 @@
     "influx.repair_counters": {
       "component": "Repair",
       "functions": 11,
-      "lines": 470,
+      "lines": 482,
       "max_complexity": 8,
       "path": "src/influx/repair_counters.py",
-      "sloc": 335
+      "sloc": 337
     },
     "influx.repair_hooks": {
       "component": "Repair",
       "functions": 28,
-      "lines": 941,
+      "lines": 942,
       "max_complexity": 9,
       "path": "src/influx/repair_hooks.py",
-      "sloc": 746
+      "sloc": 747
     },
     "influx.run": {
       "component": "Orchestration",
@@ -8498,11 +8498,11 @@
         "classes": 4,
         "functions": 14,
         "largest_module": "influx.cascade",
-        "largest_module_lines": 685,
-        "lines": 1003,
+        "largest_module_lines": 687,
+        "lines": 1005,
         "modules": 2,
         "public_symbols": 8,
-        "sloc": 806
+        "sloc": 808
       },
       "Entrypoint": {
         "classes": 0,
@@ -8589,10 +8589,10 @@
         "functions": 81,
         "largest_module": "influx.repair",
         "largest_module_lines": 1795,
-        "lines": 4082,
+        "lines": 4095,
         "modules": 5,
         "public_symbols": 39,
-        "sloc": 3112
+        "sloc": 3115
       },
       "Schemas": {
         "classes": 4,
@@ -8638,13 +8638,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 29340,
+    "total_lines": 29355,
     "total_modules": 62,
-    "total_sloc": 23054
+    "total_sloc": 23059
   },
   "tests": {
     "ratio": 2.55,
-    "src_lines": 29340,
-    "test_lines": 74713
+    "src_lines": 29355,
+    "test_lines": 74849
   }
 }
