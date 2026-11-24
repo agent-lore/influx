@@ -79,7 +79,7 @@
       "tests/test_quality.py"
     ]
   },
-  "source_hash": "f3060be83252e0e5ed696e64a8f0ffa15e40a4b1a02869c87abc7d15fdb9ea79",
+  "source_hash": "02636ddde12cb9e43da2cdb166568857d1bbf77357c8f82d4f9fd1250235e420",
   "tools": {
     "grimp": "3.14",
     "networkx": "3.6.1"
@@ -270,7 +270,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 | Feedback | 3 | 602 | 477 | 1 | 4 | 0.80 | 17 (`influx.run_dedup.dedup_scored_candidates`) | 1 |
 | Filter | 1 | 506 | 427 | 3 | 4 | 0.57 | 10 (`influx.filter.Filter.score`) | 0 |
 | HttpApi | 3 | 1141 | 918 | 2 | 8 | 0.80 | 15 (`influx.http_api.post_backfills`) | 3 |
-| LithosBridge | 9 | 4559 | 3637 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
+| LithosBridge | 9 | 4567 | 3644 | 6 | 3 | 0.33 | 17 (`influx.notes.merge_tags`) | 3 |
 | Notifications | 1 | 581 | 509 | 2 | 2 | 0.50 | 13 (`influx.notifications.dispatch_notifications`) | 2 |
 | Observability | 3 | 1923 | 1412 | 9 | 0 | 0.00 | 10 (`influx.logging_config.setup_logging`) | 0 |
 | Orchestration | 7 | 4361 | 3596 | 1 | 11 | 0.92 | 32 (`influx.inbox.InboxTick._ingest_item`) | 9 |
@@ -281,7 +281,7 @@ Instability I = fan-out / (fan-in + fan-out): 0 = stable (many dependents),
 
 ## Size
 
-- Modules: **62**, lines: **29355**, SLOC: **23059**
+- Modules: **62**, lines: **29363**, SLOC: **23066**
 - Largest module: `influx.lithos_client` (1890 lines)
 - Modules over 800 lines: **9**
   - `influx.config`
@@ -362,4 +362,4 @@ Private-name reaches across module seams. Both counts can be pinned as
 ## Domain & tests
 
 - Domain models: **20** (6 associations, 0 without docstrings)
-- Test-to-source line ratio: **2.55** (74849 test lines / 29355 source lines)
+- Test-to-source line ratio: **2.55** (74877 test lines / 29363 source lines)

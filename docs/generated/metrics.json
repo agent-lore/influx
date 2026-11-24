@@ -833,8 +833,8 @@
       ]
     },
     "influx.canonical_note.parse_lenient": {
-      "complexity": 3,
-      "length": 17,
+      "complexity": 4,
+      "length": 25,
       "module": "influx.canonical_note",
       "path": "src/influx/canonical_note.py",
       "paths": [
@@ -7874,7 +7874,7 @@
         "tests/test_quality.py"
       ]
     },
-    "source_hash": "f3060be83252e0e5ed696e64a8f0ffa15e40a4b1a02869c87abc7d15fdb9ea79",
+    "source_hash": "02636ddde12cb9e43da2cdb166568857d1bbf77357c8f82d4f9fd1250235e420",
     "tools": {
       "grimp": "3.14",
       "networkx": "3.6.1"
@@ -7924,10 +7924,10 @@
     "influx.canonical_note": {
       "component": "LithosBridge",
       "functions": 29,
-      "lines": 731,
+      "lines": 739,
       "max_complexity": 9,
       "path": "src/influx/canonical_note.py",
-      "sloc": 562
+      "sloc": 569
     },
     "influx.cascade": {
       "component": "Enrich",
@@ -8549,10 +8549,10 @@
         "functions": 137,
         "largest_module": "influx.lithos_client",
         "largest_module_lines": 1890,
-        "lines": 4559,
+        "lines": 4567,
         "modules": 9,
         "public_symbols": 61,
-        "sloc": 3637
+        "sloc": 3644
       },
       "Notifications": {
         "classes": 5,
@@ -8638,13 +8638,13 @@
       "influx.sources.rss",
       "influx.telemetry"
     ],
-    "total_lines": 29355,
+    "total_lines": 29363,
     "total_modules": 62,
-    "total_sloc": 23059
+    "total_sloc": 23066
   },
   "tests": {
     "ratio": 2.55,
-    "src_lines": 29355,
-    "test_lines": 74849
+    "src_lines": 29363,
+    "test_lines": 74877
   }
 }

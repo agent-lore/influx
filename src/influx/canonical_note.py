@@ -350,12 +350,20 @@ def parse_lenient(text: str, *, fallback_title: str = "") -> CanonicalNote:
 
     With no title heading and no *fallback_title*, delegates to
     :func:`parse`, which raises :class:`NoteParseError`.
+
+    A legacy note's YAML frontmatter is split off first: a YAML comment
+    such as ``## Archive …`` would otherwise end the title search before the
+    real title, and a reattached title must go after the frontmatter so
+    :func:`parse` still finds the fence at the start.
     """
-    if _has_title_heading(text):
+    if text.startswith(_FRONTMATTER_FENCE):
+        _, body = _split_frontmatter(text)
+        frontmatter = text[: len(text) - len(body)]
+    else:
+        frontmatter, body = "", text
+    if _has_title_heading(body) or not fallback_title:
         return parse(text)
-    if fallback_title:
-        return parse(f"# {fallback_title}\n\n{text}")
-    return parse(text)
+    return parse(f"{frontmatter}# {fallback_title}\n\n{body}")
 
 
 def _has_title_heading(text: str) -> bool:

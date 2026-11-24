@@ -43,6 +43,7 @@ ROUNDTRIP_FIXTURES = [
     "tier3_full.md",
     "with_repair.md",
     "legacy_frontmatter.md",
+    "legacy_frontmatter_heading_comment.md",
 ]
 
 TIER3 = Tier3Extraction(
@@ -190,6 +191,33 @@ class TestParse:
         archive = note.get_section(ARCHIVE)
         assert archive is not None
         assert "arxiv/2026/05/2605.18583.pdf" in archive.body
+
+    def test_lenient_skips_legacy_frontmatter_when_finding_the_title(self) -> None:
+        """A ``## `` YAML comment must not end the title search early.
+
+        It would reattach the fallback title above the frontmatter, which
+        then parsed as Markdown: the comment became an empty ``## Archive``
+        and the stored path was lost.
+        """
+        text = _read("legacy_frontmatter_heading_comment.md")
+        note = cn.parse_lenient(text, fallback_title="Doc Title")
+        assert note == cn.parse(text)
+        assert note.title == "Legacy With Comment"
+        assert "## Archive moved" in note.frontmatter_raw
+        archive = note.get_section(ARCHIVE)
+        assert archive is not None
+        assert "path: rss/2026/01/legacy.html" in archive.body
+
+    def test_lenient_reattaches_title_after_legacy_frontmatter(self) -> None:
+        text = (
+            "---\nnote_type: summary\n---\n## Archive\npath: x/y.pdf\n\n## User Notes\n"
+        )
+        note = cn.parse_lenient(text, fallback_title="Recovered")
+        assert note.title == "Recovered"
+        assert "note_type: summary" in note.frontmatter_raw
+        archive = note.get_section(ARCHIVE)
+        assert archive is not None
+        assert "path: x/y.pdf" in archive.body
 
     def test_parse_rejects_h1_after_a_section(self) -> None:
         """Strict parse raises rather than splitting the note at the stray H1."""
