@@ -10,8 +10,9 @@ each note (CONTEXT.md ``RepairCounters``):
 - :func:`render_repair_section` / :func:`upsert_repair_section`
   serialise the counters back into the note before its rewrite.
 - :func:`classify_failure` partitions sweep-stage failures into
-  ``"transient"`` vs ``"counted"``.  Transient failures (HTTP, transport,
-  resolve, archive_read, etc.) do **not** advance the counter — that
+  ``"transient"``, ``"counted"`` and ``"terminal"``.  Transient failures
+  (HTTP, transport, resolve, archive_read, etc.) do **not** advance the
+  counter, and terminal ones skip it to go terminal at once — that
   partition stays in callers via the ``classify_failure`` check.
 - :func:`record_counted_failure` performs the canonical
   parse → bump → upsert → cap-check sequence and emits the
@@ -242,6 +243,9 @@ _COUNTED_STAGES: frozenset[str] = frozenset({"parse", "validate", "oversize"})
 # them; only a different URL can.  Left transient, a paywalled note sat
 # at ``archive_attempts: 0`` indefinitely and was rewritten by every
 # sweep (observed in production at v43, gaining two versions per day).
+# ``http_401`` is the same paywall answered with a different status
+# (wsj.com); it was in the ``http_4xx`` catch-all until a WSJ note
+# reached v77 on staging the same way.
 #
 # ``blocked`` is a backstop rather than the primary path: a note acquired
 # while its domain already carried a ``blocked`` policy is stamped
@@ -258,20 +262,50 @@ _COUNTED_STAGES: frozenset[str] = frozenset({"parse", "validate", "oversize"})
 #   definition; the sweep's own cadence is the cool-down.
 # * ``http_5xx`` — server-side, recovers without our involvement.
 # * ``http_4xx`` — the catch-all bucket, which holds retryable statuses
-#   such as 408 Request Timeout and 425 Too Early.  Only the three 4xx
-#   codes with permanent semantics are broken out above.
+#   such as 408 Request Timeout and 425 Too Early.  Only the 4xx codes
+#   with permanent semantics are broken out above.
 # * ``network`` / ``timeout`` / ``dns`` / ``write`` /
 #   ``content_type_mismatch`` — transport or local conditions.
+#
+# ``min_length`` / ``extract`` for Tier 2: the sweep re-runs Tier 2 only
+# from the note's stored archive (``repair_hooks.make_sweep_tier2_extractor``),
+# a file that doesn't change, so extracting it again gives the same text —
+# too short, or none at all.  Left transient, a forum post whose archive
+# extracts to 550 characters (under ``min_html_chars``) was rewritten by
+# every sweep, twice a day, in production.  ``archive_read`` stays
+# transient: a file-system error can clear.  Live extraction (the text
+# stage) raises the same discriminators and has its own fallback to
+# ``text:abstract-only``, so they stay transient there.
 _STAGE_SCOPED_COUNTED_STAGES: dict[CountedStage, frozenset[str]] = {
     "archive": frozenset(
         {
             "unsupported_source",
+            "http_401",
             "http_403",
             "http_404",
             "http_410",
             "blocked",
         }
     ),
+    "tier2": frozenset({"min_length", "extract"}),
+}
+
+# Discriminators that make a stage terminal on the first failure.
+#
+# ``missing_by_policy`` / ``non_html_source`` / ``unsupported``: the
+# archive layer returns these before any download, from the URL's shape
+# or the operator's archive policy.  Acquisition stamps them
+# ``influx:archive-terminal`` straight away (``sources/rss.py``), so a
+# note reaches the sweep with one only when it was acquired before the
+# policy existed.  No retry can change an answer decided without a
+# download, and counting to the cap would only rewrite the note three
+# more times.  Left transient, an openai.com note acquired before the
+# ``unsupported`` policy was rewritten by every sweep (v179 on staging).
+#
+# ``blocked`` is deliberately not here: the download is still attempted,
+# and a domain can lift its block, so it keeps the counted path.
+_STAGE_SCOPED_TERMINAL_STAGES: dict[CountedStage, frozenset[str]] = {
+    "archive": frozenset({"missing_by_policy", "non_html_source", "unsupported"}),
 }
 
 
@@ -279,8 +313,8 @@ def classify_failure(
     exc: BaseException,
     *,
     repair_stage: CountedStage | None = None,
-) -> Literal["transient", "counted"]:
-    """Partition a sweep stage failure into transient vs counted.
+) -> Literal["transient", "counted", "terminal"]:
+    """Partition a sweep stage failure into transient, counted or terminal.
 
     *Counted* failures advance the per-stage attempt counter and
     eventually flip the stage to terminal — these are exceptions whose
@@ -288,11 +322,17 @@ def classify_failure(
     ``validate``).  Re-running the same prompt on the same input will
     almost certainly keep failing.
 
+    *Terminal* failures flip the stage to terminal at once, without
+    counting: the outcome was decided before anything was attempted —
+    see :data:`_STAGE_SCOPED_TERMINAL_STAGES`.  Only a stage-scoped
+    classification can return it.
+
     *Transient* failures (recoverable HTTP, transport, resolve,
     archive_read, or anything we don't specifically recognise) leave the
     counter alone.  The next sweep retries them indefinitely.  Note that
     "HTTP" is no longer transient wholesale: the archive stage counts the
-    permanently-failing statuses — see
+    permanently-failing statuses, and Tier 2 counts an extraction that
+    fails on its stored archive — see
     :data:`_STAGE_SCOPED_COUNTED_STAGES`.
 
     Parameters
@@ -310,6 +350,10 @@ def classify_failure(
     """
     if isinstance(exc, (LCMAError, ExtractionError)):
         exc_stage = getattr(exc, "stage", "") or ""
+        if repair_stage is not None and exc_stage in _STAGE_SCOPED_TERMINAL_STAGES.get(
+            repair_stage, frozenset()
+        ):
+            return "terminal"
         counted = _COUNTED_STAGES
         if repair_stage is not None:
             counted = counted | _STAGE_SCOPED_COUNTED_STAGES.get(

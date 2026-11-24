@@ -267,10 +267,10 @@ Stage is one of: `archive_download`, `text_extraction`, `tier2_enrichment`,
 `{parse, validate, oversize}` is **counted** (advances the per-stage
 attempt counter); everything else is **transient** (no counter bump).
 
-Five discriminators are counted **for the archive stage only**, because
+Six discriminators are counted **for the archive stage only**, because
 they are permanent there and not elsewhere:
-`{unsupported_source, http_403, http_404, http_410, blocked}`. A
-paywall, a dead link, a withdrawn resource, an operator-blocked domain,
+`{unsupported_source, http_401, http_403, http_404, http_410, blocked}`.
+A paywall, a dead link, a withdrawn resource, an operator-blocked domain,
 and a missing resolver all return the same answer however many times we
 ask. Recoverable statuses — `http_429`, `http_5xx`, and the `http_4xx`
 catch-all (which holds retryable codes such as 408 and 425) — stay
@@ -282,13 +282,26 @@ never enters the archive stage. Counting it catches the notes acquired
 *before* the domain was blocked, which would otherwise retry the
 newly-doomed path forever.
 
+Three more archive discriminators skip the counter and go terminal on
+the first failure: `{unsupported, missing_by_policy, non_html_source}`.
+The archive layer returns them before any download, from the archive
+policy or the URL's shape, so a retry cannot change the answer.
+
+Tier 2 counts `{min_length, extract}`: the sweep re-extracts full text
+only from the stored archive, so a page too short to pass
+`min_html_chars`, or one with no extractable text, fails the same way
+every time. Such a note reaches `influx:tier2-terminal` after three
+sweeps. `archive_read` stays transient.
+
 ### 4.4 Terminal-flip events
 
 When a per-stage counter reaches `REPAIR_COUNTED_CAP=3`, the sweep adds
 `influx:<stage>-terminal` and emits a WARNING with one of these
 `sweep_stage` values:
 
-- `archive_terminal_flip` (carries `archive_attempts`, `kind`, `detail`)
+- `archive_terminal_flip` (carries `archive_attempts`, `kind`, `detail`;
+  also emitted, with `archive_attempts` unchanged, when a policy
+  short-circuit flips the stage on its first failure)
 - `tier2_terminal_flip` (carries `tier2_attempts`, `stage`, `detail`)
 - `tier3_terminal_flip` (carries `tier3_attempts`, `stage`, `detail`)
 

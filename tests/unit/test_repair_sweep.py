@@ -1096,6 +1096,112 @@ class TestSweepTier2RecoveryViaCascade:
         assert getattr(rec, "stage", None) == "parse"
 
 
+class TestSweepTier2ShortArchive:
+    """Tier 2 on a stored archive that can't yield full text (prod 3705ff3c).
+
+    A forum post's archive extracts to 550 characters, under
+    ``min_html_chars``.  Tier 2 failed with ``min_length``, classed
+    transient, so it was never counted, logged nothing, and the note was
+    rewritten by every sweep, twice a day.  The archive is a fixed file:
+    the sweep now counts the failure, and the note leaves at the cap.
+    Runs the production extractor on a real archive file.
+    """
+
+    ARCHIVE = "rss/2026/09/forum-post.html"
+    PAGES = {
+        "min_length": (
+            "<html><head><title>Forum</title></head><body><article>"
+            "<h1>Re: Gotek touchscreen</h1><p>"
+            + "A new touchscreen for the Gotek drive. " * 8
+            + "</p></article></body></html>"
+        ),
+        "extract": "<html><body></body></html>",
+    }
+
+    @classmethod
+    def _note(cls, *, repair_section: str = "") -> dict[str, Any]:
+        body = (
+            "# Re: Gotek touchscreen\n\n"
+            "## Archive\n"
+            f"path: {cls.ARCHIVE}\n\n"
+            "## Summary\n### Contributions\n- A touchscreen for the Gotek\n\n"
+            f"{repair_section}"
+            "## Profile Relevance\n"
+            "### ai-robotics\nScore: 8/10\nNew hardware.\n\n"
+            "## User Notes\n"
+        )
+        return {
+            "id": "n1",
+            "title": "Re: Gotek touchscreen",
+            "content": body,
+            "tags": ["influx:repair-needed", "text:html", "profile:ai-robotics"],
+            "source_url": "https://forum.example.org/index.php?topic=1",
+            "confidence": 0.9,
+        }
+
+    @classmethod
+    async def _sweep_once(
+        cls, tmp_path: Any, stage: str, note: dict[str, Any]
+    ) -> dict[str, Any]:
+        from influx.repair_hooks import make_sweep_tier2_extractor
+
+        archive = tmp_path / cls.ARCHIVE
+        archive.parent.mkdir(parents=True)
+        archive.write_text(cls.PAGES[stage], encoding="utf-8")
+        config = _make_config()
+        config.storage = MagicMock(archive_dir=str(tmp_path))
+        config.extraction = MagicMock(
+            min_html_chars=1000, strip_tags=["script", "iframe", "object", "embed"]
+        )
+        client = _make_client(
+            list_items=[{"id": "n1", "title": note["title"]}], read_responses=[note]
+        )
+        await sweep(
+            "ai-robotics",
+            client=client,
+            config=config,
+            hooks=SweepHooks(),
+            cascade=_build_sweep_cascade(
+                config,
+                "ai-robotics",
+                tier2_extractor=make_sweep_tier2_extractor(config),
+            ),
+        )
+        writes = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        return dict(writes[-1].args[1])
+
+    @pytest.mark.parametrize("stage", ["min_length", "extract"])
+    async def test_first_failure_is_counted(self, tmp_path: Any, stage: str) -> None:
+        rewritten = await self._sweep_once(tmp_path, stage, self._note())
+        assert "tier2_attempts: 1" in rewritten["content"]
+        assert f'tier2_last_stage: "{stage}"' in rewritten["content"]
+        assert "influx:repair-needed" in rewritten["tags"]
+        assert "influx:tier2-terminal" not in rewritten["tags"]
+
+    @pytest.mark.parametrize("stage", ["min_length", "extract"])
+    async def test_at_the_cap_the_note_leaves_the_sweep(
+        self, tmp_path: Any, stage: str
+    ) -> None:
+        note = self._note(
+            repair_section=(
+                "## Repair\n"
+                "- tier2_attempts: 2\n"
+                f'- tier2_last_stage: "{stage}"\n'
+                '- tier2_last_error: "earlier failure"\n'
+                "- tier3_attempts: 0\n"
+                '- tier3_last_stage: ""\n'
+                '- tier3_last_error: ""\n\n'
+            )
+        )
+        rewritten = await self._sweep_once(tmp_path, stage, note)
+        assert "tier2_attempts: 3" in rewritten["content"]
+        assert "influx:tier2-terminal" in rewritten["tags"]
+        assert "influx:repair-needed" not in rewritten["tags"]
+        assert "full-text" not in rewritten["tags"]
+
+
 # ── Layer 2 self-repair: counter + terminal flip ─────────────────────
 
 
@@ -2310,3 +2416,210 @@ class TestSweepPaywalledArchiveConvergence:
         assert "archive_attempts: 0" in rewritten["content"]
         assert "influx:archive-terminal" not in rewritten["tags"]
         assert "influx:repair-needed" in rewritten["tags"]
+
+
+class TestSweepPolicySkippedArchiveTerminal:
+    """A policy-skipped archive goes terminal on its first sweep.
+
+    Reproduces staging note ``e194de38`` ("Parloa builds service agents
+    customers want to talk to", feed ``openai-news``).  It was acquired
+    with ``influx:archive-missing`` and no terminal tag, and openai.com
+    is now declared ``unsupported`` by the default archive policy.  The
+    archive layer therefore returns ``unsupported`` before any network
+    call on every pass.  While that was classified transient, the
+    counter never moved and every daily sweep rewrote the note
+    unchanged, reaching v179: each rewrite bumped the Lithos version
+    and re-ran the note's edge inference.
+
+    Acquisition already stamps these kinds ``influx:archive-terminal``
+    (``sources/rss.py``).  The sweep now does the same for notes acquired
+    before the policy, at once: retrying cannot change an answer that was
+    decided without a download.
+    """
+
+    KINDS = ("unsupported", "missing_by_policy", "non_html_source")
+
+    CONTENT = (
+        "# Parloa builds service agents customers want to talk to\n\n"
+        "## Archive\n\n"
+        "## Summary\nSummary\n\n"
+        "## Profile Relevance\n"
+        "### ai-agents\nScore: 7/10\nRelevant\n\n"
+        "## User Notes\n"
+    )
+
+    @classmethod
+    def _note(cls) -> dict[str, Any]:
+        return {
+            "id": "e194de38-5618-475a-842e-f0a92f983fa6",
+            "title": "Parloa builds service agents customers want to talk to",
+            "content": cls.CONTENT,
+            "tags": [
+                "source:blog",
+                "ingested-by:influx",
+                "schema:1",
+                "influx:archive-missing",
+                "influx:repair-needed",
+                "text:abstract-only",
+                "influx:text-terminal",
+                "profile:ai-agents",
+                "feed-slug:openai-news",
+            ],
+            "source_url": "https://openai.com/index/parloa",
+            "confidence": 1.0,
+            "version": 179,
+        }
+
+    @staticmethod
+    def _skipped(kind: str) -> Any:
+        def hook(note: dict[str, object]) -> str:
+            del note
+            raise ExtractionError(
+                f"archive_download retry failed: {kind}: archive skipped",
+                stage=kind,
+            )
+
+        return hook
+
+    @staticmethod
+    def _write_args(client: AsyncMock) -> dict[str, Any]:
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        return dict(write_calls[-1].args[1])
+
+    @pytest.mark.parametrize("kind", KINDS)
+    async def test_first_skip_flips_terminal_and_releases_note(self, kind: str) -> None:
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "e194de38", "title": "Parloa"}],
+            read_responses=[self._note()],
+        )
+
+        await sweep(
+            "ai-agents",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=self._skipped(kind)),
+        )
+
+        rewritten = self._write_args(client)
+        assert "influx:archive-terminal" in rewritten["tags"]
+        # The note leaves the sweep set, so nothing rewrites it again.
+        assert "influx:repair-needed" not in rewritten["tags"]
+        # Still factually archive-less, as after acquisition-time policy.
+        assert "influx:archive-missing" in rewritten["tags"]
+        # No attempt was made, so no attempt is counted.
+        assert rewritten["content"] == self.CONTENT
+
+    async def test_flip_is_logged_as_an_archive_terminal_flip(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Operators find it with ``influx-diagnose.py terminal-flips``."""
+        import logging
+
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "e194de38", "title": "Parloa"}],
+            read_responses=[self._note()],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="influx.repair"):
+            await sweep(
+                "ai-agents",
+                client=client,
+                config=config,
+                hooks=SweepHooks(archive_download=self._skipped("unsupported")),
+            )
+
+        flips = [
+            r
+            for r in caplog.records
+            if getattr(r, "sweep_stage", None) == "archive_terminal_flip"
+        ]
+        assert len(flips) == 1
+        assert getattr(flips[0], "kind", None) == "unsupported"
+        assert getattr(flips[0], "archive_attempts", None) == 0
+        assert getattr(flips[0], "note_id", None) == self._note()["id"]
+
+    async def test_blocked_still_counts_toward_the_cap(self) -> None:
+        """``blocked`` attempts the download, so it keeps the counted path.
+
+        A blocked domain can lift its block, and the sweep is how such a
+        note recovers.  Only kinds decided before any download go
+        terminal at once.
+        """
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "e194de38", "title": "Parloa"}],
+            read_responses=[self._note()],
+        )
+
+        await sweep(
+            "ai-agents",
+            client=client,
+            config=config,
+            hooks=SweepHooks(archive_download=self._skipped("blocked")),
+        )
+
+        rewritten = self._write_args(client)
+        assert "archive_attempts: 1" in rewritten["content"]
+        assert "influx:archive-terminal" not in rewritten["tags"]
+        assert "influx:repair-needed" in rewritten["tags"]
+
+
+class TestSweepStrayH1InFullText:
+    """A fully repaired note is released despite an H1 in its Full Text.
+
+    Reproduces staging note ``590138e5`` (arXiv 2605.18583): archive
+    stored, ``text:html``, ``full-text`` and ``influx:deep-extracted`` all
+    present, yet ``influx:repair-needed`` survived every sweep and the
+    note was rewritten daily (v181).  ``read_note`` serves the body
+    without its title line, and the paper's Full Text holds a code
+    comment that looks like an H1.  The parser took that line as the
+    title and dropped ``## Archive`` above it, so no archive path was
+    found and the archive clearing condition never held.
+    """
+
+    CONTENT = (
+        "\n## Archive\npath: arxiv/2026/05/2605.18583.pdf\n\n"
+        "## Summary\nSummary\n\n"
+        "## Full Text\nif user.is_admin:\n# authentication check would go here\n\n"
+        "## Claims\n- A claim\n\n"
+        "## Profile Relevance\n### ai-coding\nScore: 9/10\nRelevant\n\n"
+        "## User Notes\n"
+    )
+
+    async def test_repaired_note_leaves_the_sweep(self) -> None:
+        config = _make_config()
+        client = _make_client(
+            list_items=[{"id": "590138e5", "title": "Overeager Coding Agents"}],
+            read_responses=[
+                {
+                    "id": "590138e5-56e2-42d5-8944-d9bffcc99f36",
+                    "title": "Overeager Coding Agents",
+                    "content": self.CONTENT,
+                    "tags": [
+                        "arxiv-id:2605.18583",
+                        "source:arxiv",
+                        "text:html",
+                        "full-text",
+                        "influx:repair-needed",
+                        "influx:deep-extracted",
+                        "profile:ai-coding",
+                    ],
+                    "source_url": "https://arxiv.org/abs/2605.18583",
+                    "confidence": 1.0,
+                    "version": 181,
+                }
+            ],
+        )
+
+        await sweep("ai-coding", client=client, config=config, hooks=SweepHooks())
+
+        write_calls = [
+            c for c in client.call_tool.call_args_list if c.args[0] == "lithos_write"
+        ]
+        assert write_calls, "expected lithos_write call"
+        assert "influx:repair-needed" not in write_calls[-1].args[1]["tags"]

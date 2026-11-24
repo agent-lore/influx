@@ -854,10 +854,11 @@ def make_sweep_tier2_extractor(config: AppConfig) -> Tier2Extractor:
 
     A missing archive path raises a counted ``parse`` failure (exactly
     as the old ``tier2_enrich`` hook did), so the Tier-2 cap still trips
-    for a note that never gains an archive.  Archive-read and extraction
-    failures raise transient stages (``archive_read`` / ``extract`` /
-    ``min_length``) that keep ``influx:repair-needed`` without advancing
-    the counter.
+    for a note that never gains an archive.  An extraction failure
+    (``extract`` / ``min_length``) is counted too: the archive is a fixed
+    file, so the next sweep would extract the same text.  An
+    ``archive_read`` failure is transient and keeps
+    ``influx:repair-needed`` without advancing the counter.
     """
 
     def extractor(acquired: Acquired) -> Tier2Result:
